@@ -469,7 +469,7 @@ def test_molecule_s3gfn_minimol_speed_optimized_config_parses() -> None:
     config = load_and_parse(config_path, ActiveLearningConfig)
 
     assert config.sampler.type == "S3GFNSampler"
-    assert config.sampler.compile_strategy == "generation"
+    assert config.sampler.compile_strategy == "training_and_generation"
     assert config.sampler.torch_compile_mode == "max-autotune"
     assert config.sampler.model_dtype == "bfloat16"
     assert config.sampler.batch_size == 64

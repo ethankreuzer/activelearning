@@ -1,9 +1,9 @@
 # S3-GFN molecule experiment: measured GPU speedup settings.
 #
-# This is an A100-oriented starting point: the policy uses BF16 and
-# generation-only max-autotune compilation, while training, replay, and final
-# generation use independent batch sizes. Tune these values for the target GPU
-# before production use.
+# This is an A100-oriented starting point: the policy uses BF16 and max-autotune
+# compilation during training and final generation, while training, replay, and
+# final generation use independent batch sizes. Tune these values for the target
+# GPU before production use.
 #
 # Prerequisites:
 #   - uv sync --extra molecules
@@ -52,7 +52,7 @@ sampler:
   model_name_or_path: ibm-research/GP-MoLFormer-Uniq
   tokenizer_name_or_path: ibm-research/MoLFormer-XL-both-10pct
   trust_remote_code: true
-  compile_strategy: generation
+  compile_strategy: training_and_generation
   torch_compile_mode: max-autotune
   model_dtype: bfloat16
   max_length: 140

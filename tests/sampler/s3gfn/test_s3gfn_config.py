@@ -25,7 +25,7 @@ def test_s3gfn_config_round_trips_through_sampler_union() -> None:
             "n_samples": 4,
             "fidelities": [1, 2],
             "max_generation_attempts": 128,
-            "compile_strategy": "generation",
+            "compile_strategy": "training_and_generation",
             "torch_compile_mode": "default",
             "model_dtype": "bfloat16",
             "generation_batch_size": 128,
@@ -35,7 +35,7 @@ def test_s3gfn_config_round_trips_through_sampler_union() -> None:
     assert isinstance(config, S3GFNSamplerConfig)
     assert config.fidelities == [1, 2]
     assert config.max_generation_attempts == 128
-    assert config.compile_strategy == "generation"
+    assert config.compile_strategy == "training_and_generation"
     assert config.torch_compile_mode == "default"
     assert config.model_dtype == "bfloat16"
     assert config.generation_batch_size == 128

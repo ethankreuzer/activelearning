@@ -112,10 +112,12 @@ The S3-GFN sampler has three independent batch controls:
 
 The sampler's `model_dtype` can be `runtime`, `float32`, or `bfloat16`.
 `runtime` follows `runtime.precision` (`16` maps to BF16), while an explicit
-value changes only the S3-GFN model and its loss tensors. Generation-only
-compilation is selected with `compile_strategy: generation`; `none` keeps eager
-execution. The first generation batch includes TorchInductor's lazy compile
-warm-up, so compare steady-state batches rather than the first call.
+value changes only the S3-GFN model and its loss tensors. Use
+`compile_strategy: generation` to compile final generation only, or
+`compile_strategy: training_and_generation` to use the compiled policy forward
+pass during both training and final generation. `none` keeps eager execution.
+The first call in each compiled mode includes TorchInductor's lazy warm-up, so
+compare steady-state steps and batches rather than the first call.
 
 On the measured A100 benchmark, BF16 `max-autotune` generation reached about
 2,182 tokens/s at batch 64 and 3,188 tokens/s at batch 128, approximately 46%

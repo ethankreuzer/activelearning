@@ -107,7 +107,9 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
         *,
         trust_remote_code: bool = True,
         deterministic_eval: bool | None = True,
-        compile_strategy: Literal["none", "generation"] = "none",
+        compile_strategy: Literal[
+            "none", "generation", "training_and_generation"
+        ] = "none",
         torch_compile_mode: str = "default",
         model_dtype: Literal["runtime", "float32", "bfloat16"] = "runtime",
         cache_dir: str | None = None,
@@ -154,9 +156,10 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
             checkpoint's own config would otherwise redraw the linear-attention
             random features on every forward pass. Set this to ``None`` for
             checkpoints that do not support it.
-        compile_strategy : {"none", "generation"}, optional
-            Compilation behavior. ``"none"`` is eager. ``"generation"``
-            compiles the policy before final candidate generation.
+        compile_strategy : {"none", "generation", "training_and_generation"}, optional
+            Compilation behavior. ``"none"`` is eager, ``"generation"``
+            compiles the policy before final candidate generation, and
+            ``"training_and_generation"`` compiles it before policy training.
         torch_compile_mode : str, optional
             TorchInductor mode passed to :func:`torch.compile` when compiled
             generation is enabled.
@@ -248,8 +251,15 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
             raise ValueError("max_generation_attempts must be positive.")
         if seed < 0:
             raise ValueError("seed must be nonnegative.")
-        if compile_strategy not in {"none", "generation"}:
-            raise ValueError("compile_strategy must be one of 'none' or 'generation'.")
+        if compile_strategy not in {
+            "none",
+            "generation",
+            "training_and_generation",
+        }:
+            raise ValueError(
+                "compile_strategy must be one of 'none', 'generation', or "
+                "'training_and_generation'."
+            )
         if compile_strategy != "none" and not torch_compile_mode:
             raise ValueError(
                 "torch_compile_mode must not be empty when compilation is enabled."
@@ -372,6 +382,15 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
             pad_token_id=model.pad_token_id
         )
 
+        if self.compile_strategy == "training_and_generation":
+            model.compile_policy(mode=self.torch_compile_mode)
+            _logger.info(
+                "S3-GFN round %d: torch.compile enabled with mode=%s; "
+                "the first training step includes lazy compilation.",
+                round_number,
+                self.torch_compile_mode,
+            )
+
         training_started = time.perf_counter()
         self._train_round(
             model=model,
@@ -386,7 +405,6 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
         _logger.info("S3-GFN round %d: policy training complete.", round_number)
 
         if self.compile_strategy == "generation":
-            model.policy.eval()
             model.compile_policy(mode=self.torch_compile_mode)
             _logger.info(
                 "S3-GFN round %d: torch.compile enabled with mode=%s; "

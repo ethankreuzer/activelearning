@@ -289,6 +289,61 @@ def test_sampler_returns_canonical_smiles_with_conditionally_sampled_fidelities(
     }
 
 
+def test_sampler_compiles_policy_before_training(
+    make_sampler,
+    patch_molecule_dependencies,
+) -> None:
+    """Compilation must accelerate policy forwards in training and generation."""
+    events: list[tuple[str, object]] = []
+
+    class CompileAwareFakeModel(FakeModel):
+        """Record compilation without invoking TorchInductor."""
+
+        def compile_policy(self, *, mode: str) -> None:
+            """Record the requested compilation mode."""
+            events.append(("compile", mode))
+
+    model = CompileAwareFakeModel()
+    model.policy.train()
+    sampler = make_sampler(
+        compile_strategy="training_and_generation",
+        torch_compile_mode="max-autotune",
+    )
+    sampler._new_round_model = lambda: model
+    sampler._train_round = lambda **kwargs: events.append(
+        ("train", kwargs["model"].policy.training)
+    )
+
+    sampler.sample(acquisition=FakeAcquisition())
+
+    assert events == [("compile", "max-autotune"), ("train", True)]
+
+
+def test_generation_only_strategy_compiles_after_training(
+    make_sampler,
+    patch_molecule_dependencies,
+) -> None:
+    """Generation-only compilation must preserve eager policy training."""
+    events: list[str] = []
+
+    class CompileAwareFakeModel(FakeModel):
+        """Record compilation without invoking TorchInductor."""
+
+        def compile_policy(self, *, mode: str) -> None:
+            """Record policy compilation."""
+            del mode
+            events.append("compile")
+
+    model = CompileAwareFakeModel()
+    sampler = make_sampler(compile_strategy="generation")
+    sampler._new_round_model = lambda: model
+    sampler._train_round = lambda **kwargs: events.append("train")
+
+    sampler.sample(acquisition=FakeAcquisition())
+
+    assert events == ["train", "compile"]
+
+
 def test_sampler_advances_round_state_across_consecutive_samples(
     make_sampler,
     patch_molecule_dependencies,

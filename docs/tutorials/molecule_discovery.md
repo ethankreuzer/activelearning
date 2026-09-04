@@ -78,13 +78,16 @@ candidate-generation calls. Omitting `generation_batch_size` makes it inherit
 explicit value overrides the S3-GFN model dtype without changing the rest of
 the experiment.
 
-`compile_strategy: generation` compiles the policy for final generation only,
-and the first generation batch includes lazy TorchInductor warm-up. In the
-measured A100 run, BF16 `max-autotune` generation improved from approximately
-2,182 tokens/s at batch 64 to 3,188 tokens/s at batch 128, about 46% higher
-useful throughput. Treat those values as a starting point: larger generation
-batches can use more memory, so test capacity and candidate validity on the
-target GPU before adopting them.
+`compile_strategy: generation` compiles final generation only, while
+`compile_strategy: training_and_generation` compiles the policy forward pass
+used during training and final generation. The first call includes lazy
+TorchInductor warm-up. In the measured A100 run at batch 64, BF16
+`max-autotune` reduced average training time from 2.969 to 1.387 seconds per
+step, a 2.14x speedup, and reached approximately 2,182 generation tokens/s.
+Increasing only the final-generation batch size to 128 reached 3,188 tokens/s,
+about 46% higher useful throughput. Treat those values as a starting point:
+larger generation batches can use more memory, so test capacity and candidate
+validity on the target GPU before adopting them.
 
 ### **Choosing an encoder for DKL**
 

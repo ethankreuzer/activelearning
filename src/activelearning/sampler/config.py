@@ -294,10 +294,11 @@ class S3GFNSamplerConfig(BaseModel):
         Whether loading may execute repository-provided model code.
     deterministic_eval : bool, optional
         Whether policy evaluation uses deterministic random features.
-    compile_strategy : {"none", "generation"}, default="none"
-        Select eager execution or generation-only compilation.
+    compile_strategy : {"none", "generation", "training_and_generation"}, default="none"
+        Select eager execution, final-generation compilation, or policy
+        compilation during both training and final generation.
     torch_compile_mode : str, default="default"
-        TorchInductor mode used only when ``compile_strategy="generation"``.
+        TorchInductor mode used when compilation is enabled.
     model_dtype : {"runtime", "float32", "bfloat16"}, default="runtime"
         Floating-point dtype for the S3-GFN model and loss tensors. ``runtime``
         inherits the global runtime precision without changing other components.
@@ -355,7 +356,7 @@ class S3GFNSamplerConfig(BaseModel):
     # set, and the checkpoint config defaults it to False. Keep it True so the
     # frozen prior scores a molecule identically across calls.
     deterministic_eval: bool | None = True
-    compile_strategy: Literal["none", "generation"] = "none"
+    compile_strategy: Literal["none", "generation", "training_and_generation"] = "none"
     torch_compile_mode: str = "default"
     model_dtype: Literal["runtime", "float32", "bfloat16"] = "runtime"
     cache_dir: str | None = None

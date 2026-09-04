@@ -351,7 +351,7 @@ class S3GFNModel(nn.Module):
         mode: str = "default",
         dynamic: bool = True,
     ) -> None:
-        """Compile the policy forward pass for repeated generation calls.
+        """Compile the policy forward pass for training and generation.
 
         Parameters
         ----------
@@ -377,7 +377,7 @@ class S3GFNModel(nn.Module):
         compile_function = getattr(torch, "compile", None)
         if compile_function is None:
             raise RuntimeError(
-                "torch.compile is required for compiled S3-GFN generation."
+                "torch.compile is required for compiled S3-GFN policy execution."
             )
         if mode == "max-autotune":
             policy_parameter = next(self.policy.parameters(), None)
