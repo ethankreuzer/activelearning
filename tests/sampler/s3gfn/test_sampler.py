@@ -18,6 +18,7 @@ from tests.sampler.s3gfn.conftest import (
     FakeChem,
     FakeModel,
     FakeSynthesizability,
+    FakeTokenizer,
 )
 
 
@@ -55,14 +56,209 @@ class _GradientTrainingModel:
         )
 
 
-def test_sampler_rejects_static_compilation_until_static_kernels_exist():
-    """Static mode must not silently select the dynamic generation compiler."""
-    with pytest.raises(ValueError, match="fixed-shape S3-GFN kernels"):
-        sampler_module.S3GFNSampler(
-            n_samples=1,
-            fidelities=(1,),
-            compile_strategy="static",
+def test_sampler_rejects_invalid_model_dtype(make_sampler):
+    with pytest.raises(ValueError, match="model_dtype"):
+        make_sampler(model_dtype="float64")
+
+
+def test_sampler_rejects_nonpositive_generation_batch_size(make_sampler):
+    with pytest.raises(ValueError, match="generation_batch_size"):
+        make_sampler(generation_batch_size=0)
+
+
+def test_sampler_resolves_model_dtype_from_runtime_context(
+    make_sampler,
+    monkeypatch,
+):
+    calls: list[dict] = []
+
+    def fake_from_pretrained(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(
+            policy=nn.Linear(1, 1),
+            prior=nn.Linear(1, 1),
+            tokenizer=FakeTokenizer(),
+            fidelity_head=None,
         )
+
+    monkeypatch.setattr(
+        sampler_module.S3GFNModel,
+        "from_pretrained",
+        fake_from_pretrained,
+    )
+    sampler = make_sampler(model_dtype="runtime")
+    sampler.bind_runtime_context(RuntimeContext(dtype=torch.bfloat16))
+
+    sampler._new_round_model()
+
+    assert calls[0]["dtype"] is torch.bfloat16
+    assert sampler.effective_model_dtype is torch.bfloat16
+
+
+def test_sampler_uses_explicit_model_dtype_for_rewards(
+    make_sampler,
+    fake_model,
+):
+    sampler = make_sampler(model_dtype="bfloat16")
+
+    prepared = sampler._prepare_batch(
+        model=fake_model,
+        smiles=("CC",),
+        fidelity_indices=torch.tensor([0]),
+        synthesizability=FakeSynthesizability(),
+        molecule_chem=FakeChem,
+        acquisition=FakeAcquisition(),
+        cost_fn=None,
+    )
+
+    assert prepared.reward_scores.dtype is torch.bfloat16
+
+
+def test_training_uses_batch_size_for_generation(make_sampler):
+    class _TrainingModel(_GradientTrainingModel):
+        def __init__(self) -> None:
+            super().__init__()
+            self.generate_calls = []
+
+        def generate(self, count, max_length, temperature):
+            self.generate_calls.append(count)
+            return SimpleNamespace(
+                smiles=tuple("CC" for _ in range(count)),
+                input_ids=torch.ones((count, 3), dtype=torch.long),
+                fidelity_indices=torch.zeros(count, dtype=torch.long),
+            )
+
+    model = _TrainingModel()
+    sampler = make_sampler(
+        n_samples=1,
+        batch_size=3,
+        replay_batch_size=4,
+        model_dtype="float32",
+    )
+    optimizer = torch.optim.SGD(
+        [
+            *model.policy.parameters(),
+            *model.fidelity_head.parameters(),
+            model.log_z,
+        ],
+        lr=0.1,
+    )
+
+    sampler._train_step(
+        model=model,
+        synthesizability=FakeSynthesizability(),
+        positive_buffer=sampler_module.ReplayBuffer(pad_token_id=0, capacity=4),
+        negative_buffer=None,
+        molecule_chem=FakeChem,
+        acquisition=FakeAcquisition(),
+        cost_fn=None,
+        optimizer=optimizer,
+    )
+
+    assert model.generate_calls == [3]
+
+
+def test_replay_uses_replay_batch_size(make_sampler):
+    class _RecordingBuffer:
+        def __init__(self, size: int) -> None:
+            self.size = size
+            self.calls: list[dict] = []
+
+        def __len__(self) -> int:
+            return self.size
+
+        def sample(self, **kwargs):
+            self.calls.append(kwargs)
+            count = kwargs["count"]
+            return SimpleNamespace(
+                input_ids=torch.ones((count, 3), dtype=torch.long),
+                reward_scores=torch.ones(count, dtype=kwargs["dtype"]),
+                fidelity_indices=None,
+            )
+
+    sampler = make_sampler(n_samples=1, replay_batch_size=3)
+    positive_buffer = _RecordingBuffer(size=5)
+    negative_buffer = _RecordingBuffer(size=5)
+
+    class _ReplayModel:
+        def replay_loss(self, **kwargs):
+            del kwargs
+            return None
+
+    model = _ReplayModel()
+
+    sampler._update_replay_batch(
+        model=model,
+        positive_buffer=positive_buffer,
+        negative_buffer=negative_buffer,
+        optimizer=None,
+    )
+
+    assert positive_buffer.calls[0]["count"] == 3
+    assert negative_buffer.calls[0]["count"] == 3
+
+
+def test_final_generation_uses_independent_batch_size_and_strict_cap(
+    make_sampler,
+):
+    class _FinalGenerationModel:
+        def __init__(self) -> None:
+            self.policy = nn.Linear(1, 1)
+            self.prior = nn.Linear(1, 1)
+            self.calls: list[int] = []
+            self.next_smiles = 0
+
+        def generate(self, count, max_length, temperature):
+            del max_length, temperature
+            self.calls.append(count)
+            smiles = tuple(f"C{self.next_smiles + index}" for index in range(count))
+            self.next_smiles += count
+            return SimpleNamespace(
+                smiles=smiles,
+                fidelity_indices=torch.zeros(count, dtype=torch.long),
+            )
+
+    sampler = make_sampler(
+        n_samples=4,
+        batch_size=99,
+        generation_batch_size=3,
+        max_generation_attempts=5,
+    )
+    model = _FinalGenerationModel()
+
+    candidates = sampler._generate_final_candidates(
+        model=model,
+        molecule_chem=FakeChem,
+    )
+
+    assert len(candidates) == 4
+    assert model.calls == [3, 2]
+
+
+def test_final_generation_stops_at_strict_attempt_cap(make_sampler):
+    class _EmptyGenerationModel:
+        def __init__(self) -> None:
+            self.policy = nn.Linear(1, 1)
+            self.prior = nn.Linear(1, 1)
+            self.calls: list[int] = []
+
+        def generate(self, count, max_length, temperature):
+            del max_length, temperature
+            self.calls.append(count)
+            return SimpleNamespace(smiles=(), fidelity_indices=None)
+
+    sampler = make_sampler(
+        n_samples=1,
+        batch_size=99,
+        generation_batch_size=8,
+        max_generation_attempts=3,
+    )
+    model = _EmptyGenerationModel()
+
+    with pytest.raises(RuntimeError, match="after 3 attempts"):
+        sampler._generate_final_candidates(model=model, molecule_chem=FakeChem)
+
+    assert model.calls == [3]
 
 
 def test_sampler_returns_canonical_smiles_with_conditionally_sampled_fidelities(

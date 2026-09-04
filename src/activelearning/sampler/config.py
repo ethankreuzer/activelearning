@@ -8,7 +8,7 @@ discriminated union below.
 from pathlib import Path
 from typing import Annotated, Any, ClassVar, Literal, Union, overload
 
-from pydantic import BaseModel, Field, PositiveFloat, StrictInt, model_validator
+from pydantic import BaseModel, Field, PositiveFloat, StrictInt
 
 from activelearning.sampler.exact_grid_sampler import ExactGridSampler
 from activelearning.sampler.hypercube_sampler import HypercubeSampler
@@ -283,54 +283,59 @@ class S3GFNSamplerConfig(BaseModel):
     Parameters
     ----------
     n_samples : int
-    Number of candidates generated per sampling call.
+        Number of candidates generated per sampling call.
     fidelities : list[int], optional
-    Fidelity levels assigned to generated candidates.
+        Fidelity levels assigned to generated candidates.
     model_name_or_path : str, default="ibm-research/GP-MoLFormer-Uniq"
-    Hugging Face policy model identifier or local path.
+        Hugging Face policy model identifier or local path.
     tokenizer_name_or_path : str, default="ibm-research/MoLFormer-XL-both-10pct"
-    Hugging Face tokenizer identifier or local path.
+        Hugging Face tokenizer identifier or local path.
     trust_remote_code : bool, default=True
-    Whether loading may execute repository-provided model code.
+        Whether loading may execute repository-provided model code.
     deterministic_eval : bool, optional
-    Whether policy evaluation uses deterministic random features.
-    compile_strategy : {"none", "generation", "static"}, default="none"
-    Select eager execution, generation-only compilation, or the future
-    fixed-shape static compilation strategy.
+        Whether policy evaluation uses deterministic random features.
+    compile_strategy : {"none", "generation"}, default="none"
+        Select eager execution or generation-only compilation.
     torch_compile_mode : str, default="default"
-    TorchInductor mode used when compiled generation is enabled.
+        TorchInductor mode used only when ``compile_strategy="generation"``.
+    model_dtype : {"runtime", "float32", "bfloat16"}, default="runtime"
+        Floating-point dtype for the S3-GFN model and loss tensors. ``runtime``
+        inherits the global runtime precision without changing other components.
     cache_dir : str, optional
-    Directory for Hugging Face model and tokenizer files.
+        Directory for Hugging Face model and tokenizer files.
     max_length : int, default=140
-    Maximum generated sequence length.
+        Maximum generated sequence length.
     batch_size : int, default=64
-    Number of trajectories evaluated per batch.
+        Number of trajectories generated during each training step.
     replay_batch_size : int, default=64
-    Replay-buffer batch size used during training.
+        Replay-buffer batch size used during training.
+    generation_batch_size : int, optional
+        Number of trajectories generated per final candidate-generation call.
+        When omitted, ``batch_size`` is used.
     n_train_steps : int, default=5000
-    Number of policy training steps.
+        Number of policy training steps.
     num_warmup_steps : int, default=100
-    Number of learning-rate warm-up steps.
+        Number of learning-rate warm-up steps.
     learning_rate : float, default=1e-4
-    Policy learning rate.
+        Policy learning rate.
     log_z_learning_rate : float, default=1e-3
-    Learning rate for the log-partition estimate.
+        Learning rate for the log-partition estimate.
     beta : float, default=50.0
-    GFlowNet loss temperature parameter.
+        GFlowNet loss temperature parameter.
     aux_coefficient : float, default=1e-4
-    Weight of the auxiliary loss.
+        Weight of the auxiliary loss.
     buffer_size : int, default=6400
-    Maximum replay-buffer size.
+        Maximum replay-buffer size.
     sa_threshold : float, default=4.0
-    Synthetic-accessibility threshold.
+        Synthetic-accessibility threshold.
     sampling_temperature : float, default=1.0
-    Sampling temperature applied during generation.
+        Sampling temperature applied during generation.
     gradient_clip_norm : float, default=10.0
-    Maximum gradient norm during policy training.
+        Maximum gradient norm during policy training.
     max_generation_attempts : int, optional
-    Maximum attempts to produce the requested number of valid candidates.
+        Maximum attempts to produce the requested number of valid candidates.
     seed : int, default=42
-    Random seed for policy training and sampling.
+        Random seed for policy training and sampling.
     """
 
     type: Literal["S3GFNSampler"] = "S3GFNSampler"
@@ -350,12 +355,14 @@ class S3GFNSamplerConfig(BaseModel):
     # set, and the checkpoint config defaults it to False. Keep it True so the
     # frozen prior scores a molecule identically across calls.
     deterministic_eval: bool | None = True
-    compile_strategy: Literal["none", "generation", "static"] = "none"
+    compile_strategy: Literal["none", "generation"] = "none"
     torch_compile_mode: str = "default"
+    model_dtype: Literal["runtime", "float32", "bfloat16"] = "runtime"
     cache_dir: str | None = None
     max_length: int = Field(default=140, ge=2)
     batch_size: int = Field(default=64, gt=0)
     replay_batch_size: int = Field(default=64, gt=0)
+    generation_batch_size: int | None = Field(default=None, gt=0)
     n_train_steps: int = Field(default=5000, gt=0)
     num_warmup_steps: int = Field(default=100, ge=0)
     learning_rate: PositiveFloat = 1.0e-4
@@ -368,17 +375,6 @@ class S3GFNSamplerConfig(BaseModel):
     gradient_clip_norm: PositiveFloat = 10.0
     max_generation_attempts: int | None = Field(default=None, gt=0)
     seed: int = Field(default=42, ge=0)
-
-    @model_validator(mode="before")
-    @classmethod
-    def _reject_legacy_torch_compile(cls, value: Any) -> Any:
-        """Require an explicit compile strategy after the boolean migration."""
-        if isinstance(value, dict) and "torch_compile" in value:
-            raise ValueError(
-                "sampler.torch_compile was replaced by sampler.compile_strategy; "
-                "use 'none' or 'generation'."
-            )
-        return value
 
     def build(self) -> Sampler:
         """Build the sampler lazily so base installs need no Transformers.
@@ -404,10 +400,12 @@ class S3GFNSamplerConfig(BaseModel):
             deterministic_eval=self.deterministic_eval,
             compile_strategy=self.compile_strategy,
             torch_compile_mode=self.torch_compile_mode,
+            model_dtype=self.model_dtype,
             cache_dir=self.cache_dir,
             max_length=self.max_length,
             batch_size=self.batch_size,
             replay_batch_size=self.replay_batch_size,
+            generation_batch_size=self.generation_batch_size,
             n_train_steps=self.n_train_steps,
             num_warmup_steps=self.num_warmup_steps,
             learning_rate=self.learning_rate,

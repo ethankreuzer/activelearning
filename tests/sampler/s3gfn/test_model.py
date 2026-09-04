@@ -258,6 +258,7 @@ def test_pretrained_loading_constructs_bfloat16_models_in_float32(monkeypatch):
     assert all("torch_dtype" not in call for call in model_calls)
     assert next(model.policy.parameters()).dtype is torch.bfloat16
     assert next(model.prior.parameters()).dtype is torch.bfloat16
+    assert model.log_z.dtype is torch.float32
 
 
 def test_pretrained_loading_preserves_bfloat16_feature_map_redraw(monkeypatch):

@@ -14,6 +14,8 @@ def test_s3gfn_config_defaults_match_upstream_training_defaults() -> None:
     assert config.deterministic_eval is True
     assert config.compile_strategy == "none"
     assert config.torch_compile_mode == "default"
+    assert config.model_dtype == "runtime"
+    assert config.generation_batch_size is None
 
 
 def test_s3gfn_config_round_trips_through_sampler_union() -> None:
@@ -25,6 +27,8 @@ def test_s3gfn_config_round_trips_through_sampler_union() -> None:
             "max_generation_attempts": 128,
             "compile_strategy": "generation",
             "torch_compile_mode": "default",
+            "model_dtype": "bfloat16",
+            "generation_batch_size": 128,
         }
     )
 
@@ -33,15 +37,22 @@ def test_s3gfn_config_round_trips_through_sampler_union() -> None:
     assert config.max_generation_attempts == 128
     assert config.compile_strategy == "generation"
     assert config.torch_compile_mode == "default"
+    assert config.model_dtype == "bfloat16"
+    assert config.generation_batch_size == 128
 
 
-def test_s3gfn_config_rejects_legacy_torch_compile_field() -> None:
-    """The old boolean must not be silently accepted as eager execution."""
-    with pytest.raises(ValueError, match="compile_strategy"):
+@pytest.mark.parametrize("field", ["model_dtype", "compile_strategy"])
+def test_s3gfn_config_rejects_unsupported_enum_values(field: str) -> None:
+    with pytest.raises(ValueError):
         TypeAdapter(SamplerConfig).validate_python(
             {
                 "type": "S3GFNSampler",
                 "n_samples": 4,
-                "torch_compile": True,
+                field: "unsupported",
             }
         )
+
+
+def test_s3gfn_config_rejects_nonpositive_generation_batch_size() -> None:
+    with pytest.raises(ValueError):
+        S3GFNSamplerConfig(n_samples=4, generation_batch_size=0)
