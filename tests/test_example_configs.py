@@ -460,6 +460,27 @@ def test_molecule_s3gfn_minimol_variational_multi_fidelity_config_parses() -> No
     assert config.oracle.mol_repr == "smiles"
 
 
+def test_molecule_s3gfn_minimol_speed_optimized_config_parses() -> None:
+    """Ensure the GPU speedup S3-GFN example preserves its tuning controls."""
+    config_path = (
+        REPOSITORY_ROOT / "config" / "molecules" / "s3gfn_minimol_speed_optimized.yaml"
+    )
+
+    config = load_and_parse(config_path, ActiveLearningConfig)
+
+    assert config.sampler.type == "S3GFNSampler"
+    assert config.sampler.compile_strategy == "generation"
+    assert config.sampler.torch_compile_mode == "max-autotune"
+    assert config.sampler.model_dtype == "bfloat16"
+    assert config.sampler.batch_size == 64
+    assert config.sampler.replay_batch_size == 64
+    assert config.sampler.generation_batch_size == 128
+    assert config.sampler.fidelities == [1, 2, 3]
+    assert config.surrogate.type == "VariationalDKLSurrogate"
+    assert config.surrogate.is_multi_fidelity is True
+    assert config.oracle.type == "XTBIPEAOracle"
+
+
 def test_molecule_dkl_exact_pool_config_parses() -> None:
     """Ensure the exact single-fidelity pool-based molecule example matches the schema."""
     config_path = REPOSITORY_ROOT / "config" / "molecules" / "exact.yaml"

@@ -39,6 +39,7 @@ The repository includes several example molecule configs arranged as an incremen
 | `config/molecules/s3gfn_exact_multi_fidelity.yaml` | S3-GFN | Exact GP-MoLFormer SMILES DKL | MF-MES | learned fidelity `1 / 2 / 3` | Canonical SMILES multi-fidelity run |
 | `config/molecules/s3gfn_minimol_exact.yaml` | S3-GFN | Exact MiniMol SMILES DKL | UCB | fixed fidelity `1` | Canonical SMILES run with frozen graph fingerprints |
 | `config/molecules/s3gfn_minimol_variational_multi_fidelity.yaml` | S3-GFN | Variational MiniMol SMILES DKL | MF-MES | learned fidelity `1 / 2 / 3` | Canonical SMILES multi-fidelity run with a sparse GP head |
+| `config/molecules/s3gfn_minimol_speed_optimized.yaml` | S3-GFN | Variational MiniMol SMILES DKL | MF-MES | learned fidelity `1 / 2 / 3` | GPU speedup example with BF16, compilation, and separate generation batching |
 
 !!! note "Small defaults for fast checks"
     These examples are tuned to be runnable tutorial setups, not fully optimized molecule-discovery runs. The short command overrides below keep the active-learning budget small enough for a quick functional check, and the provided GFlowNet examples also use relatively short training schedules in the exact-surrogate stages so you can verify the full loop quickly. For better learning, increase both the oracle budget so the surrogate sees more observations and the GFlowNet optimization steps so the policy can better approximate reward-proportional sampling.
@@ -113,6 +114,7 @@ encoder with different GP heads:
 ```sh
 uv run activelearning config/molecules/s3gfn_minimol_exact.yaml
 uv run activelearning config/molecules/s3gfn_minimol_variational_multi_fidelity.yaml
+uv run activelearning config/molecules/s3gfn_minimol_speed_optimized.yaml
 ```
 
 The second configuration is multi-fidelity: S3-GFN chooses among fidelity
