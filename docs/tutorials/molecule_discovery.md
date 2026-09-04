@@ -68,6 +68,23 @@ fidelity proportions, and training or generation durations. The corresponding
 trajectory figures are `sampler/s3gfn/training_losses`,
 `sampler/s3gfn/log_z`, and `sampler/s3gfn/reward/trajectory`.
 
+For GPU tuning, keep the training and final-generation controls separate:
+`batch_size` controls on-policy training generation, `replay_batch_size`
+controls replay sampling, and `generation_batch_size` controls only the final
+candidate-generation calls. Omitting `generation_batch_size` makes it inherit
+`batch_size`. The sampler accepts `model_dtype: runtime`, `float32`, or
+`bfloat16`; `runtime` follows the top-level runtime precision, while an
+explicit value overrides the S3-GFN model dtype without changing the rest of
+the experiment.
+
+`compile_strategy: generation` compiles the policy for final generation only,
+and the first generation batch includes lazy TorchInductor warm-up. In the
+measured A100 run, BF16 `max-autotune` generation improved from approximately
+2,182 tokens/s at batch 64 to 3,188 tokens/s at batch 128, about 46% higher
+useful throughput. Treat those values as a starting point: larger generation
+batches can use more memory, so test capacity and candidate validity on the
+target GPU before adopting them.
+
 ### **Choosing an encoder for DKL**
 
 An encoder maps each raw molecule to features that the GP can model. A common

@@ -99,6 +99,31 @@ Every experiment is defined by a single YAML file with these top-level sections:
 | `run_writer` | *(Optional)* Durable structured run-output sink |
 | `diagnostics` | *(Optional)* Diagnostic metric and figure controls |
 
+### S3-GFN performance controls
+
+The S3-GFN sampler has three independent batch controls:
+
+- `batch_size` is the number of trajectories generated for each policy
+  training step.
+- `replay_batch_size` is the number of positive and negative trajectories used
+  by a replay update.
+- `generation_batch_size` is the number of trajectories requested by each
+  final candidate-generation call. When omitted, it inherits `batch_size`.
+
+The sampler's `model_dtype` can be `runtime`, `float32`, or `bfloat16`.
+`runtime` follows `runtime.precision` (`16` maps to BF16), while an explicit
+value changes only the S3-GFN model and its loss tensors. Generation-only
+compilation is selected with `compile_strategy: generation`; `none` keeps eager
+execution. The first generation batch includes TorchInductor's lazy compile
+warm-up, so compare steady-state batches rather than the first call.
+
+On the measured A100 benchmark, BF16 `max-autotune` generation reached about
+2,182 tokens/s at batch 64 and 3,188 tokens/s at batch 128, approximately 46%
+higher useful throughput at the larger batch. These figures are hardware- and
+workload-specific: increase `generation_batch_size` only after testing the
+target GPU's memory capacity and checking the resulting validity and duplicate
+rates.
+
 ### Overriding Config Values
 
 Append [OmegaConf dotlist](https://omegaconf.readthedocs.io/en/latest/usage.html#from-a-dot-list) overrides directly to the command:

@@ -50,9 +50,11 @@ sampler:
   trust_remote_code: true
   compile_strategy: generation
   torch_compile_mode: default
+  model_dtype: bfloat16
   max_length: 140
   batch_size: 16
   replay_batch_size: 16
+  generation_batch_size: 128
   n_train_steps: 25
   num_warmup_steps: 5
   beta: 25.0
