@@ -27,20 +27,18 @@ DEFAULT_RUNTIME_CONTEXT = RuntimeContext()
 
 def resolve_torch_dtype(precision: int) -> torch.dtype:
     """Map a floating-point precision setting to a torch dtype."""
-    if precision == 16:
-        return torch.bfloat16
     if precision == 32:
         return torch.float32
     if precision == 64:
         return torch.float64
-    raise ValueError(f"Unsupported precision {precision}. Expected 16, 32, or 64.")
+    raise ValueError(f"Unsupported precision {precision}. Expected 32 or 64.")
 
 
 class RuntimeContextConfig(BaseModel):
     """Configuration for global torch runtime defaults and shared live telemetry."""
 
     device: str = "cpu"
-    precision: Literal[16, 32, 64] = 64
+    precision: Literal[32, 64] = 64
     seed: int = Field(default=42, ge=0)
 
     def build(self, logger: Logger | None = None) -> RuntimeContext:

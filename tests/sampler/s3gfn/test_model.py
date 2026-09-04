@@ -228,46 +228,14 @@ def test_pretrained_loading_omits_deterministic_eval_when_explicitly_none(monkey
     assert all("deterministic_eval" not in call for call in model_calls)
 
 
-def test_pretrained_loading_constructs_bfloat16_models_in_float32(monkeypatch):
-    """BF16 loading must avoid GP-MoLFormer's unsupported CPU QR operation."""
+def test_pretrained_loading_preserves_bfloat16_feature_map_redraw(monkeypatch):
+    """BF16 loading must avoid CPU QR and preserve redraw tensor dtypes."""
     model_calls: list[dict] = []
 
     class _AutoModel:
         @classmethod
         def from_pretrained(cls, name, **kwargs):
             model_calls.append({"name": name, **kwargs})
-            return _FakeCausalLM()
-
-    class _AutoTokenizer:
-        @classmethod
-        def from_pretrained(cls, name, **kwargs):
-            return FakeTokenizer()
-
-    monkeypatch.setattr(
-        model_module,
-        "require_transformers",
-        lambda: (_AutoModel, _AutoTokenizer),
-    )
-
-    model = model_module.S3GFNModel.from_pretrained(
-        policy_model_name_or_path="policy",
-        tokenizer_name_or_path="tokenizer",
-        dtype=torch.bfloat16,
-    )
-
-    assert all("torch_dtype" not in call for call in model_calls)
-    assert next(model.policy.parameters()).dtype is torch.bfloat16
-    assert next(model.prior.parameters()).dtype is torch.bfloat16
-    assert model.log_z.dtype is torch.float32
-
-
-def test_pretrained_loading_preserves_bfloat16_feature_map_redraw(monkeypatch):
-    """Feature-map redraws must retain BF16 after loading and training."""
-
-    class _AutoModel:
-        @classmethod
-        def from_pretrained(cls, name, **kwargs):
-            del name, kwargs
             return _FeatureMapCausalLM()
 
     class _AutoTokenizer:
@@ -291,9 +259,13 @@ def test_pretrained_loading_preserves_bfloat16_feature_map_redraw(monkeypatch):
 
     output = model.policy(torch.ones((1, 3), dtype=torch.long))
 
+    assert all("torch_dtype" not in call for call in model_calls)
     assert output.logits.dtype is torch.bfloat16
+    assert next(model.policy.parameters()).dtype is torch.bfloat16
+    assert next(model.prior.parameters()).dtype is torch.bfloat16
     assert model.policy.feature_map.weight.dtype is torch.bfloat16
     assert model.prior.feature_map.weight.dtype is torch.bfloat16
+    assert model.log_z.dtype is torch.float32
 
 
 def test_feature_map_redraw_dtype_adapter_is_idempotent():
@@ -349,8 +321,29 @@ def test_compiled_bfloat16_feature_map_redraw_keeps_matching_dtypes():
     assert model.policy.feature_map.weight.dtype is torch.bfloat16
 
 
-def test_max_autotune_compilation_disables_cuda_graphs(monkeypatch):
-    """Max-autotune must retain kernel tuning without unsafe CUDA graphs."""
+@pytest.mark.parametrize(
+    ("dtype", "expected_options"),
+    [
+        (
+            torch.float32,
+            {"max_autotune": True, "triton.cudagraphs": False},
+        ),
+        (
+            torch.bfloat16,
+            {
+                "max_autotune": True,
+                "triton.cudagraphs": False,
+                "max_autotune_gemm_backends": "ATEN",
+            },
+        ),
+    ],
+)
+def test_max_autotune_compilation_uses_safe_options(
+    monkeypatch,
+    dtype,
+    expected_options,
+):
+    """Max-autotune must avoid unsafe CUDA graphs and BF16 Triton BMM."""
     compile_arguments = {}
 
     def fake_compile(forward, **kwargs):
@@ -362,41 +355,11 @@ def test_max_autotune_compilation_disables_cuda_graphs(monkeypatch):
         policy=_FakeCausalLM(),
         prior=_FakeCausalLM(),
         tokenizer=FakeTokenizer(),
-    )
+    ).to(dtype=dtype)
 
     model.compile_policy(mode="max-autotune")
 
-    assert compile_arguments == {
-        "dynamic": True,
-        "options": {
-            "max_autotune": True,
-            "triton.cudagraphs": False,
-        },
-    }
-
-
-def test_bfloat16_max_autotune_uses_stable_aten_gemm_backend(monkeypatch):
-    """BF16 max-autotune must avoid Triton BMM kernels that fail at launch."""
-    compile_arguments = {}
-
-    def fake_compile(forward, **kwargs):
-        compile_arguments.update(kwargs)
-        return forward
-
-    monkeypatch.setattr(torch, "compile", fake_compile)
-    model = model_module.S3GFNModel(
-        policy=_FakeCausalLM(),
-        prior=_FakeCausalLM(),
-        tokenizer=FakeTokenizer(),
-    ).to(dtype=torch.bfloat16)
-
-    model.compile_policy(mode="max-autotune")
-
-    assert compile_arguments["options"] == {
-        "max_autotune": True,
-        "triton.cudagraphs": False,
-        "max_autotune_gemm_backends": "ATEN",
-    }
+    assert compile_arguments == {"dynamic": True, "options": expected_options}
 
 
 def test_model_rejects_shared_pad_and_eos_ids() -> None:

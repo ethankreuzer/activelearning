@@ -503,20 +503,18 @@ class S3GFNModel(nn.Module):
         )
         fidelity_indices = None
         if self.fidelity_head is not None:
-            terminal_hidden_states = self._terminal_hidden_states(generated_ids)
             fidelity_indices = self.fidelity_head.sample(
-                terminal_hidden_states,
+                self._terminal_hidden_states(generated_ids),
                 temperature=temperature,
             )
-        decoded_smiles = tuple(
-            self.tokenizer.batch_decode(
-                generated_ids,
-                skip_special_tokens=True,
-            )
-        )
         return GeneratedSequences(
             input_ids=generated_ids,
-            smiles=decoded_smiles,
+            smiles=tuple(
+                self.tokenizer.batch_decode(
+                    generated_ids,
+                    skip_special_tokens=True,
+                )
+            ),
             fidelity_indices=fidelity_indices,
         )
 

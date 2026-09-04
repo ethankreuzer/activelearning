@@ -107,11 +107,9 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
         *,
         trust_remote_code: bool = True,
         deterministic_eval: bool | None = True,
-        compile_strategy: Literal[
-            "none", "generation", "training_and_generation"
-        ] = "none",
+        compile_strategy: Literal["none", "training_and_generation"] = "none",
         torch_compile_mode: str = "default",
-        model_dtype: Literal["runtime", "float32", "bfloat16"] = "runtime",
+        model_dtype: Literal["float32", "bfloat16"] = "float32",
         cache_dir: str | None = None,
         max_length: int = 140,
         batch_size: int = 64,
@@ -156,16 +154,15 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
             checkpoint's own config would otherwise redraw the linear-attention
             random features on every forward pass. Set this to ``None`` for
             checkpoints that do not support it.
-        compile_strategy : {"none", "generation", "training_and_generation"}, optional
-            Compilation behavior. ``"none"`` is eager, ``"generation"``
-            compiles the policy before final candidate generation, and
-            ``"training_and_generation"`` compiles it before policy training.
+        compile_strategy : {"none", "training_and_generation"}, optional
+            Compilation behavior. ``"none"`` is eager and
+            ``"training_and_generation"`` compiles the policy before training.
         torch_compile_mode : str, optional
             TorchInductor mode passed to :func:`torch.compile` when compiled
             generation is enabled.
-        model_dtype : {"runtime", "float32", "bfloat16"}, optional
+        model_dtype : {"float32", "bfloat16"}, optional
             Floating-point dtype for the S3-GFN policy, prior, fidelity head,
-            and loss tensors. ``"runtime"`` inherits the bound runtime dtype.
+            and loss tensors.
         cache_dir : str or None, optional
             Directory used for Hugging Face downloads and cache files.
         max_length : int, optional
@@ -251,23 +248,16 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
             raise ValueError("max_generation_attempts must be positive.")
         if seed < 0:
             raise ValueError("seed must be nonnegative.")
-        if compile_strategy not in {
-            "none",
-            "generation",
-            "training_and_generation",
-        }:
+        if compile_strategy not in {"none", "training_and_generation"}:
             raise ValueError(
-                "compile_strategy must be one of 'none', 'generation', or "
-                "'training_and_generation'."
+                "compile_strategy must be one of 'none' or 'training_and_generation'."
             )
         if compile_strategy != "none" and not torch_compile_mode:
             raise ValueError(
                 "torch_compile_mode must not be empty when compilation is enabled."
             )
-        if model_dtype not in {"runtime", "float32", "bfloat16"}:
-            raise ValueError(
-                "model_dtype must be one of 'runtime', 'float32', or 'bfloat16'."
-            )
+        if model_dtype not in {"float32", "bfloat16"}:
+            raise ValueError("model_dtype must be one of 'float32' or 'bfloat16'.")
 
         self.n_samples = n_samples
         self.fidelities = tuple(int(fidelity) for fidelity in fidelities)
@@ -306,8 +296,6 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
     @property
     def effective_model_dtype(self) -> torch.dtype:
         """Return the floating-point dtype used by S3-GFN model tensors."""
-        if self.model_dtype == "runtime":
-            return self.dtype
         if self.model_dtype == "float32":
             return torch.float32
         return torch.bfloat16
@@ -403,15 +391,6 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
         )
         self.round_metrics.training_duration_s = time.perf_counter() - training_started
         _logger.info("S3-GFN round %d: policy training complete.", round_number)
-
-        if self.compile_strategy == "generation":
-            model.compile_policy(mode=self.torch_compile_mode)
-            _logger.info(
-                "S3-GFN round %d: torch.compile enabled with mode=%s; "
-                "the first generation batch includes lazy compilation.",
-                round_number,
-                self.torch_compile_mode,
-            )
 
         generation_started = time.perf_counter()
         candidates = self._generate_final_candidates(
@@ -671,15 +650,14 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
                 positive_reward_scores,
                 fidelity_indices=positive_fidelity_indices,
             )
-            online_loss_tensor = model.on_policy_loss(
-                positive_input_ids,
-                positive_reward_scores,
-                self.beta,
-                fidelity_indices=positive_fidelity_indices,
-            )
             online_loss = self._optimize(
                 optimizer,
-                online_loss_tensor,
+                model.on_policy_loss(
+                    positive_input_ids,
+                    positive_reward_scores,
+                    self.beta,
+                    fidelity_indices=positive_fidelity_indices,
+                ),
                 model,
             )
 

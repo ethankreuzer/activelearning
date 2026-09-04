@@ -283,60 +283,59 @@ class S3GFNSamplerConfig(BaseModel):
     Parameters
     ----------
     n_samples : int
-        Number of candidates generated per sampling call.
+    Number of candidates generated per sampling call.
     fidelities : list[int], optional
-        Fidelity levels assigned to generated candidates.
+    Fidelity levels assigned to generated candidates.
     model_name_or_path : str, default="ibm-research/GP-MoLFormer-Uniq"
-        Hugging Face policy model identifier or local path.
+    Hugging Face policy model identifier or local path.
     tokenizer_name_or_path : str, default="ibm-research/MoLFormer-XL-both-10pct"
-        Hugging Face tokenizer identifier or local path.
+    Hugging Face tokenizer identifier or local path.
     trust_remote_code : bool, default=True
-        Whether loading may execute repository-provided model code.
+    Whether loading may execute repository-provided model code.
     deterministic_eval : bool, optional
-        Whether policy evaluation uses deterministic random features.
-    compile_strategy : {"none", "generation", "training_and_generation"}, default="none"
-        Select eager execution, final-generation compilation, or policy
-        compilation during both training and final generation.
+    Whether policy evaluation uses deterministic random features.
+    compile_strategy : {"none", "training_and_generation"}, default="none"
+    Select eager execution or policy compilation during training and final
+    generation.
     torch_compile_mode : str, default="default"
-        TorchInductor mode used when compilation is enabled.
-    model_dtype : {"runtime", "float32", "bfloat16"}, default="runtime"
-        Floating-point dtype for the S3-GFN model and loss tensors. ``runtime``
-        inherits the global runtime precision without changing other components.
+    TorchInductor mode used when compilation is enabled.
+    model_dtype : {"float32", "bfloat16"}, default="float32"
+    Floating-point dtype for the S3-GFN model and loss tensors.
     cache_dir : str, optional
-        Directory for Hugging Face model and tokenizer files.
+    Directory for Hugging Face model and tokenizer files.
     max_length : int, default=140
-        Maximum generated sequence length.
+    Maximum generated sequence length.
     batch_size : int, default=64
-        Number of trajectories generated during each training step.
+    Number of trajectories generated during each training step.
     replay_batch_size : int, default=64
-        Replay-buffer batch size used during training.
+    Replay-buffer batch size used during training.
     generation_batch_size : int, optional
-        Number of trajectories generated per final candidate-generation call.
-        When omitted, ``batch_size`` is used.
+    Number of trajectories generated per final candidate-generation call.
+    When omitted, ``batch_size`` is used.
     n_train_steps : int, default=5000
-        Number of policy training steps.
+    Number of policy training steps.
     num_warmup_steps : int, default=100
-        Number of learning-rate warm-up steps.
+    Number of learning-rate warm-up steps.
     learning_rate : float, default=1e-4
-        Policy learning rate.
+    Policy learning rate.
     log_z_learning_rate : float, default=1e-3
-        Learning rate for the log-partition estimate.
+    Learning rate for the log-partition estimate.
     beta : float, default=50.0
-        GFlowNet loss temperature parameter.
+    GFlowNet loss temperature parameter.
     aux_coefficient : float, default=1e-4
-        Weight of the auxiliary loss.
+    Weight of the auxiliary loss.
     buffer_size : int, default=6400
-        Maximum replay-buffer size.
+    Maximum replay-buffer size.
     sa_threshold : float, default=4.0
-        Synthetic-accessibility threshold.
+    Synthetic-accessibility threshold.
     sampling_temperature : float, default=1.0
-        Sampling temperature applied during generation.
+    Sampling temperature applied during generation.
     gradient_clip_norm : float, default=10.0
-        Maximum gradient norm during policy training.
+    Maximum gradient norm during policy training.
     max_generation_attempts : int, optional
-        Maximum attempts to produce the requested number of valid candidates.
+    Maximum attempts to produce the requested number of valid candidates.
     seed : int, default=42
-        Random seed for policy training and sampling.
+    Random seed for policy training and sampling.
     """
 
     type: Literal["S3GFNSampler"] = "S3GFNSampler"
@@ -356,9 +355,9 @@ class S3GFNSamplerConfig(BaseModel):
     # set, and the checkpoint config defaults it to False. Keep it True so the
     # frozen prior scores a molecule identically across calls.
     deterministic_eval: bool | None = True
-    compile_strategy: Literal["none", "generation", "training_and_generation"] = "none"
+    compile_strategy: Literal["none", "training_and_generation"] = "none"
     torch_compile_mode: str = "default"
-    model_dtype: Literal["runtime", "float32", "bfloat16"] = "runtime"
+    model_dtype: Literal["float32", "bfloat16"] = "float32"
     cache_dir: str | None = None
     max_length: int = Field(default=140, ge=2)
     batch_size: int = Field(default=64, gt=0)

@@ -14,7 +14,7 @@ def test_s3gfn_config_defaults_match_upstream_training_defaults() -> None:
     assert config.deterministic_eval is True
     assert config.compile_strategy == "none"
     assert config.torch_compile_mode == "default"
-    assert config.model_dtype == "runtime"
+    assert config.model_dtype == "float32"
     assert config.generation_batch_size is None
 
 

@@ -38,8 +38,7 @@ The repository includes several example molecule configs arranged as an incremen
 | `config/molecules/s3gfn_exact.yaml` | S3-GFN | Exact GP-MoLFormer SMILES DKL | UCB | fixed fidelity `1` | Canonical SMILES single-fidelity run |
 | `config/molecules/s3gfn_exact_multi_fidelity.yaml` | S3-GFN | Exact GP-MoLFormer SMILES DKL | MF-MES | learned fidelity `1 / 2 / 3` | Canonical SMILES multi-fidelity run |
 | `config/molecules/s3gfn_minimol_exact.yaml` | S3-GFN | Exact MiniMol SMILES DKL | UCB | fixed fidelity `1` | Canonical SMILES run with frozen graph fingerprints |
-| `config/molecules/s3gfn_minimol_variational_multi_fidelity.yaml` | S3-GFN | Variational MiniMol SMILES DKL | MF-MES | learned fidelity `1 / 2 / 3` | Canonical SMILES multi-fidelity run with a sparse GP head |
-| `config/molecules/s3gfn_minimol_speed_optimized.yaml` | S3-GFN | Variational MiniMol SMILES DKL | MF-MES | learned fidelity `1 / 2 / 3` | GPU speedup example with BF16, compilation, and separate generation batching |
+| `config/molecules/s3gfn_minimol_variational_multi_fidelity.yaml` | S3-GFN | Variational MiniMol SMILES DKL | MF-MES | learned fidelity `1 / 2 / 3` | GPU-optimized multi-fidelity run with a sparse GP head |
 
 !!! note "Small defaults for fast checks"
     These examples are tuned to be runnable tutorial setups, not fully optimized molecule-discovery runs. The short command overrides below keep the active-learning budget small enough for a quick functional check, and the provided GFlowNet examples also use relatively short training schedules in the exact-surrogate stages so you can verify the full loop quickly. For better learning, increase both the oracle budget so the surrogate sees more observations and the GFlowNet optimization steps so the policy can better approximate reward-proportional sampling.
@@ -73,15 +72,12 @@ For GPU tuning, keep the training and final-generation controls separate:
 `batch_size` controls on-policy training generation, `replay_batch_size`
 controls replay sampling, and `generation_batch_size` controls only the final
 candidate-generation calls. Omitting `generation_batch_size` makes it inherit
-`batch_size`. The sampler accepts `model_dtype: runtime`, `float32`, or
-`bfloat16`; `runtime` follows the top-level runtime precision, while an
-explicit value overrides the S3-GFN model dtype without changing the rest of
-the experiment.
+`batch_size`. The sampler accepts `model_dtype: float32` or `bfloat16`, which
+controls the S3-GFN model without changing the rest of the experiment.
 
-`compile_strategy: generation` compiles final generation only, while
 `compile_strategy: training_and_generation` compiles the policy forward pass
-used during training and final generation. The first call includes lazy
-TorchInductor warm-up. In the measured A100 run at batch 64, BF16
+used during training and final generation. The first training step includes
+lazy TorchInductor warm-up. In the measured A100 run at batch 64, BF16
 `max-autotune` reduced average training time from 2.969 to 1.387 seconds per
 step, a 2.14x speedup, and reached approximately 2,182 generation tokens/s.
 Increasing only the final-generation batch size to 128 reached 3,188 tokens/s,
@@ -117,7 +113,6 @@ encoder with different GP heads:
 ```sh
 uv run activelearning config/molecules/s3gfn_minimol_exact.yaml
 uv run activelearning config/molecules/s3gfn_minimol_variational_multi_fidelity.yaml
-uv run activelearning config/molecules/s3gfn_minimol_speed_optimized.yaml
 ```
 
 The second configuration is multi-fidelity: S3-GFN chooses among fidelity

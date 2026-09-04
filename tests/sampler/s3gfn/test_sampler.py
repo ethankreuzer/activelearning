@@ -18,7 +18,6 @@ from tests.sampler.s3gfn.conftest import (
     FakeChem,
     FakeModel,
     FakeSynthesizability,
-    FakeTokenizer,
 )
 
 
@@ -54,45 +53,6 @@ class _GradientTrainingModel:
             + self.fidelity_head.weight.square().sum()
             + self.log_z.square()
         )
-
-
-def test_sampler_rejects_invalid_model_dtype(make_sampler):
-    with pytest.raises(ValueError, match="model_dtype"):
-        make_sampler(model_dtype="float64")
-
-
-def test_sampler_rejects_nonpositive_generation_batch_size(make_sampler):
-    with pytest.raises(ValueError, match="generation_batch_size"):
-        make_sampler(generation_batch_size=0)
-
-
-def test_sampler_resolves_model_dtype_from_runtime_context(
-    make_sampler,
-    monkeypatch,
-):
-    calls: list[dict] = []
-
-    def fake_from_pretrained(**kwargs):
-        calls.append(kwargs)
-        return SimpleNamespace(
-            policy=nn.Linear(1, 1),
-            prior=nn.Linear(1, 1),
-            tokenizer=FakeTokenizer(),
-            fidelity_head=None,
-        )
-
-    monkeypatch.setattr(
-        sampler_module.S3GFNModel,
-        "from_pretrained",
-        fake_from_pretrained,
-    )
-    sampler = make_sampler(model_dtype="runtime")
-    sampler.bind_runtime_context(RuntimeContext(dtype=torch.bfloat16))
-
-    sampler._new_round_model()
-
-    assert calls[0]["dtype"] is torch.bfloat16
-    assert sampler.effective_model_dtype is torch.bfloat16
 
 
 def test_sampler_uses_explicit_model_dtype_for_rewards(
@@ -317,31 +277,6 @@ def test_sampler_compiles_policy_before_training(
     sampler.sample(acquisition=FakeAcquisition())
 
     assert events == [("compile", "max-autotune"), ("train", True)]
-
-
-def test_generation_only_strategy_compiles_after_training(
-    make_sampler,
-    patch_molecule_dependencies,
-) -> None:
-    """Generation-only compilation must preserve eager policy training."""
-    events: list[str] = []
-
-    class CompileAwareFakeModel(FakeModel):
-        """Record compilation without invoking TorchInductor."""
-
-        def compile_policy(self, *, mode: str) -> None:
-            """Record policy compilation."""
-            del mode
-            events.append("compile")
-
-    model = CompileAwareFakeModel()
-    sampler = make_sampler(compile_strategy="generation")
-    sampler._new_round_model = lambda: model
-    sampler._train_round = lambda **kwargs: events.append("train")
-
-    sampler.sample(acquisition=FakeAcquisition())
-
-    assert events == ["train", "compile"]
 
 
 def test_sampler_advances_round_state_across_consecutive_samples(

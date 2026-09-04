@@ -1,5 +1,5 @@
-# S3-GFN molecule experiment: MiniMol fingerprints + variational SMILES DKL
-# with explicit fidelity actions.
+# GPU-optimized S3-GFN experiment: MiniMol fingerprints + variational SMILES
+# DKL with explicit fidelity actions.
 #
 # Prerequisites:
 #   - uv sync --extra molecules
@@ -43,17 +43,17 @@ acquisition:
 
 sampler:
   type: S3GFNSampler
-  n_samples: 100
+  n_samples: 64
   fidelities: [1, 2, 3]
   model_name_or_path: ibm-research/GP-MoLFormer-Uniq
   tokenizer_name_or_path: ibm-research/MoLFormer-XL-both-10pct
   trust_remote_code: true
-  compile_strategy: generation
-  torch_compile_mode: default
+  compile_strategy: training_and_generation
+  torch_compile_mode: max-autotune
   model_dtype: bfloat16
   max_length: 140
-  batch_size: 16
-  replay_batch_size: 16
+  batch_size: 64
+  replay_batch_size: 64
   generation_batch_size: 128
   n_train_steps: 25
   num_warmup_steps: 5
@@ -62,7 +62,8 @@ sampler:
   sa_threshold: 4.0
 
 selector:
-  type: CostAwareSelector
+  type: TopKAcquisitionSelector
+  num_samples: 8
 
 oracle:
   type: XTBIPEAOracle
@@ -86,7 +87,6 @@ budget:
     value: 56.0
 
 logger:
-  type: CometLogger
+  type: ConsoleLogger
   project_name: activelearning_tutorials
   run_name: molecules-s3gfn-minimol-variational-multi-fidelity
-  workspace: pedromsferraz

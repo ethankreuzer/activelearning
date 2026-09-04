@@ -87,7 +87,7 @@ Every experiment is defined by a single YAML file with these top-level sections:
 
 | Section | Description |
 |---------|-------------|
-| `runtime` | Device (`cpu`/`cuda`) and floating-point precision (`16` = BF16, `32`, or `64`) |
+| `runtime` | Device (`cpu`/`cuda`) and floating-point precision (`32` or `64`) |
 | `dataset` | Dataset backend (e.g. `ListDataset`) |
 | `surrogate` | Probabilistic model (e.g. `BoTorchGPSurrogate`) |
 | `acquisition` | Acquisition function (e.g. `QMultiFidelityLowerBoundMaxValueEntropy`) |
@@ -101,30 +101,10 @@ Every experiment is defined by a single YAML file with these top-level sections:
 
 ### S3-GFN performance controls
 
-The S3-GFN sampler has three independent batch controls:
-
-- `batch_size` is the number of trajectories generated for each policy
-  training step.
-- `replay_batch_size` is the number of positive and negative trajectories used
-  by a replay update.
-- `generation_batch_size` is the number of trajectories requested by each
-  final candidate-generation call. When omitted, it inherits `batch_size`.
-
-The sampler's `model_dtype` can be `runtime`, `float32`, or `bfloat16`.
-`runtime` follows `runtime.precision` (`16` maps to BF16), while an explicit
-value changes only the S3-GFN model and its loss tensors. Use
-`compile_strategy: generation` to compile final generation only, or
-`compile_strategy: training_and_generation` to use the compiled policy forward
-pass during both training and final generation. `none` keeps eager execution.
-The first call in each compiled mode includes TorchInductor's lazy warm-up, so
-compare steady-state steps and batches rather than the first call.
-
-On the measured A100 benchmark, BF16 `max-autotune` generation reached about
-2,182 tokens/s at batch 64 and 3,188 tokens/s at batch 128, approximately 46%
-higher useful throughput at the larger batch. These figures are hardware- and
-workload-specific: increase `generation_batch_size` only after testing the
-target GPU's memory capacity and checking the resulting validity and duplicate
-rates.
+S3-GFN supports BF16 model execution, compiled policy forwards, and independent
+training, replay, and final-generation batch sizes. See the
+[molecule discovery tutorial](docs/tutorials/molecule_discovery.md#s3-gfn-with-smiles)
+for configuration guidance and A100 benchmark results.
 
 ### Overriding Config Values
 
