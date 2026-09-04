@@ -18,6 +18,7 @@ from __future__ import annotations
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass
+from types import MethodType
 from typing import Any
 
 import torch
@@ -31,10 +32,65 @@ from activelearning.sampler.s3gfn.losses import (
     sequence_log_probabilities,
     sequence_log_probabilities_from_logits,
 )
+from activelearning.sampler.s3gfn.profiling import profiler
 
 
 DEFAULT_GP_MOLFORMER_MODEL = "ibm-research/GP-MoLFormer-Uniq"
 DEFAULT_GP_MOLFORMER_TOKENIZER = "ibm-research/MoLFormer-XL-both-10pct"
+
+
+def _preserve_feature_map_redraw_dtype(module: nn.Module) -> None:
+    """Keep GP-MoLFormer's redrawn random-feature weights type-consistent."""
+    for feature_map in module.modules():
+        redraw = getattr(feature_map, "orthogonal_random_weights", None)
+        weight = getattr(feature_map, "weight", None)
+        if (
+            not callable(redraw)
+            or not isinstance(weight, Tensor)
+            or not weight.is_floating_point()
+        ):
+            continue
+        if (
+            getattr(feature_map, "_s3gfn_dtype_safe_redraw", False)
+            and getattr(redraw, "__self__", None) is feature_map
+        ):
+            continue
+
+        original_redraw = redraw
+
+        def redraw_with_dtype_impl(
+            current_feature_map: nn.Module,
+            device: torch.device | None = None,
+            *,
+            _original_redraw: Any = original_redraw,
+        ) -> None:
+            current_weight = getattr(current_feature_map, "weight", None)
+            target_dtype = (
+                current_weight.dtype
+                if isinstance(current_weight, Tensor)
+                and current_weight.is_floating_point()
+                else None
+            )
+            _original_redraw(device=device)
+            redrawn_weight = getattr(current_feature_map, "weight", None)
+            if target_dtype is not None and isinstance(redrawn_weight, Tensor):
+                current_feature_map.weight = redrawn_weight.to(
+                    dtype=target_dtype
+                ).clone()
+
+        compiler = getattr(torch, "compiler", None)
+        disable = getattr(compiler, "disable", None)
+        redraw_with_dtype = (
+            disable(redraw_with_dtype_impl)
+            if callable(disable)
+            else redraw_with_dtype_impl
+        )
+
+        feature_map.orthogonal_random_weights = MethodType(
+            redraw_with_dtype,
+            feature_map,
+        )
+        feature_map._s3gfn_dtype_safe_redraw = True
 
 
 @dataclass(frozen=True)
@@ -118,6 +174,8 @@ class S3GFNModel(nn.Module):
         self.prior = prior
         self.tokenizer = tokenizer
         self.fidelity_head = fidelity_head
+        _preserve_feature_map_redraw_dtype(self.policy)
+        _preserve_feature_map_redraw_dtype(self.prior)
         if self.fidelity_head is not None:
             policy_parameter = next(self.policy.parameters(), None)
             if policy_parameter is not None:
@@ -129,6 +187,7 @@ class S3GFNModel(nn.Module):
         self.eos_token_id = int(tokenizer.eos_token_id)
         self.log_z = nn.Parameter(torch.tensor(float(initial_log_z)))
         self._last_auxiliary_loss: Tensor | None = None
+        self._policy_forward_compiled = False
 
         for parameter in self.prior.parameters():
             parameter.requires_grad_(False)
@@ -221,7 +280,10 @@ class S3GFNModel(nn.Module):
         }
         if deterministic_eval is not None:
             model_kwargs["deterministic_eval"] = deterministic_eval
-        if dtype is not None:
+        # GP-MoLFormer creates orthogonal random feature maps with a CPU QR
+        # decomposition during construction. PyTorch does not implement that
+        # operation for BF16, so construct in FP32 and convert afterward.
+        if dtype is not None and dtype != torch.bfloat16:
             model_kwargs["torch_dtype"] = dtype
         prior = AutoModelForCausalLM.from_pretrained(prior_name, **model_kwargs)
         policy = AutoModelForCausalLM.from_pretrained(
@@ -234,13 +296,14 @@ class S3GFNModel(nn.Module):
                 hidden_size=_model_hidden_size(policy),
                 n_fidelities=n_fidelities,
             )
-        return cls(
+        model = cls(
             policy=policy,
             prior=prior,
             tokenizer=tokenizer,
             initial_log_z=initial_log_z,
             fidelity_head=fidelity_head,
-        ).to(device)
+        )
+        return model.to(device=device, dtype=dtype)
 
     @property
     def device(self) -> torch.device:
@@ -274,6 +337,64 @@ class S3GFNModel(nn.Module):
         super().train(mode)
         self.prior.eval()
         return self
+
+    def compile_policy(
+        self,
+        *,
+        mode: str = "default",
+        dynamic: bool = True,
+    ) -> None:
+        """Compile the policy forward pass for repeated generation calls.
+
+        Parameters
+        ----------
+        mode : str, optional
+            TorchInductor compilation mode passed to :func:`torch.compile`.
+        dynamic : bool, optional
+            Whether to allow dynamic tensor shapes across cached decoding
+            steps. This avoids compiling a separate graph for every sequence
+            length during autoregressive generation.
+
+        Raises
+        ------
+        RuntimeError
+            If the installed PyTorch version does not provide
+            :func:`torch.compile`.
+        ValueError
+            If ``mode`` is empty.
+        """
+        if not mode:
+            raise ValueError("torch.compile mode must not be empty.")
+        if self._policy_forward_compiled:
+            return
+        compile_function = getattr(torch, "compile", None)
+        if compile_function is None:
+            raise RuntimeError(
+                "torch.compile is required for compiled S3-GFN generation."
+            )
+        if mode == "max-autotune":
+            policy_parameter = next(self.policy.parameters(), None)
+            compile_options: dict[str, str | bool] = {
+                "max_autotune": True,
+                "triton.cudagraphs": False,
+            }
+            if (
+                policy_parameter is not None
+                and policy_parameter.dtype == torch.bfloat16
+            ):
+                compile_options["max_autotune_gemm_backends"] = "ATEN"
+            self.policy.forward = compile_function(
+                self.policy.forward,
+                dynamic=dynamic,
+                options=compile_options,
+            )
+        else:
+            self.policy.forward = compile_function(
+                self.policy.forward,
+                mode=mode,
+                dynamic=dynamic,
+            )
+        self._policy_forward_compiled = True
 
     def encode_smiles(
         self,
@@ -364,29 +485,35 @@ class S3GFNModel(nn.Module):
                 smiles=(),
             )
 
-        generated_ids = self.policy.generate(
-            do_sample=True,
-            max_length=max_length,
-            num_return_sequences=count,
-            temperature=temperature,
-            pad_token_id=self.pad_token_id,
-            eos_token_id=self.eos_token_id,
-            **generation_kwargs,
-        )
+        with profiler.measure("model.generate.policy", batch=count):
+            generated_ids = self.policy.generate(
+                do_sample=True,
+                max_length=max_length,
+                num_return_sequences=count,
+                temperature=temperature,
+                pad_token_id=self.pad_token_id,
+                eos_token_id=self.eos_token_id,
+                **generation_kwargs,
+            )
         fidelity_indices = None
         if self.fidelity_head is not None:
-            fidelity_indices = self.fidelity_head.sample(
-                self._terminal_hidden_states(generated_ids),
-                temperature=temperature,
-            )
-        return GeneratedSequences(
-            input_ids=generated_ids,
-            smiles=tuple(
+            with profiler.measure("model.generate.fidelity_hidden_states", batch=count):
+                terminal_hidden_states = self._terminal_hidden_states(generated_ids)
+            with profiler.measure("model.generate.fidelity_sample", batch=count):
+                fidelity_indices = self.fidelity_head.sample(
+                    terminal_hidden_states,
+                    temperature=temperature,
+                )
+        with profiler.measure("model.generate.decode", batch=count):
+            decoded_smiles = tuple(
                 self.tokenizer.batch_decode(
                     generated_ids,
                     skip_special_tokens=True,
                 )
-            ),
+            )
+        return GeneratedSequences(
+            input_ids=generated_ids,
+            smiles=decoded_smiles,
             fidelity_indices=fidelity_indices,
         )
 
@@ -415,11 +542,12 @@ class S3GFNModel(nn.Module):
         TypeError
             If ``input_ids`` does not contain integer token ids.
         """
-        return sequence_log_probabilities(
-            causal_lm=self.policy,
-            input_ids=input_ids.to(self.device),
-            pad_token_id=self.pad_token_id,
-        )
+        with profiler.measure("model.loss.policy.log_prob", batch=input_ids.shape[0]):
+            return sequence_log_probabilities(
+                causal_lm=self.policy,
+                input_ids=input_ids.to(self.device),
+                pad_token_id=self.pad_token_id,
+            )
 
     def prior_sequence_log_probabilities(self, input_ids: Tensor) -> Tensor:
         """Compute one detached sequence log probability per input under the prior.
@@ -447,11 +575,12 @@ class S3GFNModel(nn.Module):
             If ``input_ids`` does not contain integer token ids.
         """
         with torch.no_grad():
-            return sequence_log_probabilities(
-                causal_lm=self.prior,
-                input_ids=input_ids.to(self.device),
-                pad_token_id=self.pad_token_id,
-            ).detach()
+            with profiler.measure("model.loss.prior.log_prob", batch=input_ids.shape[0]):
+                return sequence_log_probabilities(
+                    causal_lm=self.prior,
+                    input_ids=input_ids.to(self.device),
+                    pad_token_id=self.pad_token_id,
+                ).detach()
 
     def policy_trajectory_log_probabilities(
         self,
@@ -498,10 +627,15 @@ class S3GFNModel(nn.Module):
                 input_ids
             )
         )
-        return sequence_log_probabilities_ + self.fidelity_head.log_prob(
-            terminal_hidden_states,
-            fidelity_indices,
-        )
+        with profiler.measure(
+            "model.loss.policy.fidelity_log_prob",
+            batch=input_ids.shape[0],
+        ):
+            fidelity_log_probabilities = self.fidelity_head.log_prob(
+                terminal_hidden_states,
+                fidelity_indices,
+            )
+        return sequence_log_probabilities_ + fidelity_log_probabilities
 
     def prior_trajectory_log_probabilities(
         self,
@@ -599,13 +733,14 @@ class S3GFNModel(nn.Module):
             positive_input_ids,
             fidelity_indices=fidelity_indices,
         )
-        return relative_trajectory_balance_loss(
-            policy_log_probabilities=policy_log_probabilities,
-            prior_log_probabilities=prior_log_probabilities,
-            reward_scores=reward_scores,
-            log_z=self.log_z,
-            beta=beta,
-        )
+        with profiler.measure("model.loss.rtb_math", batch=positive_input_ids.shape[0]):
+            return relative_trajectory_balance_loss(
+                policy_log_probabilities=policy_log_probabilities,
+                prior_log_probabilities=prior_log_probabilities,
+                reward_scores=reward_scores,
+                log_z=self.log_z,
+                beta=beta,
+            )
 
     def on_policy_loss(
         self,
@@ -737,13 +872,14 @@ class S3GFNModel(nn.Module):
             positive_input_ids,
             fidelity_indices=positive_fidelity_indices,
         )
-        rtb_loss = relative_trajectory_balance_loss(
-            policy_log_probabilities=positive_log_probabilities,
-            prior_log_probabilities=prior_log_probabilities,
-            reward_scores=reward_scores,
-            log_z=self.log_z,
-            beta=beta,
-        )
+        with profiler.measure("model.loss.rtb_math", batch=positive_input_ids.shape[0]):
+            rtb_loss = relative_trajectory_balance_loss(
+                policy_log_probabilities=positive_log_probabilities,
+                prior_log_probabilities=prior_log_probabilities,
+                reward_scores=reward_scores,
+                log_z=self.log_z,
+                beta=beta,
+            )
 
         # ``_last_auxiliary_loss`` stays ``None`` unless the contrastive branch runs,
         # so reporting can distinguish "not computed" from a measured zero.
@@ -758,10 +894,14 @@ class S3GFNModel(nn.Module):
                     negative_input_ids,
                     fidelity_indices=negative_fidelity_indices,
                 )
-                auxiliary_loss = negative_replay_contrastive_loss(
-                    positive_log_probabilities,
-                    negative_log_probabilities,
-                )
+                with profiler.measure(
+                    "model.loss.auxiliary_math",
+                    batch=positive_input_ids.shape[0],
+                ):
+                    auxiliary_loss = negative_replay_contrastive_loss(
+                        positive_log_probabilities,
+                        negative_log_probabilities,
+                    )
                 self._last_auxiliary_loss = auxiliary_loss.detach()
                 total_loss = rtb_loss + aux_coefficient * auxiliary_loss
         return total_loss
@@ -820,11 +960,15 @@ class S3GFNModel(nn.Module):
         """Return policy hidden states at the final non-padding tokens."""
         input_ids = input_ids.to(self.device)
         attention_mask = input_ids.ne(self.pad_token_id).long()
-        outputs = self.policy(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            output_hidden_states=True,
-        )
+        with profiler.measure(
+            "model.loss.policy.forward_with_hidden_states",
+            batch=input_ids.shape[0],
+        ):
+            outputs = self.policy(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_hidden_states=True,
+            )
         return self._select_terminal_hidden_states(
             outputs,
             input_ids=input_ids,
@@ -858,11 +1002,15 @@ class S3GFNModel(nn.Module):
         # The full sequence is scored in one pass so the terminal hidden state is
         # available; causal masking makes positions 0..L-2 independent of the last
         # token, so slicing here matches ``sequence_log_probabilities``.
-        sequence_log_probabilities_ = sequence_log_probabilities_from_logits(
-            outputs.logits[:, :-1],
-            labels=labels,
-            pad_token_id=self.pad_token_id,
-        )
+        with profiler.measure(
+            "model.loss.policy.sequence_score",
+            batch=input_ids.shape[0],
+        ):
+            sequence_log_probabilities_ = sequence_log_probabilities_from_logits(
+                outputs.logits[:, :-1],
+                labels=labels,
+                pad_token_id=self.pad_token_id,
+            )
         terminal_hidden_states = self._select_terminal_hidden_states(
             outputs,
             input_ids=input_ids,

@@ -36,6 +36,16 @@ def test_runtime_config_build_context_includes_seed() -> None:
     assert context.seed == 7
 
 
+def test_runtime_config_build_context_supports_bfloat16() -> None:
+    """Precision 16 should map to BF16 without changing the device."""
+    config = RuntimeContextConfig(device="cpu", precision=16, seed=7)
+
+    context = config.build(logger=None)
+
+    assert context.device == torch.device("cpu")
+    assert context.dtype == torch.bfloat16
+
+
 def test_set_global_seed_reseeds_python_numpy_and_torch() -> None:
     """Resetting the same seed should reproduce Python, NumPy, and Torch draws."""
     set_global_seed(42)

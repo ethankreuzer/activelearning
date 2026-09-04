@@ -8,7 +8,7 @@ discriminated union below.
 from pathlib import Path
 from typing import Annotated, Any, ClassVar, Literal, Union, overload
 
-from pydantic import BaseModel, Field, PositiveFloat, StrictInt
+from pydantic import BaseModel, Field, PositiveFloat, StrictInt, model_validator
 
 from activelearning.sampler.exact_grid_sampler import ExactGridSampler
 from activelearning.sampler.hypercube_sampler import HypercubeSampler
@@ -294,6 +294,11 @@ class S3GFNSamplerConfig(BaseModel):
     Whether loading may execute repository-provided model code.
     deterministic_eval : bool, optional
     Whether policy evaluation uses deterministic random features.
+    compile_strategy : {"none", "generation", "static"}, default="none"
+    Select eager execution, generation-only compilation, or the future
+    fixed-shape static compilation strategy.
+    torch_compile_mode : str, default="default"
+    TorchInductor mode used when compiled generation is enabled.
     cache_dir : str, optional
     Directory for Hugging Face model and tokenizer files.
     max_length : int, default=140
@@ -345,6 +350,8 @@ class S3GFNSamplerConfig(BaseModel):
     # set, and the checkpoint config defaults it to False. Keep it True so the
     # frozen prior scores a molecule identically across calls.
     deterministic_eval: bool | None = True
+    compile_strategy: Literal["none", "generation", "static"] = "none"
+    torch_compile_mode: str = "default"
     cache_dir: str | None = None
     max_length: int = Field(default=140, ge=2)
     batch_size: int = Field(default=64, gt=0)
@@ -361,6 +368,17 @@ class S3GFNSamplerConfig(BaseModel):
     gradient_clip_norm: PositiveFloat = 10.0
     max_generation_attempts: int | None = Field(default=None, gt=0)
     seed: int = Field(default=42, ge=0)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_legacy_torch_compile(cls, value: Any) -> Any:
+        """Require an explicit compile strategy after the boolean migration."""
+        if isinstance(value, dict) and "torch_compile" in value:
+            raise ValueError(
+                "sampler.torch_compile was replaced by sampler.compile_strategy; "
+                "use 'none' or 'generation'."
+            )
+        return value
 
     def build(self) -> Sampler:
         """Build the sampler lazily so base installs need no Transformers.
@@ -384,6 +402,8 @@ class S3GFNSamplerConfig(BaseModel):
             tokenizer_name_or_path=self.tokenizer_name_or_path,
             trust_remote_code=self.trust_remote_code,
             deterministic_eval=self.deterministic_eval,
+            compile_strategy=self.compile_strategy,
+            torch_compile_mode=self.torch_compile_mode,
             cache_dir=self.cache_dir,
             max_length=self.max_length,
             batch_size=self.batch_size,

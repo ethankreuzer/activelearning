@@ -87,7 +87,7 @@ Every experiment is defined by a single YAML file with these top-level sections:
 
 | Section | Description |
 |---------|-------------|
-| `runtime` | Device (`cpu`/`cuda`) and floating-point precision (`32`/`64`) |
+| `runtime` | Device (`cpu`/`cuda`) and floating-point precision (`16` = BF16, `32`, or `64`) |
 | `dataset` | Dataset backend (e.g. `ListDataset`) |
 | `surrogate` | Probabilistic model (e.g. `BoTorchGPSurrogate`) |
 | `acquisition` | Acquisition function (e.g. `QMultiFidelityLowerBoundMaxValueEntropy`) |

@@ -11,7 +11,7 @@
 # and a sparse variational GP.
 
 runtime:
-  device: cpu
+  device: cuda
   precision: 64
   seed: 42
 
@@ -43,11 +43,13 @@ acquisition:
 
 sampler:
   type: S3GFNSampler
-  n_samples: 64
+  n_samples: 100
   fidelities: [1, 2, 3]
   model_name_or_path: ibm-research/GP-MoLFormer-Uniq
   tokenizer_name_or_path: ibm-research/MoLFormer-XL-both-10pct
   trust_remote_code: true
+  compile_strategy: generation
+  torch_compile_mode: default
   max_length: 140
   batch_size: 16
   replay_batch_size: 16
@@ -58,8 +60,7 @@ sampler:
   sa_threshold: 4.0
 
 selector:
-  type: TopKAcquisitionSelector
-  num_samples: 8
+  type: CostAwareSelector
 
 oracle:
   type: XTBIPEAOracle
@@ -83,6 +84,7 @@ budget:
     value: 56.0
 
 logger:
-  type: ConsoleLogger
+  type: CometLogger
   project_name: activelearning_tutorials
   run_name: molecules-s3gfn-minimol-variational-multi-fidelity
+  workspace: pedromsferraz

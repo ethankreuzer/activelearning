@@ -55,6 +55,16 @@ class _GradientTrainingModel:
         )
 
 
+def test_sampler_rejects_static_compilation_until_static_kernels_exist():
+    """Static mode must not silently select the dynamic generation compiler."""
+    with pytest.raises(ValueError, match="fixed-shape S3-GFN kernels"):
+        sampler_module.S3GFNSampler(
+            n_samples=1,
+            fidelities=(1,),
+            compile_strategy="static",
+        )
+
+
 def test_sampler_returns_canonical_smiles_with_conditionally_sampled_fidelities(
     make_sampler,
     fake_model,
