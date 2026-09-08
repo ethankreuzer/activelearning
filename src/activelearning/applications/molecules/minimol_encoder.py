@@ -27,11 +27,11 @@ MINIMOL_FINGERPRINT_DIM = 512
 def _graphium_float32_compatibility() -> Iterator[None]:
     """Use a SciPy-compatible dtype while Graphium featurizes a molecule.
 
-    MiniMol 1.3.5 pins Graphium 2.4.7, whose graph-dict helper drops its
-    configured dtype before calling the adjacency helper. The resulting
-    ``float16`` sparse matrix is rejected by SciPy. The patch is scoped to
-    the active featurization call and is applied independently in each
-    process used by Graphium's featurizer.
+    Graphium 2.4.7's graph-dict helper drops its configured dtype before
+    calling the adjacency helper. The resulting ``float16`` sparse matrix is
+    rejected by SciPy. The patch is scoped to the active featurization call
+    and is applied independently in each process used by Graphium's
+    featurizer.
     """
     import numpy as np
     from graphium.features import featurizer
@@ -192,12 +192,16 @@ class MiniMolSmilesEncoder(LatentEncoder):
         self.latent_dim = latent_dim
         self.cache_size = cache_size
         self.checkpoint_path = resolved_checkpoint_path
-        self._minimol = _load_minimol()(
-            batch_size=batch_size,
-            checkpoint_path=resolved_checkpoint_path,
-        )
+        self._minimol = self._build_minimol(resolved_checkpoint_path)
         self.projection = nn.Linear(MINIMOL_FINGERPRINT_DIM, latent_dim)
         self._fingerprint_cache: OrderedDict[str, Tensor] = OrderedDict()
+
+    def _build_minimol(self, checkpoint_path: Path | None) -> Any:
+        """Construct stock MiniMol and optionally load its predictor state dict."""
+        return _load_minimol()(
+            batch_size=self.batch_size,
+            checkpoint_path=checkpoint_path,
+        )
 
     def prepare_inputs(
         self,
