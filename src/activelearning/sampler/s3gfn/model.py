@@ -55,13 +55,15 @@ def _preserve_feature_map_redraw_dtype(module: nn.Module) -> None:
         ):
             continue
 
-        original_redraw = redraw
+        original_redraw = getattr(redraw, "__func__", redraw)
+        redraw_is_bound = getattr(redraw, "__self__", None) is feature_map
 
         def redraw_with_dtype_impl(
             current_feature_map: nn.Module,
             device: torch.device | None = None,
             *,
             _original_redraw: Any = original_redraw,
+            _redraw_is_bound: bool = redraw_is_bound,
         ) -> None:
             current_weight = getattr(current_feature_map, "weight", None)
             target_dtype = (
@@ -70,7 +72,10 @@ def _preserve_feature_map_redraw_dtype(module: nn.Module) -> None:
                 and current_weight.is_floating_point()
                 else None
             )
-            _original_redraw(device=device)
+            if _redraw_is_bound:
+                _original_redraw(current_feature_map, device=device)
+            else:
+                _original_redraw(device=device)
             redrawn_weight = getattr(current_feature_map, "weight", None)
             if target_dtype is not None and isinstance(redrawn_weight, Tensor):
                 current_feature_map.weight = redrawn_weight.to(
@@ -187,6 +192,7 @@ class S3GFNModel(nn.Module):
         self.log_z = nn.Parameter(torch.tensor(float(initial_log_z)))
         self._last_auxiliary_loss: Tensor | None = None
         self._policy_forward_compiled = False
+        self._compiled_policy_forward: Any | None = None
 
         for parameter in self.prior.parameters():
             parameter.requires_grad_(False)
@@ -350,8 +356,9 @@ class S3GFNModel(nn.Module):
         *,
         mode: str = "default",
         dynamic: bool = True,
+        training_only: bool = False,
     ) -> None:
-        """Compile the policy forward pass for training and generation.
+        """Compile policy forwards for training, generation, or both.
 
         Parameters
         ----------
@@ -361,6 +368,9 @@ class S3GFNModel(nn.Module):
             Whether to allow dynamic tensor shapes across cached decoding
             steps. This avoids compiling a separate graph for every sequence
             length during autoregressive generation.
+        training_only : bool, optional
+            Keep Hugging Face generation eager and use the compiled forward
+            only for differentiable policy likelihoods.
 
         Raises
         ------
@@ -390,17 +400,21 @@ class S3GFNModel(nn.Module):
                 and policy_parameter.dtype == torch.bfloat16
             ):
                 compile_options["max_autotune_gemm_backends"] = "ATEN"
-            self.policy.forward = compile_function(
+            compiled_forward = compile_function(
                 self.policy.forward,
                 dynamic=dynamic,
                 options=compile_options,
             )
         else:
-            self.policy.forward = compile_function(
+            compiled_forward = compile_function(
                 self.policy.forward,
                 mode=mode,
                 dynamic=dynamic,
             )
+        if training_only:
+            self._compiled_policy_forward = compiled_forward
+        else:
+            self.policy.forward = compiled_forward
         self._policy_forward_compiled = True
 
     def encode_smiles(
@@ -544,7 +558,7 @@ class S3GFNModel(nn.Module):
             If ``input_ids`` does not contain integer token ids.
         """
         return sequence_log_probabilities(
-            causal_lm=self.policy,
+            causal_lm=self._compiled_policy_forward or self.policy,
             input_ids=input_ids.to(self.device),
             pad_token_id=self.pad_token_id,
         )
@@ -975,7 +989,8 @@ class S3GFNModel(nn.Module):
 
         labels = input_ids[:, 1:]
         attention_mask = input_ids.ne(self.pad_token_id).long()
-        outputs = self.policy(
+        policy_forward = self._compiled_policy_forward or self.policy
+        outputs = policy_forward(
             input_ids=input_ids,
             attention_mask=attention_mask,
             output_hidden_states=True,

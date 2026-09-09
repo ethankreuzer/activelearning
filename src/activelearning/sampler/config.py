@@ -294,11 +294,13 @@ class S3GFNSamplerConfig(BaseModel):
     Whether loading may execute repository-provided model code.
     deterministic_eval : bool, optional
     Whether policy evaluation uses deterministic random features.
-    compile_strategy : {"none", "training_and_generation"}, default="none"
-    Select eager execution or policy compilation during training and final
-    generation.
+    compile_strategy : {"none", "training_only", "training_and_generation"}, default="none"
+    Select eager execution, policy compilation during training only, or policy
+    compilation during training and final generation.
     torch_compile_mode : str, default="default"
     TorchInductor mode used when compilation is enabled.
+    torch_compile_dynamic : bool or None, default=True
+    Dynamic-shape policy passed to :func:`torch.compile`.
     model_dtype : {"float32", "bfloat16"}, default="float32"
     Floating-point dtype for the S3-GFN model and loss tensors.
     cache_dir : str, optional
@@ -355,8 +357,11 @@ class S3GFNSamplerConfig(BaseModel):
     # set, and the checkpoint config defaults it to False. Keep it True so the
     # frozen prior scores a molecule identically across calls.
     deterministic_eval: bool | None = True
-    compile_strategy: Literal["none", "training_and_generation"] = "none"
+    compile_strategy: Literal["none", "training_only", "training_and_generation"] = (
+        "none"
+    )
     torch_compile_mode: str = "default"
+    torch_compile_dynamic: bool | None = True
     model_dtype: Literal["float32", "bfloat16"] = "float32"
     cache_dir: str | None = None
     max_length: int = Field(default=140, ge=2)
@@ -400,6 +405,7 @@ class S3GFNSamplerConfig(BaseModel):
             deterministic_eval=self.deterministic_eval,
             compile_strategy=self.compile_strategy,
             torch_compile_mode=self.torch_compile_mode,
+            torch_compile_dynamic=self.torch_compile_dynamic,
             model_dtype=self.model_dtype,
             cache_dir=self.cache_dir,
             max_length=self.max_length,

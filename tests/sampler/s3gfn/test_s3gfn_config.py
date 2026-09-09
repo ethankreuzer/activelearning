@@ -14,6 +14,7 @@ def test_s3gfn_config_defaults_match_upstream_training_defaults() -> None:
     assert config.deterministic_eval is True
     assert config.compile_strategy == "none"
     assert config.torch_compile_mode == "default"
+    assert config.torch_compile_dynamic is True
     assert config.model_dtype == "float32"
     assert config.generation_batch_size is None
 
@@ -25,8 +26,9 @@ def test_s3gfn_config_round_trips_through_sampler_union() -> None:
             "n_samples": 4,
             "fidelities": [1, 2],
             "max_generation_attempts": 128,
-            "compile_strategy": "training_and_generation",
+            "compile_strategy": "training_only",
             "torch_compile_mode": "default",
+            "torch_compile_dynamic": None,
             "model_dtype": "bfloat16",
             "generation_batch_size": 128,
         }
@@ -35,8 +37,9 @@ def test_s3gfn_config_round_trips_through_sampler_union() -> None:
     assert isinstance(config, S3GFNSamplerConfig)
     assert config.fidelities == [1, 2]
     assert config.max_generation_attempts == 128
-    assert config.compile_strategy == "training_and_generation"
+    assert config.compile_strategy == "training_only"
     assert config.torch_compile_mode == "default"
+    assert config.torch_compile_dynamic is None
     assert config.model_dtype == "bfloat16"
     assert config.generation_batch_size == 128
 

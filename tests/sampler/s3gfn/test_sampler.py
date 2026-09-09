@@ -259,15 +259,22 @@ def test_sampler_compiles_policy_before_training(
     class CompileAwareFakeModel(FakeModel):
         """Record compilation without invoking TorchInductor."""
 
-        def compile_policy(self, *, mode: str) -> None:
+        def compile_policy(
+            self,
+            *,
+            mode: str,
+            dynamic: bool | None,
+            training_only: bool,
+        ) -> None:
             """Record the requested compilation mode."""
-            events.append(("compile", mode))
+            events.append(("compile", mode, dynamic, training_only))
 
     model = CompileAwareFakeModel()
     model.policy.train()
     sampler = make_sampler(
         compile_strategy="training_and_generation",
         torch_compile_mode="max-autotune",
+        torch_compile_dynamic=None,
     )
     sampler._new_round_model = lambda: model
     sampler._train_round = lambda **kwargs: events.append(
@@ -276,7 +283,10 @@ def test_sampler_compiles_policy_before_training(
 
     sampler.sample(acquisition=FakeAcquisition())
 
-    assert events == [("compile", "max-autotune"), ("train", True)]
+    assert events == [
+        ("compile", "max-autotune", None, False),
+        ("train", True),
+    ]
 
 
 def test_sampler_advances_round_state_across_consecutive_samples(

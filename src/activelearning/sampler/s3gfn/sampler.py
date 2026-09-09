@@ -107,8 +107,11 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
         *,
         trust_remote_code: bool = True,
         deterministic_eval: bool | None = True,
-        compile_strategy: Literal["none", "training_and_generation"] = "none",
+        compile_strategy: Literal[
+            "none", "training_only", "training_and_generation"
+        ] = "none",
         torch_compile_mode: str = "default",
+        torch_compile_dynamic: bool | None = True,
         model_dtype: Literal["float32", "bfloat16"] = "float32",
         cache_dir: str | None = None,
         max_length: int = 140,
@@ -154,12 +157,15 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
             checkpoint's own config would otherwise redraw the linear-attention
             random features on every forward pass. Set this to ``None`` for
             checkpoints that do not support it.
-        compile_strategy : {"none", "training_and_generation"}, optional
-            Compilation behavior. ``"none"`` is eager and
-            ``"training_and_generation"`` compiles the policy before training.
+        compile_strategy : {"none", "training_only", "training_and_generation"}, optional
+            Compilation behavior. ``"none"`` is eager, ``"training_only"``
+            compiles differentiable policy likelihoods, and
+            ``"training_and_generation"`` also compiles final generation.
         torch_compile_mode : str, optional
             TorchInductor mode passed to :func:`torch.compile` when compiled
             generation is enabled.
+        torch_compile_dynamic : bool or None, optional
+            Dynamic-shape policy passed to :func:`torch.compile`.
         model_dtype : {"float32", "bfloat16"}, optional
             Floating-point dtype for the S3-GFN policy, prior, fidelity head,
             and loss tensors.
@@ -248,9 +254,14 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
             raise ValueError("max_generation_attempts must be positive.")
         if seed < 0:
             raise ValueError("seed must be nonnegative.")
-        if compile_strategy not in {"none", "training_and_generation"}:
+        if compile_strategy not in {
+            "none",
+            "training_only",
+            "training_and_generation",
+        }:
             raise ValueError(
-                "compile_strategy must be one of 'none' or 'training_and_generation'."
+                "compile_strategy must be one of 'none', 'training_only', "
+                "or 'training_and_generation'."
             )
         if compile_strategy != "none" and not torch_compile_mode:
             raise ValueError(
@@ -267,6 +278,7 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
         self.deterministic_eval = deterministic_eval
         self.compile_strategy = compile_strategy
         self.torch_compile_mode = torch_compile_mode
+        self.torch_compile_dynamic = torch_compile_dynamic
         self.model_dtype = model_dtype
         self.cache_dir = cache_dir
         self.max_length = max_length
@@ -370,8 +382,12 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
             pad_token_id=model.pad_token_id
         )
 
-        if self.compile_strategy == "training_and_generation":
-            model.compile_policy(mode=self.torch_compile_mode)
+        if self.compile_strategy != "none":
+            model.compile_policy(
+                mode=self.torch_compile_mode,
+                dynamic=self.torch_compile_dynamic,
+                training_only=self.compile_strategy == "training_only",
+            )
             _logger.info(
                 "S3-GFN round %d: torch.compile enabled with mode=%s; "
                 "the first training step includes lazy compilation.",
@@ -490,6 +506,21 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
         )
         return positive_buffer, negative_buffer
 
+    def _build_training_optimizer(
+        self,
+        model: S3GFNModel,
+    ) -> torch.optim.Optimizer:
+        """Build the AdamW optimizer used by one policy-training lifecycle."""
+        policy_parameters = list(model.policy.parameters())
+        if model.fidelity_head is not None:
+            policy_parameters.extend(model.fidelity_head.parameters())
+        return torch.optim.AdamW(
+            [
+                {"params": policy_parameters, "lr": self.learning_rate},
+                {"params": [model.log_z], "lr": self.log_z_learning_rate},
+            ]
+        )
+
     def _train_round(
         self,
         *,
@@ -502,15 +533,7 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
         cost_fn: Callable[[Sequence[Candidate]], list[float]] | None,
     ) -> None:
         """Run the configured training steps and advance the scheduler."""
-        policy_parameters = list(model.policy.parameters())
-        if model.fidelity_head is not None:
-            policy_parameters.extend(model.fidelity_head.parameters())
-        optimizer = torch.optim.AdamW(
-            [
-                {"params": policy_parameters, "lr": self.learning_rate},
-                {"params": [model.log_z], "lr": self.log_z_learning_rate},
-            ]
-        )
+        optimizer = self._build_training_optimizer(model)
         scheduler = self._build_scheduler(optimizer)
         progress_interval = max(1, self.n_train_steps // 10)
         _logger.info(
@@ -520,6 +543,7 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
         )
 
         for step_index in range(self.n_train_steps):
+            step_started = time.perf_counter()
             (
                 generated_count,
                 valid_count,
@@ -536,6 +560,9 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
                 acquisition=acquisition,
                 cost_fn=cost_fn,
                 optimizer=optimizer,
+            )
+            self.round_metrics.training_step_durations_s.append(
+                time.perf_counter() - step_started
             )
             if scheduler is not None:
                 scheduler.step()

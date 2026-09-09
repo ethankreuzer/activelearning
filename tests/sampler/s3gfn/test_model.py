@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from types import SimpleNamespace
 
 import pytest
@@ -305,6 +306,20 @@ def test_feature_map_redraw_dtype_adapter_clones_redrawn_weight():
     assert torch.equal(feature_map.weight, feature_map.source)
 
 
+def test_feature_map_redraw_adapter_survives_policy_deepcopy():
+    """A fresh round policy must redraw its own BF16 feature-map weights."""
+    model = _FeatureMapCausalLM().to(dtype=torch.bfloat16)
+    model_module._preserve_feature_map_redraw_dtype(model)
+
+    copied_model = copy.deepcopy(model)
+    copied_model.feature_map.orthogonal_random_weights()
+
+    assert copied_model.feature_map.weight.dtype is torch.bfloat16
+    assert copied_model.feature_map.weight.data_ptr() != (
+        model.feature_map.weight.data_ptr()
+    )
+
+
 def test_compiled_bfloat16_feature_map_redraw_keeps_matching_dtypes():
     """Compiled BF16 policy forwards must survive training-time redraws."""
     model = model_module.S3GFNModel(
@@ -360,6 +375,81 @@ def test_max_autotune_compilation_uses_safe_options(
     model.compile_policy(mode="max-autotune")
 
     assert compile_arguments == {"dynamic": True, "options": expected_options}
+
+
+def test_compile_policy_forwards_dynamic_shape_setting(monkeypatch):
+    """The model API must preserve an explicit dynamic-shape experiment."""
+    compile_arguments = {}
+
+    def fake_compile(forward, **kwargs):
+        compile_arguments.update(kwargs)
+        return forward
+
+    monkeypatch.setattr(torch, "compile", fake_compile)
+    model = model_module.S3GFNModel(
+        policy=_FakeCausalLM(),
+        prior=_FakeCausalLM(),
+        tokenizer=FakeTokenizer(),
+    )
+
+    model.compile_policy(dynamic=None)
+
+    assert compile_arguments["dynamic"] is None
+
+
+def test_training_only_compilation_keeps_generation_forward_eager(monkeypatch):
+    """Training-only compilation must leave Hugging Face generation eager."""
+    compiled_forward = object()
+
+    def fake_compile(forward, **kwargs):
+        return compiled_forward
+
+    monkeypatch.setattr(torch, "compile", fake_compile)
+    model = model_module.S3GFNModel(
+        policy=_FakeCausalLM(),
+        prior=_FakeCausalLM(),
+        tokenizer=FakeTokenizer(),
+    )
+    eager_forward = model.policy.forward
+
+    model.compile_policy(training_only=True)
+
+    assert model.policy.forward.__func__ is eager_forward.__func__
+    assert model._compiled_policy_forward is compiled_forward
+
+
+def test_training_only_compilation_covers_terminal_fidelity_likelihoods(
+    monkeypatch,
+    make_model,
+):
+    """Multi-fidelity training must use the compiled policy forward."""
+    calls: list[dict[str, object]] = []
+
+    def fake_compile(forward, **kwargs):
+        del kwargs
+
+        def compiled_forward(*args, **forward_kwargs):
+            calls.append(forward_kwargs)
+            return forward(*args, **forward_kwargs)
+
+        return compiled_forward
+
+    monkeypatch.setattr(torch, "compile", fake_compile)
+    model = make_model()
+    model.compile_policy(training_only=True)
+
+    model.policy_trajectory_log_probabilities(
+        torch.tensor([[1, 2, 0], [1, 3, 2]]),
+        fidelity_indices=torch.tensor([0, 1]),
+    )
+
+    assert len(calls) == 1
+    assert torch.equal(calls[0]["input_ids"], torch.tensor([[1, 2, 0], [1, 3, 2]]))
+    assert torch.equal(
+        calls[0]["attention_mask"],
+        torch.tensor([[1, 1, 0], [1, 1, 1]]),
+    )
+    assert calls[0]["output_hidden_states"] is True
 
 
 def test_model_rejects_shared_pad_and_eos_ids() -> None:
