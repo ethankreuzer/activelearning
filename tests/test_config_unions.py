@@ -8,6 +8,7 @@ from pydantic import TypeAdapter, ValidationError
 from activelearning.surrogate.encoder_config import (
     EncoderConfig,
     GPMoLFormerSmilesEncoderConfig,
+    MiniMolAmpcSmilesEncoderConfig,
     MiniMolSmilesEncoderConfig,
     MoLFormerSmilesEncoderConfig,
     SelfiesTransformerEncoderConfig,
@@ -139,6 +140,34 @@ def test_minimol_encoder_config_defaults_to_32_latent_features() -> None:
     config = MiniMolSmilesEncoderConfig()
 
     assert config.latent_dim == 32
+
+
+def test_minimol_ampc_encoder_config_parses_checkpoint_and_package_paths() -> None:
+    """The full-trunk MiniMol config preserves its local package paths."""
+    config = MiniMolAmpcSmilesEncoderConfig.model_validate(
+        {
+            "type": "MiniMolAmpcSmilesEncoder",
+            "checkpoint_path": "minimol_resources/model/final.pt",
+            "package_path": "minimol_resources",
+            "device": "cpu",
+        }
+    )
+
+    assert config.checkpoint_path == Path("minimol_resources/model/final.pt")
+    assert config.package_path == Path("minimol_resources")
+    assert config.device == "cpu"
+
+
+def test_encoder_union_selects_minimol_ampc_config() -> None:
+    """EncoderConfig dispatches the full-trunk MiniMol discriminator."""
+    parsed = TypeAdapter(EncoderConfig).validate_python(
+        {
+            "type": "MiniMolAmpcSmilesEncoder",
+            "checkpoint_path": "minimol_resources/model/final.pt",
+        }
+    )
+
+    assert isinstance(parsed, MiniMolAmpcSmilesEncoderConfig)
 
 
 @pytest.mark.parametrize(
