@@ -1,4 +1,4 @@
-"""MiniMol-backed SMILES feature extraction for molecular DKL surrogates."""
+"""MiniMol-backed SMILES encoders for molecular surrogate models."""
 
 from __future__ import annotations
 
@@ -7,8 +7,7 @@ from collections.abc import Callable, Mapping, Sequence
 from contextlib import contextmanager
 from functools import partial
 from pathlib import Path
-from typing import Any
-from typing import Iterator
+from typing import Any, Iterator
 
 import torch
 from torch import Tensor, nn
@@ -16,9 +15,9 @@ from torch import Tensor, nn
 from activelearning.applications.molecules._optional import (
     missing_molecules_dependency_error,
 )
-from activelearning.surrogate.encoder import LatentEncoder
+from activelearning.surrogate.encoder import FixedEncoder, LatentEncoder
 
-__all__ = ["MiniMolSmilesEncoder"]
+__all__ = ["MiniMolSmilesEncoder", "MiniMolSmilesFixedEncoder"]
 
 MINIMOL_FINGERPRINT_DIM = 512
 
@@ -125,32 +124,24 @@ def _load_minimol() -> Callable[..., Any]:
     return partial(_build_compatible_minimol, Minimol)
 
 
-class MiniMolSmilesEncoder(LatentEncoder):
-    """Encode SMILES with frozen MiniMol fingerprints and a trainable head.
+class MiniMolSmilesFixedEncoder(FixedEncoder):
+    """Encode SMILES as fixed 512-dimensional MiniMol fingerprints."""
 
-    MiniMol returns fixed-width graph fingerprints rather than token IDs or
-    hidden states from a PyTorch module. The fingerprints are kept frozen and
-    passed through a trainable linear projection so the DKL surrogate can
-    adapt the representation during fitting.
-
-    """
+    feature_dim = MINIMOL_FINGERPRINT_DIM
 
     def __init__(
         self,
         *,
         batch_size: int = 100,
-        latent_dim: int = 32,
         cache_size: int = 4096,
         checkpoint_path: str | Path | None = None,
     ) -> None:
-        """Initialize the MiniMol encoder and trainable projection.
+        """Initialize the fixed MiniMol encoder.
 
         Parameters
         ----------
         batch_size : int, default=100
             Maximum number of SMILES sent to MiniMol per extraction batch.
-        latent_dim : int, default=32
-            Width of the projected latent representation.
         cache_size : int, default=4096
             Maximum number of detached CPU fingerprints retained by the LRU
             cache. Zero disables caching.
@@ -161,18 +152,14 @@ class MiniMolSmilesEncoder(LatentEncoder):
         Raises
         ------
         ValueError
-            If ``batch_size`` or ``latent_dim`` is not positive, or if
-            ``cache_size`` is negative.
+            If ``batch_size`` is not positive or ``cache_size`` is negative.
         FileNotFoundError
             If ``checkpoint_path`` is provided but does not point to a file.
         ImportError
             If MiniMol is not installed.
         """
-        super().__init__()
         if batch_size < 1:
             raise ValueError("batch_size must be positive.")
-        if latent_dim < 1:
-            raise ValueError("latent_dim must be positive.")
         if cache_size < 0:
             raise ValueError("cache_size must be non-negative.")
 
@@ -189,11 +176,9 @@ class MiniMolSmilesEncoder(LatentEncoder):
             )
 
         self.batch_size = batch_size
-        self.latent_dim = latent_dim
         self.cache_size = cache_size
         self.checkpoint_path = resolved_checkpoint_path
         self._minimol = self._build_minimol(resolved_checkpoint_path)
-        self.projection = nn.Linear(MINIMOL_FINGERPRINT_DIM, latent_dim)
         self._fingerprint_cache: OrderedDict[str, Tensor] = OrderedDict()
 
     def _build_minimol(self, checkpoint_path: Path | None) -> Any:
@@ -203,7 +188,7 @@ class MiniMolSmilesEncoder(LatentEncoder):
             checkpoint_path=checkpoint_path,
         )
 
-    def prepare_inputs(
+    def encode(
         self,
         values: Sequence[Any],
         *,
@@ -236,7 +221,7 @@ class MiniMolSmilesEncoder(LatentEncoder):
         for value in values:
             if not isinstance(value, str):
                 raise ValueError(
-                    "MiniMol SMILES encoders require string inputs, got "
+                    "MiniMol SMILES fixed encoders require string inputs, got "
                     f"{type(value).__name__}."
                 )
             strings.append(value)
@@ -277,42 +262,6 @@ class MiniMolSmilesEncoder(LatentEncoder):
             dim=0,
         ).to(device=device, dtype=torch.float32)
 
-    def forward(self, model_inputs: Tensor) -> Tensor:
-        """Project MiniMol fingerprints into the DKL latent space.
-
-        Parameters
-        ----------
-        model_inputs : Tensor
-            Two-dimensional tensor of shape ``(B, 512)`` returned by
-            :meth:`prepare_inputs`.
-
-        Returns
-        -------
-        Tensor
-            Projected latent features of shape ``(B, latent_dim)``.
-
-        Raises
-        ------
-        ValueError
-            If ``model_inputs`` is not two-dimensional or does not contain
-            512-dimensional MiniMol fingerprints.
-        """
-        if model_inputs.ndim != 2:
-            raise ValueError(
-                "MiniMol fingerprints must be 2-D (B, 512), got "
-                f"{tuple(model_inputs.shape)}."
-            )
-        if model_inputs.shape[-1] != MINIMOL_FINGERPRINT_DIM:
-            raise ValueError(
-                "MiniMol fingerprints must have width "
-                f"{MINIMOL_FINGERPRINT_DIM}, got {model_inputs.shape[-1]}."
-            )
-        projection_inputs = model_inputs.to(
-            device=self.projection.weight.device,
-            dtype=self.projection.weight.dtype,
-        )
-        return self.projection(projection_inputs)
-
     def _extract_fingerprints(self, smiles: list[str]) -> list[Tensor]:
         """Run frozen MiniMol inference and validate its fingerprint output."""
         with torch.inference_mode():
@@ -343,3 +292,82 @@ class MiniMolSmilesEncoder(LatentEncoder):
                 )
             features.append(feature)
         return features
+
+
+class MiniMolSmilesEncoder(LatentEncoder):
+    """Encode SMILES with frozen MiniMol fingerprints and a trainable head.
+
+    MiniMol returns fixed-width graph fingerprints rather than token IDs or
+    hidden states from a PyTorch module. The fingerprints are kept frozen and
+    passed through a trainable linear projection so the DKL surrogate can
+    adapt the representation during fitting.
+    """
+
+    def __init__(
+        self,
+        *,
+        batch_size: int = 100,
+        latent_dim: int = 32,
+        cache_size: int = 4096,
+        checkpoint_path: str | Path | None = None,
+    ) -> None:
+        """Initialize the MiniMol encoder and trainable projection."""
+        super().__init__()
+        if batch_size < 1:
+            raise ValueError("batch_size must be positive.")
+        if latent_dim < 1:
+            raise ValueError("latent_dim must be positive.")
+        if cache_size < 0:
+            raise ValueError("cache_size must be non-negative.")
+
+        self.fixed_encoder = self._build_fixed_encoder(
+            batch_size=batch_size,
+            cache_size=cache_size,
+            checkpoint_path=checkpoint_path,
+        )
+        self.batch_size = self.fixed_encoder.batch_size
+        self.latent_dim = latent_dim
+        self.cache_size = self.fixed_encoder.cache_size
+        self.checkpoint_path = self.fixed_encoder.checkpoint_path
+        self.projection = nn.Linear(MINIMOL_FINGERPRINT_DIM, latent_dim)
+
+    def _build_fixed_encoder(
+        self,
+        *,
+        batch_size: int,
+        cache_size: int,
+        checkpoint_path: str | Path | None,
+    ) -> MiniMolSmilesFixedEncoder:
+        """Construct the fixed MiniMol encoder used by DKL."""
+        return MiniMolSmilesFixedEncoder(
+            batch_size=batch_size,
+            cache_size=cache_size,
+            checkpoint_path=checkpoint_path,
+        )
+
+    def prepare_inputs(
+        self,
+        values: Sequence[Any],
+        *,
+        device: torch.device,
+    ) -> Tensor:
+        """Convert raw SMILES into frozen MiniMol fingerprint tensors."""
+        return self.fixed_encoder.encode(values, device=device)
+
+    def forward(self, model_inputs: Tensor) -> Tensor:
+        """Project MiniMol fingerprints into the DKL latent space."""
+        if model_inputs.ndim != 2:
+            raise ValueError(
+                "MiniMol fingerprints must be 2-D (B, 512), got "
+                f"{tuple(model_inputs.shape)}."
+            )
+        if model_inputs.shape[-1] != MINIMOL_FINGERPRINT_DIM:
+            raise ValueError(
+                "MiniMol fingerprints must have width "
+                f"{MINIMOL_FINGERPRINT_DIM}, got {model_inputs.shape[-1]}."
+            )
+        projection_inputs = model_inputs.to(
+            device=self.projection.weight.device,
+            dtype=self.projection.weight.dtype,
+        )
+        return self.projection(projection_inputs)
