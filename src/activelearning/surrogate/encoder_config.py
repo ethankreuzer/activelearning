@@ -1,4 +1,4 @@
-"""Configuration classes for built-in DKL encoder components.
+"""Configuration classes for built-in DKL and fixed encoder components.
 
 The encoder configuration union lives with the core surrogate interfaces so
 the surrogate package does not import application implementations eagerly.
@@ -22,9 +22,11 @@ if TYPE_CHECKING:
         TransformerSequenceEncoder,
     )
     from activelearning.applications.molecules.minimol_encoder import (
+        MiniMolSmilesFixedEncoder,
         MiniMolSmilesEncoder,
     )
     from activelearning.applications.molecules.minimol_ampc_encoder import (
+        MiniMolAmpcSmilesFixedEncoder,
         MiniMolAmpcSmilesEncoder,
     )
 
@@ -259,6 +261,54 @@ class MiniMolAmpcSmilesEncoderConfig(BaseModel):
         )
 
 
+class MiniMolSmilesFixedEncoderConfig(BaseModel):
+    """Configuration for fixed stock MiniMol SMILES representations."""
+
+    type: Literal["MiniMolSmilesFixedEncoder"] = "MiniMolSmilesFixedEncoder"
+    input_representation: ClassVar[str] = "smiles"
+    batch_size: int = Field(default=100, ge=1)
+    cache_size: int = Field(default=4096, ge=0)
+    checkpoint_path: Path | None = None
+
+    def build(self) -> "MiniMolSmilesFixedEncoder":
+        """Build the configured stock MiniMol fixed encoder."""
+        from activelearning.applications.molecules.minimol_encoder import (
+            MiniMolSmilesFixedEncoder,
+        )
+
+        return MiniMolSmilesFixedEncoder(
+            batch_size=self.batch_size,
+            cache_size=self.cache_size,
+            checkpoint_path=self.checkpoint_path,
+        )
+
+
+class MiniMolAmpcSmilesFixedEncoderConfig(BaseModel):
+    """Configuration for fixed MiniMol AmpC ``pooled512`` representations."""
+
+    type: Literal["MiniMolAmpcSmilesFixedEncoder"] = "MiniMolAmpcSmilesFixedEncoder"
+    input_representation: ClassVar[str] = "smiles"
+    checkpoint_path: Path
+    package_path: Path | None = None
+    device: str | None = "cpu"
+    batch_size: int = Field(default=100, ge=1)
+    cache_size: int = Field(default=4096, ge=0)
+
+    def build(self) -> "MiniMolAmpcSmilesFixedEncoder":
+        """Build the configured MiniMol AmpC fixed encoder."""
+        from activelearning.applications.molecules.minimol_ampc_encoder import (
+            MiniMolAmpcSmilesFixedEncoder,
+        )
+
+        return MiniMolAmpcSmilesFixedEncoder(
+            checkpoint_path=self.checkpoint_path,
+            package_path=self.package_path,
+            device=self.device,
+            batch_size=self.batch_size,
+            cache_size=self.cache_size,
+        )
+
+
 EncoderConfig = Annotated[
     Union[
         SelfiesTransformerEncoderConfig,
@@ -266,6 +316,14 @@ EncoderConfig = Annotated[
         MoLFormerSmilesEncoderConfig,
         MiniMolSmilesEncoderConfig,
         MiniMolAmpcSmilesEncoderConfig,
+    ],
+    Field(discriminator="type"),
+]
+
+FixedEncoderConfig = Annotated[
+    Union[
+        MiniMolSmilesFixedEncoderConfig,
+        MiniMolAmpcSmilesFixedEncoderConfig,
     ],
     Field(discriminator="type"),
 ]

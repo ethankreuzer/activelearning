@@ -136,6 +136,23 @@ def test_prepare_inputs_extracts_ordered_fingerprints(
     assert fake_minimol[0].grad_enabled == [False]
 
 
+def test_fixed_encoder_returns_raw_fingerprints(
+    fake_minimol: list[_FakeMiniMol],
+) -> None:
+    """The fixed encoder returns pooled512 without a projection module."""
+    encoder = minimol_module.MiniMolSmilesFixedEncoder(
+        batch_size=2,
+        cache_size=8,
+    )
+
+    features = encoder.encode(["CC", "CO"], device=torch.device("cpu"))
+
+    assert encoder.feature_dim == 512
+    assert features.shape == (2, 512)
+    assert not hasattr(encoder, "projection")
+    assert fake_minimol[0].calls == [["CC", "CO"]]
+
+
 def test_prepare_inputs_handles_empty_batches_without_model_call(
     fake_minimol: list[_FakeMiniMol],
 ) -> None:

@@ -1,4 +1,4 @@
-"""MiniMol AmpC checkpoint support for molecular DKL surrogates."""
+"""MiniMol AmpC checkpoint support for molecular surrogate encoders."""
 
 from __future__ import annotations
 
@@ -18,12 +18,13 @@ from activelearning.applications.molecules._optional import (
 )
 from activelearning.applications.molecules.minimol_encoder import (
     MINIMOL_FINGERPRINT_DIM,
+    MiniMolSmilesFixedEncoder,
     MiniMolSmilesEncoder,
     _graphium_float32_compatibility,
     _minimol_molecule_transform,
 )
 
-__all__ = ["MiniMolAmpcSmilesEncoder"]
+__all__ = ["MiniMolAmpcSmilesEncoder", "MiniMolAmpcSmilesFixedEncoder"]
 
 
 @contextmanager
@@ -95,20 +96,8 @@ def _load_ampc_encoder(
     return encoder
 
 
-class MiniMolAmpcSmilesEncoder(MiniMolSmilesEncoder):
-    """Encode SMILES with the collaborator's fine-tuned MiniMol AmpC trunk.
-
-    This must be a separate class because ``MiniMolSmilesEncoder`` accepts a
-    stock MiniMol predictor state dict, while the AmpC artifact is a complete
-    ``MiniMolAmpcEncoder`` checkpoint containing a custom trunk, prediction
-    head, and normalization metadata. Its bundled loader reconstructs that
-    architecture with strict loading and exposes the fine-tuned ``pooled512``
-    representation; passing this checkpoint to the base class would select
-    the wrong loader and could not produce the intended embedding.
-
-    Only ``pooled512`` is passed to the inherited DKL projection. The AmpC
-    prediction head remains part of the checkpoint but is not used by DKL.
-    """
+class MiniMolAmpcSmilesFixedEncoder(MiniMolSmilesFixedEncoder):
+    """Encode SMILES as fixed ``pooled512`` AmpC representations."""
 
     def __init__(
         self,
@@ -117,10 +106,9 @@ class MiniMolAmpcSmilesEncoder(MiniMolSmilesEncoder):
         package_path: str | Path | None = None,
         device: str | torch.device | None = "cpu",
         batch_size: int = 100,
-        latent_dim: int = 32,
         cache_size: int = 4096,
     ) -> None:
-        """Initialize the fine-tuned MiniMol AmpC encoder.
+        """Initialize the fine-tuned MiniMol AmpC fixed encoder.
 
         Parameters
         ----------
@@ -134,8 +122,6 @@ class MiniMolAmpcSmilesEncoder(MiniMolSmilesEncoder):
             device selection to the shared package.
         batch_size : int, default=100
             Maximum number of SMILES encoded per inference batch.
-        latent_dim : int, default=32
-            Width of the trainable DKL projection.
         cache_size : int, default=4096
             Maximum number of detached CPU fingerprints retained by the LRU
             cache. Zero disables caching.
@@ -148,7 +134,6 @@ class MiniMolAmpcSmilesEncoder(MiniMolSmilesEncoder):
         self.backend_device = device
         super().__init__(
             batch_size=batch_size,
-            latent_dim=latent_dim,
             cache_size=cache_size,
             checkpoint_path=resolved_checkpoint_path,
         )
@@ -185,3 +170,51 @@ class MiniMolAmpcSmilesEncoder(MiniMolSmilesEncoder):
             torch.from_numpy(np.asarray(output, dtype=np.float32).copy())
             for output in outputs
         ]
+
+
+class MiniMolAmpcSmilesEncoder(MiniMolSmilesEncoder):
+    """Encode SMILES with the collaborator's fine-tuned MiniMol AmpC trunk.
+
+    The fixed ``pooled512`` representation is passed through the same trainable
+    DKL projection used by :class:`MiniMolSmilesEncoder`. The checkpoint's
+    prediction head is not used.
+    """
+
+    def __init__(
+        self,
+        *,
+        checkpoint_path: str | Path,
+        package_path: str | Path | None = None,
+        device: str | torch.device | None = "cpu",
+        batch_size: int = 100,
+        latent_dim: int = 32,
+        cache_size: int = 4096,
+    ) -> None:
+        """Initialize the fine-tuned MiniMol AmpC encoder."""
+        self.package_path = package_path
+        self.backend_device = device
+        super().__init__(
+            batch_size=batch_size,
+            latent_dim=latent_dim,
+            cache_size=cache_size,
+            checkpoint_path=checkpoint_path,
+        )
+        self.package_path = self.fixed_encoder.package_path
+
+    def _build_fixed_encoder(
+        self,
+        *,
+        batch_size: int,
+        cache_size: int,
+        checkpoint_path: str | Path | None,
+    ) -> MiniMolAmpcSmilesFixedEncoder:
+        """Construct the fixed AmpC encoder used by DKL."""
+        if checkpoint_path is None:
+            raise ValueError("MiniMol AmpC requires a checkpoint_path.")
+        return MiniMolAmpcSmilesFixedEncoder(
+            checkpoint_path=checkpoint_path,
+            package_path=self.package_path,
+            device=self.backend_device,
+            batch_size=batch_size,
+            cache_size=cache_size,
+        )
