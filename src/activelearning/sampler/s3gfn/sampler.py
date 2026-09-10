@@ -112,6 +112,8 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
         ] = "none",
         torch_compile_mode: str = "default",
         torch_compile_dynamic: bool | None = True,
+        attention_mask_adapter: bool = False,
+        compile_prior_scorer: bool = False,
         model_dtype: Literal["float32", "bfloat16"] = "float32",
         cache_dir: str | None = None,
         max_length: int = 140,
@@ -166,6 +168,10 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
             generation is enabled.
         torch_compile_dynamic : bool or None, optional
             Dynamic-shape policy passed to :func:`torch.compile`.
+        attention_mask_adapter : bool, optional
+            Enable the pinned GP-MoLFormer attention-mask compile adapter.
+        compile_prior_scorer : bool, optional
+            Compile frozen-prior sequence scoring as a separate no-grad graph.
         model_dtype : {"float32", "bfloat16"}, optional
             Floating-point dtype for the S3-GFN policy, prior, fidelity head,
             and loss tensors.
@@ -279,6 +285,8 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
         self.compile_strategy = compile_strategy
         self.torch_compile_mode = torch_compile_mode
         self.torch_compile_dynamic = torch_compile_dynamic
+        self.attention_mask_adapter = attention_mask_adapter
+        self.compile_prior_scorer = compile_prior_scorer
         self.model_dtype = model_dtype
         self.cache_dir = cache_dir
         self.max_length = max_length
@@ -388,6 +396,11 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
                 dynamic=self.torch_compile_dynamic,
                 training_only=self.compile_strategy == "training_only",
             )
+            if self.compile_prior_scorer:
+                model.compile_prior_scorer(
+                    mode=self.torch_compile_mode,
+                    dynamic=self.torch_compile_dynamic,
+                )
             _logger.info(
                 "S3-GFN round %d: torch.compile enabled with mode=%s; "
                 "the first training step includes lazy compilation.",
@@ -458,6 +471,8 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
             tokenizer=self._pretrained_model.tokenizer,
             fidelity_head=copy.deepcopy(self._pretrained_model.fidelity_head),
         ).to(self.device)
+        if self.attention_mask_adapter:
+            model.enable_attention_mask_adapter()
         model.policy.train()
         model.prior.eval()
         _logger.info("Fresh trainable S3-GFN policy initialized.")

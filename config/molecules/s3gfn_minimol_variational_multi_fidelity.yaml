@@ -48,13 +48,10 @@ sampler:
   model_name_or_path: ibm-research/GP-MoLFormer-Uniq
   tokenizer_name_or_path: ibm-research/MoLFormer-XL-both-10pct
   trust_remote_code: true
-  compile_strategy: training_and_generation
-  torch_compile_mode: max-autotune
-  model_dtype: bfloat16
+  performance_mode: optimized
   max_length: 140
   batch_size: 64
   replay_batch_size: 64
-  generation_batch_size: 128
   n_train_steps: 25
   num_warmup_steps: 5
   beta: 25.0

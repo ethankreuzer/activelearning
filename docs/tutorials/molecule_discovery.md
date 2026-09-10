@@ -68,22 +68,26 @@ fidelity proportions, and training or generation durations. The corresponding
 trajectory figures are `sampler/s3gfn/training_losses`,
 `sampler/s3gfn/log_z`, and `sampler/s3gfn/reward/trajectory`.
 
-For GPU tuning, keep the training and final-generation controls separate:
-`batch_size` controls on-policy training generation, `replay_batch_size`
-controls replay sampling, and `generation_batch_size` controls only the final
-candidate-generation calls. Omitting `generation_batch_size` makes it inherit
-`batch_size`. The sampler accepts `model_dtype: float32` or `bfloat16`, which
-controls the S3-GFN model without changing the rest of the experiment.
+S3-GFN uses the validated GPU configuration by default: BF16, compilation for
+training and final generation, the attention-mask adapter, the compiled frozen
+prior scorer, and equal training, replay, and final-generation batch sizes of
+64. `generation_batch_size: null` inherits `batch_size`, so the normal config
+does not need to repeat that value.
 
-`compile_strategy: training_and_generation` compiles the policy forward pass
-used during training and final generation. The first training step includes
-lazy TorchInductor warm-up. In the measured A100 run at batch 64, BF16
-`max-autotune` reduced average training time from 2.969 to 1.387 seconds per
-step, a 2.14x speedup, and reached approximately 2,182 generation tokens/s.
-Increasing only the final-generation batch size to 128 reached 3,188 tokens/s,
-about 46% higher useful throughput. Treat those values as a starting point:
-larger generation batches can use more memory, so test capacity and candidate
-validity on the target GPU before adopting them.
+To opt out of compilation and use the eager FP32 path, add one line under the
+sampler:
+
+```yaml
+sampler:
+  performance_mode: eager
+```
+
+Advanced users can still set `compile_strategy`, `torch_compile_mode`,
+`torch_compile_dynamic`, `attention_mask_adapter`, `compile_prior_scorer`, and
+`model_dtype` individually. Explicit low-level values take precedence over the
+selected preset. Keep `batch_size` and `replay_batch_size` aligned unless the
+workload has been measured on the target GPU; leave `generation_batch_size`
+omitted to retain the validated inheritance behavior.
 
 ### **Choosing an encoder for DKL**
 
