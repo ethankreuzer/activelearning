@@ -18,6 +18,7 @@ from tests.sampler.s3gfn.conftest import (
     FakeChem,
     FakeModel,
     FakeSynthesizability,
+    FakeTokenizer,
 )
 
 
@@ -287,6 +288,37 @@ def test_sampler_compiles_policy_before_training(
         ("compile", "max-autotune", None, False),
         ("train", True),
     ]
+
+
+def test_round_model_enables_attention_adapter_after_copy(
+    make_sampler,
+    monkeypatch,
+) -> None:
+    """The adapter must bind to the fresh round policy, not its CPU template."""
+    sampler = make_sampler(attention_mask_adapter=True)
+    template = SimpleNamespace(
+        policy=nn.Linear(1, 1),
+        prior=nn.Linear(1, 1),
+        tokenizer=FakeTokenizer(),
+        fidelity_head=None,
+    )
+    sampler._pretrained_model = template
+    sampler._keep_pretrained_template_on_cpu = lambda: None
+    enabled_policies = []
+
+    def record_enable(model):
+        enabled_policies.append(model.policy)
+        return 1
+
+    monkeypatch.setattr(
+        sampler_module.S3GFNModel,
+        "enable_attention_mask_adapter",
+        record_enable,
+    )
+    round_model = sampler._new_round_model()
+
+    assert enabled_policies == [round_model.policy]
+    assert round_model.policy is not template.policy
 
 
 def test_sampler_advances_round_state_across_consecutive_samples(

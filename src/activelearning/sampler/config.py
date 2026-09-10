@@ -8,7 +8,7 @@ discriminated union below.
 from pathlib import Path
 from typing import Annotated, Any, ClassVar, Literal, Union, overload
 
-from pydantic import BaseModel, Field, PositiveFloat, StrictInt
+from pydantic import BaseModel, Field, PositiveFloat, StrictInt, model_validator
 
 from activelearning.sampler.exact_grid_sampler import ExactGridSampler
 from activelearning.sampler.hypercube_sampler import HypercubeSampler
@@ -294,14 +294,22 @@ class S3GFNSamplerConfig(BaseModel):
     Whether loading may execute repository-provided model code.
     deterministic_eval : bool, optional
     Whether policy evaluation uses deterministic random features.
-    compile_strategy : {"none", "training_only", "training_and_generation"}, default="none"
+    performance_mode : {"optimized", "eager"}, default="optimized"
+    Performance preset for the S3-GFN model. The optimized preset enables the
+    validated BF16 and compilation stack. Use ``"eager"`` to opt out. Explicit
+    low-level performance fields override the selected preset.
+    compile_strategy : {"none", "training_only", "training_and_generation"}, default="training_and_generation"
     Select eager execution, policy compilation during training only, or policy
     compilation during training and final generation.
     torch_compile_mode : str, default="default"
     TorchInductor mode used when compilation is enabled.
-    torch_compile_dynamic : bool or None, default=True
+    torch_compile_dynamic : bool or None, default=None
     Dynamic-shape policy passed to :func:`torch.compile`.
-    model_dtype : {"float32", "bfloat16"}, default="float32"
+    attention_mask_adapter : bool, default=True
+    Enable the pinned GP-MoLFormer attention-mask compile adapter.
+    compile_prior_scorer : bool, default=True
+    Compile frozen-prior sequence scoring as a separate no-grad graph.
+    model_dtype : {"float32", "bfloat16"}, default="bfloat16"
     Floating-point dtype for the S3-GFN model and loss tensors.
     cache_dir : str, optional
     Directory for Hugging Face model and tokenizer files.
@@ -357,12 +365,15 @@ class S3GFNSamplerConfig(BaseModel):
     # set, and the checkpoint config defaults it to False. Keep it True so the
     # frozen prior scores a molecule identically across calls.
     deterministic_eval: bool | None = True
+    performance_mode: Literal["optimized", "eager"] = "optimized"
     compile_strategy: Literal["none", "training_only", "training_and_generation"] = (
-        "none"
+        "training_and_generation"
     )
     torch_compile_mode: str = "default"
-    torch_compile_dynamic: bool | None = True
-    model_dtype: Literal["float32", "bfloat16"] = "float32"
+    torch_compile_dynamic: bool | None = None
+    attention_mask_adapter: bool = True
+    compile_prior_scorer: bool = True
+    model_dtype: Literal["float32", "bfloat16"] = "bfloat16"
     cache_dir: str | None = None
     max_length: int = Field(default=140, ge=2)
     batch_size: int = Field(default=64, gt=0)
@@ -380,6 +391,38 @@ class S3GFNSamplerConfig(BaseModel):
     gradient_clip_norm: PositiveFloat = 10.0
     max_generation_attempts: int | None = Field(default=None, gt=0)
     seed: int = Field(default=42, ge=0)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _apply_performance_mode(cls, data: Any) -> Any:
+        """Fill omitted performance fields from the selected preset."""
+        if not isinstance(data, dict):
+            return data
+
+        values = dict(data)
+        mode = values.get("performance_mode", "optimized")
+        preset = {
+            "optimized": {
+                "compile_strategy": "training_and_generation",
+                "torch_compile_mode": "default",
+                "torch_compile_dynamic": None,
+                "attention_mask_adapter": True,
+                "compile_prior_scorer": True,
+                "model_dtype": "bfloat16",
+            },
+            "eager": {
+                "compile_strategy": "none",
+                "torch_compile_mode": "default",
+                "torch_compile_dynamic": True,
+                "attention_mask_adapter": False,
+                "compile_prior_scorer": False,
+                "model_dtype": "float32",
+            },
+        }.get(mode)
+        if preset is not None:
+            for field_name, default in preset.items():
+                values.setdefault(field_name, default)
+        return values
 
     def build(self) -> Sampler:
         """Build the sampler lazily so base installs need no Transformers.
@@ -406,6 +449,8 @@ class S3GFNSamplerConfig(BaseModel):
             compile_strategy=self.compile_strategy,
             torch_compile_mode=self.torch_compile_mode,
             torch_compile_dynamic=self.torch_compile_dynamic,
+            attention_mask_adapter=self.attention_mask_adapter,
+            compile_prior_scorer=self.compile_prior_scorer,
             model_dtype=self.model_dtype,
             cache_dir=self.cache_dir,
             max_length=self.max_length,

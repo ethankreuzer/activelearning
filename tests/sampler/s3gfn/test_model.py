@@ -97,6 +97,71 @@ class _GenerationTokenizer(FakeTokenizer):
         return ["CC", "CO"]
 
 
+class MolformerSelfAttention(nn.Module):
+    """Small source-inspectable stand-in for the pinned remote attention."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.scale = nn.Parameter(torch.tensor(2.0))
+
+    def forward(self, hidden_states, attention_mask=None, past_key_value=None):
+        del past_key_value
+        if attention_mask is not None:
+            per_query_attn = attention_mask[:, 0, -1]
+            per_query_extended = per_query_attn[:, None, None, :]
+            if not torch.equal(attention_mask, per_query_extended):
+                raise ValueError(model_module._ATTENTION_MASK_ERROR)
+            hidden_states = hidden_states * per_query_attn.unsqueeze(-1)
+        return hidden_states * self.scale
+
+
+class _AdapterPolicy(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.attention = MolformerSelfAttention()
+
+    def forward(self, hidden_states, attention_mask=None, past_key_value=None):
+        extended_mask = (
+            None
+            if attention_mask is None
+            else attention_mask[:, None, None, :].to(hidden_states.dtype)
+        )
+        return self.attention(
+            hidden_states,
+            attention_mask=extended_mask,
+            past_key_value=past_key_value,
+        )
+
+
+_ORIGINAL_ADAPTER_FORWARD_CODE = MolformerSelfAttention.forward.__code__
+_ORIGINAL_ADAPTER_POLICY_FORWARD_CODE = _AdapterPolicy.forward.__code__
+
+
+@pytest.fixture(autouse=True)
+def restore_adapter_test_forward(monkeypatch):
+    """Isolate class-level code replacement between adapter tests."""
+    monkeypatch.setattr(
+        MolformerSelfAttention.forward,
+        "__code__",
+        _ORIGINAL_ADAPTER_FORWARD_CODE,
+    )
+    monkeypatch.delattr(
+        MolformerSelfAttention.forward,
+        "_s3gfn_attention_mask_adapter",
+        raising=False,
+    )
+    monkeypatch.setattr(
+        _AdapterPolicy.forward,
+        "__code__",
+        _ORIGINAL_ADAPTER_POLICY_FORWARD_CODE,
+    )
+    monkeypatch.delattr(
+        _AdapterPolicy.forward,
+        "_s3gfn_attention_mask_validator",
+        raising=False,
+    )
+
+
 @pytest.fixture
 def make_model():
     """Return a factory building ``S3GFNModel`` from language-model doubles.
@@ -160,6 +225,69 @@ def test_pretrained_loading_passes_deterministic_eval_to_both_models(monkeypatch
     assert all(call["trust_remote_code"] is True for call in model_calls)
     assert model.prior.training is False
     assert all(not parameter.requires_grad for parameter in model.prior.parameters())
+
+
+@pytest.mark.parametrize(
+    "attention_mask",
+    [torch.ones((2, 3)), torch.tensor([[1, 1, 0], [1, 0, 0]])],
+)
+def test_attention_mask_adapter_preserves_outputs_and_gradients(
+    monkeypatch,
+    attention_mask,
+):
+    revision_module = (
+        "transformers_modules.ibm-research.GP-MoLFormer-Uniq."
+        f"{model_module._SUPPORTED_GP_MOLFORMER_REVISION}.modeling_molformer"
+    )
+    monkeypatch.setattr(MolformerSelfAttention.forward, "__module__", revision_module)
+    eager_policy = _AdapterPolicy()
+    adapted_policy = copy.deepcopy(eager_policy)
+    hidden_states = torch.arange(12, dtype=torch.float32).reshape(2, 3, 2)
+
+    eager_input = hidden_states.clone().requires_grad_()
+    eager_output = eager_policy(eager_input, attention_mask=attention_mask)
+    eager_output.sum().backward()
+    adapted_count = model_module._install_gp_molformer_attention_mask_adapter(
+        adapted_policy
+    )
+    adapted_input = hidden_states.clone().requires_grad_()
+    adapted_output = adapted_policy(adapted_input, attention_mask=attention_mask)
+    adapted_output.sum().backward()
+
+    assert adapted_count == 1
+    assert adapted_policy._s3gfn_attention_mask_adapter_count == 1
+    assert adapted_policy.attention._s3gfn_attention_mask_adapter is True
+    assert adapted_policy.attention.forward.__globals__["torch"] is torch
+    torch.testing.assert_close(adapted_output, eager_output)
+    torch.testing.assert_close(adapted_input.grad, eager_input.grad)
+    torch.testing.assert_close(
+        adapted_policy.attention.scale.grad,
+        eager_policy.attention.scale.grad,
+    )
+
+
+def test_attention_mask_adapter_rejects_arbitrary_caller_mask(monkeypatch):
+    revision_module = (
+        "transformers_modules.ibm-research.GP-MoLFormer-Uniq."
+        f"{model_module._SUPPORTED_GP_MOLFORMER_REVISION}.modeling_molformer"
+    )
+    monkeypatch.setattr(MolformerSelfAttention.forward, "__module__", revision_module)
+    policy = _AdapterPolicy()
+    model_module._install_gp_molformer_attention_mask_adapter(policy)
+
+    with pytest.raises(ValueError, match="does not support arbitrary 3D attention"):
+        policy(torch.ones((1, 2, 2)), attention_mask=torch.ones((1, 2, 2)))
+
+
+def test_attention_mask_adapter_rejects_unknown_revision(monkeypatch):
+    monkeypatch.setattr(
+        MolformerSelfAttention.forward,
+        "__module__",
+        "transformers_modules.unknown.modeling_molformer",
+    )
+
+    with pytest.raises(RuntimeError, match="Unsupported GP-MoLFormer revision"):
+        model_module._install_gp_molformer_attention_mask_adapter(_AdapterPolicy())
 
 
 def test_pretrained_loading_requests_deterministic_eval_by_default(monkeypatch):
@@ -306,7 +434,7 @@ def test_feature_map_redraw_dtype_adapter_clones_redrawn_weight():
     assert torch.equal(feature_map.weight, feature_map.source)
 
 
-def test_feature_map_redraw_adapter_survives_policy_deepcopy():
+def test_feature_map_redraw_dtype_adapter_survives_policy_deepcopy():
     """A fresh round policy must redraw its own BF16 feature-map weights."""
     model = _FeatureMapCausalLM().to(dtype=torch.bfloat16)
     model_module._preserve_feature_map_redraw_dtype(model)
@@ -450,6 +578,74 @@ def test_training_only_compilation_covers_terminal_fidelity_likelihoods(
         torch.tensor([[1, 1, 0], [1, 1, 1]]),
     )
     assert calls[0]["output_hidden_states"] is True
+
+
+def test_training_only_compilation_preserves_fixed_trajectory_values_and_gradients(
+    monkeypatch,
+    make_model,
+) -> None:
+    """Compiled dispatch must preserve trajectory values and policy gradients."""
+    eager_model = make_model(language_model=_CausalPrefixLanguageModel)
+    compiled_model = make_model(language_model=_CausalPrefixLanguageModel)
+    compiled_model.load_state_dict(eager_model.state_dict())
+    monkeypatch.setattr(torch, "compile", lambda forward, **kwargs: forward)
+    compiled_model.compile_policy(training_only=True)
+    input_ids = torch.tensor([[1, 3, 2, 0], [1, 1, 3, 2]])
+    fidelity_indices = torch.tensor([0, 1])
+
+    eager_values = eager_model.policy_trajectory_log_probabilities(
+        input_ids,
+        fidelity_indices=fidelity_indices,
+    )
+    compiled_values = compiled_model.policy_trajectory_log_probabilities(
+        input_ids,
+        fidelity_indices=fidelity_indices,
+    )
+    eager_values.sum().backward()
+    compiled_values.sum().backward()
+
+    assert torch.allclose(compiled_values, eager_values)
+    eager_gradients = {
+        name: parameter.grad
+        for name, parameter in eager_model.named_parameters()
+        if parameter.grad is not None
+    }
+    compiled_gradients = {
+        name: parameter.grad
+        for name, parameter in compiled_model.named_parameters()
+        if parameter.grad is not None
+    }
+    assert eager_gradients.keys() == compiled_gradients.keys()
+    for name, eager_gradient in eager_gradients.items():
+        assert torch.allclose(compiled_gradients[name], eager_gradient)
+
+
+def test_compiled_prior_scorer_preserves_values_detachment_and_ownership(
+    monkeypatch,
+    make_model,
+) -> None:
+    """Compiled prior scoring must stay frozen and preserve state ownership."""
+    eager_model = make_model(language_model=_CausalPrefixLanguageModel)
+    compiled_model = make_model(language_model=_CausalPrefixLanguageModel)
+    compiled_model.load_state_dict(eager_model.state_dict())
+    original_state_keys = tuple(compiled_model.state_dict())
+    monkeypatch.setattr(torch, "compile", lambda callable_, **kwargs: callable_)
+    compiled_model.compile_prior_scorer()
+    input_ids = torch.tensor([[1, 3, 2, 0], [1, 1, 3, 2]])
+
+    eager_values = eager_model.prior_sequence_log_probabilities(input_ids)
+    compiled_values = compiled_model.prior_sequence_log_probabilities(input_ids)
+
+    assert torch.allclose(compiled_values, eager_values)
+    assert compiled_values.requires_grad is False
+    assert all(
+        parameter.grad is None for parameter in compiled_model.prior.parameters()
+    )
+    assert all(
+        parameter.requires_grad is False
+        for parameter in compiled_model.prior.parameters()
+    )
+    assert tuple(compiled_model.state_dict()) == original_state_keys
 
 
 def test_model_rejects_shared_pad_and_eos_ids() -> None:
