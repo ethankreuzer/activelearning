@@ -24,6 +24,9 @@ if TYPE_CHECKING:
     from activelearning.applications.molecules.minimol_encoder import (
         MiniMolSmilesEncoder,
     )
+    from activelearning.applications.molecules.minimol_ampc_encoder import (
+        MiniMolAmpcSmilesEncoder,
+    )
 
 
 def _default_selfies_vocab() -> list[str]:
@@ -192,12 +195,77 @@ class MiniMolSmilesEncoderConfig(BaseModel):
         )
 
 
+class MiniMolAmpcSmilesEncoderConfig(BaseModel):
+    """Configuration for a fine-tuned MiniMol encoder aimed at the AmpC docking campaign.
+
+    The full checkpoint is loaded through the ``minimol_ampc`` package
+    shipped with the checkpoint. Its recommended 512-dimensional ``pooled512``
+    representation is projected into the configured DKL latent dimension.
+
+    Parameters
+    ----------
+    checkpoint_path : Path
+        Full ``MiniMolAmpcEncoder`` checkpoint.
+    package_path : Path, optional
+        Directory containing the sibling ``minimol_ampc`` package. When
+        omitted, it is inferred from the checkpoint path when possible.
+    device : str, optional
+        Device used by the frozen checkpoint encoder. ``"cpu"`` avoids
+        selecting a hidden CUDA device; ``null`` delegates selection to the
+        shared package.
+    batch_size : int, default=100
+        Maximum number of SMILES encoded per inference batch.
+    latent_dim : int, default=32
+        Width of the projected latent representation.
+    cache_size : int, default=4096
+        Maximum number of fingerprints retained in the encoder cache.
+    """
+
+    type: Literal["MiniMolAmpcSmilesEncoder"] = "MiniMolAmpcSmilesEncoder"
+    input_representation: ClassVar[str] = "smiles"
+    checkpoint_path: Path
+    package_path: Path | None = None
+    device: str | None = "cpu"
+    batch_size: int = Field(default=100, ge=1)
+    latent_dim: int = Field(default=32, ge=1)
+    cache_size: int = Field(default=4096, ge=0)
+
+    def build(self) -> "MiniMolAmpcSmilesEncoder":
+        """Instantiate the fine-tuned MiniMol AmpC encoder.
+
+        Returns
+        -------
+        MiniMolAmpcSmilesEncoder
+            Frozen ``pooled512`` extraction with a trainable DKL projection.
+
+        Raises
+        ------
+        ImportError
+            If the shared MiniMol AmpC dependencies are not installed.
+        FileNotFoundError
+            If the checkpoint or package path is unavailable.
+        """
+        from activelearning.applications.molecules.minimol_ampc_encoder import (
+            MiniMolAmpcSmilesEncoder,
+        )
+
+        return MiniMolAmpcSmilesEncoder(
+            checkpoint_path=self.checkpoint_path,
+            package_path=self.package_path,
+            device=self.device,
+            batch_size=self.batch_size,
+            latent_dim=self.latent_dim,
+            cache_size=self.cache_size,
+        )
+
+
 EncoderConfig = Annotated[
     Union[
         SelfiesTransformerEncoderConfig,
         GPMoLFormerSmilesEncoderConfig,
         MoLFormerSmilesEncoderConfig,
         MiniMolSmilesEncoderConfig,
+        MiniMolAmpcSmilesEncoderConfig,
     ],
     Field(discriminator="type"),
 ]

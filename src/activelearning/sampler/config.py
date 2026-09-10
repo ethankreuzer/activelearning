@@ -294,14 +294,26 @@ class S3GFNSamplerConfig(BaseModel):
     Whether loading may execute repository-provided model code.
     deterministic_eval : bool, optional
     Whether policy evaluation uses deterministic random features.
+    compile_strategy : {"none", "training_only", "training_and_generation"}, default="none"
+    Select eager execution, policy compilation during training only, or policy
+    compilation during training and final generation.
+    torch_compile_mode : str, default="default"
+    TorchInductor mode used when compilation is enabled.
+    torch_compile_dynamic : bool or None, default=True
+    Dynamic-shape policy passed to :func:`torch.compile`.
+    model_dtype : {"float32", "bfloat16"}, default="float32"
+    Floating-point dtype for the S3-GFN model and loss tensors.
     cache_dir : str, optional
     Directory for Hugging Face model and tokenizer files.
     max_length : int, default=140
     Maximum generated sequence length.
     batch_size : int, default=64
-    Number of trajectories evaluated per batch.
+    Number of trajectories generated during each training step.
     replay_batch_size : int, default=64
     Replay-buffer batch size used during training.
+    generation_batch_size : int, optional
+    Number of trajectories generated per final candidate-generation call.
+    When omitted, ``batch_size`` is used.
     n_train_steps : int, default=5000
     Number of policy training steps.
     num_warmup_steps : int, default=100
@@ -345,10 +357,17 @@ class S3GFNSamplerConfig(BaseModel):
     # set, and the checkpoint config defaults it to False. Keep it True so the
     # frozen prior scores a molecule identically across calls.
     deterministic_eval: bool | None = True
+    compile_strategy: Literal["none", "training_only", "training_and_generation"] = (
+        "none"
+    )
+    torch_compile_mode: str = "default"
+    torch_compile_dynamic: bool | None = True
+    model_dtype: Literal["float32", "bfloat16"] = "float32"
     cache_dir: str | None = None
     max_length: int = Field(default=140, ge=2)
     batch_size: int = Field(default=64, gt=0)
     replay_batch_size: int = Field(default=64, gt=0)
+    generation_batch_size: int | None = Field(default=None, gt=0)
     n_train_steps: int = Field(default=5000, gt=0)
     num_warmup_steps: int = Field(default=100, ge=0)
     learning_rate: PositiveFloat = 1.0e-4
@@ -384,10 +403,15 @@ class S3GFNSamplerConfig(BaseModel):
             tokenizer_name_or_path=self.tokenizer_name_or_path,
             trust_remote_code=self.trust_remote_code,
             deterministic_eval=self.deterministic_eval,
+            compile_strategy=self.compile_strategy,
+            torch_compile_mode=self.torch_compile_mode,
+            torch_compile_dynamic=self.torch_compile_dynamic,
+            model_dtype=self.model_dtype,
             cache_dir=self.cache_dir,
             max_length=self.max_length,
             batch_size=self.batch_size,
             replay_batch_size=self.replay_batch_size,
+            generation_batch_size=self.generation_batch_size,
             n_train_steps=self.n_train_steps,
             num_warmup_steps=self.num_warmup_steps,
             learning_rate=self.learning_rate,

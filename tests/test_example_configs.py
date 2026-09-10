@@ -7,7 +7,7 @@ from omegaconf import OmegaConf
 from pydantic import ValidationError
 
 from activelearning.config import ActiveLearningConfig
-from activelearning.run_writer import JSONLinesRunWriter
+from activelearning.monitoring.run_writer import JSONLinesRunWriter
 from activelearning.utils.config_loader import load_and_parse, load_config, parse_config
 
 
@@ -104,6 +104,9 @@ def test_branin_benchmark_configs_parse(
     assert config.surrogate.is_multi_fidelity is surrogate_is_multi_fidelity
     assert config.budget.available_budget == 100.0
     assert config.budget.max_rounds == 300
+    assert config.diagnostics.enabled is True
+    assert config.diagnostics.figure_interval == 1
+    assert config.diagnostics.max_points == 1000
     assert config.run_writer is not None
     assert config.run_writer.output_dir == Path(
         f"outputs/branin_benchmark/{overlay_name}/seed_42"
@@ -449,6 +452,42 @@ def test_molecule_s3gfn_minimol_variational_multi_fidelity_config_parses() -> No
     assert config.surrogate.target_fidelity == 3
     assert config.surrogate.encoder.type == "MiniMolSmilesEncoder"
     assert config.surrogate.encoder.latent_dim == 32
+    assert config.surrogate.num_inducing == 64
+    assert config.acquisition.type == "QMultiFidelityLowerBoundMaxValueEntropy"
+    assert config.oracle.fidelity_costs == {1: 1.0, 2: 3.5, 3: 7.0}
+    assert config.oracle.per_fidelity_num_conformers == {1: 1, 2: 2, 3: 4}
+    assert config.oracle.type == "XTBIPEAOracle"
+    assert config.oracle.mol_repr == "smiles"
+    assert config.sampler.compile_strategy == "training_and_generation"
+    assert config.sampler.torch_compile_mode == "max-autotune"
+    assert config.sampler.model_dtype == "bfloat16"
+    assert config.sampler.batch_size == 64
+    assert config.sampler.replay_batch_size == 64
+    assert config.sampler.generation_batch_size == 128
+
+
+def test_molecule_s3gfn_minimol_ampc_variational_multi_fidelity_config_parses() -> None:
+    """Ensure the AmpC MiniMol variational example matches the schema."""
+    config_path = (
+        REPOSITORY_ROOT
+        / "config"
+        / "molecules"
+        / "s3gfn_minimol_ampc_variational_multi_fidelity.yaml"
+    )
+
+    config = load_and_parse(config_path, ActiveLearningConfig)
+
+    assert config.sampler.type == "S3GFNSampler"
+    assert config.sampler.fidelities == [1, 2, 3]
+    assert config.surrogate.is_multi_fidelity is True
+    assert config.surrogate.type == "VariationalDKLSurrogate"
+    assert config.surrogate.target_fidelity == 3
+    assert config.surrogate.encoder.type == "MiniMolAmpcSmilesEncoder"
+    assert config.surrogate.encoder.checkpoint_path == Path(
+        "minimol_ampc_encoder/model/final.pt"
+    )
+    assert config.surrogate.encoder.package_path == Path("minimol_ampc_encoder")
+    assert config.surrogate.encoder.device == "cpu"
     assert config.surrogate.num_inducing == 64
     assert config.acquisition.type == "QMultiFidelityLowerBoundMaxValueEntropy"
     assert config.oracle.fidelity_costs == {1: 1.0, 2: 3.5, 3: 7.0}

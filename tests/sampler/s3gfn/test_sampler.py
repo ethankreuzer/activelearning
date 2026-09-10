@@ -6,6 +6,7 @@ from unittest.mock import Mock
 import torch
 from torch import nn
 import pytest
+from matplotlib import pyplot as plt
 from matplotlib.figure import Figure
 
 from activelearning.runtime import RuntimeContext
@@ -54,6 +55,172 @@ class _GradientTrainingModel:
         )
 
 
+def test_sampler_uses_explicit_model_dtype_for_rewards(
+    make_sampler,
+    fake_model,
+):
+    sampler = make_sampler(model_dtype="bfloat16")
+
+    prepared = sampler._prepare_batch(
+        model=fake_model,
+        smiles=("CC",),
+        fidelity_indices=torch.tensor([0]),
+        synthesizability=FakeSynthesizability(),
+        molecule_chem=FakeChem,
+        acquisition=FakeAcquisition(),
+        cost_fn=None,
+    )
+
+    assert prepared.reward_scores.dtype is torch.bfloat16
+
+
+def test_training_uses_batch_size_for_generation(make_sampler):
+    class _TrainingModel(_GradientTrainingModel):
+        def __init__(self) -> None:
+            super().__init__()
+            self.generate_calls = []
+
+        def generate(self, count, max_length, temperature):
+            self.generate_calls.append(count)
+            return SimpleNamespace(
+                smiles=tuple("CC" for _ in range(count)),
+                input_ids=torch.ones((count, 3), dtype=torch.long),
+                fidelity_indices=torch.zeros(count, dtype=torch.long),
+            )
+
+    model = _TrainingModel()
+    sampler = make_sampler(
+        n_samples=1,
+        batch_size=3,
+        replay_batch_size=4,
+        model_dtype="float32",
+    )
+    optimizer = torch.optim.SGD(
+        [
+            *model.policy.parameters(),
+            *model.fidelity_head.parameters(),
+            model.log_z,
+        ],
+        lr=0.1,
+    )
+
+    sampler._train_step(
+        model=model,
+        synthesizability=FakeSynthesizability(),
+        positive_buffer=sampler_module.ReplayBuffer(pad_token_id=0, capacity=4),
+        negative_buffer=None,
+        molecule_chem=FakeChem,
+        acquisition=FakeAcquisition(),
+        cost_fn=None,
+        optimizer=optimizer,
+    )
+
+    assert model.generate_calls == [3]
+
+
+def test_replay_uses_replay_batch_size(make_sampler):
+    class _RecordingBuffer:
+        def __init__(self, size: int) -> None:
+            self.size = size
+            self.calls: list[dict] = []
+
+        def __len__(self) -> int:
+            return self.size
+
+        def sample(self, **kwargs):
+            self.calls.append(kwargs)
+            count = kwargs["count"]
+            return SimpleNamespace(
+                input_ids=torch.ones((count, 3), dtype=torch.long),
+                reward_scores=torch.ones(count, dtype=kwargs["dtype"]),
+                fidelity_indices=None,
+            )
+
+    sampler = make_sampler(n_samples=1, replay_batch_size=3)
+    positive_buffer = _RecordingBuffer(size=5)
+    negative_buffer = _RecordingBuffer(size=5)
+
+    class _ReplayModel:
+        def replay_loss(self, **kwargs):
+            del kwargs
+            return None
+
+    model = _ReplayModel()
+
+    sampler._update_replay_batch(
+        model=model,
+        positive_buffer=positive_buffer,
+        negative_buffer=negative_buffer,
+        optimizer=None,
+    )
+
+    assert positive_buffer.calls[0]["count"] == 3
+    assert negative_buffer.calls[0]["count"] == 3
+
+
+def test_final_generation_uses_independent_batch_size_and_strict_cap(
+    make_sampler,
+):
+    class _FinalGenerationModel:
+        def __init__(self) -> None:
+            self.policy = nn.Linear(1, 1)
+            self.prior = nn.Linear(1, 1)
+            self.calls: list[int] = []
+            self.next_smiles = 0
+
+        def generate(self, count, max_length, temperature):
+            del max_length, temperature
+            self.calls.append(count)
+            smiles = tuple(f"C{self.next_smiles + index}" for index in range(count))
+            self.next_smiles += count
+            return SimpleNamespace(
+                smiles=smiles,
+                fidelity_indices=torch.zeros(count, dtype=torch.long),
+            )
+
+    sampler = make_sampler(
+        n_samples=4,
+        batch_size=99,
+        generation_batch_size=3,
+        max_generation_attempts=5,
+    )
+    model = _FinalGenerationModel()
+
+    candidates = sampler._generate_final_candidates(
+        model=model,
+        molecule_chem=FakeChem,
+    )
+
+    assert len(candidates) == 4
+    assert model.calls == [3, 2]
+
+
+def test_final_generation_stops_at_strict_attempt_cap(make_sampler):
+    class _EmptyGenerationModel:
+        def __init__(self) -> None:
+            self.policy = nn.Linear(1, 1)
+            self.prior = nn.Linear(1, 1)
+            self.calls: list[int] = []
+
+        def generate(self, count, max_length, temperature):
+            del max_length, temperature
+            self.calls.append(count)
+            return SimpleNamespace(smiles=(), fidelity_indices=None)
+
+    sampler = make_sampler(
+        n_samples=1,
+        batch_size=99,
+        generation_batch_size=8,
+        max_generation_attempts=3,
+    )
+    model = _EmptyGenerationModel()
+
+    with pytest.raises(RuntimeError, match="after 3 attempts"):
+        sampler._generate_final_candidates(model=model, molecule_chem=FakeChem)
+
+    assert model.calls == [3]
+
+
 def test_sampler_returns_canonical_smiles_with_conditionally_sampled_fidelities(
     make_sampler,
     fake_model,
@@ -80,6 +247,46 @@ def test_sampler_returns_canonical_smiles_with_conditionally_sampled_fidelities(
         "max_length": 8,
         "temperature": 1.0,
     }
+
+
+def test_sampler_compiles_policy_before_training(
+    make_sampler,
+    patch_molecule_dependencies,
+) -> None:
+    """Compilation must accelerate policy forwards in training and generation."""
+    events: list[tuple[str, object]] = []
+
+    class CompileAwareFakeModel(FakeModel):
+        """Record compilation without invoking TorchInductor."""
+
+        def compile_policy(
+            self,
+            *,
+            mode: str,
+            dynamic: bool | None,
+            training_only: bool,
+        ) -> None:
+            """Record the requested compilation mode."""
+            events.append(("compile", mode, dynamic, training_only))
+
+    model = CompileAwareFakeModel()
+    model.policy.train()
+    sampler = make_sampler(
+        compile_strategy="training_and_generation",
+        torch_compile_mode="max-autotune",
+        torch_compile_dynamic=None,
+    )
+    sampler._new_round_model = lambda: model
+    sampler._train_round = lambda **kwargs: events.append(
+        ("train", kwargs["model"].policy.training)
+    )
+
+    sampler.sample(acquisition=FakeAcquisition())
+
+    assert events == [
+        ("compile", "max-autotune", None, False),
+        ("train", True),
+    ]
 
 
 def test_sampler_advances_round_state_across_consecutive_samples(
@@ -352,8 +559,6 @@ def test_round_metrics_aggregate_scalars_and_figures(
     make_replay_buffer,
 ) -> None:
     sampler = make_sampler(n_train_steps=2)
-    logger = Mock()
-    sampler.bind_runtime_context(RuntimeContext(logger=logger))
     metrics = sampler.round_metrics
     metrics.record_training_step(
         generated_count=4,
@@ -388,45 +593,48 @@ def test_round_metrics_aggregate_scalars_and_figures(
     )
     metrics.training_duration_s = 1.25
     metrics.generation_duration_s = 0.75
+    metrics.positive_buffer_size = 3
 
-    sampler._log_round_metrics(
-        positive_buffer=make_replay_buffer(),
-        negative_buffer=None,
+    logged, figure_calls = sampler.drain_round_diagnostics(
+        include_figures=True,
+        max_points=1000,
     )
 
-    logged = {call.args[0]: call.args[1] for call in logger.log_metric.call_args_list}
-    assert logged["s3gfn/train/generated_total"] == 6
-    assert logged["s3gfn/train/valid_total"] == 5
-    assert logged["s3gfn/train/synthesizable_total"] == 3
-    assert logged["s3gfn/train/validity_rate"] == pytest.approx(5 / 6)
-    assert logged["s3gfn/train/synthesizable_rate"] == pytest.approx(3 / 5)
-    assert logged["s3gfn/train/online_updates"] == 2
-    assert logged["s3gfn/train/replay_updates"] == 1
-    assert logged["s3gfn/train/online_rtb_loss_mean"] == pytest.approx(3.0)
-    assert logged["s3gfn/train/online_rtb_loss_final"] == pytest.approx(4.0)
-    assert logged["s3gfn/train/replay_loss_mean"] == pytest.approx(3.0)
-    assert logged["s3gfn/train/auxiliary_loss_mean"] == pytest.approx(0.5)
-    assert logged["s3gfn/train/log_z_final"] == pytest.approx(0.2)
-    assert logged["s3gfn/reward/raw_mean"] == pytest.approx(6.0)
-    assert logged["s3gfn/reward/raw_max"] == pytest.approx(10.0)
-    assert logged["s3gfn/generation/yield"] == pytest.approx(0.4)
-    assert logged["s3gfn/generation/invalid_rate"] == pytest.approx(0.2)
-    assert logged["s3gfn/generation/duplicate_rate"] == pytest.approx(0.2)
-    assert logged["s3gfn/generation/fidelity_1"] == pytest.approx(0.5)
-    assert logged["s3gfn/generation/fidelity_2"] == pytest.approx(0.5)
+    assert logged["sampler/s3gfn/train/generated_total"] == 6
+    assert logged["sampler/s3gfn/train/valid_total"] == 5
+    assert logged["sampler/s3gfn/train/synthesizable_total"] == 3
+    assert logged["sampler/s3gfn/train/validity_rate"] == pytest.approx(5 / 6)
+    assert logged["sampler/s3gfn/train/synthesizable_rate"] == pytest.approx(3 / 5)
+    assert logged["sampler/s3gfn/train/online_updates"] == 2
+    assert logged["sampler/s3gfn/train/replay_updates"] == 1
+    assert logged["sampler/s3gfn/train/online_rtb_loss_mean"] == pytest.approx(3.0)
+    assert logged["sampler/s3gfn/train/online_rtb_loss_final"] == pytest.approx(4.0)
+    assert logged["sampler/s3gfn/train/replay_loss_mean"] == pytest.approx(3.0)
+    assert logged["sampler/s3gfn/train/contrastive_loss_mean"] == pytest.approx(0.5)
+    assert logged["sampler/s3gfn/train/contrastive_loss_final"] == pytest.approx(0.5)
+    assert logged["sampler/s3gfn/train/log_z_final"] == pytest.approx(0.2)
+    assert logged["sampler/s3gfn/reward/raw_mean"] == pytest.approx(6.0)
+    assert logged["sampler/s3gfn/reward/raw_max"] == pytest.approx(10.0)
+    assert logged["sampler/s3gfn/generation/yield"] == pytest.approx(0.4)
+    assert logged["sampler/s3gfn/generation/invalid_rate"] == pytest.approx(0.2)
+    assert logged["sampler/s3gfn/generation/duplicate_rate"] == pytest.approx(0.2)
     assert all(
         isinstance(value, (int, float)) and not isinstance(value, bool)
         for value in logged.values()
     )
-    figure_calls = {
-        call.args[0]: call.args[1] for call in logger.log_figure.call_args_list
+    assert set(figure_calls) == {
+        "sampler/s3gfn/training_losses",
+        "sampler/s3gfn/log_z",
+        "sampler/s3gfn/reward/trajectory",
     }
-    assert set(figure_calls) == {"s3gfn/training_losses", "s3gfn/log_z"}
     assert all(isinstance(figure, Figure) for figure in figure_calls.values())
-    logger.log_step.assert_not_called()
+    training_axis = figure_calls["sampler/s3gfn/training_losses"].axes[0]
+    assert training_axis.get_ylabel() == "S3-GFN training loss"
+    for figure in figure_calls.values():
+        plt.close(figure)
 
 
-def test_sampler_logs_round_metrics_without_advancing_runtime_step(
+def test_sampler_drains_round_metrics_without_touching_runtime_logger(
     make_sampler,
     fake_model,
     patch_molecule_dependencies,
@@ -439,12 +647,19 @@ def test_sampler_logs_round_metrics_without_advancing_runtime_step(
 
     sampler.sample(acquisition=FakeAcquisition())
 
-    runtime_logger.log_metric.assert_called()
+    metrics, figures = sampler.drain_round_diagnostics(
+        include_figures=False,
+        max_points=1000,
+    )
+
+    assert metrics["sampler/s3gfn/generation/yield"] == pytest.approx(1.0)
+    assert figures == {}
+    runtime_logger.log_metric.assert_not_called()
     runtime_logger.log_step.assert_not_called()
     runtime_logger.end.assert_not_called()
 
 
-def test_round_metrics_are_a_noop_without_runtime_logger(
+def test_round_metrics_drain_without_runtime_logger(
     make_sampler,
     make_replay_buffer,
 ) -> None:
@@ -463,14 +678,17 @@ def test_round_metrics_are_a_noop_without_runtime_logger(
         raw_reward_scores=[1.0],
     )
 
-    sampler._log_round_metrics(
-        positive_buffer=make_replay_buffer(capacity=1),
-        negative_buffer=None,
+    logged, figures = sampler.drain_round_diagnostics(
+        include_figures=False,
+        max_points=1000,
     )
 
-    # The recorded round is left intact for a later bound logger to emit.
-    assert sampler.round_metrics is metrics
-    assert metrics.generated_counts == [1]
+    assert logged["sampler/s3gfn/train/generated_total"] == 1
+    assert figures == {}
+    assert sampler.drain_round_diagnostics(
+        include_figures=False,
+        max_points=1000,
+    ) == ({}, {})
 
 
 def test_prepare_batch_retains_raw_reward_scores(

@@ -1,17 +1,18 @@
-# GPU-optimized S3-GFN experiment: MiniMol fingerprints + variational SMILES
-# DKL with explicit fidelity actions.
+# S3-GFN molecule experiment: fine-tuned MiniMol AmpC embeddings +
+# variational multi-fidelity SMILES DKL with explicit fidelity actions.
 #
 # Prerequisites:
 #   - uv sync --extra molecules
+#   - the intact collaborator package and checkpoint under minimol_ampc_encoder/
+#   - the dependency pins documented by minimol_ampc_encoder/
 #   - the xtb binary on PATH
 #
-# S3-GFN emits canonical connected SMILES and samples among the three xTB
-# fidelity levels. Its trainable policy still uses GP-MoLFormer, while the
-# surrogate uses frozen MiniMol fingerprints followed by a trainable projection
-# and a sparse variational GP.
+# This is the AmpC-checkpoint counterpart to
+# s3gfn_minimol_variational_multi_fidelity.yaml. The sampler, acquisition,
+# oracle, and budget are intentionally unchanged.
 
 runtime:
-  device: cuda
+  device: cpu
   precision: 64
   seed: 42
 
@@ -22,7 +23,10 @@ surrogate:
   type: VariationalDKLSurrogate
   target_fidelity: 3
   encoder:
-    type: MiniMolSmilesEncoder
+    type: MiniMolAmpcSmilesEncoder
+    checkpoint_path: minimol_ampc_encoder/model/final.pt
+    package_path: minimol_ampc_encoder
+    device: cpu
     batch_size: 16
     latent_dim: 32
     cache_size: 4096
@@ -48,13 +52,9 @@ sampler:
   model_name_or_path: ibm-research/GP-MoLFormer-Uniq
   tokenizer_name_or_path: ibm-research/MoLFormer-XL-both-10pct
   trust_remote_code: true
-  compile_strategy: training_and_generation
-  torch_compile_mode: max-autotune
-  model_dtype: bfloat16
   max_length: 140
-  batch_size: 64
-  replay_batch_size: 64
-  generation_batch_size: 128
+  batch_size: 16
+  replay_batch_size: 16
   n_train_steps: 25
   num_warmup_steps: 5
   beta: 25.0
@@ -89,4 +89,4 @@ budget:
 logger:
   type: ConsoleLogger
   project_name: activelearning_tutorials
-  run_name: molecules-s3gfn-minimol-variational-multi-fidelity
+  run_name: molecules-s3gfn-minimol-ampc-variational-multi-fidelity

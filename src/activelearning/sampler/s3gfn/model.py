@@ -18,6 +18,7 @@ from __future__ import annotations
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass
+from types import MethodType
 from typing import Any
 
 import torch
@@ -35,6 +36,65 @@ from activelearning.sampler.s3gfn.losses import (
 
 DEFAULT_GP_MOLFORMER_MODEL = "ibm-research/GP-MoLFormer-Uniq"
 DEFAULT_GP_MOLFORMER_TOKENIZER = "ibm-research/MoLFormer-XL-both-10pct"
+
+
+def _preserve_feature_map_redraw_dtype(module: nn.Module) -> None:
+    """Keep GP-MoLFormer's redrawn random-feature weights type-consistent."""
+    for feature_map in module.modules():
+        redraw = getattr(feature_map, "orthogonal_random_weights", None)
+        weight = getattr(feature_map, "weight", None)
+        if (
+            not callable(redraw)
+            or not isinstance(weight, Tensor)
+            or not weight.is_floating_point()
+        ):
+            continue
+        if (
+            getattr(feature_map, "_s3gfn_dtype_safe_redraw", False)
+            and getattr(redraw, "__self__", None) is feature_map
+        ):
+            continue
+
+        original_redraw = getattr(redraw, "__func__", redraw)
+        redraw_is_bound = getattr(redraw, "__self__", None) is feature_map
+
+        def redraw_with_dtype_impl(
+            current_feature_map: nn.Module,
+            device: torch.device | None = None,
+            *,
+            _original_redraw: Any = original_redraw,
+            _redraw_is_bound: bool = redraw_is_bound,
+        ) -> None:
+            current_weight = getattr(current_feature_map, "weight", None)
+            target_dtype = (
+                current_weight.dtype
+                if isinstance(current_weight, Tensor)
+                and current_weight.is_floating_point()
+                else None
+            )
+            if _redraw_is_bound:
+                _original_redraw(current_feature_map, device=device)
+            else:
+                _original_redraw(device=device)
+            redrawn_weight = getattr(current_feature_map, "weight", None)
+            if target_dtype is not None and isinstance(redrawn_weight, Tensor):
+                current_feature_map.weight = redrawn_weight.to(
+                    dtype=target_dtype
+                ).clone()
+
+        compiler = getattr(torch, "compiler", None)
+        disable = getattr(compiler, "disable", None)
+        redraw_with_dtype = (
+            disable(redraw_with_dtype_impl)
+            if callable(disable)
+            else redraw_with_dtype_impl
+        )
+
+        feature_map.orthogonal_random_weights = MethodType(
+            redraw_with_dtype,
+            feature_map,
+        )
+        feature_map._s3gfn_dtype_safe_redraw = True
 
 
 @dataclass(frozen=True)
@@ -118,6 +178,8 @@ class S3GFNModel(nn.Module):
         self.prior = prior
         self.tokenizer = tokenizer
         self.fidelity_head = fidelity_head
+        _preserve_feature_map_redraw_dtype(self.policy)
+        _preserve_feature_map_redraw_dtype(self.prior)
         if self.fidelity_head is not None:
             policy_parameter = next(self.policy.parameters(), None)
             if policy_parameter is not None:
@@ -129,6 +191,8 @@ class S3GFNModel(nn.Module):
         self.eos_token_id = int(tokenizer.eos_token_id)
         self.log_z = nn.Parameter(torch.tensor(float(initial_log_z)))
         self._last_auxiliary_loss: Tensor | None = None
+        self._policy_forward_compiled = False
+        self._compiled_policy_forward: Any | None = None
 
         for parameter in self.prior.parameters():
             parameter.requires_grad_(False)
@@ -221,7 +285,10 @@ class S3GFNModel(nn.Module):
         }
         if deterministic_eval is not None:
             model_kwargs["deterministic_eval"] = deterministic_eval
-        if dtype is not None:
+        # GP-MoLFormer creates orthogonal random feature maps with a CPU QR
+        # decomposition during construction. PyTorch does not implement that
+        # operation for BF16, so construct in FP32 and convert afterward.
+        if dtype is not None and dtype != torch.bfloat16:
             model_kwargs["torch_dtype"] = dtype
         prior = AutoModelForCausalLM.from_pretrained(prior_name, **model_kwargs)
         policy = AutoModelForCausalLM.from_pretrained(
@@ -234,13 +301,22 @@ class S3GFNModel(nn.Module):
                 hidden_size=_model_hidden_size(policy),
                 n_fidelities=n_fidelities,
             )
-        return cls(
+        model = cls(
             policy=policy,
             prior=prior,
             tokenizer=tokenizer,
             initial_log_z=initial_log_z,
             fidelity_head=fidelity_head,
-        ).to(device)
+        )
+        if dtype is None:
+            return model.to(device=device)
+        model = model.to(device=device, dtype=dtype)
+        # Keep the RTB normalizer in FP32 so its scalar accumulation remains
+        # stable when the policy and prior use reduced precision.
+        model.log_z = nn.Parameter(
+            model.log_z.detach().to(device=device, dtype=torch.float32)
+        )
+        return model
 
     @property
     def device(self) -> torch.device:
@@ -274,6 +350,72 @@ class S3GFNModel(nn.Module):
         super().train(mode)
         self.prior.eval()
         return self
+
+    def compile_policy(
+        self,
+        *,
+        mode: str = "default",
+        dynamic: bool = True,
+        training_only: bool = False,
+    ) -> None:
+        """Compile policy forwards for training, generation, or both.
+
+        Parameters
+        ----------
+        mode : str, optional
+            TorchInductor compilation mode passed to :func:`torch.compile`.
+        dynamic : bool, optional
+            Whether to allow dynamic tensor shapes across cached decoding
+            steps. This avoids compiling a separate graph for every sequence
+            length during autoregressive generation.
+        training_only : bool, optional
+            Keep Hugging Face generation eager and use the compiled forward
+            only for differentiable policy likelihoods.
+
+        Raises
+        ------
+        RuntimeError
+            If the installed PyTorch version does not provide
+            :func:`torch.compile`.
+        ValueError
+            If ``mode`` is empty.
+        """
+        if not mode:
+            raise ValueError("torch.compile mode must not be empty.")
+        if self._policy_forward_compiled:
+            return
+        compile_function = getattr(torch, "compile", None)
+        if compile_function is None:
+            raise RuntimeError(
+                "torch.compile is required for compiled S3-GFN policy execution."
+            )
+        if mode == "max-autotune":
+            policy_parameter = next(self.policy.parameters(), None)
+            compile_options: dict[str, str | bool] = {
+                "max_autotune": True,
+                "triton.cudagraphs": False,
+            }
+            if (
+                policy_parameter is not None
+                and policy_parameter.dtype == torch.bfloat16
+            ):
+                compile_options["max_autotune_gemm_backends"] = "ATEN"
+            compiled_forward = compile_function(
+                self.policy.forward,
+                dynamic=dynamic,
+                options=compile_options,
+            )
+        else:
+            compiled_forward = compile_function(
+                self.policy.forward,
+                mode=mode,
+                dynamic=dynamic,
+            )
+        if training_only:
+            self._compiled_policy_forward = compiled_forward
+        else:
+            self.policy.forward = compiled_forward
+        self._policy_forward_compiled = True
 
     def encode_smiles(
         self,
@@ -416,7 +558,7 @@ class S3GFNModel(nn.Module):
             If ``input_ids`` does not contain integer token ids.
         """
         return sequence_log_probabilities(
-            causal_lm=self.policy,
+            causal_lm=self._compiled_policy_forward or self.policy,
             input_ids=input_ids.to(self.device),
             pad_token_id=self.pad_token_id,
         )
@@ -498,10 +640,11 @@ class S3GFNModel(nn.Module):
                 input_ids
             )
         )
-        return sequence_log_probabilities_ + self.fidelity_head.log_prob(
+        fidelity_log_probabilities = self.fidelity_head.log_prob(
             terminal_hidden_states,
             fidelity_indices,
         )
+        return sequence_log_probabilities_ + fidelity_log_probabilities
 
     def prior_trajectory_log_probabilities(
         self,
@@ -846,7 +989,8 @@ class S3GFNModel(nn.Module):
 
         labels = input_ids[:, 1:]
         attention_mask = input_ids.ne(self.pad_token_id).long()
-        outputs = self.policy(
+        policy_forward = self._compiled_policy_forward or self.policy
+        outputs = policy_forward(
             input_ids=input_ids,
             attention_mask=attention_mask,
             output_hidden_states=True,

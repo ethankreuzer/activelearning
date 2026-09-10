@@ -38,7 +38,7 @@ The repository includes several example molecule configs arranged as an incremen
 | `config/molecules/s3gfn_exact.yaml` | S3-GFN | Exact GP-MoLFormer SMILES DKL | UCB | fixed fidelity `1` | Canonical SMILES single-fidelity run |
 | `config/molecules/s3gfn_exact_multi_fidelity.yaml` | S3-GFN | Exact GP-MoLFormer SMILES DKL | MF-MES | learned fidelity `1 / 2 / 3` | Canonical SMILES multi-fidelity run |
 | `config/molecules/s3gfn_minimol_exact.yaml` | S3-GFN | Exact MiniMol SMILES DKL | UCB | fixed fidelity `1` | Canonical SMILES run with frozen graph fingerprints |
-| `config/molecules/s3gfn_minimol_variational_multi_fidelity.yaml` | S3-GFN | Variational MiniMol SMILES DKL | MF-MES | learned fidelity `1 / 2 / 3` | Canonical SMILES multi-fidelity run with a sparse GP head |
+| `config/molecules/s3gfn_minimol_variational_multi_fidelity.yaml` | S3-GFN | Variational MiniMol SMILES DKL | MF-MES | learned fidelity `1 / 2 / 3` | GPU-optimized multi-fidelity run with a sparse GP head |
 
 !!! note "Small defaults for fast checks"
     These examples are tuned to be runnable tutorial setups, not fully optimized molecule-discovery runs. The short command overrides below keep the active-learning budget small enough for a quick functional check, and the provided GFlowNet examples also use relatively short training schedules in the exact-surrogate stages so you can verify the full loop quickly. For better learning, increase both the oracle budget so the surrogate sees more observations and the GFlowNet optimization steps so the policy can better approximate reward-proportional sampling.
@@ -60,6 +60,30 @@ Both configurations require the molecules extra and an `xtb` executable on
 identifiers: S3-GFN fine-tunes its policy, while the surrogate keeps a frozen
 feature prior. They therefore load separate model instances and require
 additional memory.
+
+With a runtime logger enabled, S3-GFN training telemetry is grouped under
+`sampler/s3gfn/`. The scalar metrics include online, replay, and contrastive
+losses, log-Z, raw reward statistics, generation validity and duplicate rates,
+fidelity proportions, and training or generation durations. The corresponding
+trajectory figures are `sampler/s3gfn/training_losses`,
+`sampler/s3gfn/log_z`, and `sampler/s3gfn/reward/trajectory`.
+
+For GPU tuning, keep the training and final-generation controls separate:
+`batch_size` controls on-policy training generation, `replay_batch_size`
+controls replay sampling, and `generation_batch_size` controls only the final
+candidate-generation calls. Omitting `generation_batch_size` makes it inherit
+`batch_size`. The sampler accepts `model_dtype: float32` or `bfloat16`, which
+controls the S3-GFN model without changing the rest of the experiment.
+
+`compile_strategy: training_and_generation` compiles the policy forward pass
+used during training and final generation. The first training step includes
+lazy TorchInductor warm-up. In the measured A100 run at batch 64, BF16
+`max-autotune` reduced average training time from 2.969 to 1.387 seconds per
+step, a 2.14x speedup, and reached approximately 2,182 generation tokens/s.
+Increasing only the final-generation batch size to 128 reached 3,188 tokens/s,
+about 46% higher useful throughput. Treat those values as a starting point:
+larger generation batches can use more memory, so test capacity and candidate
+validity on the target GPU before adopting them.
 
 ### **Choosing an encoder for DKL**
 
@@ -220,8 +244,8 @@ uv run activelearning config/molecules/exact.yaml \
 You should see the same round-level fields as in the synthetic tutorials, plus a figure acknowledgement from the console logger:
 
 ```text
-[Figure] 'xtb_ea_query_molecules' (not rendered in console)
-[Step 1] round=1 | num_new_samples=5 | round_cost=5.0000 | total_cost=5.0000 | budget_remaining=0.0000
+[Figure] 'oracle/xtb/ea/query_molecules' (not rendered in console)
+[Step 1] active_learning/round=1 | active_learning/samples/selected=5 | active_learning/observations/new=5 | active_learning/cost/round=5.0000 | active_learning/cost/cumulative=5.0000 | active_learning/budget/remaining=0.0000 | profiling/...
 Done. Rounds: 1 | Total cost: 5.0000
 ```
 
@@ -279,7 +303,7 @@ Open Aim:
 uv run aim up
 ```
 
-In the Aim UI, open the run and inspect **Images**. For EA runs, the image key is `xtb_ea_query_molecules`; for IP runs, it is `xtb_ip_query_molecules`. Each panel shows the query index, fidelity, observed score in eV, and the decoded molecule identifier.
+In the Aim UI, open the run and inspect **Images**. For EA runs, the image key is `oracle/xtb/ea/query_molecules`; for IP runs, it is `oracle/xtb/ip/query_molecules`. Each panel shows the query index, fidelity, observed score in eV, and the decoded molecule identifier.
 
 The example below was generated from a short fidelity-1 EA run over the bundled SELFIES pool, then ranking the successful xTB evaluations by observed EA and rendering the top four molecules as a 2x2 grid:
 
