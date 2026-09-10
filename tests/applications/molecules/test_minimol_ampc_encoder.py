@@ -103,6 +103,42 @@ def test_ampc_encoder_loads_backend_and_uses_pooled512(
     assert contexts == ["enter", "exit"]
 
 
+def test_ampc_fixed_encoder_returns_pooled512_without_projection(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The fixed AmpC encoder exposes pooled512 directly."""
+    checkpoint_path, package_path = _make_checkpoint_package(tmp_path)
+    backend = _FakeAmpcEncoder(
+        outputs=np.ones((2, 512), dtype=np.float32),
+    )
+
+    @contextmanager
+    def fake_graphium_compatibility() -> Any:
+        yield
+
+    monkeypatch.setattr(
+        ampc_module,
+        "_load_ampc_encoder",
+        lambda checkpoint, package, device: backend,
+    )
+    monkeypatch.setattr(
+        ampc_module,
+        "_graphium_float32_compatibility",
+        fake_graphium_compatibility,
+    )
+
+    encoder = ampc_module.MiniMolAmpcSmilesFixedEncoder(
+        checkpoint_path=checkpoint_path,
+        package_path=package_path,
+    )
+    features = encoder.encode(["CC", "CO"], device=torch.device("cpu"))
+
+    assert encoder.feature_dim == 512
+    assert features.shape == (2, 512)
+    assert not hasattr(encoder, "projection")
+
+
 def test_ampc_backend_loader_configures_worker_safe_featurizer(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

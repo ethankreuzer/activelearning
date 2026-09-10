@@ -405,22 +405,22 @@ def _extract_molecule_representation(oracle: BaseModel) -> str | None:
     return representations[0]
 
 
-def _encoder_molecule_representation(encoder: object) -> str | None:
+def _encoder_molecule_representation(component: object) -> str | None:
     """Return the representation declared by an encoder config.
 
     Parameters
     ----------
-    encoder : object
-        Parsed encoder configuration, if the surrogate declares one.
+    component : object
+        Parsed encoder configuration.
 
     Returns
     -------
     str or None
         Declared representation, or ``None`` when no representation is known.
     """
-    if not isinstance(encoder, BaseModel):
+    if not isinstance(component, BaseModel):
         return None
-    representation = getattr(encoder, "input_representation", None)
+    representation = getattr(component, "input_representation", None)
     return representation if isinstance(representation, str) else None
 
 
@@ -454,8 +454,8 @@ def _validate_component_compatibility(
         If a known sampler, surrogate, acquisition, or oracle contract is
         incompatible with another configured component.
     """
-    encoder = getattr(surrogate, "encoder", None)
-    encoder_representation = _encoder_molecule_representation(encoder)
+    encoder_component = getattr(surrogate, "encoder", None)
+    encoder_representation = _encoder_molecule_representation(encoder_component)
     oracle_representation = _extract_molecule_representation(oracle)
 
     sampler_representation = getattr(sampler, "output_representation", None)
@@ -485,7 +485,7 @@ def _validate_component_compatibility(
         if encoder_representation is not None:
             raise ValueError(
                 f"{type(sampler).__name__} generates numeric candidates, but "
-                f"{type(encoder).__name__} expects "
+                f"{type(encoder_component).__name__} expects "
                 f"{encoder_representation.upper()} strings."
             )
         if oracle_representation is not None:
@@ -498,14 +498,14 @@ def _validate_component_compatibility(
     if encoder_representation is not None:
         if oracle_representation is None:
             raise ValueError(
-                f"{type(encoder).__name__} expects "
+                f"{type(encoder_component).__name__} expects "
                 f"{encoder_representation.upper()} strings, but the configured "
                 f"{type(oracle).__name__} does not expose one consistent "
                 "molecular representation."
             )
         if oracle_representation != encoder_representation:
             raise ValueError(
-                f"{type(encoder).__name__} expects "
+                f"{type(encoder_component).__name__} expects "
                 f"{encoder_representation.upper()} strings, but the oracle is "
                 f"configured with mol_repr={oracle_representation!r}."
             )
