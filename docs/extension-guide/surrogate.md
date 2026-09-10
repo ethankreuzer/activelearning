@@ -114,10 +114,17 @@ through `batch_from_strings(strings, max_tokens, device)`, and returns a
 matching mask from `attention_mask_from_batch(token_batch)`. Note that
 `max_tokens` counts special tokens and padding, not just content tokens.
 
-Models that accept raw values directly, such as graph or fingerprint
-extractors, can implement `LatentEncoder` without a tokenizer. In that case,
+Models that accept raw values directly, such as graph or fingerprint encoders,
+can implement `LatentEncoder` without a tokenizer. In that case,
 `prepare_inputs()` performs the model-specific extraction and `forward()`
 maps the resulting tensor to the latent features used by DKL.
+
+For a fixed, non-trainable representation used by
+`VariationalGPSurrogate`, implement
+[`FixedEncoder`](../reference/activelearning/surrogate/encoder/#activelearning.surrogate.encoder.FixedEncoder)
+with a `feature_dim` and an `encode(values, *, device)` method. Unlike
+`LatentEncoder`, a fixed encoder does not expose a trainable projection or a
+gradient-carrying `forward()` path.
 
 Encoders built on a pretrained backbone should load their model in the
 application layer and reuse

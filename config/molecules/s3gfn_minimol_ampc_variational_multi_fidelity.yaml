@@ -1,5 +1,5 @@
-# S3-GFN molecule experiment: fine-tuned MiniMol AmpC embeddings +
-# variational multi-fidelity SMILES DKL with explicit fidelity actions.
+# S3-GFN molecule experiment: fine-tuned MiniMol AmpC representations +
+# fixed-feature variational multi-fidelity GP with explicit fidelity actions.
 #
 # Prerequisites:
 #   - uv sync --extra molecules
@@ -20,15 +20,14 @@ dataset:
   type: ListDataset
 
 surrogate:
-  type: VariationalDKLSurrogate
+  type: VariationalGPSurrogate
   target_fidelity: 3
   encoder:
-    type: MiniMolAmpcSmilesEncoder
+    type: MiniMolAmpcSmilesFixedEncoder
     checkpoint_path: minimol_ampc_encoder/model/final.pt
     package_path: minimol_ampc_encoder
     device: cpu
     batch_size: 16
-    latent_dim: 32
     cache_size: 4096
   training_params:
     epochs: 10

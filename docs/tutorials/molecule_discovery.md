@@ -13,7 +13,7 @@ At a high level, the framework models molecules as:
 
 ```text
 Molecular string (SELFIES or canonical SMILES)
-  -> encode with a sequence model or molecular feature extractor
+  -> encode with a sequence model or molecular encoder
   -> fit a deep-kernel GP surrogate
   -> score candidate molecules with an acquisition function
   -> sample candidates from a pool, SELFIES GFlowNet, or S3-GFN environment
@@ -92,21 +92,21 @@ omitted to retain the validated inheritance behavior.
 ### **Choosing an encoder for DKL**
 
 An encoder maps each raw molecule to features that the GP can model. A common
-design for a pretrained or non-differentiable feature extractor is:
+design for a pretrained or non-differentiable encoder is:
 
 ```text
 canonical SMILES
-  -> feature extractor
+  -> fixed encoder
   -> fixed-width feature vector
   -> trainable projection to latent_dim
   -> GP surrogate
 ```
 
-The feature extractor can be frozen while the projection is trained jointly
+The fixed encoder can be frozen while the projection is trained jointly
 with the GP. If the encoder itself is trainable, its parameters can be updated
 through the same path. This keeps the DKL implementation independent of how
 the molecular features are produced: a tokenizer-backed sequence model,
-fingerprint generator, or another domain-specific encoder can all implement
+fingerprint encoder, or another domain-specific encoder can all implement
 the same encoder contract.
 
 MiniMol is one example of this pattern. It produces a frozen 512-dimensional
@@ -134,6 +134,22 @@ surrogate:
 
 The checkpoint must contain either the predictor state dict directly or under
 a `state_dict` key, and must use the same MiniMol architecture.
+
+To fit only a variational GP on the raw MiniMol representation, use
+`VariationalGPSurrogate` with a `MiniMolSmilesFixedEncoder` or
+`MiniMolAmpcSmilesFixedEncoder`. This path bypasses the trainable DKL
+projection and fits only the GP, likelihood, variational distribution, and
+learned inducing locations.
+
+```yaml
+surrogate:
+  type: VariationalGPSurrogate
+  encoder:
+    type: MiniMolAmpcSmilesFixedEncoder
+    checkpoint_path: minimol_ampc_encoder/model/final.pt
+    package_path: minimol_ampc_encoder
+  num_inducing: 64
+```
 
 ## **What are SELFIES?**
 
