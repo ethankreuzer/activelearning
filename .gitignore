@@ -339,7 +339,9 @@ wandb/
 
 # GFlowNet runtime artifacts
 logs/gflownet/
-data/replay.csv
+
+# Local data files (large CSVs, datasets pulled/generated per-run)
+data/
 
 # Outputs and plots
 outputs/
