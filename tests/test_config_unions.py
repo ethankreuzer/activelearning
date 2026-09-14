@@ -178,6 +178,29 @@ def test_minimol_encoder_config_defaults_to_32_latent_features() -> None:
     assert config.latent_dim == 32
 
 
+def test_minimol_cache_config_parses_feature_path_and_rejects_old_fields() -> None:
+    """MiniMol feature-cache settings use the pre-1.0 API."""
+    config = MiniMolSmilesEncoderConfig.model_validate(
+        {
+            "feature_cache_path": "cache/minimol.npy",
+        }
+    )
+
+    assert config.feature_cache_path == Path("cache/minimol.npy")
+    with pytest.raises(ValidationError, match="training_cache_path"):
+        MiniMolSmilesEncoderConfig.model_validate(
+            {
+                "training_cache_path": "cache/minimol.npy",
+            }
+        )
+    with pytest.raises(ValidationError, match="cache_features"):
+        MiniMolSmilesFixedEncoderConfig.model_validate(
+            {
+                "cache_features": True,
+            }
+        )
+
+
 def test_minimol_ampc_encoder_config_parses_checkpoint_and_package_paths() -> None:
     """The full-trunk MiniMol config preserves its local package paths."""
     config = MiniMolAmpcSmilesEncoderConfig.model_validate(

@@ -10,7 +10,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, ClassVar, Literal, Union
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from activelearning.surrogate.sequence.config import HuggingFaceEncoderConfig
 
@@ -36,6 +36,14 @@ def _default_selfies_vocab() -> list[str]:
     from activelearning.applications.molecules.constants import SELFIES_VOCAB_SMALL
 
     return list(SELFIES_VOCAB_SMALL)
+
+
+class _MiniMolCacheConfig(BaseModel):
+    """Shared persistent feature-cache settings for MiniMol encoder configs."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    feature_cache_path: Path | None = None
 
 
 class SelfiesTransformerEncoderConfig(BaseModel):
@@ -145,7 +153,7 @@ class MoLFormerSmilesEncoderConfig(HuggingFaceEncoderConfig):
         return MoLFormerSmilesEncoder
 
 
-class MiniMolSmilesEncoderConfig(BaseModel):
+class MiniMolSmilesEncoderConfig(_MiniMolCacheConfig):
     """Configuration for a frozen MiniMol SMILES fingerprint encoder.
 
     MiniMol produces fixed 512-dimensional graph fingerprints. The encoder
@@ -158,8 +166,10 @@ class MiniMolSmilesEncoderConfig(BaseModel):
     latent_dim : int, default=32
         Width of the projected latent representation.
     cache_size : int, default=4096
-        Maximum number of fingerprints retained in the encoder cache. Set to
-        zero to disable caching.
+        Maximum number of fingerprints retained in the in-memory LRU cache.
+        Set to zero to disable the LRU cache.
+    feature_cache_path : Path, optional
+        Persistent ``.npy`` feature matrix path with a JSON manifest beside it.
     checkpoint_path : Path, optional
         Optional predictor state-dict checkpoint loaded over MiniMol's bundled
         pretrained weights.
@@ -193,11 +203,12 @@ class MiniMolSmilesEncoderConfig(BaseModel):
             batch_size=self.batch_size,
             latent_dim=self.latent_dim,
             cache_size=self.cache_size,
+            feature_cache_path=self.feature_cache_path,
             checkpoint_path=self.checkpoint_path,
         )
 
 
-class MiniMolAmpcSmilesEncoderConfig(BaseModel):
+class MiniMolAmpcSmilesEncoderConfig(_MiniMolCacheConfig):
     """Configuration for a fine-tuned MiniMol encoder aimed at the AmpC docking campaign.
 
     The full checkpoint is loaded through the ``minimol_ampc`` package
@@ -220,7 +231,9 @@ class MiniMolAmpcSmilesEncoderConfig(BaseModel):
     latent_dim : int, default=32
         Width of the projected latent representation.
     cache_size : int, default=4096
-        Maximum number of fingerprints retained in the encoder cache.
+        Maximum number of fingerprints retained in the in-memory LRU cache.
+    feature_cache_path : Path, optional
+        Persistent ``.npy`` feature matrix path with a JSON manifest beside it.
     """
 
     type: Literal["MiniMolAmpcSmilesEncoder"] = "MiniMolAmpcSmilesEncoder"
@@ -258,10 +271,11 @@ class MiniMolAmpcSmilesEncoderConfig(BaseModel):
             batch_size=self.batch_size,
             latent_dim=self.latent_dim,
             cache_size=self.cache_size,
+            feature_cache_path=self.feature_cache_path,
         )
 
 
-class MiniMolSmilesFixedEncoderConfig(BaseModel):
+class MiniMolSmilesFixedEncoderConfig(_MiniMolCacheConfig):
     """Configuration for fixed stock MiniMol SMILES representations."""
 
     type: Literal["MiniMolSmilesFixedEncoder"] = "MiniMolSmilesFixedEncoder"
@@ -279,11 +293,12 @@ class MiniMolSmilesFixedEncoderConfig(BaseModel):
         return MiniMolSmilesFixedEncoder(
             batch_size=self.batch_size,
             cache_size=self.cache_size,
+            feature_cache_path=self.feature_cache_path,
             checkpoint_path=self.checkpoint_path,
         )
 
 
-class MiniMolAmpcSmilesFixedEncoderConfig(BaseModel):
+class MiniMolAmpcSmilesFixedEncoderConfig(_MiniMolCacheConfig):
     """Configuration for fixed MiniMol AmpC ``pooled512`` representations."""
 
     type: Literal["MiniMolAmpcSmilesFixedEncoder"] = "MiniMolAmpcSmilesFixedEncoder"
@@ -306,6 +321,7 @@ class MiniMolAmpcSmilesFixedEncoderConfig(BaseModel):
             device=self.device,
             batch_size=self.batch_size,
             cache_size=self.cache_size,
+            feature_cache_path=self.feature_cache_path,
         )
 
 

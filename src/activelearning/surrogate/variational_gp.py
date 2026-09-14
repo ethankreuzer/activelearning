@@ -397,7 +397,17 @@ class VariationalGPSurrogate(BoTorchGPSurrogate):
         features = self._encoder.encode(
             [item.x for item in items],
             device=encoding_device,
-        ).to(device=encoding_device, dtype=self.dtype)
+        )
+        return self._assemble_encoded_items(items, features, encoding_device)
+
+    def _assemble_encoded_items(
+        self,
+        items: list[Candidate | Observation],
+        features: torch.Tensor,
+        encoding_device: torch.device,
+    ) -> torch.Tensor:
+        """Validate fixed features and append fidelity confidence if enabled."""
+        features = features.to(device=encoding_device, dtype=self.dtype)
         expected_shape = (len(items), self._encoder.feature_dim)
         if tuple(features.shape) != expected_shape:
             raise ValueError(

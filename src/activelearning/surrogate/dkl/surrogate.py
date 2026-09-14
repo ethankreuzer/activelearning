@@ -362,7 +362,16 @@ class DeepKernelSurrogate(BoTorchGPSurrogate):
         inputs = self._encoder.prepare_inputs(
             [item.x for item in items],
             device=self.device,
-        ).to(device=self.device, dtype=self.dtype)
+        )
+        return self._append_fidelity(items, inputs)
+
+    def _append_fidelity(
+        self,
+        items: list[Candidate | Observation],
+        inputs: torch.Tensor,
+    ) -> torch.Tensor:
+        """Move encoded inputs to runtime dtype and append fidelity if active."""
+        inputs = inputs.to(device=self.device, dtype=self.dtype)
         if self._is_multi_fidelity:
             fidelities = torch.tensor(
                 [

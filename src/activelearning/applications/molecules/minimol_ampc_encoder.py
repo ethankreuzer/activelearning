@@ -99,6 +99,9 @@ def _load_ampc_encoder(
 class MiniMolAmpcSmilesFixedEncoder(MiniMolSmilesFixedEncoder):
     """Encode SMILES as fixed ``pooled512`` AmpC representations."""
 
+    _cache_backend_name = "minimol_ampc.MiniMolAmpcEncoder"
+    _cache_package_names = ("minimol_ampc",)
+
     def __init__(
         self,
         *,
@@ -107,6 +110,7 @@ class MiniMolAmpcSmilesFixedEncoder(MiniMolSmilesFixedEncoder):
         device: str | torch.device | None = "cpu",
         batch_size: int = 100,
         cache_size: int = 4096,
+        feature_cache_path: str | Path | None = None,
     ) -> None:
         """Initialize the fine-tuned MiniMol AmpC fixed encoder.
 
@@ -124,7 +128,10 @@ class MiniMolAmpcSmilesFixedEncoder(MiniMolSmilesFixedEncoder):
             Maximum number of SMILES encoded per inference batch.
         cache_size : int, default=4096
             Maximum number of detached CPU fingerprints retained by the LRU
-            cache. Zero disables caching.
+            cache. Zero disables the in-memory LRU cache.
+        feature_cache_path : Path or str, optional
+            Path to a persistent ``.npy`` feature matrix and its JSON
+            manifest.
         """
         resolved_checkpoint_path = Path(checkpoint_path).expanduser().resolve()
         self.package_path = _resolve_package_path(
@@ -135,6 +142,7 @@ class MiniMolAmpcSmilesFixedEncoder(MiniMolSmilesFixedEncoder):
         super().__init__(
             batch_size=batch_size,
             cache_size=cache_size,
+            feature_cache_path=feature_cache_path,
             checkpoint_path=resolved_checkpoint_path,
         )
 
@@ -150,9 +158,10 @@ class MiniMolAmpcSmilesFixedEncoder(MiniMolSmilesFixedEncoder):
 
     def _extract_fingerprints(self, smiles: list[str]) -> list[Tensor]:
         """Extract and validate the shared encoder's ``pooled512`` vectors."""
+        encoder = self._ensure_minimol_loaded()
         with _graphium_float32_compatibility():
             outputs = np.asarray(
-                self._minimol.encode(smiles, batch_size=self.batch_size),
+                encoder.encode(smiles, batch_size=self.batch_size),
                 dtype=np.float32,
             )
         expected_shape = (len(smiles), MINIMOL_FINGERPRINT_DIM)
@@ -189,6 +198,7 @@ class MiniMolAmpcSmilesEncoder(MiniMolSmilesEncoder):
         batch_size: int = 100,
         latent_dim: int = 32,
         cache_size: int = 4096,
+        feature_cache_path: str | Path | None = None,
     ) -> None:
         """Initialize the fine-tuned MiniMol AmpC encoder."""
         self.package_path = package_path
@@ -197,6 +207,7 @@ class MiniMolAmpcSmilesEncoder(MiniMolSmilesEncoder):
             batch_size=batch_size,
             latent_dim=latent_dim,
             cache_size=cache_size,
+            feature_cache_path=feature_cache_path,
             checkpoint_path=checkpoint_path,
         )
         self.package_path = self.fixed_encoder.package_path
@@ -206,6 +217,7 @@ class MiniMolAmpcSmilesEncoder(MiniMolSmilesEncoder):
         *,
         batch_size: int,
         cache_size: int,
+        feature_cache_path: str | Path | None,
         checkpoint_path: str | Path | None,
     ) -> MiniMolAmpcSmilesFixedEncoder:
         """Construct the fixed AmpC encoder used by DKL."""
@@ -217,4 +229,5 @@ class MiniMolAmpcSmilesEncoder(MiniMolSmilesEncoder):
             device=self.backend_device,
             batch_size=batch_size,
             cache_size=cache_size,
+            feature_cache_path=feature_cache_path,
         )

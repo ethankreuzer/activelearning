@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import json
+import multiprocessing
+import sys
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
@@ -58,6 +62,43 @@ def fake_minimol(monkeypatch: pytest.MonkeyPatch) -> list[_FakeMiniMol]:
     return _FakeMiniMol.instances
 
 
+def _encode_feature_cache_in_process(
+    cache_path: str,
+    ready_queue: Any,
+    start_event: Any,
+    call_log_path: str,
+    result_queue: Any,
+) -> None:
+    """Create or reuse one feature cache from a forked worker."""
+
+    class _ProcessMiniMol:
+        def __call__(self, smiles: list[str]) -> list[Tensor]:
+            with open(call_log_path, "a", encoding="utf-8") as stream:
+                stream.write("call\n")
+            return [
+                torch.arange(512, dtype=torch.float64) + sum(map(ord, value))
+                for value in smiles
+            ]
+
+    minimol_module._bundled_minimol_checkpoint = lambda: None
+
+    encoder = minimol_module.MiniMolSmilesFixedEncoder(
+        feature_cache_path=cache_path,
+    )
+    encoder._build_minimol = lambda checkpoint_path: _ProcessMiniMol()
+    ready_queue.put(True)
+    start_event.wait(timeout=30)
+    try:
+        features = encoder.encode(
+            ["CC", "CO"],
+            device=torch.device("cpu"),
+        )
+        result_queue.put(tuple(features.shape))
+    except BaseException as error:
+        result_queue.put(repr(error))
+        raise
+
+
 def test_minimol_encoder_validates_constructor_arguments(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -90,6 +131,8 @@ def test_minimol_encoder_passes_checkpoint_path_to_loader(
     )
 
     assert encoder.checkpoint_path == checkpoint_path
+    assert fake_minimol == []
+    encoder.prepare_inputs(["CC"], device=torch.device("cpu"))
     assert fake_minimol[0].checkpoint_path == checkpoint_path
 
 
@@ -153,6 +196,19 @@ def test_fixed_encoder_returns_raw_fingerprints(
     assert fake_minimol[0].calls == [["CC", "CO"]]
 
 
+def test_cache_identity_does_not_import_minimol(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Inspecting stock cache identity must not load the MiniMol package."""
+    monkeypatch.delitem(sys.modules, "minimol", raising=False)
+    encoder = minimol_module.MiniMolSmilesFixedEncoder()
+
+    identity = encoder._cache_encoder_identity()
+
+    assert identity["backend"] == "minimol.Minimol"
+    assert "minimol" not in sys.modules
+
+
 def test_prepare_inputs_handles_empty_batches_without_model_call(
     fake_minimol: list[_FakeMiniMol],
 ) -> None:
@@ -164,7 +220,26 @@ def test_prepare_inputs_handles_empty_batches_without_model_call(
     assert encoder.latent_dim == 32
     assert prepared.shape == (0, 512)
     assert prepared.dtype == torch.float32
-    assert fake_minimol[0].calls == []
+    assert fake_minimol == []
+
+
+def test_configured_feature_cache_ignores_empty_batches(
+    fake_minimol: list[_FakeMiniMol],
+    tmp_path: Path,
+) -> None:
+    """An empty request does not create cache coordination or data files."""
+    feature_path = tmp_path / "minimol-features.npy"
+    encoder = minimol_module.MiniMolSmilesFixedEncoder(
+        feature_cache_path=feature_path,
+    )
+
+    features = encoder.encode([], device=torch.device("cpu"))
+
+    assert features.shape == (0, 512)
+    assert not feature_path.exists()
+    assert not Path(f"{feature_path}.json").exists()
+    assert not Path(f"{feature_path}.lock").exists()
+    assert fake_minimol == []
 
 
 def test_prepare_inputs_rejects_non_string_values(
@@ -176,7 +251,7 @@ def test_prepare_inputs_rejects_non_string_values(
     with pytest.raises(ValueError, match="string inputs"):
         encoder.prepare_inputs(["CC", 1], device=torch.device("cpu"))
 
-    assert fake_minimol[0].calls == []
+    assert fake_minimol == []
 
 
 def test_fingerprint_cache_deduplicates_requests_and_evicts_lru_entries(
@@ -190,6 +265,396 @@ def test_fingerprint_cache_deduplicates_requests_and_evicts_lru_entries(
     encoder.prepare_inputs(["CO"], device=torch.device("cpu"))
 
     assert fake_minimol[0].calls == [["CC", "CO"], ["CN"], ["CO"]]
+
+
+def test_persistent_feature_cache_is_reused_without_a_minimol_call(
+    fake_minimol: list[_FakeMiniMol],
+    tmp_path: Path,
+) -> None:
+    """A fresh encoder can reuse the verified feature matrix directly."""
+    feature_path = tmp_path / "minimol-features.npy"
+    values = ["CC", "CC", "CO"]
+    first_encoder = minimol_module.MiniMolSmilesFixedEncoder(
+        batch_size=2,
+        feature_cache_path=feature_path,
+    )
+    expected = first_encoder.encode(
+        values,
+        device=torch.device("cpu"),
+    )
+
+    second_encoder = minimol_module.MiniMolSmilesFixedEncoder(
+        batch_size=2,
+        feature_cache_path=feature_path,
+    )
+    actual = second_encoder.encode(
+        values,
+        device=torch.device("cpu"),
+    )
+
+    assert feature_path.is_file()
+    assert Path(f"{feature_path}.json").is_file()
+    assert torch.equal(actual, expected)
+    manifest = json.loads(Path(f"{feature_path}.json").read_text(encoding="utf-8"))
+    assert manifest["format_version"] == 2
+    assert "sha256" not in manifest["feature_file"]
+    assert fake_minimol[0].calls == [["CC", "CO"]]
+    assert len(fake_minimol) == 1
+
+
+def test_candidate_encoding_does_not_replace_feature_cache(
+    fake_minimol: list[_FakeMiniMol],
+    tmp_path: Path,
+) -> None:
+    """Prediction batches remain ordinary live/LRU requests."""
+    feature_path = tmp_path / "minimol-features.npy"
+    encoder = minimol_module.MiniMolSmilesFixedEncoder(
+        feature_cache_path=feature_path,
+    )
+    encoder.encode(["CC", "CO"], device=torch.device("cpu"))
+    feature_bytes = feature_path.read_bytes()
+    manifest_bytes = Path(f"{feature_path}.json").read_bytes()
+    encoder.encode(["CCC"], device=torch.device("cpu"))
+
+    fresh_encoder = minimol_module.MiniMolSmilesFixedEncoder(
+        feature_cache_path=feature_path,
+    )
+    combined = fresh_encoder.encode(["CC", "CO", "CN"], device=torch.device("cpu"))
+
+    manifest = json.loads(Path(f"{feature_path}.json").read_text(encoding="utf-8"))
+    assert manifest["row_count"] == 2
+    assert combined.shape == (3, 512)
+    assert combined[2, 0].item() == pytest.approx(float(sum(map(ord, "CN"))))
+    assert fake_minimol[0].calls == [["CC", "CO"], ["CCC"]]
+    assert fake_minimol[1].calls == [["CN"]]
+    assert feature_path.read_bytes() == feature_bytes
+    assert Path(f"{feature_path}.json").read_bytes() == manifest_bytes
+
+
+def test_minimol_dkl_feature_cache_does_not_constrain_predictions(
+    fake_minimol: list[_FakeMiniMol],
+    tmp_path: Path,
+) -> None:
+    """DKL fitting uses persistence while prediction remains live encoding."""
+    feature_path = tmp_path / "minimol-features.npy"
+    encoder = minimol_module.MiniMolSmilesEncoder(
+        latent_dim=4,
+        feature_cache_path=feature_path,
+    )
+    surrogate = ExactDKLSurrogate(
+        encoder=encoder,
+        training_params=DKLTrainingConfig(epochs=1, lr=1e-2),
+        standardize_outputs=False,
+    )
+
+    surrogate.fit(
+        [
+            Observation(x="CC", y=1.0),
+            Observation(x="CO", y=2.0),
+        ]
+    )
+    prediction = surrogate.predict([Candidate(x="CCC")])
+
+    assert len(prediction["mean"]) == 1
+    assert fake_minimol[0].calls == [["CC", "CO"], ["CCC"]]
+
+
+def test_feature_cache_uses_one_extraction_across_processes(
+    tmp_path: Path,
+) -> None:
+    """Concurrent first fits serialize and publish one valid artifact."""
+    context = multiprocessing.get_context("fork")
+    feature_path = tmp_path / "minimol-features.npy"
+    call_log_path = tmp_path / "backend-calls.log"
+    ready_queue = context.Queue()
+    result_queue = context.Queue()
+    start_event = context.Event()
+    processes = [
+        context.Process(
+            target=_encode_feature_cache_in_process,
+            args=(
+                str(feature_path),
+                ready_queue,
+                start_event,
+                str(call_log_path),
+                result_queue,
+            ),
+        )
+        for _ in range(2)
+    ]
+    for process in processes:
+        process.start()
+    for _ in processes:
+        ready_queue.get(timeout=30)
+    start_event.set()
+    for process in processes:
+        process.join(timeout=30)
+
+    assert all(process.exitcode == 0 for process in processes)
+    assert [result_queue.get(timeout=5) for _ in processes] == [
+        (2, 512),
+        (2, 512),
+    ]
+    assert call_log_path.read_text(encoding="utf-8").splitlines() == ["call"]
+    assert feature_path.is_file()
+    assert Path(f"{feature_path}.json").is_file()
+    assert Path(f"{feature_path}.lock").is_file()
+
+
+def test_persistent_feature_cache_encodes_only_a_verified_suffix(
+    fake_minimol: list[_FakeMiniMol],
+    tmp_path: Path,
+) -> None:
+    """Inputs appended after the cached prefix are encoded live."""
+    feature_path = tmp_path / "minimol-features.npy"
+    first_encoder = minimol_module.MiniMolSmilesFixedEncoder(
+        feature_cache_path=feature_path,
+    )
+    prefix = first_encoder.encode(
+        ["CC", "CO"],
+        device=torch.device("cpu"),
+    )
+
+    second_encoder = minimol_module.MiniMolSmilesFixedEncoder(
+        feature_cache_path=feature_path,
+    )
+    combined = second_encoder.encode(
+        ["CC", "CO", "CN"],
+        device=torch.device("cpu"),
+    )
+
+    assert torch.equal(combined[:2], prefix)
+    assert combined[2, 0].item() == pytest.approx(float(sum(map(ord, "CN"))))
+    assert fake_minimol[0].calls == [["CC", "CO"]]
+    assert fake_minimol[1].calls == [["CN"]]
+
+
+def test_persistent_feature_cache_falls_back_for_reordered_inputs(
+    fake_minimol: list[_FakeMiniMol],
+    tmp_path: Path,
+) -> None:
+    """Reordering cached inputs uses live encoding without replacing the cache."""
+    feature_path = tmp_path / "minimol-features.npy"
+    encoder = minimol_module.MiniMolSmilesFixedEncoder(
+        feature_cache_path=feature_path,
+    )
+    encoder.encode(
+        ["CC", "CO", "CC"],
+        device=torch.device("cpu"),
+    )
+    feature_bytes = feature_path.read_bytes()
+    manifest_bytes = Path(f"{feature_path}.json").read_bytes()
+
+    fresh_encoder = minimol_module.MiniMolSmilesFixedEncoder(
+        feature_cache_path=feature_path,
+    )
+    features = fresh_encoder.encode(
+        ["CO", "CC", "CC"],
+        device=torch.device("cpu"),
+    )
+
+    assert features[:, 0].tolist() == pytest.approx(
+        [float(sum(map(ord, value))) for value in ["CO", "CC", "CC"]]
+    )
+    assert fake_minimol[1].calls == [["CO", "CC"]]
+    assert feature_path.read_bytes() == feature_bytes
+    assert Path(f"{feature_path}.json").read_bytes() == manifest_bytes
+
+
+def test_persistent_feature_cache_falls_back_for_shorter_inputs(
+    fake_minimol: list[_FakeMiniMol],
+    tmp_path: Path,
+) -> None:
+    """A shorter request uses live encoding without replacing the cache."""
+    feature_path = tmp_path / "minimol-features.npy"
+    encoder = minimol_module.MiniMolSmilesFixedEncoder(
+        feature_cache_path=feature_path,
+    )
+    encoder.encode(["CC", "CO"], device=torch.device("cpu"))
+    feature_bytes = feature_path.read_bytes()
+    manifest_bytes = Path(f"{feature_path}.json").read_bytes()
+
+    fresh_encoder = minimol_module.MiniMolSmilesFixedEncoder(
+        feature_cache_path=feature_path,
+    )
+    features = fresh_encoder.encode(["CC"], device=torch.device("cpu"))
+
+    assert features[:, 0].tolist() == pytest.approx([float(sum(map(ord, "CC")))])
+    assert fake_minimol[1].calls == [["CC"]]
+    assert feature_path.read_bytes() == feature_bytes
+    assert Path(f"{feature_path}.json").read_bytes() == manifest_bytes
+
+
+def test_persistent_feature_cache_rejects_encoder_identity_changes(
+    fake_minimol: list[_FakeMiniMol],
+    tmp_path: Path,
+) -> None:
+    """A different checkpoint cannot reuse an existing feature artifact."""
+    first_checkpoint = tmp_path / "first.pth"
+    second_checkpoint = tmp_path / "second.pth"
+    first_checkpoint.write_bytes(b"first")
+    second_checkpoint.write_bytes(b"second")
+    feature_path = tmp_path / "minimol-features.npy"
+    first_encoder = minimol_module.MiniMolSmilesFixedEncoder(
+        checkpoint_path=first_checkpoint,
+        feature_cache_path=feature_path,
+    )
+    first_encoder.encode(["CC"], device=torch.device("cpu"))
+
+    second_encoder = minimol_module.MiniMolSmilesFixedEncoder(
+        checkpoint_path=second_checkpoint,
+        feature_cache_path=feature_path,
+    )
+    with pytest.raises(ValueError, match="encoder identity mismatch"):
+        second_encoder.encode(["CC"], device=torch.device("cpu"))
+
+
+def test_persistent_feature_cache_rejects_incomplete_manifest(
+    fake_minimol: list[_FakeMiniMol],
+    tmp_path: Path,
+) -> None:
+    """A manifest without its completion metadata is never reused."""
+    feature_path = tmp_path / "minimol-features.npy"
+    encoder = minimol_module.MiniMolSmilesFixedEncoder(
+        feature_cache_path=feature_path,
+    )
+    encoder.encode(["CC"], device=torch.device("cpu"))
+    manifest_path = Path(f"{feature_path}.json")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    del manifest["complete"]
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    fresh_encoder = minimol_module.MiniMolSmilesFixedEncoder(
+        feature_cache_path=feature_path,
+    )
+    with pytest.raises(ValueError, match="missing fields: complete"):
+        fresh_encoder.encode(["CC"], device=torch.device("cpu"))
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("dtype", "float64", "dtype mismatch"),
+        ("shape", [1, 511], "shape metadata"),
+    ],
+)
+def test_persistent_feature_cache_rejects_array_metadata_changes(
+    fake_minimol: list[_FakeMiniMol],
+    tmp_path: Path,
+    field: str,
+    value: object,
+    message: str,
+) -> None:
+    """Manifest dtype and shape changes cannot bypass cache verification."""
+    feature_path = tmp_path / "minimol-features.npy"
+    encoder = minimol_module.MiniMolSmilesFixedEncoder(
+        feature_cache_path=feature_path,
+    )
+    encoder.encode(["CC"], device=torch.device("cpu"))
+    manifest_path = Path(f"{feature_path}.json")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest[field] = value
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    fresh_encoder = minimol_module.MiniMolSmilesFixedEncoder(
+        feature_cache_path=feature_path,
+    )
+    with pytest.raises(ValueError, match=message):
+        fresh_encoder.encode(["CC"], device=torch.device("cpu"))
+
+
+def test_persistent_feature_cache_rejects_truncated_features(
+    fake_minimol: list[_FakeMiniMol],
+    tmp_path: Path,
+) -> None:
+    """A truncated .npy file fails before any stale rows are returned."""
+    feature_path = tmp_path / "minimol-features.npy"
+    encoder = minimol_module.MiniMolSmilesFixedEncoder(
+        feature_cache_path=feature_path,
+    )
+    encoder.encode(["CC"], device=torch.device("cpu"))
+    feature_path.write_bytes(feature_path.read_bytes()[:-1])
+
+    fresh_encoder = minimol_module.MiniMolSmilesFixedEncoder(
+        feature_cache_path=feature_path,
+    )
+    with pytest.raises(ValueError, match="file size mismatch"):
+        fresh_encoder.encode(["CC"], device=torch.device("cpu"))
+
+
+def test_zero_cache_size_disables_only_the_lru(
+    fake_minimol: list[_FakeMiniMol],
+) -> None:
+    """A zero cache size still permits ordinary live extraction."""
+    encoder = minimol_module.MiniMolSmilesFixedEncoder(
+        cache_size=0,
+    )
+    encoder.encode(["CC"], device=torch.device("cpu"))
+    encoder.encode(["CC"], device=torch.device("cpu"))
+
+    assert fake_minimol[0].calls == [["CC"], ["CC"]]
+
+
+def test_persistent_feature_cache_cleans_up_after_atomic_write_failure(
+    fake_minimol: list[_FakeMiniMol],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A failed manifest commit leaves no misleading partial artifact."""
+    feature_path = tmp_path / "minimol-features.npy"
+    real_replace = minimol_module.os.replace
+    replace_calls = 0
+
+    def fail_manifest_commit(source: str, destination: str) -> None:
+        nonlocal replace_calls
+        replace_calls += 1
+        if replace_calls == 2:
+            raise OSError("simulated manifest commit failure")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(minimol_module.os, "replace", fail_manifest_commit)
+    encoder = minimol_module.MiniMolSmilesFixedEncoder(
+        feature_cache_path=feature_path,
+    )
+    with pytest.raises(OSError, match="manifest commit"):
+        encoder.encode(["CC"], device=torch.device("cpu"))
+
+    assert not feature_path.exists()
+    assert not Path(f"{feature_path}.json").exists()
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
+def test_latent_minimol_encoder_persists_only_fixed_fingerprints(
+    fake_minimol: list[_FakeMiniMol],
+    tmp_path: Path,
+) -> None:
+    """The latent wrapper reuses fixed features without caching projections."""
+    feature_path = tmp_path / "minimol-features.npy"
+    first_encoder = minimol_module.MiniMolSmilesEncoder(
+        latent_dim=3,
+        feature_cache_path=feature_path,
+    )
+    prepared = first_encoder.prepare_inputs(
+        ["CC", "CO"],
+        device=torch.device("cpu"),
+    )
+    projected = first_encoder(prepared)
+    projected.sum().backward()
+
+    second_encoder = minimol_module.MiniMolSmilesEncoder(
+        latent_dim=3,
+        feature_cache_path=feature_path,
+    )
+    reused = second_encoder.prepare_inputs(
+        ["CC", "CO"],
+        device=torch.device("cpu"),
+    )
+
+    assert second_encoder.feature_cache_path == feature_path
+    assert torch.equal(reused, prepared)
+    assert first_encoder.projection.weight.grad is not None
+    assert fake_minimol[0].calls == [["CC", "CO"]]
+    assert len(fake_minimol) == 1
 
 
 def test_projection_is_trainable_while_minimol_inference_is_frozen(

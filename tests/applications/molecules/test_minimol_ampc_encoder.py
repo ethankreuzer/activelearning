@@ -139,6 +139,49 @@ def test_ampc_fixed_encoder_returns_pooled512_without_projection(
     assert not hasattr(encoder, "projection")
 
 
+def test_ampc_feature_cache_reuse_is_lazy(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A cache-only AmpC fit does not load a second checkpoint backend."""
+    checkpoint_path, package_path = _make_checkpoint_package(tmp_path)
+    backends: list[_FakeAmpcEncoder] = []
+
+    def fake_loader(
+        checkpoint: Path,
+        package: Path | None,
+        device: str | torch.device | None,
+    ) -> _FakeAmpcEncoder:
+        del checkpoint, package, device
+        backend = _FakeAmpcEncoder(
+            outputs=lambda smiles: np.asarray(
+                [[float(sum(map(ord, value)))] * 512 for value in smiles],
+                dtype=np.float32,
+            )
+        )
+        backends.append(backend)
+        return backend
+
+    monkeypatch.setattr(ampc_module, "_load_ampc_encoder", fake_loader)
+    cache_path = tmp_path / "ampc-features.npy"
+    first_encoder = ampc_module.MiniMolAmpcSmilesFixedEncoder(
+        checkpoint_path=checkpoint_path,
+        package_path=package_path,
+        feature_cache_path=cache_path,
+    )
+    first_encoder.encode(["CC", "CO"], device=torch.device("cpu"))
+
+    second_encoder = ampc_module.MiniMolAmpcSmilesFixedEncoder(
+        checkpoint_path=checkpoint_path,
+        package_path=package_path,
+        feature_cache_path=cache_path,
+    )
+    second_encoder.encode(["CC", "CO"], device=torch.device("cpu"))
+
+    assert len(backends) == 1
+    assert backends[0].calls == [(["CC", "CO"], 100)]
+
+
 def test_ampc_backend_loader_configures_worker_safe_featurizer(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

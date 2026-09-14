@@ -179,6 +179,9 @@ __pycache__/
 # C extensions
 *.so
 
+# Persisted MiniMol feature artifacts
+cache/
+
 # Distribution / packaging
 .Python
 build/
