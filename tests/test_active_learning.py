@@ -553,10 +553,14 @@ def test_active_learning_records_phase_profiling_with_deterministic_clock(
             }
         }
     )
+    surrogate = DummyMeanSurrogate()
+    surrogate.get_fit_profiling = Mock(
+        return_value={"profiling/surrogate/encoder_features_s": 0.25}
+    )
 
     _, cost, num_rounds = active_learning_module.active_learning(
         dataset=ListDataset(),
-        surrogate=DummyMeanSurrogate(),
+        surrogate=surrogate,
         acquisition=DummyAcquisition(),
         sampler=PoolScoreSampler(
             candidate_pool=[Candidate(index, fidelity=0) for index in range(5)],
@@ -575,6 +579,7 @@ def test_active_learning_records_phase_profiling_with_deterministic_clock(
     assert set(profiling) == {
         "profiling/dataset/get_observations_s",
         "profiling/surrogate/fit_s",
+        "profiling/surrogate/encoder_features_s",
         "profiling/acquisition/update_s",
         "profiling/sampler/sample_s",
         "profiling/budget/get_round_budget_s",
@@ -593,6 +598,7 @@ def test_active_learning_records_phase_profiling_with_deterministic_clock(
     assert profiling["profiling/sampler/sample_s"] == 1.0
     assert profiling["profiling/selector/select_s"] == 1.0
     assert profiling["profiling/oracle/query_s"] == 1.0
+    assert profiling["profiling/surrogate/encoder_features_s"] == 0.25
     assert profiling["profiling/diagnostics/total_s"] > 0.0
     assert profiling["profiling/round/total_s"] > 1.0
 

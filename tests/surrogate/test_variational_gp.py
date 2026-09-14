@@ -74,6 +74,10 @@ def test_variational_gp_fits_only_gp_parameters() -> None:
     )
 
     assert surrogate.is_fitted()
+    profiling = surrogate.get_fit_profiling()
+    assert profiling["profiling/surrogate/encoder_features_s"] >= 0.0
+    assert profiling["profiling/surrogate/gp_fit_full_s"] >= 0.0
+    assert "profiling/surrogate/gp_fit_minibatched_s" not in profiling
     assert encoder.calls == [[[0.0, 0.0], [1.0, 1.0]]]
     assert surrogate._gp_model is not None
     inducing_points = surrogate._gp_model.variational_strategy.inducing_points
@@ -269,6 +273,10 @@ def test_variational_gp_minibatching_keeps_training_data_on_cpu() -> None:
 
     surrogate.fit(observations)
 
+    profiling = surrogate.get_fit_profiling()
+    assert profiling["profiling/surrogate/encoder_features_s"] >= 0.0
+    assert profiling["profiling/surrogate/gp_fit_minibatched_s"] >= 0.0
+    assert "profiling/surrogate/gp_fit_full_s" not in profiling
     train_x, train_y = surrogate.get_train_data()
     assert train_x.device.type == "cpu"
     assert train_y.device.type == "cpu"

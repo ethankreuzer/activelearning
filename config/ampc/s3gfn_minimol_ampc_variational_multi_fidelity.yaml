@@ -30,6 +30,7 @@ surrogate:
     device: cuda
     batch_size: 64  # Adjust depending on VRAM availability
     cache_size: 4096
+    feature_cache_path: cache/ampc/s3gfn_minimol_ampc_fingerprints.npy
   training_params:
     epochs: 50  # Adjust based on convergence; 50 is a reasonable starting point.
     lr: 1.0e-3

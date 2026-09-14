@@ -83,6 +83,10 @@ class Surrogate(ABC, ALRuntimeMixin):
             "Override fit() or ensure updates_from_latest() returns True and override update()."
         )
 
+    def get_fit_profiling(self) -> Mapping[str, float]:
+        """Return profiling metrics from the most recent non-empty fit."""
+        return {}
+
     def is_fitted(self) -> bool:
         """Return whether the surrogate is ready to make predictions.
 

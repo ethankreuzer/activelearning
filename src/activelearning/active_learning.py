@@ -165,6 +165,7 @@ def active_learning(
         else:
             with profile_operation(profiling, "surrogate/fit"):
                 surrogate.fit(observations)
+        profiling.update(surrogate.get_fit_profiling())
 
         # Only couple the acquisition to the surrogate once it has been fitted.
         # Before fitting, acquisition falls back to its unfitted behaviour (e.g.

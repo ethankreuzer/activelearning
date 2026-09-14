@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from collections.abc import Iterable
 from math import sqrt
 from typing import Any
@@ -17,6 +18,12 @@ from activelearning.runtime import RuntimeContext
 from activelearning.surrogate.botorch_surrogate import BoTorchGPSurrogate
 from activelearning.surrogate.encoder import FixedEncoder
 from activelearning.utils.types import Candidate, Observation
+
+
+def _synchronize_profile_device(device: torch.device) -> None:
+    """Wait for pending CUDA work before measuring a device-bound operation."""
+    if device.type == "cuda" and torch.cuda.is_available():
+        torch.cuda.synchronize(device)
 
 
 class _VariationalGP(gpytorch.models.ApproximateGP):
@@ -173,6 +180,7 @@ class VariationalGPSurrogate(BoTorchGPSurrogate):
         self._model_train_Y: torch.Tensor | None = None
         self._y_mean = 0.0
         self._y_std = 1.0
+        self._fit_profiling: dict[str, float] = {}
         batch_size = getattr(training_params, "batch_size", None)
         if batch_size is not None and batch_size < 1:
             raise ValueError("training_params.batch_size must be positive.")
@@ -191,6 +199,7 @@ class VariationalGPSurrogate(BoTorchGPSurrogate):
 
     def fit(self, observations: Iterable[Observation]) -> None:
         """Rebuild and fit the variational GP on all supplied observations."""
+        self._fit_profiling = {}
         observation_list = list(observations)
         if not observation_list:
             return
@@ -199,9 +208,14 @@ class VariationalGPSurrogate(BoTorchGPSurrogate):
                 "Multi-fidelity mode requires fidelity confidences before fitting."
             )
 
+        _synchronize_profile_device(self._training_device)
+        encoding_started = time.perf_counter()
         self._train_X = self._encode_items(
-            observation_list,
-            device=self._training_device,
+            observation_list, device=self._training_device
+        )
+        _synchronize_profile_device(self._training_device)
+        self._fit_profiling["profiling/surrogate/encoder_features_s"] = (
+            time.perf_counter() - encoding_started
         )
         train_y = torch.as_tensor(
             [observation.y for observation in observation_list],
@@ -487,6 +501,8 @@ class VariationalGPSurrogate(BoTorchGPSurrogate):
         ]
         targets = self._model_train_Y.squeeze(-1)
         batch_size = getattr(self._training, "batch_size", None)
+        _synchronize_profile_device(self.device)
+        fit_started = time.perf_counter()
         if batch_size is None:
             for _ in range(self._training.epochs):
                 self._gp_model.train()
@@ -497,6 +513,7 @@ class VariationalGPSurrogate(BoTorchGPSurrogate):
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(parameters, max_norm=1.0)
                 optimizer.step()
+            fit_key = "profiling/surrogate/gp_fit_full_s"
         else:
             generator = torch.Generator(device="cpu")
             generator.manual_seed(self.runtime_context.seed)
@@ -527,8 +544,15 @@ class VariationalGPSurrogate(BoTorchGPSurrogate):
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(parameters, max_norm=1.0)
                     optimizer.step()
+            fit_key = "profiling/surrogate/gp_fit_minibatched_s"
+        _synchronize_profile_device(self.device)
+        self._fit_profiling[fit_key] = time.perf_counter() - fit_started
         self._gp_model.eval()
         self._likelihood.eval()
+
+    def get_fit_profiling(self) -> dict[str, float]:
+        """Return feature-encoding and GP-fit timings from the latest fit."""
+        return dict(self._fit_profiling)
 
     def _remove_noise_prior(self) -> None:
         """Remove the noise prior and initialize observation noise safely."""
