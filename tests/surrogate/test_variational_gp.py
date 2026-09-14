@@ -251,6 +251,32 @@ def test_variational_gp_respects_runtime_dtype() -> None:
     assert next(surrogate._gp_model.parameters()).dtype == torch.float32
 
 
+def test_variational_gp_minibatching_keeps_training_data_on_cpu() -> None:
+    """Configured minibatching stores rows on CPU and trains successfully."""
+    surrogate = VariationalGPSurrogate(
+        encoder=_NumericFixedEncoder(),
+        training_params=VariationalGPTrainingConfig(
+            epochs=2,
+            lr=1e-2,
+            batch_size=2,
+        ),
+        num_inducing=2,
+    )
+    observations = [
+        Observation(x=[float(index), float(index)], y=float(index))
+        for index in range(5)
+    ]
+
+    surrogate.fit(observations)
+
+    train_x, train_y = surrogate.get_train_data()
+    assert train_x.device.type == "cpu"
+    assert train_y.device.type == "cpu"
+    selected = surrogate.get_encoded_train_rows(torch.tensor([0, 3]))
+    assert selected.device.type == "cpu"
+    assert selected.shape == (2, 2)
+
+
 def test_variational_gp_update_refits_supplied_observations() -> None:
     """Direct update calls cannot fall through to the exact-GP base method."""
     surrogate = VariationalGPSurrogate(

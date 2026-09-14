@@ -973,6 +973,160 @@ class TestMultiFidelityAcquisitionIntegration:
         acq.update(mf_surrogate, mf_obs)
         self._scores_valid(acq.score(mf_cands))
 
+    def test_mfmes_retries_with_sticky_fallback(
+        self,
+        mf_surrogate: BoTorchGPSurrogate,
+        mf_obs: list[Observation],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Known Gumbel bracket failures activate one bounded retry."""
+        from activelearning.acquisition.botorch.botorch_multifidelity import (
+            QMultiFidelityMaxValueEntropy,
+        )
+
+        spec = TrainDataCandidateSetSpec(fallback_size=2)
+        spec.update(mf_obs)
+        acq = QMultiFidelityMaxValueEntropy(candidate_set_spec=spec)
+        acq._botorch_surrogate = mf_surrogate
+        full_build = MagicMock(
+            side_effect=ValueError("f(a) and f(b) must have different signs")
+        )
+        fallback_build = MagicMock(return_value=torch.zeros(2, 3))
+        constructor = MagicMock(return_value="fallback-acquisition")
+        monkeypatch.setattr(spec, "build", full_build)
+        monkeypatch.setattr(spec, "build_fallback", fallback_build)
+        monkeypatch.setattr(acq, "_construct_botorch_acquisition", constructor)
+
+        with pytest.warns(UserWarning, match="full support size 4"):
+            assert acq._build_botorch_acquisition() == "fallback-acquisition"
+        assert acq._fallback_active is True
+        assert full_build.call_count == 1
+        assert fallback_build.call_count == 1
+
+        assert acq._build_botorch_acquisition() == "fallback-acquisition"
+        assert full_build.call_count == 1
+        assert fallback_build.call_count == 2
+
+    def test_mfmes_does_not_swallow_unrelated_value_error(
+        self,
+        mf_surrogate: BoTorchGPSurrogate,
+        mf_obs: list[Observation],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Only the known BoTorch bracketing error is recoverable."""
+        from activelearning.acquisition.botorch.botorch_multifidelity import (
+            QMultiFidelityMaxValueEntropy,
+        )
+
+        spec = TrainDataCandidateSetSpec(fallback_size=2)
+        spec.update(mf_obs)
+        acq = QMultiFidelityMaxValueEntropy(candidate_set_spec=spec)
+        acq._botorch_surrogate = mf_surrogate
+        monkeypatch.setattr(spec, "build", MagicMock(side_effect=ValueError("bad")))
+
+        with pytest.raises(ValueError, match="bad"):
+            acq._build_botorch_acquisition()
+        assert acq._fallback_active is False
+
+    @pytest.mark.parametrize(
+        "allocation_error",
+        [
+            torch.OutOfMemoryError("CUDA out of memory"),
+            MemoryError("host allocation failed"),
+            RuntimeError("DefaultCPUAllocator: can't allocate memory"),
+        ],
+    )
+    def test_mfmes_retries_supported_allocation_errors(
+        self,
+        mf_surrogate: BoTorchGPSurrogate,
+        mf_obs: list[Observation],
+        monkeypatch: pytest.MonkeyPatch,
+        allocation_error: Exception,
+    ) -> None:
+        """CUDA and host allocation failures activate bounded fallback."""
+        from activelearning.acquisition.botorch.botorch_multifidelity import (
+            QMultiFidelityMaxValueEntropy,
+        )
+
+        spec = TrainDataCandidateSetSpec(fallback_size=2)
+        spec.update(mf_obs)
+        acq = QMultiFidelityMaxValueEntropy(candidate_set_spec=spec)
+        acq._botorch_surrogate = mf_surrogate
+        monkeypatch.setattr(spec, "build", MagicMock(side_effect=allocation_error))
+        fallback_build = MagicMock(return_value=torch.zeros(2, 3))
+        monkeypatch.setattr(spec, "build_fallback", fallback_build)
+        monkeypatch.setattr(
+            acq,
+            "_construct_botorch_acquisition",
+            MagicMock(return_value="fallback-acquisition"),
+        )
+
+        with pytest.warns(UserWarning, match="full support size 4"):
+            result = acq._build_botorch_acquisition()
+
+        assert result == "fallback-acquisition"
+        assert acq._fallback_active is True
+        fallback_build.assert_called_once()
+
+    def test_mfmes_does_not_swallow_unrelated_runtime_error(
+        self,
+        mf_surrogate: BoTorchGPSurrogate,
+        mf_obs: list[Observation],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Only known CPU allocator RuntimeErrors are recoverable."""
+        from activelearning.acquisition.botorch.botorch_multifidelity import (
+            QMultiFidelityMaxValueEntropy,
+        )
+
+        spec = TrainDataCandidateSetSpec(fallback_size=2)
+        spec.update(mf_obs)
+        acq = QMultiFidelityMaxValueEntropy(candidate_set_spec=spec)
+        acq._botorch_surrogate = mf_surrogate
+        monkeypatch.setattr(
+            spec,
+            "build",
+            MagicMock(side_effect=RuntimeError("unrelated failure")),
+        )
+
+        with pytest.raises(RuntimeError, match="unrelated failure"):
+            acq._build_botorch_acquisition()
+        assert acq._fallback_active is False
+
+    def test_mfmes_propagates_failed_fallback(
+        self,
+        mf_surrogate: BoTorchGPSurrogate,
+        mf_obs: list[Observation],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A bounded retry failure propagates without another retry."""
+        from activelearning.acquisition.botorch.botorch_multifidelity import (
+            QMultiFidelityMaxValueEntropy,
+        )
+
+        spec = TrainDataCandidateSetSpec(fallback_size=2)
+        spec.update(mf_obs)
+        acq = QMultiFidelityMaxValueEntropy(candidate_set_spec=spec)
+        acq._botorch_surrogate = mf_surrogate
+        monkeypatch.setattr(
+            spec,
+            "build",
+            MagicMock(side_effect=torch.OutOfMemoryError("CUDA out of memory")),
+        )
+        fallback_build = MagicMock(side_effect=RuntimeError("fallback failed"))
+        monkeypatch.setattr(spec, "build_fallback", fallback_build)
+
+        with (
+            pytest.warns(UserWarning),
+            pytest.raises(
+                RuntimeError,
+                match="fallback failed",
+            ),
+        ):
+            acq._build_botorch_acquisition()
+
+        fallback_build.assert_called_once()
+
     def test_qmflbmes_scores(
         self,
         mf_surrogate: BoTorchGPSurrogate,

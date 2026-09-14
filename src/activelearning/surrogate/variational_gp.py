@@ -173,6 +173,9 @@ class VariationalGPSurrogate(BoTorchGPSurrogate):
         self._model_train_Y: torch.Tensor | None = None
         self._y_mean = 0.0
         self._y_std = 1.0
+        batch_size = getattr(training_params, "batch_size", None)
+        if batch_size is not None and batch_size < 1:
+            raise ValueError("training_params.batch_size must be positive.")
         super().__init__(
             scale_inputs=False,
             standardize_outputs=False,
@@ -196,11 +199,14 @@ class VariationalGPSurrogate(BoTorchGPSurrogate):
                 "Multi-fidelity mode requires fidelity confidences before fitting."
             )
 
-        self._train_X = self._encode_items(observation_list)
+        self._train_X = self._encode_items(
+            observation_list,
+            device=self._training_device,
+        )
         train_y = torch.as_tensor(
             [observation.y for observation in observation_list],
             dtype=self.dtype,
-            device=self.device,
+            device=self._training_device,
         ).unsqueeze(-1)
         self._train_Y = train_y
         self._model_train_Y = self._standardize_targets(train_y)
@@ -291,6 +297,22 @@ class VariationalGPSurrogate(BoTorchGPSurrogate):
             raise ValueError("Cannot encode an empty candidate iterable.")
         return self._encode_items(candidate_list)
 
+    def get_encoded_train_rows(self, indices: torch.Tensor) -> torch.Tensor:
+        """Return selected training rows on the active model device."""
+        if self._train_X is None:
+            raise RuntimeError("Surrogate has not been fitted yet.")
+        row_indices = indices.to(device=self._train_X.device, dtype=torch.long)
+        return self._train_X.index_select(0, row_indices).to(
+            device=self.device,
+            dtype=self.dtype,
+        )
+
+    def get_encoded_train_data(self) -> torch.Tensor:
+        """Return all fixed-feature training rows on the active model device."""
+        if self._train_X is None:
+            raise RuntimeError("Surrogate has not been fitted yet.")
+        return self._train_X.to(device=self.device, dtype=self.dtype)
+
     def predict(self, candidates: Iterable[Candidate]) -> dict[str, Any]:
         """Predict means and standard deviations on the original target scale."""
         if self._gp_model is None or self._likelihood is None:
@@ -326,9 +348,16 @@ class VariationalGPSurrogate(BoTorchGPSurrogate):
         sample_indices = torch.randint(
             self._train_X.shape[0],
             (self._num_inducing,),
-            device=self.device,
+            device=self._train_X.device,
         )
-        inducing_points = self._train_X[sample_indices].clone()
+        inducing_points = (
+            self._train_X[sample_indices]
+            .to(
+                device=self.device,
+                dtype=self.dtype,
+            )
+            .clone()
+        )
         inducing_points += 1e-3 * torch.randn_like(inducing_points)
         self._gp_model = _VariationalGP(
             input_dim=input_dim,
@@ -360,20 +389,26 @@ class VariationalGPSurrogate(BoTorchGPSurrogate):
     def _encode_items(
         self,
         items: list[Candidate | Observation],
+        *,
+        device: torch.device | None = None,
     ) -> torch.Tensor:
         """Encode fixed features and append fidelity confidence when enabled."""
+        encoding_device = self.device if device is None else device
         features = self._encoder.encode(
             [item.x for item in items],
-            device=self.device,
-        ).to(device=self.device, dtype=self.dtype)
+            device=encoding_device,
+        ).to(device=encoding_device, dtype=self.dtype)
         expected_shape = (len(items), self._encoder.feature_dim)
         if tuple(features.shape) != expected_shape:
             raise ValueError(
                 "Fixed encoder output must have shape "
                 f"{expected_shape}, got {tuple(features.shape)}."
             )
-        if not torch.isfinite(features).all():
-            raise ValueError("Fixed encoder output contains non-finite values.")
+        for start in range(0, len(items), self._finite_check_chunk_size):
+            if not torch.isfinite(
+                features[start : start + self._finite_check_chunk_size]
+            ).all():
+                raise ValueError("Fixed encoder output contains non-finite values.")
         if not self._is_multi_fidelity:
             return features
 
@@ -385,9 +420,21 @@ class VariationalGPSurrogate(BoTorchGPSurrogate):
                 for item in items
             ],
             dtype=self.dtype,
-            device=self.device,
+            device=encoding_device,
         ).unsqueeze(-1)
         return torch.cat([features, fidelities], dim=-1)
+
+    @property
+    def _training_device(self) -> torch.device:
+        """Return the storage device used for encoded training data."""
+        if getattr(self._training, "batch_size", None) is not None:
+            return torch.device("cpu")
+        return self.device
+
+    @property
+    def _finite_check_chunk_size(self) -> int:
+        """Return the maximum number of rows checked in one finite-value pass."""
+        return 100_000
 
     def _encode_fidelity_level(self, fidelity_level: int) -> float:
         """Map a discrete fidelity id to its configured confidence."""
@@ -429,15 +476,47 @@ class VariationalGPSurrogate(BoTorchGPSurrogate):
             for parameter in group["params"]
         ]
         targets = self._model_train_Y.squeeze(-1)
-        for _ in range(self._training.epochs):
-            self._gp_model.train()
-            self._likelihood.train()
-            optimizer.zero_grad()
-            with gpytorch.settings.cholesky_jitter(1e-1):
-                loss = -objective(self._gp_model(self._train_X), targets)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(parameters, max_norm=1.0)
-            optimizer.step()
+        batch_size = getattr(self._training, "batch_size", None)
+        if batch_size is None:
+            for _ in range(self._training.epochs):
+                self._gp_model.train()
+                self._likelihood.train()
+                optimizer.zero_grad()
+                with gpytorch.settings.cholesky_jitter(1e-1):
+                    loss = -objective(self._gp_model(self._train_X), targets)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(parameters, max_norm=1.0)
+                optimizer.step()
+        else:
+            generator = torch.Generator(device="cpu")
+            generator.manual_seed(self.runtime_context.seed)
+            for _ in range(self._training.epochs):
+                self._gp_model.train()
+                self._likelihood.train()
+                permutation = torch.randperm(
+                    num_data,
+                    generator=generator,
+                    device=torch.device("cpu"),
+                )
+                for start in range(0, num_data, batch_size):
+                    batch_indices = permutation[start : start + batch_size]
+                    batch_x = self._train_X.index_select(0, batch_indices).to(
+                        device=self.device,
+                        dtype=self.dtype,
+                    )
+                    batch_targets = targets.index_select(0, batch_indices).to(
+                        device=self.device,
+                        dtype=self.dtype,
+                    )
+                    optimizer.zero_grad()
+                    with gpytorch.settings.cholesky_jitter(1e-1):
+                        loss = -objective(
+                            self._gp_model(batch_x),
+                            batch_targets,
+                        )
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(parameters, max_norm=1.0)
+                    optimizer.step()
         self._gp_model.eval()
         self._likelihood.eval()
 

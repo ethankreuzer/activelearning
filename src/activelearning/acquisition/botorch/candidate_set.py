@@ -26,6 +26,8 @@ and overriding :meth:`~CandidateSetSpec.build`.
 """
 
 from abc import ABC, abstractmethod
+import math
+import random
 from typing import Iterable, Literal, Optional
 
 import torch
@@ -214,21 +216,27 @@ class TrainDataCandidateSetSpec(CandidateSetSpec):
     or unrepresentative of the full search space.
     """
 
-    def __init__(self) -> None:
-        self._cached_candidates: list[Candidate] = []
+    def __init__(self, fallback_size: int = 100_000, seed: int = 42) -> None:
+        if fallback_size < 1:
+            raise ValueError(f"fallback_size must be > 0, got {fallback_size}")
+        self.fallback_size = fallback_size
+        self.seed = seed
+        self._cached_observations: list[Observation] = []
+
+    @property
+    def observation_count(self) -> int:
+        """Return the number of observations currently cached."""
+        return len(self._cached_observations)
 
     def update(self, observations: Iterable[Observation]) -> None:
-        """Cache the candidates from the current observations.
+        """Cache the current observations for full and fallback support builds.
 
         Parameters
         ----------
         observations : Iterable[Observation]
-            Current observations. Candidates are extracted and stored for
-            use in the next :meth:`build` call.
+            Current observations used in the next :meth:`build` call.
         """
-        self._cached_candidates = [
-            Candidate(x=obs.x, fidelity=obs.fidelity) for obs in observations
-        ]
+        self._cached_observations = list(observations)
 
     def build(
         self,
@@ -258,7 +266,7 @@ class TrainDataCandidateSetSpec(CandidateSetSpec):
         AttributeError
             If the surrogate does not implement ``encode_candidates()``.
         """
-        if not self._cached_candidates:
+        if not self._cached_observations:
             raise RuntimeError(
                 "TrainDataCandidateSetSpec has no cached candidates. "
                 "Call update() with observations before build()."
@@ -268,7 +276,154 @@ class TrainDataCandidateSetSpec(CandidateSetSpec):
                 f"{type(surrogate).__name__} does not implement encode_candidates(). "
                 "TrainDataCandidateSetSpec requires a surrogate with this method."
             )
-        return surrogate.encode_candidates(self._cached_candidates)  # type: ignore[attr-defined]
+        get_encoded_train_data = getattr(surrogate, "get_encoded_train_data", None)
+        if callable(get_encoded_train_data):
+            train_x, _ = surrogate.get_train_data()
+            if train_x.shape[0] == len(self._cached_observations):
+                return get_encoded_train_data()
+
+        candidates = [
+            Candidate(x=observation.x, fidelity=observation.fidelity)
+            for observation in self._cached_observations
+        ]
+        return surrogate.encode_candidates(candidates)  # type: ignore[attr-defined]
+
+    def build_fallback(
+        self,
+        surrogate: BoTorchGPSurrogate,
+        *,
+        maximize: bool,
+        target_fidelity_value: Optional[float] = None,
+    ) -> torch.Tensor:
+        """Build a bounded support stratified by fidelity and target value."""
+        if not self._cached_observations:
+            raise RuntimeError(
+                "TrainDataCandidateSetSpec has no cached candidates. "
+                "Call update() with observations before build_fallback()."
+            )
+        indices = self._select_fallback_indices(maximize=maximize)
+        if len(indices) == len(self._cached_observations):
+            return self.build(
+                surrogate,
+                target_fidelity_value=target_fidelity_value,
+            )
+
+        row_indices = torch.tensor(indices, dtype=torch.long)
+        get_encoded_rows = getattr(surrogate, "get_encoded_train_rows", None)
+        if callable(get_encoded_rows):
+            train_x, _ = surrogate.get_train_data()
+            if train_x.shape[0] == len(self._cached_observations):
+                return get_encoded_rows(row_indices)
+
+        candidates = [
+            Candidate(
+                x=self._cached_observations[index].x,
+                fidelity=self._cached_observations[index].fidelity,
+            )
+            for index in indices
+        ]
+        return surrogate.encode_candidates(candidates)  # type: ignore[attr-defined]
+
+    def _select_fallback_indices(self, *, maximize: bool) -> list[int]:
+        """Select deterministic fidelity/target-stratified observation indices."""
+        observation_count = len(self._cached_observations)
+        if observation_count <= self.fallback_size:
+            return list(range(observation_count))
+
+        generator = random.Random(self.seed)
+        reservoirs: dict[int, list[int]] = {}
+        seen_by_fidelity: dict[int, int] = {}
+        best_by_fidelity: dict[int, int] = {}
+        best_target_by_fidelity: dict[int, float] = {}
+
+        for index, observation in enumerate(self._cached_observations):
+            target = float(observation.y)
+            if not math.isfinite(target):
+                raise ValueError("TrainDataCandidateSetSpec requires finite targets.")
+            fidelity = observation.fidelity
+            seen = seen_by_fidelity.get(fidelity, 0) + 1
+            seen_by_fidelity[fidelity] = seen
+
+            best_target = best_target_by_fidelity.get(fidelity)
+            is_better = best_target is None or (
+                target > best_target if maximize else target < best_target
+            )
+            if is_better:
+                best_target_by_fidelity[fidelity] = target
+                best_by_fidelity[fidelity] = index
+
+            reservoir = reservoirs.setdefault(fidelity, [])
+            if len(reservoir) < self.fallback_size:
+                reservoir.append(index)
+            else:
+                replacement = generator.randrange(seen)
+                if replacement < self.fallback_size:
+                    reservoir[replacement] = index
+
+        strata_by_fidelity: list[list[torch.Tensor]] = []
+        for fidelity in sorted(reservoirs):
+            reservoir = reservoirs[fidelity]
+            best_index = best_by_fidelity[fidelity]
+            if best_index not in reservoir:
+                reservoir[0] = best_index
+            ordered_indices = torch.tensor(
+                sorted(
+                    reservoir,
+                    key=lambda index: (
+                        float(self._cached_observations[index].y),
+                        index,
+                    ),
+                    reverse=maximize,
+                ),
+                dtype=torch.long,
+            )
+            strata: list[torch.Tensor] = []
+            for quantile in range(4):
+                start = quantile * ordered_indices.numel() // 4
+                end = (quantile + 1) * ordered_indices.numel() // 4
+                if start < end:
+                    strata.append(ordered_indices[start:end])
+            strata_by_fidelity.append(strata)
+
+        extreme_indices = [
+            best_by_fidelity[fidelity] for fidelity in sorted(best_by_fidelity)
+        ]
+        if self.fallback_size < len(extreme_indices):
+            return sorted(
+                extreme_indices,
+                key=lambda index: float(self._cached_observations[index].y),
+                reverse=maximize,
+            )[: self.fallback_size]
+
+        selected = list(extreme_indices)
+        selected_set = set(selected)
+        strata_with_positions = []
+        for stratum_index in range(max(len(strata) for strata in strata_by_fidelity)):
+            for strata in strata_by_fidelity:
+                if stratum_index < len(strata):
+                    strata_with_positions.append(
+                        (
+                            strata[stratum_index],
+                            1 if stratum_index == 0 else 0,
+                        )
+                    )
+        while len(selected) < self.fallback_size:
+            added = False
+            for entry_index, (stratum, position) in enumerate(strata_with_positions):
+                while position < stratum.numel():
+                    index = int(stratum[position].item())
+                    position += 1
+                    if index not in selected_set:
+                        selected.append(index)
+                        selected_set.add(index)
+                        added = True
+                        break
+                strata_with_positions[entry_index] = (stratum, position)
+                if len(selected) >= self.fallback_size:
+                    break
+            if not added:
+                break
+        return selected
 
 
 class TensorCandidateSetSpec(CandidateSetSpec):

@@ -47,9 +47,14 @@ class HypercubeCandidateSetSpecConfig(BaseModel):
 
 class TrainDataCandidateSetSpecConfig(BaseModel):
     type: Literal["TrainDataCandidateSetSpec"] = "TrainDataCandidateSetSpec"
+    fallback_size: int = Field(default=100_000, ge=1)
+    seed: int = Field(default=42, ge=0)
 
     def build(self) -> CandidateSetSpec:
-        return TrainDataCandidateSetSpec()
+        return TrainDataCandidateSetSpec(
+            fallback_size=self.fallback_size,
+            seed=self.seed,
+        )
 
 
 CandidateSetSpecConfig = Annotated[

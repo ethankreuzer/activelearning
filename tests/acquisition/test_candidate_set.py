@@ -5,6 +5,8 @@ TensorCandidateSetSpec against both single-fidelity and multi-fidelity
 fitted surrogates.
 """
 
+from unittest.mock import MagicMock
+
 import pytest
 import torch
 
@@ -266,6 +268,36 @@ class TestTrainDataCandidateSetSpec:
         expected = fitted_sf_surrogate.encode_candidates(candidates)
         assert torch.allclose(result, expected)
 
+    def test_full_support_reuses_fitted_training_rows(
+        self,
+        fitted_sf_surrogate: BoTorchGPSurrogate,
+        single_fidelity_observations: list[Observation],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Full support should not re-encode already fitted observations."""
+        spec = TrainDataCandidateSetSpec()
+        spec.update(single_fidelity_observations)
+        train_x, _ = fitted_sf_surrogate.get_train_data()
+        encode_candidates = MagicMock(side_effect=AssertionError("re-encoded"))
+        get_encoded_train_data = MagicMock(return_value=train_x)
+        monkeypatch.setattr(
+            fitted_sf_surrogate,
+            "encode_candidates",
+            encode_candidates,
+        )
+        monkeypatch.setattr(
+            fitted_sf_surrogate,
+            "get_encoded_train_data",
+            get_encoded_train_data,
+            raising=False,
+        )
+
+        result = spec.build(fitted_sf_surrogate)
+
+        assert result is train_x
+        get_encoded_train_data.assert_called_once_with()
+        encode_candidates.assert_not_called()
+
     def test_raises_before_update(
         self, fitted_sf_surrogate: BoTorchGPSurrogate
     ) -> None:
@@ -286,6 +318,55 @@ class TestTrainDataCandidateSetSpec:
         spec.update(new_obs)
         result = spec.build(fitted_sf_surrogate)
         assert result.shape[0] == 1
+
+    def test_fallback_is_deterministic_and_stratified(self) -> None:
+        """Fallback support keeps fidelity strata and the maximizing extreme."""
+        observations = [
+            Observation(x=[float(index), 0.0], y=float(index), fidelity=index % 2)
+            for index in range(40)
+        ]
+        first = TrainDataCandidateSetSpec(fallback_size=8, seed=7)
+        second = TrainDataCandidateSetSpec(fallback_size=8, seed=7)
+        first.update(observations)
+        second.update(observations)
+
+        first_indices = first._select_fallback_indices(maximize=True)
+        second_indices = second._select_fallback_indices(maximize=True)
+
+        assert first_indices == second_indices
+        assert len(first_indices) == 8
+        assert {observations[index].fidelity for index in first_indices} == {0, 1}
+        assert 39 in first_indices
+
+    def test_fallback_preserves_minimizing_extreme(self) -> None:
+        """Fallback support keeps the lowest target for minimization."""
+        observations = [
+            Observation(x=[float(index), 0.0], y=float(index), fidelity=index % 2)
+            for index in range(40)
+        ]
+        spec = TrainDataCandidateSetSpec(fallback_size=8, seed=7)
+        spec.update(observations)
+
+        indices = spec._select_fallback_indices(maximize=False)
+
+        assert 0 in indices
+        assert {observations[index].fidelity for index in indices} == {0, 1}
+
+    def test_fallback_reuses_fitted_training_rows(
+        self,
+        fitted_sf_surrogate: BoTorchGPSurrogate,
+        single_fidelity_observations: list[Observation],
+    ) -> None:
+        """A bounded support can be selected directly from fitted train data."""
+        spec = TrainDataCandidateSetSpec(fallback_size=2, seed=3)
+        spec.update(single_fidelity_observations)
+        indices = spec._select_fallback_indices(maximize=True)
+        train_x, _ = fitted_sf_surrogate.get_train_data()
+
+        result = spec.build_fallback(fitted_sf_surrogate, maximize=True)
+
+        expected = train_x.index_select(0, torch.tensor(indices))
+        assert torch.equal(result, expected)
 
 
 # ---------------------------------------------------------------------------

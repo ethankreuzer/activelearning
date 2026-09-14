@@ -266,6 +266,7 @@ class VariationalGPTrainingConfig(BaseModel):
 
     epochs: int = Field(default=50, ge=1)
     lr: float = Field(default=1e-3, gt=0.0)
+    batch_size: int | None = Field(default=None, ge=1)
 
 
 class VariationalGPSurrogateConfig(BaseModel):

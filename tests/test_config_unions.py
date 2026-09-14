@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 from pydantic import TypeAdapter, ValidationError
 
+from activelearning.acquisition.config import TrainDataCandidateSetSpecConfig
 from activelearning.surrogate.encoder_config import (
     EncoderConfig,
     FixedEncoderConfig,
@@ -252,6 +253,16 @@ def test_variational_gp_config_parses_fixed_encoder() -> None:
         MiniMolAmpcSmilesFixedEncoderConfig,
     )
     assert config.num_inducing == 8
+
+
+def test_train_data_candidate_set_config_parses_fallback_settings() -> None:
+    """Train-data candidate fallback settings reach the runtime spec."""
+    config = TrainDataCandidateSetSpecConfig(fallback_size=123, seed=7)
+
+    spec = config.build()
+
+    assert spec.fallback_size == 123
+    assert spec.seed == 7
 
 
 def test_variational_gp_config_resolves_multi_fidelity_target() -> None:
