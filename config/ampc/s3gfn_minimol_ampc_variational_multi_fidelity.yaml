@@ -15,7 +15,7 @@ runtime:
 dataset:
   type: ListDataset
   initial_data:
-    path: AL_d0_initial_data.csv
+    path: data/10M_unif_random_subset.csv
     x_columns: SMILE
     y_column: y
     fidelity_column: fidelity
