@@ -498,6 +498,7 @@ def test_molecule_s3gfn_minimol_ampc_variational_multi_fidelity_config_parses(
     assert config.surrogate.num_inducing == 64
     assert config.acquisition.type == "QMultiFidelityLowerBoundMaxValueEntropy"
     if config_directory == "ampc":
+        assert config.acquisition.score_chunk_size == 5000
         assert config.sampler.fidelities == [0, 1]
         assert config.surrogate.target_fidelity == 1
         assert config.surrogate.encoder.device == "cuda"
@@ -507,6 +508,7 @@ def test_molecule_s3gfn_minimol_ampc_variational_multi_fidelity_config_parses(
             "Dock3Oracle",
         ]
     else:
+        assert config.acquisition.score_chunk_size is None
         assert config.sampler.fidelities == [1, 2, 3]
         assert config.surrogate.target_fidelity == 3
         assert config.surrogate.encoder.device == "cpu"

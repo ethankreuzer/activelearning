@@ -208,6 +208,12 @@ class TestParameterValidation:
                 num_y_samples=0,
             )
 
+    @pytest.mark.parametrize("chunk_size", [0, -1])
+    def test_score_chunk_size_must_be_positive(self, chunk_size: int) -> None:
+        """Singleton scoring chunks reject non-positive sizes."""
+        with pytest.raises(ValueError, match="score_chunk_size must be positive"):
+            StubAnalytic(score_chunk_size=chunk_size)
+
 
 # ===================================================================
 # Properties — default state before update()
@@ -437,6 +443,115 @@ class TestAnalyticScore:
         acq.update(fitted_surrogate, single_fidelity_observations)
         scores = acq.score(candidates)
         assert all(isinstance(s, float) for s in scores)
+
+    def test_unbounded_scoring_encodes_the_full_pool_once(
+        self,
+        fitted_surrogate: BoTorchGPSurrogate,
+        single_fidelity_observations: list[Observation],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The default keeps the existing one-shot encoding behavior."""
+        acq = StubAnalytic()
+        acq.update(fitted_surrogate, single_fidelity_observations)
+        candidate_list = [
+            Candidate(x=[float(index), float(index + 1)]) for index in range(5)
+        ]
+        encode_candidates = MagicMock(side_effect=fitted_surrogate.encode_candidates)
+        monkeypatch.setattr(
+            fitted_surrogate,
+            "encode_candidates",
+            encode_candidates,
+        )
+
+        scores = acq.score(candidate_list)
+
+        assert len(scores) == len(candidate_list)
+        encode_candidates.assert_called_once_with(candidate_list)
+
+    def test_chunked_scoring_preserves_candidate_order(
+        self,
+        fitted_surrogate: BoTorchGPSurrogate,
+        single_fidelity_observations: list[Observation],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Bounded scoring encodes the pool in ordered chunks."""
+        acq = StubAnalytic(score_chunk_size=2)
+        acq.update(fitted_surrogate, single_fidelity_observations)
+        candidate_list = [
+            Candidate(x=[float(index), float(index + 1)]) for index in range(5)
+        ]
+        encode_candidates = MagicMock(side_effect=fitted_surrogate.encode_candidates)
+        monkeypatch.setattr(
+            fitted_surrogate,
+            "encode_candidates",
+            encode_candidates,
+        )
+
+        scores = acq.score(candidate_list)
+
+        encoded_chunks = [call.args[0] for call in encode_candidates.call_args_list]
+        assert encoded_chunks == [
+            candidate_list[:2],
+            candidate_list[2:4],
+            candidate_list[4:],
+        ]
+        assert len(scores) == len(candidate_list)
+
+    def test_chunked_scoring_matches_unbounded_scoring(
+        self,
+        fitted_surrogate: BoTorchGPSurrogate,
+        single_fidelity_observations: list[Observation],
+    ) -> None:
+        """Chunking preserves deterministic singleton acquisition values."""
+        candidate_list = [
+            Candidate(x=[float(index), float(index + 1)]) for index in range(5)
+        ]
+        unbounded = StubAnalytic()
+        unbounded.update(fitted_surrogate, single_fidelity_observations)
+        chunked = StubAnalytic(score_chunk_size=2)
+        chunked.update(fitted_surrogate, single_fidelity_observations)
+
+        assert chunked.score(candidate_list) == unbounded.score(candidate_list)
+
+    def test_chunked_cost_weighting_receives_the_full_pool_once(
+        self,
+        fitted_surrogate: BoTorchGPSurrogate,
+        single_fidelity_observations: list[Observation],
+    ) -> None:
+        """Cost weighting is applied once after all chunks are scored."""
+        acq = StubAnalytic(score_chunk_size=2)
+        acq.update(fitted_surrogate, single_fidelity_observations)
+        candidate_list = [
+            Candidate(x=[float(index), float(index + 1)]) for index in range(5)
+        ]
+        weighting_calls: list[tuple[list[float], list[Candidate]]] = []
+
+        def record_weighting(
+            scores: list[float],
+            candidates: list[Candidate],
+        ) -> list[float]:
+            weighting_calls.append((list(scores), list(candidates)))
+            return [score + 1.0 for score in scores]
+
+        weighted_scores = acq.score(
+            candidate_list,
+            cost_weighting=record_weighting,
+        )
+
+        assert len(weighting_calls) == 1
+        raw_scores, weighted_candidates = weighting_calls[0]
+        assert weighted_candidates == candidate_list
+        assert len(raw_scores) == len(candidate_list)
+        assert weighted_scores == [score + 1.0 for score in raw_scores]
+
+    def test_chunked_cold_start_returns_ones(
+        self,
+        candidates: list[Candidate],
+    ) -> None:
+        """Chunk configuration does not alter unfitted acquisition behavior."""
+        acq = StubAnalytic(score_chunk_size=2)
+
+        assert acq.score(candidates) == [1.0] * len(candidates)
 
     def test_score_batches_raises(
         self,

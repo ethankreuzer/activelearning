@@ -5,7 +5,10 @@ from pathlib import Path
 import pytest
 from pydantic import TypeAdapter, ValidationError
 
-from activelearning.acquisition.config import TrainDataCandidateSetSpecConfig
+from activelearning.acquisition.config import (
+    AcquisitionConfig,
+    TrainDataCandidateSetSpecConfig,
+)
 from activelearning.surrogate.encoder_config import (
     EncoderConfig,
     FixedEncoderConfig,
@@ -286,6 +289,54 @@ def test_train_data_candidate_set_config_parses_fallback_settings() -> None:
 
     assert spec.fallback_size == 123
     assert spec.seed == 7
+
+
+@pytest.mark.parametrize(
+    ("config_type", "extra"),
+    [
+        ("UpperConfidenceBound", {}),
+        ("ExpectedImprovement", {}),
+        ("LogExpectedImprovement", {}),
+        ("ProbabilityOfImprovement", {}),
+        ("LogProbabilityOfImprovement", {}),
+        ("PosteriorMean", {}),
+        (
+            "QMultiFidelityMaxValueEntropy",
+            {"candidate_set_spec": {"type": "TrainDataCandidateSetSpec"}},
+        ),
+        (
+            "QMultiFidelityLowerBoundMaxValueEntropy",
+            {"candidate_set_spec": {"type": "TrainDataCandidateSetSpec"}},
+        ),
+        ("QMultiFidelityKnowledgeGradient", {}),
+    ],
+)
+def test_botorch_acquisition_config_forwards_score_chunk_size(
+    config_type: str,
+    extra: dict[str, object],
+) -> None:
+    """All BoTorch acquisition configs forward the chunk-size option."""
+    config_data = {
+        "type": config_type,
+        "score_chunk_size": 7,
+        **extra,
+    }
+
+    config = TypeAdapter(AcquisitionConfig).validate_python(config_data)
+    acquisition = config.build()
+
+    assert acquisition._score_chunk_size == 7  # type: ignore[attr-defined]
+
+
+def test_botorch_acquisition_config_rejects_nonpositive_chunk_size() -> None:
+    """Pydantic rejects invalid BoTorch scoring chunk sizes."""
+    with pytest.raises(ValidationError):
+        TypeAdapter(AcquisitionConfig).validate_python(
+            {
+                "type": "UpperConfidenceBound",
+                "score_chunk_size": 0,
+            }
+        )
 
 
 def test_variational_gp_config_resolves_multi_fidelity_target() -> None:

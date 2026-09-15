@@ -15,7 +15,7 @@ class BoTorchAcquisitionBase(Acquisition, ABC):
 
     Provides shared infrastructure for all BoTorch-based acquisitions:
     - Surrogate management and validation
-    - Candidate encoding and scoring
+    - Candidate encoding and scoring, optionally in bounded chunks
     - Multi-fidelity and cost-aware support
     - BoTorch acquisition object lifecycle
 
@@ -35,6 +35,7 @@ class BoTorchAcquisitionBase(Acquisition, ABC):
         project_to_target_fidelity_fn: Optional[
             Callable[[torch.Tensor], torch.Tensor]
         ] = None,
+        score_chunk_size: int | None = None,
     ) -> None:
         """Initialize the BoTorch acquisition base.
 
@@ -57,9 +58,16 @@ class BoTorchAcquisitionBase(Acquisition, ABC):
             fidelity coordinate to a fixed value (e.g. the highest fidelity),
             but more general transformations are supported. If ``None``, a
             default projection is constructed from the surrogate.
+        score_chunk_size : int, optional
+            Maximum number of singleton candidates to encode and score at
+            once. ``None`` keeps scoring unbounded.
         """
+        if score_chunk_size is not None and score_chunk_size <= 0:
+            raise ValueError("score_chunk_size must be positive when provided.")
+
         super().__init__()
         self.maximize = maximize
+        self._score_chunk_size = score_chunk_size
 
         # User-specified multi-fidelity configuration
         self._target_fidelity_value_override = target_fidelity_value
@@ -330,6 +338,10 @@ class BoTorchAcquisitionBase(Acquisition, ABC):
         allows the active learning loop to sample candidates uniformly on
         the first round before any observations are available.
 
+        When ``score_chunk_size`` is configured, fitted acquisitions encode
+        and score at most that many singleton candidates at a time. The
+        default ``None`` preserves unbounded scoring.
+
         Parameters
         ----------
         candidates : Iterable[Candidate]
@@ -349,8 +361,18 @@ class BoTorchAcquisitionBase(Acquisition, ABC):
             return []
         if self._botorch_acqf is None:
             return [1.0] * len(cand_list)
-        X = self._botorch_surrogate.encode_candidates(cand_list).unsqueeze(1)  # type: ignore[union-attr]
-        raw_scores = self._score_encoded(X)
+
+        if self._score_chunk_size is None:
+            X = self._botorch_surrogate.encode_candidates(cand_list).unsqueeze(1)  # type: ignore[union-attr]
+            raw_scores = self._score_encoded(X)
+        else:
+            raw_scores = []
+            for start in range(0, len(cand_list), self._score_chunk_size):
+                chunk = cand_list[start : start + self._score_chunk_size]
+                X = self._botorch_surrogate.encode_candidates(chunk).unsqueeze(1)  # type: ignore[union-attr]
+                raw_scores.extend(self._score_encoded(X))
+                del X
+
         if cost_weighting is None:
             return raw_scores
         return cost_weighting(raw_scores, cand_list)

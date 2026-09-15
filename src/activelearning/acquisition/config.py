@@ -71,7 +71,13 @@ class DummyAcquisitionConfig(BaseModel):
         return DummyAcquisition(beta=self.beta)
 
 
-class UpperConfidenceBoundConfig(BaseModel):
+class _BoTorchAcquisitionConfig(BaseModel):
+    """Common configuration for BoTorch singleton-scoring acquisitions."""
+
+    score_chunk_size: int | None = Field(default=None, gt=0)
+
+
+class UpperConfidenceBoundConfig(_BoTorchAcquisitionConfig):
     type: Literal["UpperConfidenceBound"] = "UpperConfidenceBound"
     beta: float = 2.0
     maximize: bool = True
@@ -82,10 +88,11 @@ class UpperConfidenceBoundConfig(BaseModel):
             beta=self.beta,
             maximize=self.maximize,
             target_fidelity_value=self.target_fidelity_value,
+            score_chunk_size=self.score_chunk_size,
         )
 
 
-class ExpectedImprovementConfig(BaseModel):
+class ExpectedImprovementConfig(_BoTorchAcquisitionConfig):
     type: Literal["ExpectedImprovement"] = "ExpectedImprovement"
     best_f: Optional[float] = None
     maximize: bool = True
@@ -96,10 +103,11 @@ class ExpectedImprovementConfig(BaseModel):
             best_f=self.best_f,
             maximize=self.maximize,
             target_fidelity_value=self.target_fidelity_value,
+            score_chunk_size=self.score_chunk_size,
         )
 
 
-class LogExpectedImprovementConfig(BaseModel):
+class LogExpectedImprovementConfig(_BoTorchAcquisitionConfig):
     type: Literal["LogExpectedImprovement"] = "LogExpectedImprovement"
     best_f: Optional[float] = None
     maximize: bool = True
@@ -110,10 +118,11 @@ class LogExpectedImprovementConfig(BaseModel):
             best_f=self.best_f,
             maximize=self.maximize,
             target_fidelity_value=self.target_fidelity_value,
+            score_chunk_size=self.score_chunk_size,
         )
 
 
-class ProbabilityOfImprovementConfig(BaseModel):
+class ProbabilityOfImprovementConfig(_BoTorchAcquisitionConfig):
     type: Literal["ProbabilityOfImprovement"] = "ProbabilityOfImprovement"
     best_f: Optional[float] = None
     maximize: bool = True
@@ -124,10 +133,11 @@ class ProbabilityOfImprovementConfig(BaseModel):
             best_f=self.best_f,
             maximize=self.maximize,
             target_fidelity_value=self.target_fidelity_value,
+            score_chunk_size=self.score_chunk_size,
         )
 
 
-class LogProbabilityOfImprovementConfig(BaseModel):
+class LogProbabilityOfImprovementConfig(_BoTorchAcquisitionConfig):
     type: Literal["LogProbabilityOfImprovement"] = "LogProbabilityOfImprovement"
     best_f: Optional[float] = None
     maximize: bool = True
@@ -138,10 +148,11 @@ class LogProbabilityOfImprovementConfig(BaseModel):
             best_f=self.best_f,
             maximize=self.maximize,
             target_fidelity_value=self.target_fidelity_value,
+            score_chunk_size=self.score_chunk_size,
         )
 
 
-class PosteriorMeanConfig(BaseModel):
+class PosteriorMeanConfig(_BoTorchAcquisitionConfig):
     type: Literal["PosteriorMean"] = "PosteriorMean"
     maximize: bool = True
     target_fidelity_value: Optional[float] = None
@@ -150,10 +161,11 @@ class PosteriorMeanConfig(BaseModel):
         return PosteriorMean(
             maximize=self.maximize,
             target_fidelity_value=self.target_fidelity_value,
+            score_chunk_size=self.score_chunk_size,
         )
 
 
-class QMultiFidelityMaxValueEntropyConfig(BaseModel):
+class QMultiFidelityMaxValueEntropyConfig(_BoTorchAcquisitionConfig):
     type: Literal["QMultiFidelityMaxValueEntropy"] = "QMultiFidelityMaxValueEntropy"
     candidate_set_spec: CandidateSetSpecConfig
     num_fantasies: int = Field(default=16, gt=0)
@@ -170,10 +182,11 @@ class QMultiFidelityMaxValueEntropyConfig(BaseModel):
             num_y_samples=self.num_y_samples,
             maximize=self.maximize,
             target_fidelity_value=self.target_fidelity_value,
+            score_chunk_size=self.score_chunk_size,
         )
 
 
-class QMultiFidelityLowerBoundMaxValueEntropyConfig(BaseModel):
+class QMultiFidelityLowerBoundMaxValueEntropyConfig(_BoTorchAcquisitionConfig):
     type: Literal["QMultiFidelityLowerBoundMaxValueEntropy"] = (
         "QMultiFidelityLowerBoundMaxValueEntropy"
     )
@@ -192,10 +205,11 @@ class QMultiFidelityLowerBoundMaxValueEntropyConfig(BaseModel):
             num_y_samples=self.num_y_samples,
             maximize=self.maximize,
             target_fidelity_value=self.target_fidelity_value,
+            score_chunk_size=self.score_chunk_size,
         )
 
 
-class QMultiFidelityKnowledgeGradientConfig(BaseModel):
+class QMultiFidelityKnowledgeGradientConfig(_BoTorchAcquisitionConfig):
     type: Literal["QMultiFidelityKnowledgeGradient"] = "QMultiFidelityKnowledgeGradient"
     num_fantasies: int = Field(default=64, gt=0)
     current_value: Optional[float] = None
@@ -208,6 +222,7 @@ class QMultiFidelityKnowledgeGradientConfig(BaseModel):
             current_value=self.current_value,
             maximize=self.maximize,
             target_fidelity_value=self.target_fidelity_value,
+            score_chunk_size=self.score_chunk_size,
         )
 
 
