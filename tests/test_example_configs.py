@@ -10,7 +10,6 @@ from activelearning.config import ActiveLearningConfig
 from activelearning.monitoring.run_writer import JSONLinesRunWriter
 from activelearning.utils.config_loader import load_and_parse, load_config, parse_config
 
-
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -518,6 +517,32 @@ def test_molecule_s3gfn_minimol_ampc_variational_multi_fidelity_config_parses(
         assert config.oracle.mol_repr == "smiles"
 
 
+def test_molecule_s3gfn_minimol_ampc_variational_multi_fidelity_narval_config_parses() -> (
+    None
+):
+    """Ensure the Narval AmpC configuration selects the distributed DOCK3 oracle."""
+    config_path = (
+        REPOSITORY_ROOT
+        / "config"
+        / "ampc"
+        / "s3gfn_minimol_ampc_variational_multi_fidelity_narval.yaml"
+    )
+
+    config = load_and_parse(config_path, ActiveLearningConfig)
+
+    assert config.oracle.type == "CompositeOracle"
+    assert [oracle.type for oracle in config.oracle.sub_oracles] == [
+        "CxcalcOracle",
+        "SlurmDock3Oracle",
+    ]
+    dock3_oracle = config.oracle.sub_oracles[1]
+    assert dock3_oracle.num_array_tasks == 16
+    assert dock3_oracle.num_workers == 64
+    assert dock3_oracle.max_parallel_tasks == 16
+    assert "--exclusive" in dock3_oracle.sbatch_args
+    assert "--nodes=1" in dock3_oracle.sbatch_args
+
+
 def test_molecule_s3gfn_minimol_dock3_config_parses() -> None:
     """Ensure the single-fidelity DOCK3 docking example matches the schema."""
     config_path = REPOSITORY_ROOT / "config" / "molecules" / "s3gfn_minimol_dock3.yaml"
@@ -531,6 +556,20 @@ def test_molecule_s3gfn_minimol_dock3_config_parses() -> None:
     assert config.oracle.mol_repr == "smiles"
     assert config.oracle.fidelity_costs == {1: 32.0}
     assert config.oracle.pki_threshold == 6.5
+
+
+def test_molecule_s3gfn_minimol_slurm_dock3_config_parses() -> None:
+    """Ensure the optional Slurm DOCK3 example matches the schema."""
+    config_path = (
+        REPOSITORY_ROOT / "config" / "molecules" / "s3gfn_minimol_slurm_dock3.yaml"
+    )
+
+    config = load_and_parse(config_path, ActiveLearningConfig)
+
+    assert config.oracle.type == "SlurmDock3Oracle"
+    assert config.oracle.num_array_tasks == 4
+    assert config.oracle.num_workers == 32
+    assert config.oracle.max_parallel_tasks == 4
 
 
 def test_molecule_s3gfn_minimol_cxcalc_config_parses() -> None:

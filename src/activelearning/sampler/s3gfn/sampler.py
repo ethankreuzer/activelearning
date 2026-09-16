@@ -190,6 +190,7 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
             ``None`` inherits ``batch_size``.
         n_train_steps : int, optional
             Number of policy-training iterations per active-learning round.
+            Zero samples directly from a fresh pretrained policy.
         num_warmup_steps : int, optional
             Number of linear learning-rate warmup steps. Zero disables the
             Transformers scheduler.
@@ -238,8 +239,8 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
             raise ValueError("batch_size and replay_batch_size must be positive.")
         if generation_batch_size is not None and generation_batch_size <= 0:
             raise ValueError("generation_batch_size must be positive when provided.")
-        if n_train_steps <= 0:
-            raise ValueError("n_train_steps must be positive.")
+        if n_train_steps < 0:
+            raise ValueError("n_train_steps must be nonnegative.")
         if num_warmup_steps < 0:
             raise ValueError("num_warmup_steps must be nonnegative.")
         if learning_rate <= 0.0 or log_z_learning_rate <= 0.0:
@@ -335,14 +336,14 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
         observations: Iterable[Observation] | None = None,
         cost_fn: Callable[[Sequence[Candidate]], list[float]] | None = None,
     ) -> Sequence[Candidate]:
-        """Train a fresh policy and return unique acquisition-weighted candidates.
+        """Optionally train a fresh policy and return unique candidates.
 
         Parameters
         ----------
         acquisition : Any, optional
             Singleton-scoring acquisition function used to turn generated
-            molecule-fidelity pairs into RTB reward scores. S3-GFN requires
-            ``supports_singleton_scoring`` to be true.
+            molecule-fidelity pairs into RTB reward scores. Required when
+            ``n_train_steps`` is positive and ignored when it is zero.
         observations : Iterable[Observation], optional
             Current active-learning observations. Accepted for the common
             sampler interface but intentionally unused: each round starts from
@@ -361,15 +362,15 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
         Raises
         ------
         ValueError
-            If no acquisition is supplied or it does not support singleton
-            scoring.
+            If training is enabled but no compatible acquisition is supplied.
         RuntimeError
             If bounded final-generation retries cannot produce enough unique
             valid molecules.
         """
         self._round_metrics = _RoundMetrics()
         _ = observations
-        self._validate_acquisition(acquisition)
+        if self.n_train_steps:
+            self._validate_acquisition(acquisition)
 
         self._set_round_seed()
         round_number = self._round_index + 1
@@ -384,42 +385,55 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
         )
         _logger.info("S3-GFN round %d: loading molecule dependencies.", round_number)
         molecule_chem, _, _ = require_rdkit()
-        synthesizability = SAScoreSynthesizability(threshold=self.sa_threshold)
         model = self._new_round_model()
-        positive_buffer, negative_buffer = self._create_replay_buffers(
-            pad_token_id=model.pad_token_id
-        )
-
-        if self.compile_strategy != "none":
-            model.compile_policy(
-                mode=self.torch_compile_mode,
-                dynamic=self.torch_compile_dynamic,
-                training_only=self.compile_strategy == "training_only",
+        if self.n_train_steps:
+            synthesizability = SAScoreSynthesizability(threshold=self.sa_threshold)
+            positive_buffer, negative_buffer = self._create_replay_buffers(
+                pad_token_id=model.pad_token_id
             )
-            if self.compile_prior_scorer:
-                model.compile_prior_scorer(
+            if self.compile_strategy != "none":
+                model.compile_policy(
                     mode=self.torch_compile_mode,
                     dynamic=self.torch_compile_dynamic,
+                    training_only=self.compile_strategy == "training_only",
                 )
-            _logger.info(
-                "S3-GFN round %d: torch.compile enabled with mode=%s; "
-                "the first training step includes lazy compilation.",
-                round_number,
-                self.torch_compile_mode,
-            )
+                if self.compile_prior_scorer:
+                    model.compile_prior_scorer(
+                        mode=self.torch_compile_mode,
+                        dynamic=self.torch_compile_dynamic,
+                    )
+                _logger.info(
+                    "S3-GFN round %d: torch.compile enabled with mode=%s; "
+                    "the first training step includes lazy compilation.",
+                    round_number,
+                    self.torch_compile_mode,
+                )
 
-        training_started = time.perf_counter()
-        self._train_round(
-            model=model,
-            synthesizability=synthesizability,
-            positive_buffer=positive_buffer,
-            negative_buffer=negative_buffer,
-            molecule_chem=molecule_chem,
-            acquisition=acquisition,
-            cost_fn=cost_fn,
-        )
-        self.round_metrics.training_duration_s = time.perf_counter() - training_started
-        _logger.info("S3-GFN round %d: policy training complete.", round_number)
+            training_started = time.perf_counter()
+            self._train_round(
+                model=model,
+                synthesizability=synthesizability,
+                positive_buffer=positive_buffer,
+                negative_buffer=negative_buffer,
+                molecule_chem=molecule_chem,
+                acquisition=acquisition,
+                cost_fn=cost_fn,
+            )
+            self.round_metrics.training_duration_s = (
+                time.perf_counter() - training_started
+            )
+            self.round_metrics.positive_buffer_size = len(positive_buffer)
+            self.round_metrics.negative_buffer_size = (
+                len(negative_buffer) if negative_buffer is not None else 0
+            )
+            _logger.info("S3-GFN round %d: policy training complete.", round_number)
+        else:
+            self.round_metrics.training_duration_s = 0.0
+            _logger.info(
+                "S3-GFN round %d: skipping policy training; sampling from the "
+                "fresh pretrained policy.",
+                round_number,
+            )
 
         generation_started = time.perf_counter()
         candidates = self._generate_final_candidates(
@@ -428,10 +442,6 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
         )
         self.round_metrics.generation_duration_s = (
             time.perf_counter() - generation_started
-        )
-        self.round_metrics.positive_buffer_size = len(positive_buffer)
-        self.round_metrics.negative_buffer_size = (
-            len(negative_buffer) if negative_buffer is not None else 0
         )
         _logger.info(
             "S3-GFN round %d complete: generated %d candidate(s).",

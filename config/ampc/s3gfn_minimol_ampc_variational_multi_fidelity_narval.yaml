@@ -1,0 +1,159 @@
+# S3-GFN molecule experiment: fine-tuned MiniMol AmpC representations +
+# fixed-feature variational multi-fidelity GP with distributed DOCK3 on Narval.
+#
+# Narval regular CPU nodes provide 64 physical cores. This configuration
+# requests 16 concurrent whole-node array tasks (1,024 cores total), which is
+# the smallest whole-node allocation meeting a 980-core target. Replace the
+# account, user, and DOCK3 paths before submitting.
+#
+# Narval does not require a user-selected partition for ordinary CPU jobs:
+# wall time and resource requests determine the eligible scheduling pool.
+#
+# Prerequisites:
+#   - uv sync --extra molecules
+#   - the intact collaborator package and checkpoint under minimol_ampc_encoder/
+#   - the dependency pins documented by minimol_ampc_encoder/
+#   - the xtb binary on PATH
+#   - nested sbatch submissions allowed from the parent allocation
+#   - the repository, Python environment, DOCK3 inputs, and shared_work_dir
+#     visible at the same paths from every child node
+
+runtime:
+  device: cuda
+  precision: 32
+  seed: 42
+
+dataset:
+  type: ListDataset
+  initial_data:
+    path: data/10M_unif_random_subset.csv
+    x_columns: SMILE
+    y_column: y
+    fidelity_column: fidelity
+
+surrogate:
+  type: VariationalGPSurrogate
+  target_fidelity: 1
+  encoder:
+    type: MiniMolAmpcSmilesFixedEncoder
+    checkpoint_path: minimol_ampc_encoder/model/final.pt
+    package_path: minimol_ampc_encoder
+    device: cuda
+    batch_size: 64  # Adjust depending on VRAM availability
+    cache_size: 4096
+    feature_cache_path: cache/ampc/s3gfn_minimol_ampc_fingerprints.npy
+  training_params:
+    epochs: 50  # Adjust based on convergence; 50 is a reasonable starting point.
+    lr: 1.0e-3
+    batch_size: 10000  # Keep encoded training features on CPU for large datasets.
+  num_inducing: 64  # Adjust based on dataset size and VRAM; 64 is a reasonable starting point.
+  standardize_outputs: true
+
+acquisition:
+  type: QMultiFidelityLowerBoundMaxValueEntropy
+  candidate_set_spec:
+    type: TrainDataCandidateSetSpec
+    fallback_size: 100000
+    seed: 42
+  num_fantasies: 8
+  num_mv_samples: 10
+  num_y_samples: 64
+  score_chunk_size: 5000  # Bound candidate encoding and GP posterior memory.
+  maximize: true
+
+sampler:
+  type: S3GFNSampler
+  n_samples: 100000  # 100k samples with the budget config below means we'll select every sample
+  fidelities: [0, 1]
+  model_name_or_path: ibm-research/GP-MoLFormer-Uniq
+  tokenizer_name_or_path: ibm-research/MoLFormer-XL-both-10pct
+  trust_remote_code: true
+  performance_mode: optimized
+  max_length: 80
+  batch_size: 64  # Adjust depending on VRAM availability
+  replay_batch_size: 64  # Adjust depending on VRAM availability
+  generation_batch_size: 128  # Adjust depending on VRAM availability
+  n_train_steps: 2500
+  num_warmup_steps: 10
+  beta: 1.0
+  aux_coefficient: 0.001
+  sa_threshold: 4.0
+
+selector:
+  type: CostAwareSelector
+
+# fidelity_confidences must be set explicitly here. Each sub-oracle is
+# single-fidelity, so the cost/max_cost default resolves each to 1.0 on its own,
+# and CompositeOracle merges {0: 1.0, 1: 1.0} without complaint - it only errors
+# when two oracles disagree about the same fidelity. The surrogate would then
+# treat the two-valued cheap signal as exactly as trustworthy as docking.
+oracle:
+  type: CompositeOracle
+  sub_oracles:
+    - type: CxcalcOracle
+      mol_repr: smiles
+      fidelity_costs:
+        0: 0.2
+      fidelity_confidences:
+        0: 0.3
+      ph: 7.4
+      anion_percent_threshold: 0.0
+      zero_probability: 0.0
+      nonzero_probability: 0.01
+      # One subprocess already covers a whole batch, so extra threads only
+      # help past chunk_size.
+      num_workers: 1
+    - type: SlurmDock3Oracle
+      mol_repr: smiles
+      indock_template: /home/ethankrz/dock_smiles/ampc_dockfiles/INDOCK
+      dockfiles_dir: /home/ethankrz/dock_smiles/ampc_dockfiles
+      fidelity_costs:
+        1: 32.0
+      fidelity_confidences:
+        1: 1.0
+      # Each array task owns one whole 64-core Narval CPU node.
+      num_workers: 64
+      num_array_tasks: 16
+      max_parallel_tasks: 16
+      shared_work_dir: /scratch/YOUR_USERNAME/activelearning/dock3_queries
+      poll_interval: 5.0
+      sbatch_args:
+        - --account=YOUR_CPU_ACCOUNT
+        - --nodes=1
+        - --ntasks=1
+        - --exclusive
+        - --mem=0
+        - --time=03:00:00
+      ligbuild_timeout: 150
+      # Paths are relative to the repository root, like config/data/molecules.txt.
+      hitrate_params: ampc_hitrate_fits/fitted_params.json
+      score_pprop_table: ampc_hitrate_fits/data/full_scores.df
+      hitrate_target: ampc
+      pki_threshold: 6.5
+
+budget:
+  available_budget: 32000000.0 # 32M = 1M docking evals
+  schedule:
+    type: constant
+    value: 3200000.0 # 3.2M = 100k docking evals per iteration
+
+logger:
+  type: MultiLogger
+  loggers:
+    - type: ConsoleLogger
+      project_name: ampc_sanity_check
+      run_name: molecules-s3gfn-minimol-ampc-fixed-feature-variational-gp-narval
+    - type: WandbLogger
+      project_name: ampc_sanity_check
+      run_name: molecules-s3gfn-minimol-ampc-fixed-feature-variational-gp-narval
+    - type: CometLogger
+      project_name: ampc_sanity_check
+      run_name: molecules-s3gfn-minimol-ampc-fixed-feature-variational-gp-narval
+      workspace: null  # Set this if the Comet workspace is not the default.
+      api_key: null  # Uses COMET_API_KEY when unset.
+
+run_writer:
+  type: JSONLinesRunWriter
+  output_dir: outputs/ampc/s3gfn_minimol_ampc_variational_multi_fidelity_narval/seed_${runtime.seed}
+  write_samples: false  # Enable this if you want to save the sampled molecules from the sampler.
+  write_config: true

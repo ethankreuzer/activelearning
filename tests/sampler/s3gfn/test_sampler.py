@@ -250,6 +250,23 @@ def test_sampler_returns_canonical_smiles_with_conditionally_sampled_fidelities(
     }
 
 
+def test_zero_training_steps_samples_without_acquisition_or_training(
+    make_sampler,
+    fake_model,
+    patch_molecule_dependencies,
+) -> None:
+    """Zero steps generate directly from a fresh pretrained policy."""
+    sampler = make_sampler(n_train_steps=0)
+    sampler._new_round_model = lambda: fake_model
+    sampler._train_round = Mock(side_effect=AssertionError("training must not run"))
+
+    candidates = sampler.sample()
+
+    assert len(candidates) == 2
+    assert sampler._train_round.call_count == 0
+    assert sampler.round_metrics.training_duration_s == 0.0
+
+
 def test_sampler_compiles_policy_before_training(
     make_sampler,
     patch_molecule_dependencies,

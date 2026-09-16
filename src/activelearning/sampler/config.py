@@ -323,7 +323,8 @@ class S3GFNSamplerConfig(BaseModel):
     Number of trajectories generated per final candidate-generation call.
     When omitted, ``batch_size`` is used.
     n_train_steps : int, default=5000
-    Number of policy training steps.
+    Number of policy training steps. Zero samples from the fresh pretrained
+    policy without optimization.
     num_warmup_steps : int, default=100
     Number of learning-rate warm-up steps.
     learning_rate : float, default=1e-4
@@ -379,7 +380,7 @@ class S3GFNSamplerConfig(BaseModel):
     batch_size: int = Field(default=64, gt=0)
     replay_batch_size: int = Field(default=64, gt=0)
     generation_batch_size: int | None = Field(default=None, gt=0)
-    n_train_steps: int = Field(default=5000, gt=0)
+    n_train_steps: int = Field(default=5000, ge=0)
     num_warmup_steps: int = Field(default=100, ge=0)
     learning_rate: PositiveFloat = 1.0e-4
     log_z_learning_rate: PositiveFloat = 1.0e-3

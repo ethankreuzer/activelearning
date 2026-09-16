@@ -324,6 +324,48 @@ class Dock3OracleConfig(BaseModel):
         )
 
 
+class SlurmDock3OracleConfig(Dock3OracleConfig):
+    """Configuration for the optional Slurm-distributed DOCK3 oracle."""
+
+    type: Literal["SlurmDock3Oracle"] = "SlurmDock3Oracle"
+    shared_work_dir: str
+    num_array_tasks: int = Field(gt=0)
+    num_workers: int = Field(ge=1)
+    max_parallel_tasks: int | None = Field(default=None, ge=1)
+    poll_interval: float = Field(default=5.0, gt=0)
+    sbatch_args: list[str] = Field(default_factory=list)
+
+    def build(self) -> Oracle:
+        """Build the Slurm-backed DOCK3 oracle lazily."""
+        from activelearning.applications.molecules.slurm_dock3_oracle import (
+            SlurmDock3Oracle,
+        )
+
+        return SlurmDock3Oracle(
+            indock_template=self.indock_template,
+            dockfiles_dir=self.dockfiles_dir,
+            fidelity_costs=self.fidelity_costs,
+            fidelity_confidences=self.fidelity_confidences,
+            dockenv_sh=self.dockenv_sh,
+            dock64_exe=self.dock64_exe,
+            ligbuild_exe=self.ligbuild_exe,
+            tmp_dir=self.tmp_dir,
+            timeout=self.timeout,
+            ligbuild_timeout=self.ligbuild_timeout,
+            num_workers=self.num_workers,
+            hitrate_params=self.hitrate_params,
+            score_pprop_table=self.score_pprop_table,
+            pki_threshold=self.pki_threshold,
+            hitrate_target=self.hitrate_target,
+            warmup=self.warmup,
+            shared_work_dir=self.shared_work_dir,
+            num_array_tasks=self.num_array_tasks,
+            max_parallel_tasks=self.max_parallel_tasks,
+            poll_interval=self.poll_interval,
+            sbatch_args=self.sbatch_args,
+        )
+
+
 class CxcalcOracleConfig(BaseModel):
     """Configuration for :class:`~activelearning.applications.molecules.cxcalc_oracle.CxcalcOracle`.
 
@@ -452,6 +494,7 @@ OracleConfig = Annotated[
         CompositeOracleConfig,
         XTBIPEAOracleConfig,
         Dock3OracleConfig,
+        SlurmDock3OracleConfig,
         CxcalcOracleConfig,
     ],
     Field(discriminator="type"),

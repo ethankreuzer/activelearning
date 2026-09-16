@@ -39,6 +39,7 @@ from activelearning.surrogate.dkl.config import (
     ExactDKLSurrogateConfig,
     VariationalDKLSurrogateConfig,
 )
+from activelearning.oracle.config import OracleConfig, SlurmDock3OracleConfig
 
 
 @pytest.mark.parametrize(
@@ -160,6 +161,26 @@ def test_dkl_config_parses_nested_encoder_union() -> None:
 
     assert isinstance(config.encoder, MoLFormerSmilesEncoderConfig)
     assert config.encoder.latent_dim == 32
+
+
+def test_oracle_union_selects_slurm_dock3_config() -> None:
+    """OracleConfig dispatches the optional Slurm DOCK3 discriminator."""
+    parsed = TypeAdapter(OracleConfig).validate_python(
+        {
+            "type": "SlurmDock3Oracle",
+            "indock_template": "INDOCK",
+            "dockfiles_dir": "dockfiles",
+            "fidelity_costs": {0: 32.0},
+            "hitrate_params": "params.json",
+            "score_pprop_table": "scores.df",
+            "pki_threshold": 6.5,
+            "shared_work_dir": "slurm_queries",
+            "num_array_tasks": 2,
+            "num_workers": 4,
+        }
+    )
+
+    assert isinstance(parsed, SlurmDock3OracleConfig)
 
 
 def test_minimol_encoder_config_parses_checkpoint_path() -> None:
