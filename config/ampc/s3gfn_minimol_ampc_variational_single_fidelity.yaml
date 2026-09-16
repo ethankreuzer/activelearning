@@ -1,11 +1,12 @@
 # S3-GFN molecule experiment: fine-tuned MiniMol AmpC representations +
-# fixed-feature variational multi-fidelity GP with explicit fidelity actions.
+# fixed-feature variational GP with a single Dock3 fidelity.
 #
 # Prerequisites:
 #   - uv sync --extra molecules
 #   - the intact collaborator package and checkpoint under minimol_ampc_encoder/
 #   - the dependency pins documented by minimol_ampc_encoder/
-#   - the xtb binary on PATH
+#   - the DOCK3 toolchain (dockenv.sh, ligbuild, dock64) and prepared AmpC
+#     receptor dockfiles
 
 runtime:
   device: cuda
@@ -52,8 +53,9 @@ acquisition:
 
 sampler:
   type: S3GFNSampler
-  n_samples: 100000  # 100k samples with the budget config below means we'll select every sample
-  fidelities: [0, 1]
+  n_samples: 100000  # Generate a 100k-candidate pool per round; the round budget
+                     # selects about 10k Dock3 evaluations at ~32 core-seconds each.
+  fidelities: [1]
   model_name_or_path: ibm-research/GP-MoLFormer-Uniq
   tokenizer_name_or_path: ibm-research/MoLFormer-XL-both-10pct
   trust_remote_code: true
@@ -71,44 +73,23 @@ sampler:
 selector:
   type: CostAwareSelector
 
-# fidelity_confidences must be set explicitly here. Each sub-oracle is
-# single-fidelity, so the cost/max_cost default resolves each to 1.0 on its own,
-# and CompositeOracle merges {0: 1.0, 1: 1.0} without complaint - it only errors
-# when two oracles disagree about the same fidelity. The surrogate would then
-# treat the two-valued cheap signal as exactly as trustworthy as docking.
 oracle:
-  type: CompositeOracle
-  sub_oracles:
-    - type: CxcalcOracle
-      mol_repr: smiles
-      fidelity_costs:
-        0: 0.2
-      fidelity_confidences:
-        0: 0.3
-      ph: 7.4
-      anion_percent_threshold: 0.0
-      zero_probability: 0.0
-      nonzero_probability: 0.01
-      # One subprocess already covers a whole batch, so extra threads only
-      # help past chunk_size.
-      num_workers: 1
-    - type: Dock3Oracle
-      mol_repr: smiles
-      indock_template: /home/ethankrz/dock_smiles/ampc_dockfiles/INDOCK
-      dockfiles_dir: /home/ethankrz/dock_smiles/ampc_dockfiles
-      fidelity_costs:
-        1: 32.0
-      fidelity_confidences:
-        1: 1.0
-      # null sizes the docking thread pool from the CPUs this job holds.
-      # The ceiling is the fidelity-1 share of selector.num_samples.
-      num_workers: null
-      ligbuild_timeout: 150
-      # Paths are relative to the repository root, like config/data/molecules.txt.
-      hitrate_params: ampc_hitrate_fits/fitted_params.json
-      score_pprop_table: ampc_hitrate_fits/data/full_scores.df
-      hitrate_target: ampc
-      pki_threshold: 6.5
+  type: Dock3Oracle
+  mol_repr: smiles
+  indock_template: /home/ethankrz/dock_smiles/ampc_dockfiles/INDOCK
+  dockfiles_dir: /home/ethankrz/dock_smiles/ampc_dockfiles
+  fidelity_costs:
+    1: 32.0
+  fidelity_confidences:
+    1: 1.0
+  # null sizes the docking thread pool from the CPUs this job holds.
+  num_workers: null
+  ligbuild_timeout: 150
+  # The fitted hit-rate paths below are relative to the repository root.
+  hitrate_params: ampc_hitrate_fits/fitted_params.json
+  score_pprop_table: ampc_hitrate_fits/data/full_scores.df
+  hitrate_target: ampc
+  pki_threshold: 6.5
 
 budget:
   available_budget: 3200000.0 # 3.2M = 100k docking evals
@@ -128,6 +109,6 @@ logger:
 
 run_writer:
   type: JSONLinesRunWriter
-  output_dir: outputs/ampc/s3gfn_minimol_ampc_variational_multi_fidelity/seed_${runtime.seed}
+  output_dir: outputs/ampc/s3gfn_minimol_ampc_variational_single_fidelity/seed_${runtime.seed}
   write_samples: false  # Enable this if you want to save the sampled molecules from the sampler.
   write_config: true
