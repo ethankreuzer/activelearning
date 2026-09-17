@@ -11,6 +11,7 @@ import warnings
 from typing import Any, Callable, ClassVar, Iterable, Optional
 
 import torch
+from botorch.acquisition.cost_aware import InverseCostWeightedUtility
 from botorch.acquisition.acquisition import AcquisitionFunction
 from botorch.acquisition.knowledge_gradient import (
     qMultiFidelityKnowledgeGradient as _qMFKG,
@@ -20,6 +21,7 @@ from botorch.acquisition.max_value_entropy_search import (
     qMultiFidelityMaxValueEntropy as _qMFMES,
 )
 from botorch.acquisition.objective import ScalarizedPosteriorTransform
+from botorch.models.cost import FixedCostModel
 
 from activelearning.acquisition.botorch.botorch_acquisition import (
     QBatchBoTorchAcquisition,
@@ -189,6 +191,21 @@ class _QMultiFidelityEntropyBase(QBatchBoTorchAcquisition):
             "num_y_samples": self._num_y_samples,
             "maximize": self.maximize,
         }
+
+        if not self._botorch_surrogate.is_multi_fidelity:
+            # BoTorch's MF-MES default cost model assumes the last input
+            # dimension is a positive fidelity parameter. In single-fidelity
+            # mode, the last dimension is an arbitrary model feature and may
+            # be non-positive.
+            build_kwargs["cost_aware_utility"] = InverseCostWeightedUtility(
+                cost_model=FixedCostModel(
+                    fixed_cost=torch.ones(
+                        1,
+                        dtype=candidate_set.dtype,
+                        device=candidate_set.device,
+                    )
+                )
+            )
 
         if self._resolved_project_to_target_fidelity_fn is not None:
             build_kwargs["project"] = self._resolved_project_to_target_fidelity_fn

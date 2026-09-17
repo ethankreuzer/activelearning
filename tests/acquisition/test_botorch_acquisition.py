@@ -1308,6 +1308,32 @@ class TestMultiFidelityAcquisitionIntegration:
         assert acq._resolved_project_to_target_fidelity_fn is None
         self._scores_valid(acq.score(candidates))
 
+    def test_qmflbmes_single_fidelity_ignores_feature_as_cost(
+        self,
+        fitted_surrogate: BoTorchGPSurrogate,
+        single_fidelity_observations: list[Observation],
+        train_data_spec: TrainDataCandidateSetSpec,
+    ) -> None:
+        """Single-fidelity MF-MES must not use an arbitrary feature as cost."""
+        from activelearning.acquisition.botorch.botorch_multifidelity import (
+            QMultiFidelityLowerBoundMaxValueEntropy,
+        )
+
+        acq = QMultiFidelityLowerBoundMaxValueEntropy(
+            candidate_set_spec=train_data_spec,
+            num_fantasies=2,
+            num_mv_samples=5,
+            num_y_samples=16,
+        )
+        acq.update(fitted_surrogate, single_fidelity_observations)
+
+        candidates = [
+            Candidate(x=[2.0, -3.0]),
+            Candidate(x=[4.0, -5.0]),
+        ]
+
+        self._scores_valid(acq.score(candidates))
+
     def test_qmfkg_scores(
         self,
         mf_surrogate: BoTorchGPSurrogate,
