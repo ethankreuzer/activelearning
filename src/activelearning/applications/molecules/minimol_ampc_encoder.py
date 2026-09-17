@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import logging
 import sys
 from contextlib import contextmanager
 from functools import partial
@@ -25,6 +26,8 @@ from activelearning.applications.molecules.minimol_encoder import (
 )
 
 __all__ = ["MiniMolAmpcSmilesEncoder", "MiniMolAmpcSmilesFixedEncoder"]
+
+_logger = logging.getLogger(__name__)
 
 
 @contextmanager
@@ -157,22 +160,61 @@ class MiniMolAmpcSmilesFixedEncoder(MiniMolSmilesFixedEncoder):
         )
 
     def _extract_fingerprints(self, smiles: list[str]) -> list[Tensor]:
-        """Extract and validate the shared encoder's ``pooled512`` vectors."""
+        """Extract ``pooled512`` vectors, replacing skipped rows with zeros."""
         encoder = self._ensure_minimol_loaded()
         with _graphium_float32_compatibility():
             outputs = np.asarray(
-                encoder.encode(smiles, batch_size=self.batch_size),
+                encoder.encode(
+                    smiles,
+                    batch_size=self.batch_size,
+                    on_invalid="skip",
+                ),
                 dtype=np.float32,
             )
+
         expected_shape = (len(smiles), MINIMOL_FINGERPRINT_DIM)
-        if outputs.shape != expected_shape:
+        if outputs.size == 0 and outputs.ndim == 1:
+            outputs = outputs.reshape(0, MINIMOL_FINGERPRINT_DIM)
+        if outputs.ndim != 2 or outputs.shape[1] != MINIMOL_FINGERPRINT_DIM:
             raise ValueError(
                 "MiniMol AmpC pooled512 output must have shape "
-                f"{expected_shape}, got {outputs.shape}."
+                f"(N, {MINIMOL_FINGERPRINT_DIM}), got {outputs.shape}."
             )
         if not np.isfinite(outputs).all():
             raise ValueError(
                 "MiniMol AmpC pooled512 output contains non-finite values."
+            )
+
+        if outputs.shape[0] != len(smiles):
+            with _graphium_float32_compatibility():
+                _, _, invalid = encoder.featurize(smiles, on_invalid="skip")
+            if not all(isinstance(value, str) for value in invalid):
+                raise TypeError(
+                    "MiniMol AmpC must report invalid molecules as SMILES strings."
+                )
+            invalid_smiles = list(invalid)
+            invalid_indices = [
+                index for index, smile in enumerate(smiles) if smile in invalid_smiles
+            ]
+            retained_indices = [
+                index for index in range(len(smiles)) if index not in invalid_indices
+            ]
+            if outputs.shape[0] != len(retained_indices):
+                raise ValueError(
+                    "MiniMol AmpC returned "
+                    f"{outputs.shape[0]} fingerprints for {len(retained_indices)} "
+                    "featurizable SMILES."
+                )
+
+            restored = np.zeros(expected_shape, dtype=np.float32)
+            restored[retained_indices] = outputs
+            outputs = restored
+            _logger.warning(
+                "MiniMol AmpC could not featurize %d/%d SMILES; using zero "
+                "fingerprints. Examples: %s",
+                len(invalid_indices),
+                len(smiles),
+                invalid_smiles[:3],
             )
 
         return [

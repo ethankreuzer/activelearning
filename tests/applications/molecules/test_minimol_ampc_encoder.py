@@ -17,16 +17,41 @@ import activelearning.applications.molecules.minimol_ampc_encoder as ampc_module
 class _FakeAmpcEncoder:
     """Deterministic replacement for the collaborator's pooled512 encoder."""
 
-    def __init__(self, outputs: Any = None) -> None:
+    def __init__(
+        self,
+        outputs: Any = None,
+        invalid: list[str] | None = None,
+    ) -> None:
         self.outputs = outputs
+        self.invalid = invalid or []
         self.calls: list[tuple[list[str], int]] = []
+        self.options: list[dict[str, Any]] = []
 
-    def encode(self, smiles: list[str], *, batch_size: int) -> Any:
+    def encode(
+        self,
+        smiles: list[str],
+        *,
+        batch_size: int,
+        **kwargs: Any,
+    ) -> Any:
         """Record the request and return the configured backend output."""
         self.calls.append((list(smiles), batch_size))
+        self.options.append(kwargs)
         if callable(self.outputs):
             return self.outputs(smiles)
         return self.outputs
+
+    def featurize(
+        self,
+        smiles: list[str],
+        *,
+        on_invalid: str,
+    ) -> tuple[list[object], list[str], list[str]]:
+        """Return the configured invalid SMILES for skip-mode featurization."""
+        assert on_invalid == "skip"
+        invalid = [smile for smile in smiles if smile in self.invalid]
+        kept = [smile for smile in smiles if smile not in invalid]
+        return [], kept, invalid
 
 
 def _make_checkpoint_package(tmp_path: Path) -> tuple[Path, Path]:
@@ -100,7 +125,60 @@ def test_ampc_encoder_loads_backend_and_uses_pooled512(
         [float(sum(map(ord, value))) for value in ["CC", "CC", "CO"]]
     )
     assert backend.calls == [(["CC", "CO"], 2)]
+    assert backend.options == [{"on_invalid": "skip"}]
     assert contexts == ["enter", "exit"]
+
+
+def test_ampc_encoder_substitutes_zero_rows_for_invalid_molecules(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """MiniMol-invalid inputs retain batch alignment with zero fingerprints."""
+    checkpoint_path, package_path = _make_checkpoint_package(tmp_path)
+
+    backend = _FakeAmpcEncoder(
+        outputs=lambda smiles: np.asarray(
+            [
+                [float(index + 1)] * 512
+                for index, _ in enumerate(
+                    smile for smile in smiles if smile != "unsupported"
+                )
+            ],
+            dtype=np.float32,
+        ),
+        invalid=["unsupported"],
+    )
+
+    @contextmanager
+    def fake_graphium_compatibility() -> Any:
+        yield
+
+    monkeypatch.setattr(
+        ampc_module,
+        "_load_ampc_encoder",
+        lambda checkpoint, package, device: backend,
+    )
+    monkeypatch.setattr(
+        ampc_module,
+        "_graphium_float32_compatibility",
+        fake_graphium_compatibility,
+    )
+    encoder = ampc_module.MiniMolAmpcSmilesFixedEncoder(
+        checkpoint_path=checkpoint_path,
+        package_path=package_path,
+    )
+
+    with caplog.at_level("WARNING", logger=ampc_module.__name__):
+        features = encoder.encode(
+            ["CC", "unsupported", "CO"],
+            device=torch.device("cpu"),
+        )
+
+    assert features.shape == (3, 512)
+    assert features[:, 0].tolist() == [1.0, 0.0, 2.0]
+    assert backend.options == [{"on_invalid": "skip"}]
+    assert "using zero fingerprints" in caplog.text
 
 
 def test_ampc_fixed_encoder_returns_pooled512_without_projection(
