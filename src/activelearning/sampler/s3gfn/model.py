@@ -7,7 +7,7 @@ comparing their trajectory probabilities with a reward-weighted target:
 
 ``log((Z * P_policy(tau)) / (R(x) * P_prior(tau)))``.
 
-The API accepts scaled reward scores ``r(x)`` and converts them to positive
+The API accepts acquisition reward scores ``r(x)`` and converts them to positive
 rewards with ``R(x) = exp(beta * r(x))``. The implementation follows the
 generation and loss flow of the upstream S3-GFN trainer:
 https://github.com/hyeonahkimm/s3gfn/blob/43aa7b310e9e03ef71ea0bd0cce501a48b6e2d52/src/s3gfn/train.py
@@ -400,6 +400,19 @@ class S3GFNModel(nn.Module):
             eos_token_id=self.eos_token_id,
             **generation_kwargs,
         )
+        # RTB updates require complete trajectories, so we exclude max-length truncations.
+        terminated_mask = generated_ids.eq(self.eos_token_id).any(dim=1)
+        generated_ids = generated_ids[terminated_mask]
+        if generated_ids.shape[0] == 0 and self.fidelity_head is not None:
+            return GeneratedSequences(
+                input_ids=generated_ids,
+                smiles=(),
+                fidelity_indices=torch.empty(
+                    0,
+                    dtype=torch.long,
+                    device=generated_ids.device,
+                ),
+            )
         fidelity_indices = None
         if self.fidelity_head is not None:
             fidelity_indices = self.fidelity_head.sample(

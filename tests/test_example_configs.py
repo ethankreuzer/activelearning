@@ -1,5 +1,6 @@
 """Configuration-level tests for the checked-in tutorial examples."""
 
+import math
 from pathlib import Path
 
 import pytest
@@ -467,6 +468,25 @@ def test_molecule_s3gfn_minimol_variational_multi_fidelity_config_parses() -> No
     assert config.sampler.batch_size == 64
     assert config.sampler.replay_batch_size == 64
     assert config.sampler.generation_batch_size is None
+
+
+def test_molecule_s3gfn_minimol_ampc_variational_single_fidelity_config_parses() -> (
+    None
+):
+    """Ensure the raw-score beta targets a tenfold reward ratio."""
+    config_path = (
+        REPOSITORY_ROOT
+        / "config"
+        / "ampc"
+        / "s3gfn_minimol_ampc_variational_single_fidelity.yaml"
+    )
+
+    config = load_and_parse(config_path, ActiveLearningConfig)
+
+    assert config.sampler.fidelities == [1]
+    assert config.sampler.model_dtype == "bfloat16"
+    assert config.sampler.beta == pytest.approx(2302.585093)
+    assert math.exp(config.sampler.beta * (0.002 - 0.001)) == pytest.approx(10.0)
 
 
 @pytest.mark.parametrize(
