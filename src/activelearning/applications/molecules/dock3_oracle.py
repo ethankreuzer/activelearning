@@ -888,8 +888,8 @@ class Dock3Oracle(MultiFidelityOracle):
             recent :meth:`query` call.
         workers_used : int
             Threads the batch was actually spread over. Logged as
-            ``dock3/workers_used`` so a run's own metrics answer whether the CPU
-            allocation was saturated, without external instrumentation.
+            ``oracle/dock3/workers_used`` so a run's own metrics answer whether
+            the CPU allocation was saturated, without external instrumentation.
         """
         if self.logger is None or not results:
             return
@@ -898,13 +898,15 @@ class Dock3Oracle(MultiFidelityOracle):
         total = len(results)
         succeeded = total - sum(reasons.values())
 
-        self.logger.log_metric("dock3/workers_used", float(workers_used))
-        self.logger.log_metric("dock3/workers_available", float(self._num_workers))
-        self.logger.log_metric("dock3/queried", float(total))
-        self.logger.log_metric("dock3/succeeded", float(succeeded))
-        self.logger.log_metric("dock3/success_rate", succeeded / total)
+        self.logger.log_metric("oracle/dock3/workers_used", float(workers_used))
+        self.logger.log_metric(
+            "oracle/dock3/workers_available", float(self._num_workers)
+        )
+        self.logger.log_metric("oracle/dock3/queried", float(total))
+        self.logger.log_metric("oracle/dock3/succeeded", float(succeeded))
+        self.logger.log_metric("oracle/dock3/success_rate", succeeded / total)
         for reason, count in sorted(reasons.items()):
-            self.logger.log_metric(f"dock3/failures/{reason}", float(count))
+            self.logger.log_metric(f"oracle/dock3/failures/{reason}", float(count))
 
     def _get_dock_root(self) -> Path:
         """Return this oracle's shared dock root, creating it on first use.

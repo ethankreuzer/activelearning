@@ -29,6 +29,7 @@ from activelearning.applications.molecules.dock3_oracle import (
     _warmup_dockenv,
 )
 from activelearning.logger.logger import Logger
+from activelearning.monitoring.keys import validate_log_key
 from activelearning.oracle.config import Dock3OracleConfig
 from activelearning.runtime import RuntimeContext
 from activelearning.utils.types import Candidate
@@ -103,7 +104,8 @@ class _RecordingLogger(Logger):
         """Ignore configuration."""
 
     def log_metric(self, key: str, value: Any) -> None:
-        """Record one metric."""
+        """Record one metric, rejecting keys the real loggers would reject."""
+        validate_log_key(key)
         self.metrics[key] = value
 
     def log_figure(self, key: str, figure: Any) -> None:
@@ -1108,11 +1110,11 @@ class TestQueryFailureSummary:
         ):
             oracle.query([Candidate(x=key, fidelity=0) for key in "abcd"])
 
-        assert recorder.metrics["dock3/queried"] == 4.0
-        assert recorder.metrics["dock3/succeeded"] == 1.0
-        assert recorder.metrics["dock3/success_rate"] == pytest.approx(0.25)
-        assert recorder.metrics["dock3/failures/ligbuild_no_tgz"] == 2.0
-        assert recorder.metrics["dock3/failures/dock64_timeout"] == 1.0
+        assert recorder.metrics["oracle/dock3/queried"] == 4.0
+        assert recorder.metrics["oracle/dock3/succeeded"] == 1.0
+        assert recorder.metrics["oracle/dock3/success_rate"] == pytest.approx(0.25)
+        assert recorder.metrics["oracle/dock3/failures/ligbuild_no_tgz"] == 2.0
+        assert recorder.metrics["oracle/dock3/failures/dock64_timeout"] == 1.0
 
     def test_no_failure_keys_when_everything_succeeds(self, oracle) -> None:
         recorder = _RecordingLogger()
@@ -1120,7 +1122,7 @@ class TestQueryFailureSummary:
         with patch.object(oracle, "_dock3_score", return_value=(-10.0, None)):
             oracle.query([Candidate(x="CCO", fidelity=0)])
 
-        assert recorder.metrics["dock3/success_rate"] == pytest.approx(1.0)
+        assert recorder.metrics["oracle/dock3/success_rate"] == pytest.approx(1.0)
         assert not [key for key in recorder.metrics if "failures" in key]
 
     def test_is_a_no_op_without_a_bound_logger(self, oracle) -> None:

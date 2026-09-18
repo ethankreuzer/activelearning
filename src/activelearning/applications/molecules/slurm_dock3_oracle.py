@@ -825,9 +825,11 @@ class SlurmDock3Oracle(Dock3Oracle):
             "infrastructure_failure": int(infrastructure_failure),
         }
         for name, value in metrics.items():
-            self.logger.log_metric(f"slurm_dock3/{name}", float(value))
+            self.logger.log_metric(f"oracle/slurm_dock3/{name}", float(value))
         for reason, count in sorted(reasons.items()):
-            self.logger.log_metric(f"slurm_dock3/failures/{reason}", float(count))
+            self.logger.log_metric(
+                f"oracle/slurm_dock3/failures/{reason}", float(count)
+            )
 
     @staticmethod
     def _remove_query_dir(query_dir: Path) -> None:

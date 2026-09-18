@@ -222,7 +222,7 @@ uv run activelearning config/molecules/s3gfn_minimol_dock3.yaml
 
 Docking is expensive — roughly 32 core-seconds per molecule for that receptor — so the budget in that config is denominated in core-seconds. `num_workers` defaults to `null`, which sizes the thread pool from the CPUs the job actually holds (the process CPU affinity mask and `$SLURM_CPUS_PER_TASK`, whichever is smaller), so you do not normally set it. The work happens in subprocesses, so threads scale well.
 
-The real ceiling is the batch, not the allocation: `active_learning()` hands the oracle exactly `selector.num_samples` candidates per round, so a 16-candidate round docks on 16 cores no matter how many are allocated — and under `CompositeOracle` only the fidelity-1 share of that batch reaches DOCK3. Each round logs `dock3/workers_used` alongside `dock3/workers_available`, so the run's own metrics say whether the allocation was saturated.
+The real ceiling is the batch, not the allocation: `active_learning()` hands the oracle exactly `selector.num_samples` candidates per round, so a 16-candidate round docks on 16 cores no matter how many are allocated — and under `CompositeOracle` only the fidelity-1 share of that batch reaches DOCK3. Each round logs `oracle/dock3/workers_used` alongside `oracle/dock3/workers_available`, so the run's own metrics say whether the allocation was saturated.
 
 !!! warning "External dependency"
     Unlike `XTBIPEAOracle`, this oracle needs no extra Python packages — the chemistry all happens in external binaries. It does need the DOCK3 toolchain (`dockenv.sh`, `ligbuild`, `dock64`) and a prepared receptor `dockfiles` directory with its `INDOCK` template, and it expects to run inside a Slurm allocation so that node-local scratch is available through a short path. Point `indock_template` and `dockfiles_dir` at your own receptor before running.
@@ -231,7 +231,7 @@ The real ceiling is the batch, not the allocation: `active_learning()` hands the
 
 Both molecular oracles return `NaN` for a molecule they cannot evaluate — a SMILES that fails geometry construction, a ligand `ligbuild` cannot build, a docking run that places no pose. The active-learning loop drops those observations before fitting the surrogate, but **still consumes their budget**, because a failed evaluation costs real compute. The specific xTB failure modes are covered in [step 2](#2-run-the-pool-based-dkl-examples) below.
 
-Because failures are dropped, they are invisible in the dataset, so `Dock3Oracle` logs a per-round breakdown instead: `dock3/success_rate` plus one `dock3/failures/<reason>` counter per failure mode, whenever a logger is bound. Watch it on the first round. A success rate near zero usually means the docking environment did not provision correctly on the compute node rather than that the sampler is generating bad molecules — and the two are indistinguishable from the scores alone.
+Because failures are dropped, they are invisible in the dataset, so `Dock3Oracle` logs a per-round breakdown instead: `oracle/dock3/success_rate` plus one `oracle/dock3/failures/<reason>` counter per failure mode, whenever a logger is bound. Watch it on the first round. A success rate near zero usually means the docking environment did not provision correctly on the compute node rather than that the sampler is generating bad molecules — and the two are indistinguishable from the scores alone.
 
 ## **1. Prepare the molecule environment**
 

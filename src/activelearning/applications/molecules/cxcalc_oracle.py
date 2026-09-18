@@ -766,11 +766,11 @@ class CxcalcOracle(MultiFidelityOracle):
         total = len(results)
         succeeded = total - sum(reasons.values())
 
-        self.logger.log_metric("cxcalc/queried", float(total))
-        self.logger.log_metric("cxcalc/succeeded", float(succeeded))
-        self.logger.log_metric("cxcalc/success_rate", succeeded / total)
+        self.logger.log_metric("oracle/cxcalc/queried", float(total))
+        self.logger.log_metric("oracle/cxcalc/succeeded", float(succeeded))
+        self.logger.log_metric("oracle/cxcalc/success_rate", succeeded / total)
         for reason, count in sorted(reasons.items()):
-            self.logger.log_metric(f"cxcalc/failures/{reason}", float(count))
+            self.logger.log_metric(f"oracle/cxcalc/failures/{reason}", float(count))
 
     @staticmethod
     def _extract_smiles(candidate: Candidate) -> str:

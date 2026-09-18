@@ -19,6 +19,7 @@ from activelearning.applications.molecules.cxcalc_oracle import (
     anion_percent_to_probability,
 )
 from activelearning.logger.logger import Logger
+from activelearning.monitoring.keys import validate_log_key
 from activelearning.oracle.config import CxcalcOracleConfig
 from activelearning.runtime import RuntimeContext
 from activelearning.utils.types import Candidate
@@ -652,12 +653,12 @@ class TestCxcalcOracleQuery:
         with patch.object(oracle, "_run_chunk", return_value=({"0": 12.0}, None)):
             oracle.query([Candidate(x=f"C{'C' * i}O", fidelity=0) for i in range(4)])
 
-        assert recorder.metrics["cxcalc/queried"] == pytest.approx(4.0)
-        assert recorder.metrics["cxcalc/succeeded"] == pytest.approx(1.0)
-        assert recorder.metrics["cxcalc/success_rate"] == pytest.approx(0.25)
-        assert recorder.metrics["cxcalc/failures/cxcalc_no_result"] == pytest.approx(
-            3.0
-        )
+        assert recorder.metrics["oracle/cxcalc/queried"] == pytest.approx(4.0)
+        assert recorder.metrics["oracle/cxcalc/succeeded"] == pytest.approx(1.0)
+        assert recorder.metrics["oracle/cxcalc/success_rate"] == pytest.approx(0.25)
+        assert recorder.metrics[
+            "oracle/cxcalc/failures/cxcalc_no_result"
+        ] == pytest.approx(3.0)
 
     def test_no_logger_is_not_an_error(self, oracle: CxcalcOracle) -> None:
         """Metrics are optional; an unbound logger must not raise."""
@@ -724,7 +725,8 @@ class _RecordingLogger(Logger):
         """Ignore configuration."""
 
     def log_metric(self, key: str, value: Any) -> None:
-        """Record one metric."""
+        """Record one metric, rejecting keys the real loggers would reject."""
+        validate_log_key(key)
         self.metrics[key] = value
 
     def log_figure(self, key: str, figure: Any) -> None:
