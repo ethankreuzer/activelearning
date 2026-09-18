@@ -110,5 +110,5 @@ logger:
 run_writer:
   type: JSONLinesRunWriter
   output_dir: outputs/ampc/s3gfn_minimol_ampc_variational_single_fidelity/seed_${runtime.seed}
-  write_samples: false  # Enable this if you want to save the sampled molecules from the sampler.
+  write_samples: true  # Enable this if you want to save the sampled molecules from the sampler.
   write_config: true
