@@ -66,7 +66,7 @@ sampler:
   generation_batch_size: 128  # Adjust depending on VRAM availability
   n_train_steps: 2500
   num_warmup_steps: 10
-  beta: 1.0
+  beta: 100
   aux_coefficient: 0.001
   sa_threshold: 4.0
 
@@ -79,7 +79,7 @@ oracle:
   indock_template: /home/ethankrz/dock_smiles/ampc_dockfiles/INDOCK
   dockfiles_dir: /home/ethankrz/dock_smiles/ampc_dockfiles
   fidelity_costs:
-    1: 32.0
+    1: 1.0
   fidelity_confidences:
     1: 1.0
   # null sizes the docking thread pool from the CPUs this job holds.
@@ -92,10 +92,10 @@ oracle:
   pki_threshold: 6.5
 
 budget:
-  available_budget: 3200000.0 # 3.2M = 100k docking evals
+  available_budget: 100000.0 # 100k = 100k docking evals
   schedule:
     type: constant
-    value: 320000.0 # 320k = 10k docking evals per iteration
+    value: 10000.0 # 10k = 10k docking evals per iteration
 
 logger:
   type: MultiLogger
