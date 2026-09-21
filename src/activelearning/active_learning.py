@@ -200,6 +200,10 @@ def active_learning(
                     round_budget=round_budget,
                 )
             )
+        # Keep the selector's per-candidate scores for this round's record so the
+        # run writer can persist them and diagnostics can summarize them.
+        score_drain = getattr(selector, "drain_selection_scores", None)
+        selection_scores = score_drain() if callable(score_drain) else None
 
         # No candidates selected for this round; terminate to avoid stalling.
         if not selected_samples:
@@ -274,6 +278,7 @@ def active_learning(
             metrics=metrics,
             profiling=profiling,
             diagnostics={},
+            selection_scores=selection_scores,
         )
         with profile_operation(profiling, "diagnostics/total"):
             (

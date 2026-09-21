@@ -107,10 +107,15 @@ def collect_round_diagnostics(
             _merge_unique(metrics, component_metrics)
             _merge_unique(figures, component_figures)
 
+    # The loop drains the selector into the record; direct callers may not.
     score_drain = getattr(selector, "drain_selection_scores", None)
-    if callable(score_drain):
+    if record.selection_scores is not None or callable(score_drain):
         try:
-            selection_scores = score_drain()
+            selection_scores = (
+                record.selection_scores
+                if record.selection_scores is not None
+                else score_drain()  # type: ignore[misc]
+            )
             if enabled:
                 score_metrics, score_figures = selection_score_diagnostics(
                     selection_scores,

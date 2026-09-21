@@ -1,3 +1,4 @@
+import csv
 import pytest
 from itertools import count
 from unittest.mock import Mock
@@ -9,7 +10,11 @@ from activelearning.acquisition.dummy_acquisition import DummyAcquisition
 from activelearning.budget.budget import Budget
 from activelearning.dataset.list_dataset import ListDataset
 from activelearning.oracle.multi_fidelity_oracle import MultiFidelityOracle
-from activelearning.monitoring.run_writer import RoundRecord, RunWriter
+from activelearning.monitoring.run_writer import (
+    JSONLinesRunWriter,
+    RoundRecord,
+    RunWriter,
+)
 from activelearning.sampler.pool_score_sampler import PoolScoreSampler
 from activelearning.selector.score_selector import TopKAcquisitionSelector
 from activelearning.surrogate.botorch_surrogate import BoTorchGPSurrogate
@@ -54,6 +59,7 @@ class RecordingRunWriter(RunWriter):
                 "metrics": dict(record.metrics),
                 "profiling": dict(record.profiling),
                 "diagnostics": dict(record.diagnostics),
+                "selection_scores": record.selection_scores,
             }
         )
 
@@ -419,6 +425,78 @@ def test_active_learning_discards_selector_scores_when_diagnostics_disabled() ->
     assert recorded_round["metrics"]["active_learning/round"] == 1
     assert "profiling/round/total_s" in recorded_round["profiling"]
     assert selector.drain_selection_scores() is None
+
+
+def test_active_learning_records_selector_scores_on_the_round() -> None:
+    """The round record carries the pool scores even with diagnostics disabled."""
+    run_writer = RecordingRunWriter()
+    oracle = MultiFidelityOracle(
+        fidelity_configs={
+            0: {
+                "cost_per_sample": 1.0,
+                "score_fn": lambda value: float(value),
+                "fidelity_confidence": 1.0,
+            }
+        }
+    )
+
+    active_learning(
+        dataset=ListDataset(),
+        surrogate=DummyMeanSurrogate(),
+        acquisition=DummyAcquisition(),
+        sampler=PoolScoreSampler(
+            candidate_pool=[Candidate(1, fidelity=0), Candidate(2, fidelity=0)],
+            num_samples=2,
+        ),
+        selector=TopKAcquisitionSelector(num_samples=1),
+        oracle=oracle,
+        budget=Budget(available_budget=1.0, schedule=lambda _: 1.0),
+        run_writer=run_writer,
+        diagnostics_config=DiagnosticsConfig(enabled=False),
+    )
+
+    scores = run_writer.rounds[0]["selection_scores"]
+    assert scores is not None
+    assert len(scores.acquisition_scores) == len(
+        run_writer.rounds[0]["sampled_candidates"]
+    )
+    assert len(scores.selected_indices) == 1
+
+
+def test_active_learning_writes_scored_samples_next_to_score_figure(
+    tmp_path,
+) -> None:
+    """The JSON-lines writer puts the scored pool beside the score histogram."""
+    oracle = MultiFidelityOracle(
+        fidelity_configs={
+            0: {
+                "cost_per_sample": 1.0,
+                "score_fn": lambda value: float(value),
+                "fidelity_confidence": 1.0,
+            }
+        }
+    )
+
+    active_learning(
+        dataset=ListDataset(),
+        surrogate=DummyMeanSurrogate(),
+        acquisition=DummyAcquisition(),
+        sampler=PoolScoreSampler(
+            candidate_pool=[Candidate(1, fidelity=0), Candidate(2, fidelity=0)],
+            num_samples=2,
+        ),
+        selector=TopKAcquisitionSelector(num_samples=1),
+        oracle=oracle,
+        budget=Budget(available_budget=1.0, schedule=lambda _: 1.0),
+        run_writer=JSONLinesRunWriter(output_dir=tmp_path),
+    )
+
+    round_dir = tmp_path / "artifacts" / "acquisition" / "general" / "round_0001"
+    assert (round_dir / "score_distribution.png").exists()
+    with (round_dir / "scored_samples.csv").open(newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    assert len(rows) == 2
+    assert sum(row["selected"] == "True" for row in rows) == 1
 
 
 def test_active_learning_accepts_list_returning_selector_without_score_hook() -> None:

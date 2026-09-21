@@ -131,7 +131,17 @@ The run manifest stores initial observations once. Each line in
 - selected candidates and costs;
 - optional sampled candidates when `write_samples` is enabled;
 - `queried_observations` and `valid_observations`; and
-- figure paths under `artifacts`.
+- figure and scored-sample paths under `artifacts`.
+
+When `write_sample_scores` is enabled (the default), the writer also saves the
+round's whole sampled pool with the selector's scores to
+`artifacts/acquisition/general/round_NNNN/scored_samples.csv`, next to that
+round's `score_distribution.png`. It is written every round, even when
+`figure_interval` skips the figure. Columns are `sample_index`, `x` (e.g. the
+SMILES string), `fidelity`, `acquisition_score`, `ranking_score` (the value the
+selector ranked by, e.g. acquisition per unit cost), `selected`,
+`selection_rank` (0-based, blank if not selected) and `y` (the oracle value for
+selected candidates; `nan` if the evaluation failed, blank if not selected).
 
 The writer does not repeat the cumulative observation dataset in every round.
 Offline benchmark loaders reconstruct a checkpoint by starting with

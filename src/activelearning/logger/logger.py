@@ -229,12 +229,17 @@ class WandbLogger(Logger):
     def log_step(self, step: int) -> None:
         """Flush all buffered metrics and figures to wandb for this step.
 
+        The step is committed immediately. Without ``commit=True``, wandb
+        defaults to ``commit=False`` when ``step`` is given, so a step would
+        stay open until the next step (or the end of the run) and a round would
+        appear only after the following round finished.
+
         Parameters
         ----------
         step : int
             The current step or iteration number.
         """
-        self.run.log(self._buffer, step=step)
+        self.run.log(self._buffer, step=step, commit=True)
         self._buffer = {}
 
     def end(self) -> None:

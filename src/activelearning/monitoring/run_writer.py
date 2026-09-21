@@ -2,6 +2,7 @@
 
 import csv
 import json
+import logging
 import math
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass, is_dataclass
@@ -12,7 +13,13 @@ from matplotlib.figure import Figure
 from pydantic import BaseModel, Field
 
 from activelearning.monitoring.keys import validate_log_key
+from activelearning.selector.selector import SelectionScores
 from activelearning.utils.types import Candidate, Observation
+
+_logger = logging.getLogger(__name__)
+
+# Written next to the acquisition score-distribution figure of the same round.
+_SCORED_SAMPLES_KEY = "acquisition/general/scored_samples"
 
 
 @dataclass(frozen=True)
@@ -23,8 +30,9 @@ class RoundRecord:
     sampled and selected candidates, oracle results, and budget state. Its
     ``metrics``, ``profiling``, and ``diagnostics`` mappings contain core round
     values, operational timings, and optional diagnostic enrichment,
-    respectively. Raw selector and acquisition score arrays are temporary data
-    used to calculate round diagnostics; they are deliberately not persisted.
+    respectively. ``selection_scores`` holds the selector's per-candidate
+    acquisition and ranking scores for the sampled pool, when the selector
+    captured them; writers may persist them alongside the round.
     """
 
     round_index: int
@@ -42,6 +50,7 @@ class RoundRecord:
     metrics: Mapping[str, int | float]
     profiling: Mapping[str, float]
     diagnostics: Mapping[str, int | float]
+    selection_scores: SelectionScores | None = None
 
 
 class RunWriter(ABC):
@@ -83,7 +92,11 @@ class JSONLinesRunWriter(RunWriter):
 
     The output directory contains ``run_manifest.json``, ``round_history.jsonl``,
     ``run_summary.json``, and ``experiment_log.csv``. Diagnostic figures are
-    written below ``artifacts/`` using their monitoring namespaces.
+    written below ``artifacts/`` using their monitoring namespaces. When
+    ``write_sample_scores`` is set, each round's sampled pool is written with
+    its acquisition scores to
+    ``artifacts/acquisition/general/round_NNNN/scored_samples.csv``, next to that
+    round's score-distribution figure.
     """
 
     def __init__(
@@ -92,9 +105,11 @@ class JSONLinesRunWriter(RunWriter):
         write_samples: bool = True,
         write_config: bool = True,
         metadata: dict[str, Any] | None = None,
+        write_sample_scores: bool = True,
     ) -> None:
         self.output_dir = output_dir
         self.write_samples = write_samples
+        self.write_sample_scores = write_sample_scores
         self.write_config = write_config
         self.metadata = metadata or {}
         self._manifest: dict[str, Any] | None = None
@@ -138,6 +153,10 @@ class JSONLinesRunWriter(RunWriter):
             round_index=record.round_index,
             figures=figures or {},
         )
+        if self.write_sample_scores:
+            scored_samples_path = self._write_scored_samples(record)
+            if scored_samples_path is not None:
+                artifact_paths[_SCORED_SAMPLES_KEY] = scored_samples_path
         payload: dict[str, Any] = {
             "round_index": record.round_index,
             "selected_candidates": _jsonable(record.selected_candidates),
@@ -193,6 +212,88 @@ class JSONLinesRunWriter(RunWriter):
             figure.savefig(path, dpi=150, bbox_inches="tight")
             artifact_paths[key] = relative_path.as_posix()
         return artifact_paths
+
+    def _write_scored_samples(self, record: RoundRecord) -> str | None:
+        """Write the sampled pool with its selector scores as one CSV per round.
+
+        Parameters
+        ----------
+        record : RoundRecord
+            The completed round. Nothing is written when it carries no
+            ``selection_scores``.
+
+        Returns
+        -------
+        result : str | None
+            The CSV path relative to ``output_dir``, or ``None`` if nothing was
+            written.
+        """
+        scores = record.selection_scores
+        if scores is None:
+            return None
+        candidates = record.sampled_candidates
+        if len(scores.acquisition_scores) != len(candidates) or len(
+            scores.ranking_scores
+        ) != len(candidates):
+            _logger.warning(
+                "Not writing scored samples for round %d: %d acquisition scores "
+                "and %d ranking scores for %d sampled candidates.",
+                record.round_index,
+                len(scores.acquisition_scores),
+                len(scores.ranking_scores),
+                len(candidates),
+            )
+            return None
+
+        # Both selectors return candidates in selected_indices order, and the
+        # loop validates that oracle results match the selected candidates.
+        selection_ranks = {
+            index: rank for rank, index in enumerate(scores.selected_indices)
+        }
+        observed_targets: dict[int, Any] = {}
+        if len(record.queried_observations) == len(scores.selected_indices):
+            observed_targets = {
+                index: observation.y
+                for index, observation in zip(
+                    scores.selected_indices, record.queried_observations
+                )
+            }
+
+        relative_path = _artifact_relative_path(
+            _SCORED_SAMPLES_KEY, record.round_index, suffix=".csv"
+        )
+        path = self.output_dir / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(
+                [
+                    "sample_index",
+                    "x",
+                    "fidelity",
+                    "acquisition_score",
+                    "ranking_score",
+                    "selected",
+                    "selection_rank",
+                    "y",
+                ]
+            )
+            for index, candidate in enumerate(candidates):
+                rank = selection_ranks.get(index)
+                target = observed_targets.get(index)
+                writer.writerow(
+                    [
+                        index,
+                        _csv_value(candidate.x),
+                        "" if candidate.fidelity is None else candidate.fidelity,
+                        scores.acquisition_scores[index],
+                        scores.ranking_scores[index],
+                        rank is not None,
+                        "" if rank is None else rank,
+                        "" if target is None else _csv_value(target),
+                    ]
+                )
+        return relative_path.as_posix()
 
     def _append_experiment_row(
         self,
@@ -251,6 +352,7 @@ class JSONLinesRunWriterConfig(BaseModel):
     output_dir: Path
     write_samples: bool = True
     write_config: bool = True
+    write_sample_scores: bool = True
     metadata: dict[str, Any] = Field(default_factory=dict)
 
     def build(self, metadata: dict[str, Any] | None = None) -> RunWriter:
@@ -272,6 +374,7 @@ class JSONLinesRunWriterConfig(BaseModel):
             write_samples=self.write_samples,
             write_config=self.write_config,
             metadata=_deep_merge(self.metadata, metadata or {}),
+            write_sample_scores=self.write_sample_scores,
         )
 
 
@@ -280,14 +383,26 @@ RunWriterConfig = JSONLinesRunWriterConfig
 
 def _figure_relative_path(key: str, round_index: int) -> Path:
     """Return the local artifact path for a stable diagnostic figure key."""
+    return _artifact_relative_path(key, round_index, suffix=".png")
+
+
+def _artifact_relative_path(key: str, round_index: int, *, suffix: str) -> Path:
+    """Return the local path for a round artifact keyed by a monitoring namespace."""
     segments = key.split("/")
     if len(segments) < 2 or any(
         not _is_safe_path_segment(segment) for segment in segments
     ):
         raise ValueError(f"Invalid diagnostic figure key: {key!r}")
     return Path("artifacts", *segments[:-1], f"round_{round_index:04d}") / (
-        f"{segments[-1]}.png"
+        f"{segments[-1]}{suffix}"
     )
+
+
+def _csv_value(value: Any) -> Any:
+    """Return a CSV cell for a candidate input or target of any type."""
+    if isinstance(value, (str, int, float, bool)):
+        return value
+    return json.dumps(_jsonable(value))
 
 
 def _is_safe_path_segment(segment: str) -> bool:

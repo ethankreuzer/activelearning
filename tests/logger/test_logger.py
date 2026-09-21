@@ -196,6 +196,7 @@ class TestWandbLogger:
                 "surrogate/general/accuracy": 0.9,
             },
             step=3,
+            commit=True,
         )
 
     def test_log_step_clears_buffer(self, logger):
@@ -204,7 +205,7 @@ class TestWandbLogger:
         wandb_logger.log_step(1)
         mock_run.log.reset_mock()
         wandb_logger.log_step(2)
-        mock_run.log.assert_called_once_with({}, step=2)
+        mock_run.log.assert_called_once_with({}, step=2, commit=True)
 
     def test_log_figure_buffers_image(self, logger):
         wandb_logger, mock, mock_run = logger

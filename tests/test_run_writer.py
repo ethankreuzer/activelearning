@@ -13,6 +13,7 @@ from activelearning.monitoring.run_writer import (
     RoundRecord,
     _resolve_method,
 )
+from activelearning.selector.selector import SelectionScores
 from activelearning.utils.types import Candidate, Observation
 
 
@@ -439,3 +440,104 @@ def test_run_writer_rejects_unqualified_diagnostic_keys(tmp_path) -> None:
 
     with pytest.raises(ValueError, match="component-qualified namespace"):
         run_writer.record_round(replace(record, diagnostics={"loss": 0.5}))
+
+
+def _scored_round_record(selection_scores: SelectionScores | None) -> RoundRecord:
+    """Build a round whose pool of four SMILES selected indices 2 then 0."""
+    record = _round_record(
+        round_index=3,
+        sampled_candidates=[
+            Candidate("CCO", fidelity=1),
+            Candidate("CCN", fidelity=1),
+            Candidate("c1ccccc1", fidelity=1),
+            Candidate("CC(=O)O", fidelity=1),
+        ],
+        selected_candidates=[
+            Candidate("c1ccccc1", fidelity=1),
+            Candidate("CCO", fidelity=1),
+        ],
+        selected_costs=[1.0, 1.0],
+        observations=[
+            Observation(x="c1ccccc1", y=0.5, fidelity=1),
+            Observation(x="CCO", y=float("nan"), fidelity=1),
+        ],
+        cumulative_cost=2.0,
+        remaining_budget=0.0,
+    )
+    return replace(record, selection_scores=selection_scores)
+
+
+_SCORES = SelectionScores(
+    acquisition_scores=(0.2, 0.0, 0.9, 0.1),
+    ranking_scores=(0.2, 0.0, 0.9, 0.1),
+    selected_indices=(2, 0),
+)
+_SCORED_SAMPLES_PATH = "artifacts/acquisition/general/round_0003/scored_samples.csv"
+
+
+def test_run_writer_writes_scored_samples_beside_score_figure(tmp_path) -> None:
+    """Every pooled molecule is written with its scores and oracle result."""
+    run_writer = JSONLinesRunWriter(output_dir=tmp_path)
+    run_writer.start_run({})
+
+    run_writer.record_round(_scored_round_record(_SCORES))
+
+    with (tmp_path / _SCORED_SAMPLES_PATH).open(newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    assert [row["x"] for row in rows] == ["CCO", "CCN", "c1ccccc1", "CC(=O)O"]
+    assert [float(row["acquisition_score"]) for row in rows] == [0.2, 0.0, 0.9, 0.1]
+    assert [row["selected"] for row in rows] == ["True", "False", "True", "False"]
+    assert [row["selection_rank"] for row in rows] == ["1", "", "0", ""]
+    assert rows[2]["y"] == "0.5"
+    assert math.isnan(float(rows[0]["y"]))
+    assert rows[1]["y"] == rows[3]["y"] == ""
+    assert {row["fidelity"] for row in rows} == {"1"}
+
+    round_payload = json.loads(
+        (tmp_path / "round_history.jsonl").read_text(encoding="utf-8")
+    )
+    assert (
+        round_payload["artifacts"]["acquisition/general/scored_samples"]
+        == _SCORED_SAMPLES_PATH
+    )
+
+
+@pytest.mark.parametrize(
+    ("write_sample_scores", "selection_scores"),
+    [(False, _SCORES), (True, None)],
+    ids=["disabled", "no-scores"],
+)
+def test_run_writer_skips_scored_samples(
+    tmp_path,
+    write_sample_scores: bool,
+    selection_scores: SelectionScores | None,
+) -> None:
+    """No CSV is written when disabled or when the round carries no scores."""
+    run_writer = JSONLinesRunWriter(
+        output_dir=tmp_path,
+        write_sample_scores=write_sample_scores,
+    )
+    run_writer.start_run({})
+
+    run_writer.record_round(_scored_round_record(selection_scores))
+
+    assert not (tmp_path / _SCORED_SAMPLES_PATH).exists()
+    round_payload = json.loads(
+        (tmp_path / "round_history.jsonl").read_text(encoding="utf-8")
+    )
+    assert "acquisition/general/scored_samples" not in round_payload["artifacts"]
+
+
+def test_run_writer_skips_scored_samples_with_mismatched_scores(tmp_path) -> None:
+    """Scores that do not cover the whole pool are not written."""
+    run_writer = JSONLinesRunWriter(output_dir=tmp_path)
+    run_writer.start_run({})
+    short_scores = SelectionScores(
+        acquisition_scores=(0.2,),
+        ranking_scores=(0.2,),
+        selected_indices=(0,),
+    )
+
+    run_writer.record_round(_scored_round_record(short_scores))
+
+    assert not (tmp_path / _SCORED_SAMPLES_PATH).exists()
