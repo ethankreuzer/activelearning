@@ -1401,3 +1401,107 @@ class TestMultiFidelityAcquisitionIntegration:
         scores_min = acq_min.score(mf_cands)
 
         assert scores_max != scores_min
+
+
+# ===================================================================
+# Single-fidelity max-value entropy acquisitions
+# ===================================================================
+
+
+class TestSingleFidelityMaxValueEntropy:
+    """Integration tests for the single-fidelity MES and GIBBON wrappers."""
+
+    @staticmethod
+    def _build(acq_class: type, **kwargs: Any) -> Any:
+        if acq_class.__name__ == "QMaxValueEntropy":
+            kwargs.setdefault("num_fantasies", 2)
+            kwargs.setdefault("num_y_samples", 16)
+        kwargs.setdefault("num_mv_samples", 5)
+        return acq_class(candidate_set_spec=TrainDataCandidateSetSpec(), **kwargs)
+
+    @pytest.fixture(params=["QMaxValueEntropy", "QLowerBoundMaxValueEntropy"])
+    def acq_class(self, request: pytest.FixtureRequest) -> type:
+        from activelearning.acquisition.botorch import botorch_entropy
+
+        return getattr(botorch_entropy, request.param)
+
+    def test_scores_single_fidelity(
+        self,
+        acq_class: type,
+        fitted_surrogate: BoTorchGPSurrogate,
+        single_fidelity_observations: list[Observation],
+        candidates: list[Candidate],
+    ) -> None:
+        acq = self._build(acq_class)
+        acq.update(fitted_surrogate, single_fidelity_observations)
+
+        scores = acq.score(candidates)
+
+        assert len(scores) == len(candidates)
+        assert all(math.isfinite(s) and s >= 0.0 for s in scores)
+
+    def test_is_not_multi_fidelity(self, acq_class: type) -> None:
+        assert acq_class._supports_multi_fidelity is False
+
+    def test_warns_with_multi_fidelity_surrogate(
+        self,
+        acq_class: type,
+        fitted_mf_surrogate: BoTorchGPSurrogate,
+        multi_fidelity_observations: list[Observation],
+    ) -> None:
+        acq = self._build(acq_class)
+        with pytest.warns(UserWarning, match="not a multi-fidelity acquisition"):
+            acq.update(fitted_mf_surrogate, multi_fidelity_observations)
+
+    def test_clamps_negative_information_gain_estimates(self, acq_class: type) -> None:
+        acq = self._build(acq_class)
+        acq._botorch_acqf = lambda X: torch.tensor(
+            [-1.0e-12, -0.5, 0.25], dtype=X.dtype, device=X.device
+        )
+
+        scores = acq._score_encoded(torch.zeros(3, 1, 1, dtype=torch.float64))
+
+        assert scores == [0.0, 0.0, 0.25]
+
+    def test_num_mv_samples_must_be_positive(self, acq_class: type) -> None:
+        with pytest.raises(ValueError, match="num_mv_samples must be > 0"):
+            self._build(acq_class, num_mv_samples=0)
+
+    @pytest.mark.parametrize("name", ["num_fantasies", "num_y_samples"])
+    def test_qmes_sample_counts_must_be_positive(self, name: str) -> None:
+        from activelearning.acquisition.botorch.botorch_entropy import (
+            QMaxValueEntropy,
+        )
+
+        with pytest.raises(ValueError, match=f"{name} must be > 0"):
+            QMaxValueEntropy(
+                candidate_set_spec=TrainDataCandidateSetSpec(), **{name: 0}
+            )
+
+    def test_retries_with_sticky_fallback(
+        self,
+        acq_class: type,
+        fitted_surrogate: BoTorchGPSurrogate,
+        single_fidelity_observations: list[Observation],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """An out-of-memory full support activates one sticky bounded retry."""
+        spec = TrainDataCandidateSetSpec(fallback_size=2)
+        spec.update(single_fidelity_observations)
+        acq = acq_class(candidate_set_spec=spec)
+        acq._botorch_surrogate = fitted_surrogate
+        full_build = MagicMock(side_effect=torch.OutOfMemoryError("CUDA out of memory"))
+        fallback_build = MagicMock(return_value=torch.zeros(2, 2))
+        monkeypatch.setattr(spec, "build", full_build)
+        monkeypatch.setattr(spec, "build_fallback", fallback_build)
+        monkeypatch.setattr(
+            acq,
+            "_construct_botorch_acquisition",
+            MagicMock(return_value="fallback-acquisition"),
+        )
+
+        with pytest.warns(UserWarning, match="MES candidate support failed"):
+            assert acq._build_botorch_acquisition() == "fallback-acquisition"
+        assert acq._build_botorch_acquisition() == "fallback-acquisition"
+        assert full_build.call_count == 1
+        assert fallback_build.call_count == 2

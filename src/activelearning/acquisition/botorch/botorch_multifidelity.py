@@ -7,8 +7,7 @@ projection and other shared helpers from the base class into the BoTorch
 object.
 """
 
-import warnings
-from typing import Any, Callable, ClassVar, Iterable, Optional
+from typing import Any, Callable, ClassVar, Optional
 
 import torch
 from botorch.acquisition.cost_aware import InverseCostWeightedUtility
@@ -26,26 +25,19 @@ from botorch.models.cost import FixedCostModel
 from activelearning.acquisition.botorch.botorch_acquisition import (
     QBatchBoTorchAcquisition,
 )
-from activelearning.acquisition.botorch.candidate_set import (
-    CandidateSetSpec,
-    TrainDataCandidateSetSpec,
-)
-from activelearning.runtime import RuntimeContext
-from activelearning.surrogate.surrogate import Surrogate
-from activelearning.utils.types import Observation
+from activelearning.acquisition.botorch.botorch_entropy import _MaxValueEntropyBase
+from activelearning.acquisition.botorch.candidate_set import CandidateSetSpec
 
 
-class _QMultiFidelityEntropyBase(QBatchBoTorchAcquisition):
+class _QMultiFidelityEntropyBase(_MaxValueEntropyBase):
     """Shared base for multi-fidelity max-value entropy acquisition functions.
 
-    Implements the common constructor, ``update()``, and
-    ``_build_botorch_acquisition()`` shared by
+    Adds the multi-fidelity parts to :class:`_MaxValueEntropyBase`: fantasy
+    and outcome sample counts, trace-observation expansion, target-fidelity
+    projection and the cost-aware utility. Shared by
     :class:`QMultiFidelityMaxValueEntropy` and
     :class:`QMultiFidelityLowerBoundMaxValueEntropy`. Subclasses set
     ``_botorch_acqf_class`` to select the underlying BoTorch implementation.
-    Information gain is theoretically non-negative. Scores are clamped to zero
-    because finite-sample and floating-point error can produce negative
-    estimates, and downstream weighted samplers require non-negative weights.
 
     This class is not intended to be instantiated directly.
 
@@ -69,6 +61,7 @@ class _QMultiFidelityEntropyBase(QBatchBoTorchAcquisition):
 
     _botorch_acqf_class: ClassVar[type[AcquisitionFunction]]
     _supports_multi_fidelity: ClassVar[bool] = True
+    _display_name: ClassVar[str] = "MF-MES"
 
     def __init__(
         self,
@@ -87,96 +80,14 @@ class _QMultiFidelityEntropyBase(QBatchBoTorchAcquisition):
         if num_y_samples <= 0:
             raise ValueError(f"num_y_samples must be > 0, got {num_y_samples}")
 
-        super().__init__(**kwargs)
-        self._candidate_set_spec = candidate_set_spec
+        super().__init__(
+            candidate_set_spec=candidate_set_spec,
+            num_mv_samples=num_mv_samples,
+            **kwargs,
+        )
         self._num_fantasies = num_fantasies
-        self._num_mv_samples = num_mv_samples
         self._num_y_samples = num_y_samples
         self._expand = expand
-        self._fallback_active = False
-
-    def bind_runtime_context(self, runtime_context: RuntimeContext) -> None:
-        """Bind runtime context to this acquisition and its candidate set spec."""
-        super().bind_runtime_context(runtime_context)
-        self._candidate_set_spec.bind_runtime_context(runtime_context)
-
-    def update(
-        self,
-        surrogate: Surrogate,
-        observations: Optional[Iterable[Observation]] = None,
-    ) -> None:
-        """Update the candidate set spec with current observations, then update the base.
-
-        The candidate set (used to approximate the max-value distribution) is
-        refreshed each round from the latest observations before the BoTorch
-        acquisition object is rebuilt.
-
-        Parameters
-        ----------
-        surrogate : Surrogate
-            The fitted surrogate model for the current round.
-        observations : Iterable[Observation], optional
-            Current observations forwarded to the candidate set spec and base.
-        """
-        if observations is not None:
-            obs_list = list(observations)
-            self._candidate_set_spec.update(obs_list)
-            super().update(surrogate, obs_list)
-        else:
-            super().update(surrogate, observations)
-
-    def _build_botorch_acquisition(self) -> Any:
-        if self._botorch_surrogate is None:
-            raise RuntimeError(
-                f"{self.__class__.__name__} not updated with surrogate before building acquisition."
-            )
-
-        if self._fallback_active:
-            candidate_set = self._build_fallback_candidate_set()
-            return self._construct_botorch_acquisition(candidate_set)
-
-        candidate_set: torch.Tensor | None = None
-        retry_info: tuple[str, str, int] | None = None
-        try:
-            candidate_set = self._candidate_set_spec.build(
-                self._botorch_surrogate,
-                target_fidelity_value=self._resolved_target_fidelity_value,
-            )
-            return self._construct_botorch_acquisition(candidate_set)
-        except (torch.OutOfMemoryError, MemoryError, RuntimeError, ValueError) as error:
-            if not self._is_retryable_error(error):
-                raise
-            if not isinstance(self._candidate_set_spec, TrainDataCandidateSetSpec):
-                raise
-
-            original_support_size = (
-                candidate_set.shape[0]
-                if candidate_set is not None
-                else self._candidate_set_spec.observation_count
-            )
-            retry_info = (
-                type(error).__name__,
-                str(error),
-                original_support_size,
-            )
-            del candidate_set
-
-        if retry_info is None:
-            raise RuntimeError("MF-MES candidate support retry state was not set.")
-        error_type, error_message, original_support_size = retry_info
-        self._fallback_active = True
-        if self._botorch_surrogate.device.type == "cuda":
-            torch.cuda.empty_cache()
-        warnings.warn(
-            "MF-MES candidate support failed with "
-            f"{error_type}: {error_message}. Retrying with "
-            f"full support size {original_support_size} using "
-            f"{self._candidate_set_spec.fallback_size} deterministic "
-            "fidelity/target-stratified observations.",
-            UserWarning,
-            stacklevel=2,
-        )
-        return self._construct_botorch_acquisition(self._build_fallback_candidate_set())
 
     def _construct_botorch_acquisition(
         self,
@@ -213,40 +124,6 @@ class _QMultiFidelityEntropyBase(QBatchBoTorchAcquisition):
             build_kwargs["expand"] = self._expand
 
         return self._botorch_acqf_class(**build_kwargs)
-
-    def _build_fallback_candidate_set(self) -> torch.Tensor:
-        """Build the bounded support after full-support recovery activates."""
-        if not isinstance(self._candidate_set_spec, TrainDataCandidateSetSpec):
-            raise RuntimeError("MF-MES fallback requires a train-data candidate set.")
-        assert self._botorch_surrogate is not None
-        return self._candidate_set_spec.build_fallback(
-            self._botorch_surrogate,
-            maximize=self.maximize,
-            target_fidelity_value=self._resolved_target_fidelity_value,
-        )
-
-    @staticmethod
-    def _is_retryable_error(error: Exception) -> bool:
-        """Return whether an MF-MES construction error has a supported retry."""
-        return (
-            isinstance(error, (torch.OutOfMemoryError, MemoryError))
-            or (
-                isinstance(error, ValueError)
-                and "f(a) and f(b) must have different signs" in str(error)
-            )
-            or (
-                isinstance(error, RuntimeError)
-                and (
-                    "DefaultCPUAllocator: can't allocate memory" in str(error)
-                    or "DefaultCPUAllocator: not enough memory" in str(error)
-                )
-            )
-        )
-
-    def _score_encoded(self, X: torch.Tensor) -> list[float]:
-        """Evaluate information gain and clamp negative estimates to zero."""
-        scores = super()._score_encoded(X)
-        return [max(0.0, score) for score in scores]
 
 
 class QMultiFidelityMaxValueEntropy(_QMultiFidelityEntropyBase):

@@ -322,6 +322,14 @@ def test_train_data_candidate_set_config_parses_fallback_settings() -> None:
         ("LogProbabilityOfImprovement", {}),
         ("PosteriorMean", {}),
         (
+            "QMaxValueEntropy",
+            {"candidate_set_spec": {"type": "TrainDataCandidateSetSpec"}},
+        ),
+        (
+            "QLowerBoundMaxValueEntropy",
+            {"candidate_set_spec": {"type": "TrainDataCandidateSetSpec"}},
+        ),
+        (
             "QMultiFidelityMaxValueEntropy",
             {"candidate_set_spec": {"type": "TrainDataCandidateSetSpec"}},
         ),

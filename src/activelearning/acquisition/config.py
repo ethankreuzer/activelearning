@@ -24,6 +24,10 @@ from activelearning.acquisition.botorch.botorch_analytic import (
     ProbabilityOfImprovement,
     UpperConfidenceBound,
 )
+from activelearning.acquisition.botorch.botorch_entropy import (
+    QLowerBoundMaxValueEntropy,
+    QMaxValueEntropy,
+)
 from activelearning.acquisition.botorch.botorch_multifidelity import (
     QMultiFidelityKnowledgeGradient,
     QMultiFidelityLowerBoundMaxValueEntropy,
@@ -165,6 +169,40 @@ class PosteriorMeanConfig(_BoTorchAcquisitionConfig):
         )
 
 
+class QMaxValueEntropyConfig(_BoTorchAcquisitionConfig):
+    type: Literal["QMaxValueEntropy"] = "QMaxValueEntropy"
+    candidate_set_spec: CandidateSetSpecConfig
+    num_fantasies: int = Field(default=16, gt=0)
+    num_mv_samples: int = Field(default=10, gt=0)
+    num_y_samples: int = Field(default=128, gt=0)
+    maximize: bool = True
+
+    def build(self) -> Acquisition:
+        return QMaxValueEntropy(
+            candidate_set_spec=self.candidate_set_spec.build(),  # type: ignore[arg-type]
+            num_fantasies=self.num_fantasies,
+            num_mv_samples=self.num_mv_samples,
+            num_y_samples=self.num_y_samples,
+            maximize=self.maximize,
+            score_chunk_size=self.score_chunk_size,
+        )
+
+
+class QLowerBoundMaxValueEntropyConfig(_BoTorchAcquisitionConfig):
+    type: Literal["QLowerBoundMaxValueEntropy"] = "QLowerBoundMaxValueEntropy"
+    candidate_set_spec: CandidateSetSpecConfig
+    num_mv_samples: int = Field(default=10, gt=0)
+    maximize: bool = True
+
+    def build(self) -> Acquisition:
+        return QLowerBoundMaxValueEntropy(
+            candidate_set_spec=self.candidate_set_spec.build(),  # type: ignore[arg-type]
+            num_mv_samples=self.num_mv_samples,
+            maximize=self.maximize,
+            score_chunk_size=self.score_chunk_size,
+        )
+
+
 class QMultiFidelityMaxValueEntropyConfig(_BoTorchAcquisitionConfig):
     type: Literal["QMultiFidelityMaxValueEntropy"] = "QMultiFidelityMaxValueEntropy"
     candidate_set_spec: CandidateSetSpecConfig
@@ -235,6 +273,8 @@ AcquisitionConfig = Annotated[
         ProbabilityOfImprovementConfig,
         LogProbabilityOfImprovementConfig,
         PosteriorMeanConfig,
+        QMaxValueEntropyConfig,
+        QLowerBoundMaxValueEntropyConfig,
         QMultiFidelityMaxValueEntropyConfig,
         QMultiFidelityLowerBoundMaxValueEntropyConfig,
         QMultiFidelityKnowledgeGradientConfig,
