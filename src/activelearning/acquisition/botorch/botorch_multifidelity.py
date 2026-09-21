@@ -55,6 +55,11 @@ class _QMultiFidelityEntropyBase(_MaxValueEntropyBase):
     expand : callable, optional
         Optional callable to expand q-batches with trace observations,
         used for multi-fidelity information gain calculations.
+    use_cost_aware_utility : bool, default=True
+        Whether to keep BoTorch's built-in cost utility, which divides
+        information gain by ``fixed_cost + fidelity`` read from the last
+        input dimension. Set to ``False`` when the selector already divides
+        by oracle cost (e.g. ``CostAwareSelector``) so cost is applied once.
     **kwargs
         Forwarded to :class:`QBatchBoTorchAcquisition`.
     """
@@ -71,6 +76,7 @@ class _QMultiFidelityEntropyBase(_MaxValueEntropyBase):
         num_mv_samples: int = 10,
         num_y_samples: int = 128,
         expand: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+        use_cost_aware_utility: bool = True,
         **kwargs: Any,
     ) -> None:
         if num_fantasies <= 0:
@@ -88,6 +94,7 @@ class _QMultiFidelityEntropyBase(_MaxValueEntropyBase):
         self._num_fantasies = num_fantasies
         self._num_y_samples = num_y_samples
         self._expand = expand
+        self._use_cost_aware_utility = use_cost_aware_utility
 
     def _construct_botorch_acquisition(
         self,
@@ -103,11 +110,15 @@ class _QMultiFidelityEntropyBase(_MaxValueEntropyBase):
             "maximize": self.maximize,
         }
 
-        if not self._botorch_surrogate.is_multi_fidelity:
+        if (
+            not self._botorch_surrogate.is_multi_fidelity
+            or not self._use_cost_aware_utility
+        ):
             # BoTorch's MF-MES default cost model assumes the last input
             # dimension is a positive fidelity parameter. In single-fidelity
             # mode, the last dimension is an arbitrary model feature and may
-            # be non-positive.
+            # be non-positive. When the caller opts out, cost is applied
+            # elsewhere (e.g. by the selector), so use a unit cost here.
             build_kwargs["cost_aware_utility"] = InverseCostWeightedUtility(
                 cost_model=FixedCostModel(
                     fixed_cost=torch.ones(
@@ -153,6 +164,9 @@ class QMultiFidelityMaxValueEntropy(_QMultiFidelityEntropyBase):
         Number of outcome samples per max-value sample.
     expand : callable, optional
         Optional callable to expand q-batches with trace observations.
+    use_cost_aware_utility : bool, default=True
+        Whether to keep BoTorch's built-in fidelity cost utility. See
+        :class:`_QMultiFidelityEntropyBase`.
     **kwargs
         Forwarded to :class:`QBatchBoTorchAcquisition`.
     """
@@ -187,6 +201,9 @@ class QMultiFidelityLowerBoundMaxValueEntropy(_QMultiFidelityEntropyBase):
         Number of outcome samples per max-value sample.
     expand : callable, optional
         Optional callable to expand q-batches with trace observations.
+    use_cost_aware_utility : bool, default=True
+        Whether to keep BoTorch's built-in fidelity cost utility. See
+        :class:`_QMultiFidelityEntropyBase`.
     **kwargs
         Forwarded to :class:`QBatchBoTorchAcquisition`.
     """

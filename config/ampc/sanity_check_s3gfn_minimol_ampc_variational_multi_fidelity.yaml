@@ -44,6 +44,10 @@ acquisition:
   num_mv_samples: 10
   num_y_samples: 64
   maximize: true
+  # CostAwareSelector already divides by oracle cost (0.2 vs 32). BoTorch's
+  # built-in utility would also divide by 0.01 + fidelity confidence, which
+  # compounds to ~520:1 in favour of fidelity 0, so apply cost only once.
+  use_cost_aware_utility: false
 
 sampler:
   type: S3GFNSampler

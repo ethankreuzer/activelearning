@@ -1284,6 +1284,33 @@ class TestMultiFidelityAcquisitionIntegration:
 
         assert scores == [0.0, 0.0, 0.25]
 
+    @pytest.mark.parametrize("use_cost_aware_utility", [True, False])
+    def test_qmflbmes_cost_aware_utility_opt_out(
+        self,
+        fitted_mf_surrogate: BoTorchGPSurrogate,
+        multi_fidelity_observations: list[Observation],
+        train_data_spec: TrainDataCandidateSetSpec,
+        use_cost_aware_utility: bool,
+    ) -> None:
+        """Opting out replaces BoTorch's fidelity cost with a unit cost."""
+        from botorch.models.cost import FixedCostModel
+
+        from activelearning.acquisition.botorch.botorch_multifidelity import (
+            QMultiFidelityLowerBoundMaxValueEntropy,
+        )
+
+        acq = QMultiFidelityLowerBoundMaxValueEntropy(
+            candidate_set_spec=train_data_spec,
+            num_fantasies=2,
+            num_mv_samples=5,
+            num_y_samples=16,
+            use_cost_aware_utility=use_cost_aware_utility,
+        )
+        acq.update(fitted_mf_surrogate, multi_fidelity_observations)
+
+        cost_model = acq._botorch_acqf.cost_aware_utility.cost_model
+        assert isinstance(cost_model, FixedCostModel) is not use_cost_aware_utility
+
     def test_qmflbmes_scores_single_fidelity(
         self,
         fitted_surrogate: BoTorchGPSurrogate,

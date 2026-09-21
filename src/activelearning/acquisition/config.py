@@ -211,6 +211,7 @@ class QMultiFidelityMaxValueEntropyConfig(_BoTorchAcquisitionConfig):
     num_y_samples: int = Field(default=128, gt=0)
     maximize: bool = True
     target_fidelity_value: Optional[float] = None
+    use_cost_aware_utility: bool = True
 
     def build(self) -> Acquisition:
         return QMultiFidelityMaxValueEntropy(
@@ -220,6 +221,7 @@ class QMultiFidelityMaxValueEntropyConfig(_BoTorchAcquisitionConfig):
             num_y_samples=self.num_y_samples,
             maximize=self.maximize,
             target_fidelity_value=self.target_fidelity_value,
+            use_cost_aware_utility=self.use_cost_aware_utility,
             score_chunk_size=self.score_chunk_size,
         )
 
@@ -234,6 +236,7 @@ class QMultiFidelityLowerBoundMaxValueEntropyConfig(_BoTorchAcquisitionConfig):
     num_y_samples: int = Field(default=128, gt=0)
     maximize: bool = True
     target_fidelity_value: Optional[float] = None
+    use_cost_aware_utility: bool = True
 
     def build(self) -> Acquisition:
         return QMultiFidelityLowerBoundMaxValueEntropy(
@@ -243,6 +246,7 @@ class QMultiFidelityLowerBoundMaxValueEntropyConfig(_BoTorchAcquisitionConfig):
             num_y_samples=self.num_y_samples,
             maximize=self.maximize,
             target_fidelity_value=self.target_fidelity_value,
+            use_cost_aware_utility=self.use_cost_aware_utility,
             score_chunk_size=self.score_chunk_size,
         )
 
