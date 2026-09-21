@@ -105,8 +105,8 @@ oracle:
       num_workers: 1
     - type: SlurmDock3Oracle
       mol_repr: smiles
-      indock_template: /home/ethankrz/dock_smiles/ampc_dockfiles/INDOCK
-      dockfiles_dir: /home/ethankrz/dock_smiles/ampc_dockfiles
+      indock_template: /project/rrg-mailhoto/share/ampc_chemstep_dockfiles/dockfiles/INDOCK
+      dockfiles_dir: /project/rrg-mailhoto/share/ampc_chemstep_dockfiles/dockfiles/
       fidelity_costs:
         1: 32.0
       fidelity_confidences:
@@ -115,10 +115,10 @@ oracle:
       num_workers: 64
       num_array_tasks: 16
       max_parallel_tasks: 16
-      shared_work_dir: /scratch/YOUR_USERNAME/activelearning/dock3_queries
+      shared_work_dir: /scratch/ethankrz/activelearning/dock3_queries
       poll_interval: 5.0
       sbatch_args:
-        - --account=YOUR_CPU_ACCOUNT
+        - --account=rrg-mailhoto_cpu
         - --nodes=1
         - --ntasks=1
         - --exclusive

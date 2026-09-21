@@ -105,10 +105,13 @@ logger:
       run_name: molecules-s3gfn-minimol-ampc-fixed-feature-variational-gp
     - type: WandbLogger
       project_name: ampc_sanity_check
-      run_name: molecules-s3gfn-minimol-ampc-fixed-feature-variational-gp
+      run_name: molecules-s3gfn-minimol-ampc-fixed-feature-variational-gp-10M-single-fidelity-10-rounds-first-fix
 
 run_writer:
   type: JSONLinesRunWriter
   output_dir: outputs/ampc/s3gfn_minimol_ampc_variational_single_fidelity/seed_${runtime.seed}
   write_samples: true  # Enable this if you want to save the sampled molecules from the sampler.
+  # Per-round CSV of every sampled molecule with its acquisition score, next to
+  # artifacts/acquisition/general/round_NNNN/score_distribution.png.
+  write_sample_scores: true
   write_config: true

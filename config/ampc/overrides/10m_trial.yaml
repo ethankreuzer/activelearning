@@ -1,0 +1,26 @@
+# Overlay for a short survival trial of the full 10M config. Merge it after the
+# base config:
+#   activelearning config/ampc/s3gfn_minimol_ampc_variational_multi_fidelity.yaml \
+#                  config/ampc/overrides/10m_trial.yaml
+#
+# Lists are replaced on merge, so this drops the base config's CometLogger: it
+# opens an online comet_ml.Experiment, which a compute node with no internet
+# and no COMET_API_KEY cannot start.
+
+logger:
+  type: MultiLogger
+  loggers:
+    - type: ConsoleLogger
+      project_name: ampc_10m_trial
+      run_name: molecules-s3gfn-minimol-ampc-fixed-feature-variational-gp-10m
+    - type: WandbLogger
+      project_name: ampc_10m_trial
+      run_name: molecules-s3gfn-minimol-ampc-fixed-feature-variational-gp-10m
+
+# The base config shares its output_dir with the sanity-check run, and starting
+# a run truncates round_history.jsonl there. Write this trial elsewhere.
+run_writer:
+  type: JSONLinesRunWriter
+  output_dir: outputs/ampc/10m_trial/seed_${runtime.seed}
+  write_samples: false
+  write_config: true

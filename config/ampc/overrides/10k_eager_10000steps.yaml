@@ -1,0 +1,61 @@
+# Overlay for a short S3-GFN experiment: a 10k initial dataset, 10000 GFlowNet
+# training steps per round, the S3-GFN performance optimizations switched off,
+# single-fidelity GIBBON (lower-bound MES) as the acquisition, and 1 round of active learning.
+# Merge it after the single-fidelity base config:
+#   activelearning config/ampc/s3gfn_minimol_ampc_variational_single_fidelity.yaml \
+#                  config/ampc/overrides/10k_eager_10000steps.yaml
+
+dataset:
+  initial_data:
+    path: data/10k_unif_random_subset.csv
+
+surrogate:
+  encoder:
+    # The base config's persistent cache is a 10M-row file bound to the 10M CSV's
+    # exact row order. A 10k run never matches its prefix, so it would only fall
+    # back to live encoding, and if that file were ever deleted this run would
+    # write a 10k-row cache into its path and silently break the 10M run. Live
+    # encoding of ~10-20k molecules is cheap, so run without a persistent cache.
+    feature_cache_path: null
+
+sampler:
+  # "eager" is the opt-out for the S3-GFN optimizations: it disables
+  # torch.compile, the attention-mask adapter and the compiled prior scorer, and
+  # runs the model in float32 instead of bfloat16.
+  performance_mode: eager
+  n_train_steps: 10000  # base config: 2500
+
+acquisition:
+  # Single-fidelity lower-bound MES (GIBBON) instead of the base config's
+  # multi-fidelity lower-bound MES. The candidate set, num_mv_samples,
+  # score_chunk_size and maximize are inherited from the base config; its
+  # num_fantasies and num_y_samples are ignored, since GIBBON uses neither.
+  type: QLowerBoundMaxValueEntropy
+
+budget:
+  # available_budget and the constant 10k/round schedule are inherited; this
+  # stops the loop after 1 query round (the initial dataset is not a round).
+  max_rounds: 1
+
+# Lists are replaced on merge, so the loggers are restated in full.
+logger:
+  type: MultiLogger
+  loggers:
+    - type: ConsoleLogger
+      project_name: ampc_sanity_check
+      run_name: molecules-s3gfn-minimol-ampc-fixed-feature-variational-gp-10k-init-eager-10000steps-gibbon
+    - type: WandbLogger
+      project_name: ampc_sanity_check
+      run_name: molecules-s3gfn-minimol-ampc-fixed-feature-variational-gp-10k-init-eager-10000steps-gibbon-1-round
+
+# The base config's output_dir belongs to the 10M single-fidelity run, and
+# starting a run truncates round_history.jsonl there. Write this run elsewhere,
+# and apart from the earlier 10k run that used the lower-bound MF-MES.
+run_writer:
+  type: JSONLinesRunWriter
+  output_dir: outputs/ampc/10k_eager_10000steps_gibbon/seed_${runtime.seed}
+  write_samples: true
+  # Per-round CSV of every sampled molecule with its acquisition score, next to
+  # artifacts/acquisition/general/round_NNNN/score_distribution.png.
+  write_sample_scores: true
+  write_config: true

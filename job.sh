@@ -5,13 +5,13 @@
 # unless the whole node (all 4 GPUs) is requested, and this code uses one GPU.
 #SBATCH --mem=510000M
 # Survival trial: does one round of the full 10M config get through encoding and
-# the GP fit? Estimated encoding alone is ~3-7 h per round, so 3 h would likely
-# stop mid-encoding and prove nothing either way.
-#SBATCH --time=6:00:00
-#SBATCH --job-name=ampc_10m_trial
+# the GP fit? Estimated encoding alone is ~3-7 h per round, and the first run
+# also pays for building the persistent feature cache, so allow headroom.
+#SBATCH --time=60:00:00
+#SBATCH --job-name=ampc_10m_sf
 #SBATCH --account=def-yvesbrun_gpu
-#SBATCH --output=slurm_logs/ampc_10m_trial_%j.out
-#SBATCH --error=slurm_logs/ampc_10m_trial_%j.err
+#SBATCH --output=slurm_logs/ampc_10m_sf_%j.out
+#SBATCH --error=slurm_logs/ampc_10m_sf_%j.err
 cd /home/ethankrz/activelearning
 
 source .venv/bin/activate
@@ -36,8 +36,7 @@ export HF_HUB_OFFLINE=1
 # SIGTERM by default, which would discard the entire buffered wandb run, so go
 # through the wrapper that turns SIGTERM into a clean interpreter shutdown.
 #
-# The overlay drops the CometLogger (no internet on compute nodes) and moves the
-# run outputs away from the sanity-check run's directory.
+# The single-fidelity config has no CometLogger and its own output_dir, so it
+# needs no overlay.
 uv run --no-sync python scripts/run_with_sigterm_flush.py \
-  config/ampc/s3gfn_minimol_ampc_variational_multi_fidelity.yaml \
-  config/ampc/overrides/10m_trial.yaml
+  config/ampc/s3gfn_minimol_ampc_variational_single_fidelity.yaml
