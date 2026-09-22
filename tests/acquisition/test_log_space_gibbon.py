@@ -332,3 +332,176 @@ def test_config_option(config_class: type) -> None:
     assert config_class.model_validate(base).build()._log_space is False
     built = config_class.model_validate({**base, "log_space": True}).build()
     assert built._log_space is True
+
+
+# --------------------------------------------------------------------------- #
+# log_output: scores are log information gains
+# --------------------------------------------------------------------------- #
+from activelearning.acquisition.botorch.log_space_gibbon import (  # noqa: E402
+    LogOutputQLowerBoundMaxValueEntropy,
+    LogOutputQMultiFidelityLowerBoundMaxValueEntropy,
+    log_information_gain,
+)
+
+
+def _exact_log(gamma: np.ndarray, rho2: float) -> np.ndarray:
+    """High-precision ``log(-0.5 * log(1 - rho2 * r * (gamma + r)))``, valid far below 1e-308."""
+    mpmath.mp.dps = 80
+    out = []
+    for g in gamma:
+        g = mpmath.mpf(float(g))
+        r = mpmath.npdf(g) / mpmath.ncdf(g)
+        out.append(float(mpmath.log(-mpmath.log1p(-mpmath.mpf(rho2) * r * (g + r)) / 2)))
+    return np.array(out)
+
+
+@pytest.mark.parametrize("rho2", RHO2_VALUES)
+def test_log_output_matches_high_precision_reference(rho2: float) -> None:
+    gamma = np.round(np.arange(-8.0, 60.0 + 1e-9, 0.25), 6)
+    g = torch.tensor(gamma, dtype=torch.float64)
+    ours = log_information_gain(g, torch.full_like(g, math.log(rho2))).numpy()
+    assert np.isfinite(ours).all()
+    np.testing.assert_allclose(ours, _exact_log(gamma, rho2), rtol=0, atol=1e-6)
+    # exp(log output) equals the log-space value wherever that is representable.
+    value = log_space_information_gain(g, torch.full_like(g, math.log(rho2))).numpy()
+    ok = value > 1e-300
+    np.testing.assert_allclose(np.exp(ours[ok]), value[ok], rtol=1e-10)
+
+
+def test_log_output_gradients_are_finite() -> None:
+    gamma = torch.linspace(-10.0, 60.0, 281, dtype=torch.float64, requires_grad=True)
+    (grad,) = torch.autograd.grad(log_information_gain(gamma, torch.zeros_like(gamma)).sum(), gamma)
+    assert torch.isfinite(grad).all()
+    # d log(IG) / d gamma -> -gamma for large gamma.
+    assert grad[-1].item() == pytest.approx(-60.0, rel=0.05)
+
+
+def test_log_output_is_finite_beyond_float64(gp: SingleTaskGP) -> None:
+    """gamma ~ 50 gives IG ~ 1e-540: 0 even for log-space fp64, finite and exact in log output."""
+    candidate_set = torch.rand(30, 2, dtype=torch.float64)
+    X = torch.rand(15, 1, 2, dtype=torch.float64)
+    value = LogSpaceQLowerBoundMaxValueEntropy(gp, candidate_set, num_mv_samples=2)
+    log_out = LogOutputQLowerBoundMaxValueEntropy(gp, candidate_set, num_mv_samples=2)
+    with torch.no_grad():
+        post = gp.posterior(X.unsqueeze(-3))
+        mu, var = post.mean.reshape(-1), post.variance.reshape(-1)
+        var_noisy = gp.posterior(X, observation_noise=True).variance.reshape(-1)
+        mstar = (mu + 50.0 * var.sqrt()).max().repeat(2).reshape(2, 1)
+        value.posterior_max_values = mstar
+        log_out.posterior_max_values = mstar
+        v = value(X).numpy()
+        lo = log_out(X).numpy()
+    gamma = ((mstar.reshape(1, -1) - mu.reshape(-1, 1)) / var.sqrt().reshape(-1, 1)).numpy()
+    rho2 = (var / var_noisy).numpy()
+    assert gamma.min() > 37 and (v == 0).all()
+    # Both samples share m*, so logmeanexp over identical samples is just the sample.
+    expected = np.array([_exact_log(gamma[i, :1], float(rho2[i]))[0] for i in range(len(rho2))])
+    assert np.isfinite(lo).all()
+    np.testing.assert_allclose(lo, expected, rtol=0, atol=1e-6)
+
+
+def test_log_output_rejects_pending_points(gp: SingleTaskGP) -> None:
+    acqf = LogOutputQLowerBoundMaxValueEntropy(
+        gp, torch.rand(20, 2, dtype=torch.float64), X_pending=torch.rand(2, 2, dtype=torch.float64)
+    )
+    with pytest.raises(NotImplementedError, match="q = 1"):
+        acqf(torch.rand(3, 1, 2, dtype=torch.float64))
+
+
+def test_sf_wrapper_log_output_is_log_of_log_space(
+    sf_observations: list[Observation], candidates: list[Candidate]
+) -> None:
+    surrogate = _sf_surrogate(sf_observations)
+    value = QLowerBoundMaxValueEntropy(candidate_set_spec=TrainDataCandidateSetSpec(), log_space=True)
+    log_out = QLowerBoundMaxValueEntropy(candidate_set_spec=TrainDataCandidateSetSpec(), log_output=True)
+    s_value = np.array(_score(value, surrogate, sf_observations, candidates))
+    s_log = np.array(_score(log_out, surrogate, sf_observations, candidates))
+    assert type(log_out._botorch_acqf) is LogOutputQLowerBoundMaxValueEntropy
+    assert value.score_scale == "value" and log_out.score_scale == "log"
+    assert (s_log < 0).all()  # unclamped: log of a gain below 1
+    np.testing.assert_allclose(np.exp(s_log), s_value, rtol=1e-10)
+
+
+def test_mf_wrapper_log_output_includes_log_cost(
+    mf_observations: list[Observation], candidates: list[Candidate]
+) -> None:
+    surrogate = _mf_surrogate(mf_observations)
+    cands = candidates + [Candidate(x=c.x, fidelity=0) for c in candidates]
+    kwargs = dict(candidate_set_spec=TrainDataCandidateSetSpec(), num_fantasies=2, num_y_samples=8)
+    value = QMultiFidelityLowerBoundMaxValueEntropy(**kwargs, log_space=True)
+    log_out = QMultiFidelityLowerBoundMaxValueEntropy(**kwargs, log_output=True)
+    s_value = np.array(_score(value, surrogate, mf_observations, cands))
+    s_log = np.array(_score(log_out, surrogate, mf_observations, cands))
+    assert type(log_out._botorch_acqf) is LogOutputQMultiFidelityLowerBoundMaxValueEntropy
+    assert log_out._botorch_acqf.cost_aware_utility._log
+    # log(IG / cost) = log IG - log cost, with BoTorch's default affine cost.
+    np.testing.assert_allclose(np.exp(s_log), s_value, rtol=1e-10)
+
+
+def test_log_output_config_option() -> None:
+    base = {"candidate_set_spec": {"type": "TrainDataCandidateSetSpec"}}
+    for config_class in (QLowerBoundMaxValueEntropyConfig, QMultiFidelityLowerBoundMaxValueEntropyConfig):
+        assert config_class.model_validate(base).build().score_scale == "value"
+        built = config_class.model_validate({**base, "log_output": True}).build()
+        assert built.score_scale == "log" and built._log_space is True
+
+
+def test_default_acquisition_score_scale_is_value() -> None:
+    from activelearning.acquisition.botorch.botorch_entropy import QMaxValueEntropy
+
+    assert QMaxValueEntropy(candidate_set_spec=TrainDataCandidateSetSpec()).score_scale == "value"
+
+
+# --------------------------------------------------------------------------- #
+# Consumers
+# --------------------------------------------------------------------------- #
+class _FixedScores:
+    """Acquisition stub returning preset scores."""
+
+    supports_singleton_scoring = True
+
+    def __init__(self, scores: list[float], scale: str) -> None:
+        self._scores = scores
+        self.score_scale = scale
+
+    def score(self, candidates: Any, cost_weighting: Any = None) -> list[float]:
+        scores = list(self._scores)
+        return scores if cost_weighting is None else cost_weighting(scores, list(candidates))
+
+
+def test_selectors_pick_the_same_candidates_from_log_scores_with_unit_cost() -> None:
+    from activelearning.selector.cost_aware_selector import CostAwareSelector
+    from activelearning.selector.score_selector import TopKAcquisitionSelector
+
+    rng = np.random.default_rng(0)
+    values = np.exp(-rng.uniform(0, 200, size=50))  # spans ~1e-87 .. 1
+    cands = [Candidate(x=[float(i)]) for i in range(50)]
+    unit = lambda cs: [1.0] * len(cs)  # noqa: E731
+    value_acq, log_acq = _FixedScores(values.tolist(), "value"), _FixedScores(np.log(values).tolist(), "log")
+    by_value = CostAwareSelector()(cands, acquisition=value_acq, cost_fn=unit, round_budget=10)
+    by_log = CostAwareSelector()(cands, acquisition=log_acq, cost_fn=unit, round_budget=10)
+    assert by_value == by_log
+    top = TopKAcquisitionSelector(num_samples=10)
+    assert top(cands, acquisition=value_acq, cost_fn=unit) == top(cands, acquisition=log_acq, cost_fn=unit)
+
+
+def test_config_guard_rejects_value_scale_samplers() -> None:
+    from pathlib import Path
+
+    from activelearning.config import ActiveLearningConfig
+    from activelearning.utils.config_loader import load_config, parse_config
+
+    root = Path(__file__).resolve().parents[2] / "config"
+
+    def parse(paths: list[str], overrides: list[str]) -> Any:
+        return parse_config(load_config([root / p for p in paths], overrides), ActiveLearningConfig)
+
+    with pytest.raises(ValueError, match="GFlowNetGridSampler"):
+        parse(["branin/gflownet_single_fidelity.yaml"], ["acquisition.log_output=true"])
+    with pytest.raises(ValueError, match="ExactGridSampler"):
+        parse(["branin_benchmark/base.yaml", "branin_benchmark/sf_high_fid.yaml"], ["acquisition.log_output=true"])
+    parsed = parse(
+        ["ampc/s3gfn_minimol_ampc_variational_single_fidelity.yaml"],
+        ["acquisition.type=QLowerBoundMaxValueEntropy", "acquisition.log_output=true"],
+    )
+    assert parsed.acquisition.log_output is True

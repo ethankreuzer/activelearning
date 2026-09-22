@@ -19,6 +19,7 @@ import logging
 import math
 import random
 import time
+import warnings
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Literal, Sequence
 
@@ -70,6 +71,10 @@ class _PreparedMoleculeBatch:
     reward_scores: Tensor
     synthesizable: tuple[bool, ...]
     fidelity_indices: Tensor | None = None
+
+
+# Warn above this beta when the acquisition reports log-scale scores.
+_LOG_SCORE_BETA_WARNING = 10.0
 
 
 class S3GFNSampler(S3GFNLoggingMixin, Sampler):
@@ -499,6 +504,19 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
             raise ValueError(
                 f"{type(acquisition).__name__} does not support singleton scoring. "
                 "S3GFNSampler requires an acquisition with score()."
+            )
+        if (
+            getattr(acquisition, "score_scale", "value") == "log"
+            and self.beta > _LOG_SCORE_BETA_WARNING
+        ):
+            warnings.warn(
+                f"{type(acquisition).__name__} returns log-scale scores, so the RTB "
+                f"target log R = beta * score gives R proportional to "
+                f"acquisition**beta with beta={self.beta:g}. Such a large exponent "
+                "concentrates the reward on very few molecules; beta around 1 "
+                "(R proportional to the acquisition) is recommended.",
+                UserWarning,
+                stacklevel=2,
             )
 
     def _create_replay_buffers(

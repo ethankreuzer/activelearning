@@ -7,7 +7,7 @@ projection and other shared helpers from the base class into the BoTorch
 object.
 """
 
-from typing import Any, Callable, ClassVar, Optional
+from typing import Any, Callable, ClassVar, Literal, Optional
 
 import torch
 from botorch.acquisition.cost_aware import InverseCostWeightedUtility
@@ -20,7 +20,7 @@ from botorch.acquisition.max_value_entropy_search import (
     qMultiFidelityMaxValueEntropy as _qMFMES,
 )
 from botorch.acquisition.objective import ScalarizedPosteriorTransform
-from botorch.models.cost import FixedCostModel
+from botorch.models.cost import AffineFidelityCostModel, FixedCostModel
 
 from activelearning.acquisition.botorch.botorch_acquisition import (
     QBatchBoTorchAcquisition,
@@ -28,6 +28,7 @@ from activelearning.acquisition.botorch.botorch_acquisition import (
 from activelearning.acquisition.botorch.botorch_entropy import _MaxValueEntropyBase
 from activelearning.acquisition.botorch.candidate_set import CandidateSetSpec
 from activelearning.acquisition.botorch.log_space_gibbon import (
+    LogOutputQMultiFidelityLowerBoundMaxValueEntropy,
     LogSpaceQMultiFidelityLowerBoundMaxValueEntropy,
 )
 
@@ -106,6 +107,7 @@ class _QMultiFidelityEntropyBase(_MaxValueEntropyBase):
             "maximize": self.maximize,
         }
 
+        log_utility = self.score_scale == "log"
         if not self._botorch_surrogate.is_multi_fidelity:
             # BoTorch's MF-MES default cost model assumes the last input
             # dimension is a positive fidelity parameter. In single-fidelity
@@ -118,7 +120,15 @@ class _QMultiFidelityEntropyBase(_MaxValueEntropyBase):
                         dtype=candidate_set.dtype,
                         device=candidate_set.device,
                     )
-                )
+                ),
+                log=log_utility,
+            )
+        elif log_utility:
+            # Log-scale information gain: subtract log(cost) instead of
+            # dividing. Same cost model as BoTorch's MF-MES default.
+            build_kwargs["cost_aware_utility"] = InverseCostWeightedUtility(
+                cost_model=AffineFidelityCostModel(fidelity_weights={-1: 1.0}),
+                log=True,
             )
 
         if self._resolved_project_to_target_fidelity_fn is not None:
@@ -196,17 +206,33 @@ class QMultiFidelityLowerBoundMaxValueEntropy(_QMultiFidelityEntropyBase):
         Scores keep BoTorch's scale, including the cost-aware utility, but no
         longer underflow to exactly zero when the max-value samples lie far
         above the posterior mean.
+    log_output : bool, default=False
+        If True, return the natural log of the (log-space) information gain
+        (:class:`~activelearning.acquisition.botorch.log_space_gibbon.LogOutputQMultiFidelityLowerBoundMaxValueEntropy`),
+        with the cost-aware utility applied in log space (``log IG - log cost``).
+        Scores are negative and never underflow; ``score_scale`` is ``"log"``.
+        Implies ``log_space``.
     **kwargs
         Forwarded to :class:`QBatchBoTorchAcquisition`.
     """
 
     _botorch_acqf_class = _qMFLBMES
 
-    def __init__(self, *, log_space: bool = False, **kwargs: Any) -> None:
+    def __init__(
+        self, *, log_space: bool = False, log_output: bool = False, **kwargs: Any
+    ) -> None:
         super().__init__(**kwargs)
-        self._log_space = log_space
-        if log_space:
+        self._log_space = log_space or log_output
+        self._log_output = log_output
+        if log_output:
+            self._botorch_acqf_class = LogOutputQMultiFidelityLowerBoundMaxValueEntropy
+        elif log_space:
             self._botorch_acqf_class = LogSpaceQMultiFidelityLowerBoundMaxValueEntropy
+
+    @property
+    def score_scale(self) -> Literal["value", "log"]:
+        """Return ``"log"`` when ``log_output`` is enabled."""
+        return "log" if self._log_output else "value"
 
 
 class QMultiFidelityKnowledgeGradient(QBatchBoTorchAcquisition):

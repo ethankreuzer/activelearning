@@ -13,7 +13,7 @@ same base.
 
 import warnings
 from abc import abstractmethod
-from typing import Any, ClassVar, Iterable, Optional
+from typing import Any, ClassVar, Iterable, Literal, Optional
 
 import torch
 from botorch.acquisition.max_value_entropy_search import (
@@ -29,6 +29,7 @@ from activelearning.acquisition.botorch.candidate_set import (
     TrainDataCandidateSetSpec,
 )
 from activelearning.acquisition.botorch.log_space_gibbon import (
+    LogOutputQLowerBoundMaxValueEntropy,
     LogSpaceQLowerBoundMaxValueEntropy,
 )
 from activelearning.runtime import RuntimeContext
@@ -209,8 +210,14 @@ class _MaxValueEntropyBase(QBatchBoTorchAcquisition):
         )
 
     def _score_encoded(self, X: torch.Tensor) -> list[float]:
-        """Evaluate information gain and clamp negative estimates to zero."""
+        """Evaluate information gain and clamp negative estimates to zero.
+
+        Log-scale scores are returned unclamped, since they are negative by
+        construction.
+        """
         scores = super()._score_encoded(X)
+        if self.score_scale == "log":
+            return scores
         return [max(0.0, score) for score in scores]
 
 
@@ -290,6 +297,11 @@ class QLowerBoundMaxValueEntropy(_MaxValueEntropyBase):
         (:class:`~activelearning.acquisition.botorch.log_space_gibbon.LogSpaceQLowerBoundMaxValueEntropy`).
         Scores keep BoTorch's scale but no longer underflow to exactly zero
         when the max-value samples lie far above the posterior mean.
+    log_output : bool, default=False
+        If True, return the natural log of the (log-space) information gain
+        (:class:`~activelearning.acquisition.botorch.log_space_gibbon.LogOutputQLowerBoundMaxValueEntropy`).
+        Scores are negative and never underflow; ``score_scale`` is ``"log"``.
+        Implies ``log_space``.
     **kwargs
         Forwarded to :class:`QBatchBoTorchAcquisition`.
     """
@@ -300,6 +312,7 @@ class QLowerBoundMaxValueEntropy(_MaxValueEntropyBase):
         candidate_set_spec: CandidateSetSpec,
         num_mv_samples: int = 10,
         log_space: bool = False,
+        log_output: bool = False,
         **kwargs: Any,
     ) -> None:
         super().__init__(
@@ -307,11 +320,22 @@ class QLowerBoundMaxValueEntropy(_MaxValueEntropyBase):
             num_mv_samples=num_mv_samples,
             **kwargs,
         )
-        self._log_space = log_space
+        self._log_space = log_space or log_output
+        self._log_output = log_output
+
+    @property
+    def score_scale(self) -> Literal["value", "log"]:
+        """Return ``"log"`` when ``log_output`` is enabled."""
+        return "log" if self._log_output else "value"
 
     def _construct_botorch_acquisition(self, candidate_set: torch.Tensor) -> Any:
         """Construct the BoTorch GIBBON object for a support tensor."""
-        acqf_class = LogSpaceQLowerBoundMaxValueEntropy if self._log_space else _qLBMES
+        if self._log_output:
+            acqf_class = LogOutputQLowerBoundMaxValueEntropy
+        elif self._log_space:
+            acqf_class = LogSpaceQLowerBoundMaxValueEntropy
+        else:
+            acqf_class = _qLBMES
         return acqf_class(
             model=self._botorch_surrogate.get_model(),  # type: ignore[union-attr]
             candidate_set=candidate_set,

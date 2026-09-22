@@ -1,5 +1,5 @@
 from abc import ABC
-from typing import Callable, Iterable, Optional
+from typing import Callable, Iterable, Literal, Optional
 
 from activelearning.runtime import ALRuntimeMixin
 from activelearning.surrogate.surrogate import Surrogate
@@ -197,3 +197,18 @@ class Acquisition(ABC, ALRuntimeMixin):
         return (
             getattr(self.score_batches, "__func__", None) != Acquisition.score_batches
         )
+
+    @property
+    def score_scale(self) -> Literal["value", "log"]:
+        """Return the scale of the scores this acquisition produces.
+
+        Informational: ``"log"`` means each score is the natural logarithm of
+        a positive utility (so scores can be negative). Components may use it
+        to warn about, or reject, settings that assume value-scale scores.
+
+        Returns
+        -------
+        result : {"value", "log"}
+            ``"value"`` unless a subclass reports log-scale scores.
+        """
+        return "value"

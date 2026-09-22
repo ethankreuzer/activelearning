@@ -530,3 +530,21 @@ def _validate_component_compatibility(
             f"{type(acquisition).__name__} requires a BoTorch-compatible "
             "surrogate, but DummyMeanSurrogateConfig is not one."
         )
+
+    if getattr(acquisition, "log_output", False):
+        sampler_type = getattr(sampler, "type", type(sampler).__name__)
+        if sampler_type in ("GFlowNetSampler", "GFlowNetGridSampler"):
+            raise ValueError(
+                f"acquisition.log_output=true produces negative log scores, but "
+                f"{sampler_type} shapes rewards from value-scale scores (its default "
+                "power reward clips them to reward_min), which would flatten the "
+                "reward. Use log_output=false with GFlowNet samplers."
+            )
+        if sampler_type == "ExactGridSampler" and getattr(
+            sampler, "use_acquisition_scores", False
+        ):
+            raise ValueError(
+                "acquisition.log_output=true produces negative log scores, but "
+                "ExactGridSampler with use_acquisition_scores=true samples in "
+                "proportion to non-negative scores."
+            )
