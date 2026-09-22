@@ -40,16 +40,20 @@ surrogate:
   standardize_outputs: true
 
 acquisition:
-  type: QMultiFidelityLowerBoundMaxValueEntropy
+  # Single-fidelity GIBBON (lower-bound MES). With ~10M candidates most BoTorch
+  # GIBBON values underflow to exactly 0 (see diagnostics/mes_gibbon). log_output
+  # returns log(information gain) instead, computed in log space so it never
+  # underflows; scores are therefore negative, and the S3-GFN beta below is set
+  # for log scores.
+  type: QLowerBoundMaxValueEntropy
   candidate_set_spec:
     type: TrainDataCandidateSetSpec
     fallback_size: 100000
     seed: 42
-  num_fantasies: 8
   num_mv_samples: 10
-  num_y_samples: 64
   score_chunk_size: 5000  # Bound candidate encoding and GP posterior memory.
   maximize: true
+  log_output: true
 
 sampler:
   type: S3GFNSampler
@@ -66,7 +70,9 @@ sampler:
   generation_batch_size: 128  # Adjust depending on VRAM availability
   n_train_steps: 2500
   num_warmup_steps: 10
-  beta: 100
+  # Acquisition scores are log information gains (see log_output flag above),
+  # so log R = beta * log(IG), gives R proportional to IG**beta;
+  beta: 1.0
   aux_coefficient: 0.001
   sa_threshold: 4.0
 

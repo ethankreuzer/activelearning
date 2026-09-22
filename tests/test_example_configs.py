@@ -473,7 +473,7 @@ def test_molecule_s3gfn_minimol_variational_multi_fidelity_config_parses() -> No
 def test_molecule_s3gfn_minimol_ampc_variational_single_fidelity_config_parses() -> (
     None
 ):
-    """Ensure the raw-score beta targets a tenfold reward ratio."""
+    """Ensure log-output GIBBON and a beta that keeps reward ratios equal to IG ratios."""
     config_path = (
         REPOSITORY_ROOT
         / "config"
@@ -485,8 +485,11 @@ def test_molecule_s3gfn_minimol_ampc_variational_single_fidelity_config_parses()
 
     assert config.sampler.fidelities == [1]
     assert config.sampler.model_dtype == "bfloat16"
-    assert config.sampler.beta == pytest.approx(2302.585093)
-    assert math.exp(config.sampler.beta * (0.002 - 0.001)) == pytest.approx(10.0)
+    assert config.acquisition.type == "QLowerBoundMaxValueEntropy"
+    assert config.acquisition.log_output is True
+    # Scores are log(IG): a tenfold IG ratio must give a tenfold reward ratio.
+    assert config.sampler.beta == pytest.approx(1.0)
+    assert math.exp(config.sampler.beta * (math.log(10.0) - 0.0)) == pytest.approx(10.0)
 
 
 @pytest.mark.parametrize(

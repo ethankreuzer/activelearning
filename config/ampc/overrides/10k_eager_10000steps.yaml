@@ -26,10 +26,10 @@ sampler:
   n_train_steps: 10000  # base config: 2500
 
 acquisition:
-  # Single-fidelity lower-bound MES (GIBBON) instead of the base config's
-  # multi-fidelity lower-bound MES. The candidate set, num_mv_samples,
-  # score_chunk_size and maximize are inherited from the base config; its
-  # num_fantasies and num_y_samples are ignored, since GIBBON uses neither.
+  # Single-fidelity lower-bound MES (GIBBON), the same class as the base config.
+  # The candidate set, num_mv_samples, score_chunk_size, maximize and
+  # log_output (log-scale scores, paired with the base config's sampler beta)
+  # are inherited from the base config.
   type: QLowerBoundMaxValueEntropy
 
 budget:
