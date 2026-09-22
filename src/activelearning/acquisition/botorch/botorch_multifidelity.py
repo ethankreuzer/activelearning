@@ -27,6 +27,9 @@ from activelearning.acquisition.botorch.botorch_acquisition import (
 )
 from activelearning.acquisition.botorch.botorch_entropy import _MaxValueEntropyBase
 from activelearning.acquisition.botorch.candidate_set import CandidateSetSpec
+from activelearning.acquisition.botorch.log_space_gibbon import (
+    LogSpaceQMultiFidelityLowerBoundMaxValueEntropy,
+)
 
 
 class _QMultiFidelityEntropyBase(_MaxValueEntropyBase):
@@ -187,11 +190,23 @@ class QMultiFidelityLowerBoundMaxValueEntropy(_QMultiFidelityEntropyBase):
         Number of outcome samples per max-value sample.
     expand : callable, optional
         Optional callable to expand q-batches with trace observations.
+    log_space : bool, default=False
+        If True, evaluate the information gain in log space
+        (:class:`~activelearning.acquisition.botorch.log_space_gibbon.LogSpaceQMultiFidelityLowerBoundMaxValueEntropy`).
+        Scores keep BoTorch's scale, including the cost-aware utility, but no
+        longer underflow to exactly zero when the max-value samples lie far
+        above the posterior mean.
     **kwargs
         Forwarded to :class:`QBatchBoTorchAcquisition`.
     """
 
     _botorch_acqf_class = _qMFLBMES
+
+    def __init__(self, *, log_space: bool = False, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._log_space = log_space
+        if log_space:
+            self._botorch_acqf_class = LogSpaceQMultiFidelityLowerBoundMaxValueEntropy
 
 
 class QMultiFidelityKnowledgeGradient(QBatchBoTorchAcquisition):

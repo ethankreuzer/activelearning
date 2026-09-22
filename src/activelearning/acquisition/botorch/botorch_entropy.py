@@ -28,6 +28,9 @@ from activelearning.acquisition.botorch.candidate_set import (
     CandidateSetSpec,
     TrainDataCandidateSetSpec,
 )
+from activelearning.acquisition.botorch.log_space_gibbon import (
+    LogSpaceQLowerBoundMaxValueEntropy,
+)
 from activelearning.runtime import RuntimeContext
 from activelearning.surrogate.surrogate import Surrogate
 from activelearning.utils.types import Observation
@@ -282,13 +285,34 @@ class QLowerBoundMaxValueEntropy(_MaxValueEntropyBase):
         to approximate the max-value distribution.
     num_mv_samples : int, default=10
         Number of max-value samples.
+    log_space : bool, default=False
+        If True, evaluate the information gain in log space
+        (:class:`~activelearning.acquisition.botorch.log_space_gibbon.LogSpaceQLowerBoundMaxValueEntropy`).
+        Scores keep BoTorch's scale but no longer underflow to exactly zero
+        when the max-value samples lie far above the posterior mean.
     **kwargs
         Forwarded to :class:`QBatchBoTorchAcquisition`.
     """
 
+    def __init__(
+        self,
+        *,
+        candidate_set_spec: CandidateSetSpec,
+        num_mv_samples: int = 10,
+        log_space: bool = False,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(
+            candidate_set_spec=candidate_set_spec,
+            num_mv_samples=num_mv_samples,
+            **kwargs,
+        )
+        self._log_space = log_space
+
     def _construct_botorch_acquisition(self, candidate_set: torch.Tensor) -> Any:
         """Construct the BoTorch GIBBON object for a support tensor."""
-        return _qLBMES(
+        acqf_class = LogSpaceQLowerBoundMaxValueEntropy if self._log_space else _qLBMES
+        return acqf_class(
             model=self._botorch_surrogate.get_model(),  # type: ignore[union-attr]
             candidate_set=candidate_set,
             num_mv_samples=self._num_mv_samples,

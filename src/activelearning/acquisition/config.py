@@ -193,12 +193,14 @@ class QLowerBoundMaxValueEntropyConfig(_BoTorchAcquisitionConfig):
     candidate_set_spec: CandidateSetSpecConfig
     num_mv_samples: int = Field(default=10, gt=0)
     maximize: bool = True
+    log_space: bool = False
 
     def build(self) -> Acquisition:
         return QLowerBoundMaxValueEntropy(
             candidate_set_spec=self.candidate_set_spec.build(),  # type: ignore[arg-type]
             num_mv_samples=self.num_mv_samples,
             maximize=self.maximize,
+            log_space=self.log_space,
             score_chunk_size=self.score_chunk_size,
         )
 
@@ -234,6 +236,7 @@ class QMultiFidelityLowerBoundMaxValueEntropyConfig(_BoTorchAcquisitionConfig):
     num_y_samples: int = Field(default=128, gt=0)
     maximize: bool = True
     target_fidelity_value: Optional[float] = None
+    log_space: bool = False
 
     def build(self) -> Acquisition:
         return QMultiFidelityLowerBoundMaxValueEntropy(
@@ -242,6 +245,7 @@ class QMultiFidelityLowerBoundMaxValueEntropyConfig(_BoTorchAcquisitionConfig):
             num_mv_samples=self.num_mv_samples,
             num_y_samples=self.num_y_samples,
             maximize=self.maximize,
+            log_space=self.log_space,
             target_fidelity_value=self.target_fidelity_value,
             score_chunk_size=self.score_chunk_size,
         )
