@@ -490,6 +490,12 @@ def test_molecule_s3gfn_minimol_ampc_variational_single_fidelity_config_parses()
     # Scores are log(IG): a tenfold IG ratio must give a tenfold reward ratio.
     assert config.sampler.beta == pytest.approx(1.0)
     assert math.exp(config.sampler.beta * (math.log(10.0) - 0.0)) == pytest.approx(10.0)
+    # GIBBON scores candidates by their posterior variance, so this run uses the
+    # objective that calibrates it better (Jankowiak et al., 2020).
+    assert (
+        config.surrogate.training_params.variational_objective
+        == "PredictiveLogLikelihood"
+    )
 
 
 @pytest.mark.parametrize(

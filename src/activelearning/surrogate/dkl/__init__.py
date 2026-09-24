@@ -5,6 +5,7 @@ from activelearning.surrogate.dkl.config import (
     DKLSurrogateConfigBase,
     ExactDKLSurrogateConfig,
     VariationalDKLSurrogateConfig,
+    VariationalDKLTrainingConfig,
 )
 from activelearning.surrogate.dkl.surrogate import DeepKernelSurrogate
 from activelearning.surrogate.dkl.kernel import EncoderKernel
@@ -20,4 +21,5 @@ __all__ = [
     "ExactDKLSurrogateConfig",
     "VariationalDKLSurrogate",
     "VariationalDKLSurrogateConfig",
+    "VariationalDKLTrainingConfig",
 ]

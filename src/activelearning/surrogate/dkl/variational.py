@@ -7,11 +7,15 @@ from typing import Any, Optional
 
 import gpytorch
 import torch
-from gpytorch.mlls import VariationalELBO
+from gpytorch.mlls import MarginalLogLikelihood
 from torch.optim import Adam
 
 from activelearning.surrogate.dkl.surrogate import DeepKernelSurrogate
 from activelearning.surrogate.encoder import LatentEncoder
+from activelearning.surrogate.objectives import (
+    build_variational_objective,
+    resolve_variational_objective,
+)
 from activelearning.surrogate.variational_gp import (
     _VariationalBoTorchAdapter,
     _VariationalGP,
@@ -25,7 +29,9 @@ class VariationalDKLSurrogate(DeepKernelSurrogate):
     The encoder and sparse GP are separate components:
 
     - Encoder and GP are **separate** components; encoding is explicit.
-    - Training minimises ``VariationalELBO + MLM loss`` via Adam (ELBO, not MLL).
+    - Training minimises ``variational objective + MLM loss`` via Adam. The objective is
+      ``VariationalELBO`` by default and ``PredictiveLogLikelihood`` when
+      ``training_params.variational_objective`` selects it (neither is an exact MLL).
     - GP operates in **latent feature space** (encoder output + optional fidelity).
     - Compatible with all BoTorch acquisition functions via
       :class:`_VariationalBoTorchAdapter`, including qMF-MES.
@@ -181,8 +187,13 @@ class VariationalDKLSurrogate(DeepKernelSurrogate):
             return (train_Y - self._y_mean) / self._y_std
         return train_Y
 
-    def _make_mll(self, num_data: int) -> VariationalELBO:
-        return VariationalELBO(self._likelihood, self._gp_model, num_data=num_data)
+    def _make_mll(self, num_data: int) -> MarginalLogLikelihood:
+        return build_variational_objective(
+            resolve_variational_objective(self._training),
+            self._likelihood,
+            self._gp_model,
+            num_data,
+        )
 
     def _gp_forward(self, model_X: torch.Tensor) -> Any:
         return self._gp_model(self._encode_with_fidelity(model_X))

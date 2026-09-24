@@ -34,6 +34,10 @@ from activelearning.surrogate.dkl.config import (
 )
 from activelearning.surrogate.dummy_mean_surrogate import DummyMeanSurrogate
 from activelearning.surrogate.encoder_config import FixedEncoderConfig
+from activelearning.surrogate.objectives import (
+    DEFAULT_VARIATIONAL_OBJECTIVE,
+    VariationalObjective,
+)
 from activelearning.surrogate.surrogate import Surrogate
 
 
@@ -262,11 +266,20 @@ class BoTorchGPSurrogateConfig(BaseModel):
 
 
 class VariationalGPTrainingConfig(BaseModel):
-    """Adam training settings for a fixed-feature variational GP."""
+    """Adam training settings for a fixed-feature variational GP.
+
+    Parameters
+    ----------
+    variational_objective : VariationalObjective
+        Objective maximized during fitting; see
+        :mod:`activelearning.surrogate.objectives` for how the choice affects the
+        posterior variance.
+    """
 
     epochs: int = Field(default=50, ge=1)
     lr: float = Field(default=1e-3, gt=0.0)
     batch_size: int | None = Field(default=None, ge=1)
+    variational_objective: VariationalObjective = DEFAULT_VARIATIONAL_OBJECTIVE
 
 
 class VariationalGPSurrogateConfig(BaseModel):

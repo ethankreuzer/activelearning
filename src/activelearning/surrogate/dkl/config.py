@@ -7,6 +7,10 @@ from typing import Any, Literal, Optional
 from pydantic import BaseModel, Field, PrivateAttr
 
 from activelearning.surrogate.encoder_config import EncoderConfig
+from activelearning.surrogate.objectives import (
+    DEFAULT_VARIATIONAL_OBJECTIVE,
+    VariationalObjective,
+)
 from activelearning.surrogate.surrogate import Surrogate
 
 
@@ -30,6 +34,23 @@ class DKLTrainingConfig(BaseModel):
     lr: float = 1e-3
     mask_ratio: float = 0.125
     pretrain_epochs: int = 0
+
+
+class VariationalDKLTrainingConfig(DKLTrainingConfig):
+    """DKL training settings plus the objective of the variational GP head.
+
+    Kept separate from :class:`DKLTrainingConfig` so the setting does not appear on
+    :class:`ExactDKLSurrogateConfig`, whose objective is an exact marginal log likelihood.
+
+    Parameters
+    ----------
+    variational_objective : VariationalObjective
+        Objective maximized during fitting; see
+        :mod:`activelearning.surrogate.objectives` for how the choice affects the
+        posterior variance.
+    """
+
+    variational_objective: VariationalObjective = DEFAULT_VARIATIONAL_OBJECTIVE
 
 
 class DKLSurrogateConfigBase(BaseModel):
@@ -145,6 +166,9 @@ class VariationalDKLSurrogateConfig(DKLSurrogateConfigBase):
 
     type: Literal["VariationalDKLSurrogate"] = "VariationalDKLSurrogate"
     num_inducing: int = 64
+    training_params: VariationalDKLTrainingConfig = Field(
+        default_factory=VariationalDKLTrainingConfig
+    )
 
     def _surrogate_class(self) -> type[Surrogate]:
         """Return the variational DKL surrogate class."""

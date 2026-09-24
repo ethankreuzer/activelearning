@@ -36,6 +36,14 @@ surrogate:
     epochs: 50  # Adjust based on convergence; 50 is a reasonable starting point.
     lr: 1.0e-3
     batch_size: 10000  # Keep encoded training features on CPU for large datasets.
+    # GIBBON below scores candidates by their posterior variance, so how well that
+    # variance is calibrated decides what gets picked. For a Gaussian likelihood the
+    # default VariationalELBO penalizes the variance directly (its per-point term is
+    # log N(y | mu, sigma^2) - s^2 / (2 sigma^2)), whereas PredictiveLogLikelihood folds
+    # it into the predictive distribution and "typically produces better predictive
+    # variances" (gpytorch; Jankowiak et al., 2020, https://arxiv.org/abs/1910.07123).
+    # It costs the same per step. See activelearning.surrogate.objectives.
+    variational_objective: PredictiveLogLikelihood
   num_inducing: 64  # Adjust based on dataset size and VRAM; 64 is a reasonable starting point.
   standardize_outputs: true
 

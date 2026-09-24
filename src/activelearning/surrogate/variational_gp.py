@@ -11,12 +11,15 @@ import gpytorch
 import torch
 from botorch.models.model import Model
 from botorch.posteriors.gpytorch import GPyTorchPosterior
-from gpytorch.mlls import VariationalELBO
 from torch.optim import Adam
 
 from activelearning.runtime import RuntimeContext
 from activelearning.surrogate.botorch_surrogate import BoTorchGPSurrogate
 from activelearning.surrogate.encoder import FixedEncoder
+from activelearning.surrogate.objectives import (
+    build_variational_objective,
+    resolve_variational_objective,
+)
 from activelearning.utils.types import Candidate, Observation
 
 
@@ -475,16 +478,17 @@ class VariationalGPSurrogate(BoTorchGPSurrogate):
         return (train_y - self._y_mean) / self._y_std
 
     def _train_variational_gp(self, num_data: int) -> None:
-        """Optimize the variational ELBO and learned inducing locations."""
+        """Optimize the configured variational objective and inducing locations."""
         assert self._gp_model is not None
         assert self._likelihood is not None
         assert self._train_X is not None
         assert self._model_train_Y is not None
 
-        objective = VariationalELBO(
+        objective = build_variational_objective(
+            resolve_variational_objective(self._training),
             self._likelihood,
             self._gp_model,
-            num_data=num_data,
+            num_data,
         )
         trainable_parameters = [
             parameter
