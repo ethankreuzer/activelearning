@@ -145,40 +145,23 @@ def collect_round_diagnostics(
             else:
                 _close_figures(score_figures.values())
 
-    for component_name, component in (
-        ("dataset", dataset),
-        ("surrogate", surrogate),
-        ("acquisition", acquisition),
-        ("sampler", sampler),
-        ("selector", selector),
-        ("oracle", oracle),
-        ("budget", budget),
-    ):
-        drain = getattr(component, "drain_round_diagnostics", None)
-        if not callable(drain):
-            continue
-        try:
-            component_metrics, component_figures = drain(
-                include_figures=enabled and include_figures,
-                max_points=max_points,
-            )
-        except Exception:
-            _logger.warning(
-                "Could not collect %s implementation diagnostics for round %d.",
-                component_name,
-                record.round_index,
-                exc_info=True,
-            )
-            if enabled:
-                metrics[f"diagnostics/failures/{component_name}"] = 1
-            continue
-        if enabled:
-            _validate_component_namespace(component_name, component_metrics)
-            _validate_component_namespace(component_name, component_figures)
-            _merge_unique(metrics, component_metrics)
-            _merge_unique(figures, component_figures)
-        else:
-            _close_figures(component_figures.values())
+    _drain_component_diagnostics(
+        _component_diagnostic_sources(
+            dataset=dataset,
+            surrogate=surrogate,
+            acquisition=acquisition,
+            sampler=sampler,
+            selector=selector,
+            oracle=oracle,
+            budget=budget,
+        ),
+        metrics=metrics,
+        figures=figures,
+        round_index=record.round_index,
+        enabled=enabled,
+        include_figures=include_figures,
+        max_points=max_points,
+    )
     return metrics, figures, updated_prequential_history
 
 
@@ -218,6 +201,150 @@ def record_completed_round(
             logger.log_step(record.round_index)
     finally:
         _close_figures(figures.values())
+
+
+def record_partial_round(
+    *,
+    logger: Logger | None,
+    round_index: int,
+    profiling: Mapping[str, float],
+    enabled: bool,
+    max_points: int,
+    dataset: Dataset,
+    surrogate: Surrogate,
+    acquisition: Acquisition,
+    sampler: Sampler,
+    selector: Selector,
+    oracle: Oracle,
+    budget: Budget,
+) -> None:
+    """Commit the telemetry of a round that failed before it completed.
+
+    The loop calls this while an exception unwinds, so a round that died partway
+    still reaches the logger instead of vanishing with the process. Only the
+    logger is written: a :class:`RoundRecord` describes a completed round, so the
+    run writer keeps its completed-round history intact. Figures are drained
+    regardless of the configured interval, because this is the round's last
+    chance to emit them, and nothing is committed when the round produced no
+    telemetry at all.
+
+    Monitoring must never replace the exception that is unwinding, so any failure
+    here is warned about and swallowed.
+    """
+    if logger is None:
+        return
+
+    figures: dict[str, Figure] = {}
+    try:
+        metrics: dict[str, int | float] = {}
+        _drain_component_diagnostics(
+            _component_diagnostic_sources(
+                dataset=dataset,
+                surrogate=surrogate,
+                acquisition=acquisition,
+                sampler=sampler,
+                selector=selector,
+                oracle=oracle,
+                budget=budget,
+            ),
+            metrics=metrics,
+            figures=figures,
+            round_index=round_index,
+            enabled=enabled,
+            include_figures=True,
+            max_points=max_points,
+        )
+        if not metrics and not figures and not profiling:
+            return
+
+        _validate_log_namespace(metrics)
+        _validate_log_namespace(profiling)
+        _validate_log_namespace(figures)
+        for key, figure in figures.items():
+            figure.set_label(key)
+
+        for key, value in metrics.items():
+            logger.log_metric(key, value)
+        for key, value in profiling.items():
+            logger.log_metric(key, value)
+        for key, figure in figures.items():
+            logger.log_figure(key, figure)
+        logger.log_metric("active_learning/round", round_index)
+        logger.log_metric("active_learning/partial", 1)
+        logger.log_step(round_index)
+    except Exception:
+        _logger.warning(
+            "Could not log the telemetry of failed round %d.",
+            round_index,
+            exc_info=True,
+        )
+    finally:
+        _close_figures(figures.values())
+
+
+def _component_diagnostic_sources(
+    *,
+    dataset: Dataset,
+    surrogate: Surrogate,
+    acquisition: Acquisition,
+    sampler: Sampler,
+    selector: Selector,
+    oracle: Oracle,
+    budget: Budget,
+) -> tuple[tuple[str, object], ...]:
+    """Pair every component with the namespace its diagnostics must use."""
+    return (
+        ("dataset", dataset),
+        ("surrogate", surrogate),
+        ("acquisition", acquisition),
+        ("sampler", sampler),
+        ("selector", selector),
+        ("oracle", oracle),
+        ("budget", budget),
+    )
+
+
+def _drain_component_diagnostics(
+    components: Sequence[tuple[str, object]],
+    *,
+    metrics: dict[str, int | float],
+    figures: dict[str, Figure],
+    round_index: int,
+    enabled: bool,
+    include_figures: bool,
+    max_points: int,
+) -> None:
+    """Drain implementation-specific diagnostics into the given payloads.
+
+    Every component is drained even when diagnostics are disabled, so pending
+    values cannot appear in a later round.
+    """
+    for component_name, component in components:
+        drain = getattr(component, "drain_round_diagnostics", None)
+        if not callable(drain):
+            continue
+        try:
+            component_metrics, component_figures = drain(
+                include_figures=enabled and include_figures,
+                max_points=max_points,
+            )
+        except Exception:
+            _logger.warning(
+                "Could not collect %s implementation diagnostics for round %d.",
+                component_name,
+                round_index,
+                exc_info=True,
+            )
+            if enabled:
+                metrics[f"diagnostics/failures/{component_name}"] = 1
+            continue
+        if enabled:
+            _validate_component_namespace(component_name, component_metrics)
+            _validate_component_namespace(component_name, component_figures)
+            _merge_unique(metrics, component_metrics)
+            _merge_unique(figures, component_figures)
+        else:
+            _close_figures(component_figures.values())
 
 
 def _merge_unique(target: dict[str, object], incoming: Mapping[str, object]) -> None:

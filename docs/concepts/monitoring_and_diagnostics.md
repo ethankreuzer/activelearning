@@ -213,6 +213,20 @@ failed diagnostic logs a warning and adds
 continues. Duplicate diagnostic keys and malformed namespaces are programming
 errors and raise.
 
+When a round raises, the loop commits whatever that round already produced to
+the logger before the exception propagates: implementation-specific drains, the
+timings of the phases that finished, and the markers `active_learning/round`
+and `active_learning/partial`. Figures are included regardless of
+`diagnostics.figure_interval`, because this is the round's last chance to emit
+them. The commit uses the failed round's index, so tracker steps stay strictly
+increasing. Both sinks are then finalized, so the run summary is written and
+the tracker session is closed. The run writer receives no record for the failed
+round, because a `RoundRecord` describes a completed round. A monitoring
+failure on this path is warned about and swallowed so it cannot replace the
+exception that ended the run. A `SIGKILL` bypasses all of this; reaching the
+Slurm wall clock does not, because `scripts/run_with_sigterm_flush.py` turns
+`SIGTERM` into a `KeyboardInterrupt`.
+
 Oracle result count, positional input identity when comparable, and fidelity
 are core contract checks. Violations raise before filtering or dataset
 mutation, because silently associating a label with the wrong candidate would

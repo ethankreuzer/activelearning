@@ -107,6 +107,25 @@ class DiagnosticPoolSampler(PoolScoreSampler):
         )
 
 
+class FailingQueryOracle(MultiFidelityOracle):
+    """Oracle that fails while querying, after sampling has already succeeded."""
+
+    def query(self, candidates: Sequence[Candidate]) -> Sequence[Observation]:
+        """Fail the way an unreachable docking backend does."""
+        raise RuntimeError("oracle unavailable")
+
+
+def _single_fidelity_oracle_config() -> dict:
+    """Return the one-fidelity configuration the crash tests share."""
+    return {
+        0: {
+            "cost_per_sample": 1.0,
+            "score_fn": lambda value: float(value),
+            "fidelity_confidence": 1.0,
+        }
+    }
+
+
 @pytest.fixture
 def dataset():
     """Create a dummy dataset for testing."""
@@ -389,6 +408,123 @@ def test_active_learning_fans_diagnostics_out_to_independent_sinks() -> None:
     assert sampler._figure is None
     assert sampler.created_figure is not None
     assert not plt.fignum_exists(sampler.created_figure.number)
+
+
+def _run_until_the_oracle_fails(
+    *,
+    runtime_logger: Mock,
+    run_writer: RunWriter,
+    sampler: DiagnosticPoolSampler,
+    diagnostics_config: DiagnosticsConfig = DiagnosticsConfig(),
+) -> None:
+    """Drive one round that reaches the oracle and dies there."""
+    with pytest.raises(RuntimeError, match="oracle unavailable"):
+        active_learning(
+            dataset=ListDataset(),
+            surrogate=DummyMeanSurrogate(),
+            acquisition=DummyAcquisition(),
+            sampler=sampler,
+            selector=TopKAcquisitionSelector(num_samples=1),
+            oracle=FailingQueryOracle(
+                fidelity_configs=_single_fidelity_oracle_config()
+            ),
+            budget=Budget(available_budget=1.0, schedule=lambda _: 1.0),
+            runtime_context=RuntimeContext(logger=runtime_logger),
+            run_writer=run_writer,
+            diagnostics_config=diagnostics_config,
+        )
+
+
+def test_active_learning_commits_the_telemetry_of_a_failed_round() -> None:
+    """A round dying in the oracle should still submit what sampling produced."""
+    runtime_logger = Mock()
+    run_writer = RecordingRunWriter()
+    sampler = DiagnosticPoolSampler(
+        candidate_pool=[Candidate(1, fidelity=0)],
+        num_samples=1,
+    )
+
+    _run_until_the_oracle_fails(
+        runtime_logger=runtime_logger,
+        run_writer=run_writer,
+        sampler=sampler,
+    )
+
+    logged_metrics = {
+        call.args[0]: call.args[1] for call in runtime_logger.log_metric.call_args_list
+    }
+    assert logged_metrics["sampler/test/generated"] == 1
+    assert logged_metrics["active_learning/round"] == 1
+    assert logged_metrics["active_learning/partial"] == 1
+    assert "profiling/sampler/sample_s" in logged_metrics
+    assert any(
+        call.args == ("sampler/test/trajectory", sampler.created_figure)
+        for call in runtime_logger.log_figure.call_args_list
+    )
+    runtime_logger.log_step.assert_called_once_with(1)
+    assert not plt.fignum_exists(sampler.created_figure.number)
+    # The round never completed, so only the logger hears about it.
+    assert run_writer.rounds == []
+
+
+def test_active_learning_finalizes_both_sinks_when_a_round_fails() -> None:
+    """The run summary and the logger handle should close on the failure path."""
+    runtime_logger = Mock()
+    run_writer = RecordingRunWriter()
+
+    _run_until_the_oracle_fails(
+        runtime_logger=runtime_logger,
+        run_writer=run_writer,
+        sampler=DiagnosticPoolSampler(
+            candidate_pool=[Candidate(1, fidelity=0)],
+            num_samples=1,
+        ),
+    )
+
+    runtime_logger.end.assert_called_once_with()
+    assert run_writer.summary is not None
+    assert run_writer.summary["num_rounds"] == 0
+    # Budget is consumed before the oracle runs, so the failed query still cost.
+    assert run_writer.summary["total_cost"] == 1.0
+
+
+def test_active_learning_partial_round_failure_does_not_mask_the_crash() -> None:
+    """A tracker that fails while unwinding must not replace the real error."""
+    runtime_logger = Mock()
+    runtime_logger.log_step.side_effect = RuntimeError("tracker unavailable")
+
+    _run_until_the_oracle_fails(
+        runtime_logger=runtime_logger,
+        run_writer=RecordingRunWriter(),
+        sampler=DiagnosticPoolSampler(
+            candidate_pool=[Candidate(1, fidelity=0)],
+            num_samples=1,
+        ),
+    )
+
+
+def test_active_learning_partial_round_omits_disabled_diagnostics() -> None:
+    """Disabled diagnostics still commit core profiling for the failed round."""
+    runtime_logger = Mock()
+
+    _run_until_the_oracle_fails(
+        runtime_logger=runtime_logger,
+        run_writer=RecordingRunWriter(),
+        sampler=DiagnosticPoolSampler(
+            candidate_pool=[Candidate(1, fidelity=0)],
+            num_samples=1,
+        ),
+        diagnostics_config=DiagnosticsConfig(enabled=False),
+    )
+
+    logged_metrics = {
+        call.args[0]: call.args[1] for call in runtime_logger.log_metric.call_args_list
+    }
+    assert "sampler/test/generated" not in logged_metrics
+    assert logged_metrics["active_learning/partial"] == 1
+    assert "profiling/sampler/sample_s" in logged_metrics
+    runtime_logger.log_figure.assert_not_called()
+    runtime_logger.log_step.assert_called_once_with(1)
 
 
 def test_active_learning_discards_selector_scores_when_diagnostics_disabled() -> None:

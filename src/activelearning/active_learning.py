@@ -11,6 +11,7 @@ from activelearning.monitoring.diagnostics_config import DiagnosticsConfig
 from activelearning.monitoring.orchestration import (
     collect_round_diagnostics,
     record_completed_round,
+    record_partial_round,
 )
 from activelearning.oracle.oracle import Oracle
 from activelearning.monitoring.profiling import profile_operation
@@ -117,6 +118,11 @@ def active_learning(
     -----
         The loop terminates early if no candidates can be afforded within
         the remaining budget to prevent infinite loops.
+
+        When a round raises, the telemetry it already produced is committed to
+        the logger as a partial round and both monitoring sinks are finalized
+        before the exception propagates, so a failure late in a long round does
+        not discard the work that preceded it.
     """
     resolved_runtime_context = runtime_context or DEFAULT_RUNTIME_CONTEXT
     logger = resolved_runtime_context.logger
@@ -129,205 +135,228 @@ def active_learning(
 
     initial_budget = budget.available_budget
     num_rounds = 0
+    # Held outside the loop so a failed round's completed stage timings are
+    # still available to the monitoring sinks while the exception unwinds.
+    profiling: dict[str, float] = {}
     surrogate_prequential_history: tuple[PredictionPanel, ...] = ()
+    diagnostics_enabled = diagnostics_config.enabled and (
+        logger is not None or run_writer is not None
+    )
 
     run_started = time.perf_counter()
 
-    # Validate that every reachable round can afford at least one oracle query.
-    # Catches misconfigured schedules (e.g. sigmoid with too-slow start) that
-    # would silently terminate the experiment.
-    budget.validate_schedule(min_query_cost=oracle.get_min_query_cost())
-    _start_run_logging(
-        run_writer=run_writer,
-        dataset=dataset,
-        initial_budget=initial_budget,
-    )
-
-    while budget.available_budget > 0 and (
-        budget.max_rounds is None or num_rounds < budget.max_rounds
-    ):
-        round_started = time.perf_counter()
-        profiling: dict[str, float] = {}
-
-        # Call once per round so all consumers share the same consistent epoch view.
-        # Implementations must guarantee the returned iterable supports multiple
-        # iterations with the same sequence (see Dataset.get_observations_iterable).
-        with profile_operation(profiling, "dataset/get_observations"):
-            observations = list(dataset.get_observations_iterable())
-
-        # Dispatch surrogate update based on its declared strategy:
-        # - updates_from_latest() True  -> incremental update on new observations only
-        # - updates_from_latest() False -> full refit using the shared round iterable,
-        #   guaranteeing the surrogate sees the same consistent data as acquisition/sampler.
-        if surrogate.updates_from_latest():
-            with profile_operation(profiling, "surrogate/update"):
-                surrogate.update(dataset.get_latest_observations_iterable())
-        else:
-            with profile_operation(profiling, "surrogate/fit"):
-                surrogate.fit(observations)
-        profiling.update(surrogate.get_fit_profiling())
-
-        # Only couple the acquisition to the surrogate once it has been fitted.
-        # Before fitting, acquisition falls back to its unfitted behaviour (e.g.
-        # returning zero scores), enabling random candidate selection on cold start.
-        if surrogate.is_fitted():
-            with profile_operation(profiling, "acquisition/update"):
-                acquisition.update(surrogate, observations)
-
-        # Let the sampler build its candidate pool from the current acquisition,
-        # observations, and oracle cost model.
-        with profile_operation(profiling, "sampler/sample"):
-            samples = sampler.sample(
-                acquisition=acquisition,
-                observations=observations,
-                cost_fn=oracle.get_costs,
-            )
-
-        diagnostics_enabled = diagnostics_config.enabled and (
-            logger is not None or run_writer is not None
-        )
-        # Get the current round budget and pass the same oracle cost model to
-        # the selector for ranking/filtering.
-        with profile_operation(profiling, "budget/get_round_budget"):
-            round_budget = budget.get_round_budget(num_rounds)
-
-        with profile_operation(profiling, "selector/select"):
-            selected_samples = list(
-                selector(
-                    samples,
-                    acquisition=acquisition,
-                    cost_fn=oracle.get_costs,
-                    round_budget=round_budget,
-                )
-            )
-        # Keep the selector's per-candidate scores for this round's record so the
-        # run writer can persist them and diagnostics can summarize them.
-        score_drain = getattr(selector, "drain_selection_scores", None)
-        selection_scores = score_drain() if callable(score_drain) else None
-
-        # No candidates selected for this round; terminate to avoid stalling.
-        if not selected_samples:
-            break
-
-        # Query oracle to obtain total cost for the samples.
-        with profile_operation(profiling, "oracle/get_costs"):
-            costs = oracle.get_costs(selected_samples)
-        total_cost = sum(costs)
-
-        # Check if we can afford this query before consuming budget.
-        with profile_operation(profiling, "budget/can_afford"):
-            can_afford = budget.can_afford(total_cost)
-        if not can_afford:
-            # Budget exhausted - stop iteration.
-            break
-
-        # Consume budget and query oracle for new observations.
-        # Filter out any observations with invalid targets (None, NaN, or infinite)
-        # before adding to the dataset.
-        # Budget is consumed regardless: a failed evaluation still costs compute time.
-        with profile_operation(profiling, "budget/consume"):
-            budget.consume(total_cost)
-
-        with profile_operation(profiling, "oracle/query"):
-            new_observations = list(oracle.query(selected_samples))
-        _validate_oracle_results(selected_samples, new_observations)
-
-        with profile_operation(profiling, "oracle/filter_observations"):
-            valid_observations = filter_finite_target_observations(new_observations)
-        num_dropped = len(new_observations) - len(valid_observations)
-        if num_dropped > 0:
-            _logger.warning(
-                "Dropped %d/%d oracle observation(s) with invalid targets "
-                "(None, NaN, or infinite). Budget was already consumed.",
-                num_dropped,
-                len(new_observations),
-            )
-
-        with profile_operation(profiling, "dataset/add_observations"):
-            dataset.add_observations(valid_observations)
-        observations_after = list(dataset.get_observations_iterable())
-        total_observations = len(observations_after)
-
-        num_rounds += 1
-        metrics: dict[str, int | float] = {
-            "active_learning/round": num_rounds,
-            "active_learning/samples/proposed": len(samples),
-            "active_learning/samples/selected": len(selected_samples),
-            "active_learning/observations/new": len(valid_observations),
-            "active_learning/observations/dropped": num_dropped,
-            "active_learning/observations/total": total_observations,
-            "active_learning/cost/round": total_cost,
-            "active_learning/cost/cumulative": initial_budget - budget.available_budget,
-            "active_learning/budget/round": round_budget,
-            "active_learning/budget/remaining": budget.available_budget,
-        }
-
-        preliminary_record = RoundRecord(
-            round_index=num_rounds,
-            observations_before=observations,
-            observations_after=observations_after,
-            sampled_candidates=samples,
-            selected_candidates=selected_samples,
-            selected_costs=costs,
-            queried_observations=new_observations,
-            valid_observations=valid_observations,
-            round_budget=round_budget,
+    # An AL round is hours of work, so a failure must still commit the telemetry
+    # the round produced and finalize both sinks before the exception propagates.
+    try:
+        # Validate that every reachable round can afford at least one oracle query.
+        # Catches misconfigured schedules (e.g. sigmoid with too-slow start) that
+        # would silently terminate the experiment.
+        budget.validate_schedule(min_query_cost=oracle.get_min_query_cost())
+        _start_run_logging(
+            run_writer=run_writer,
+            dataset=dataset,
             initial_budget=initial_budget,
-            cumulative_cost=initial_budget - budget.available_budget,
-            remaining_budget=budget.available_budget,
-            metrics=metrics,
-            profiling=profiling,
-            diagnostics={},
-            selection_scores=selection_scores,
-        )
-        with profile_operation(profiling, "diagnostics/total"):
-            (
-                diagnostic_metrics,
-                diagnostic_figures,
-                surrogate_prequential_history,
-            ) = collect_round_diagnostics(
-                record=preliminary_record,
-                surrogate=surrogate,
-                acquisition=acquisition,
-                sampler=sampler,
-                selector=selector,
-                oracle=oracle,
-                dataset=dataset,
-                budget=budget,
-                enabled=diagnostics_enabled,
-                include_figures=(num_rounds % diagnostics_config.figure_interval == 0),
-                max_points=diagnostics_config.max_points,
-                prequential_history=surrogate_prequential_history,
-            )
-        profiling["profiling/round/total_s"] = time.perf_counter() - round_started
-        record = replace(
-            preliminary_record,
-            profiling=dict(profiling),
-            diagnostics=diagnostic_metrics,
         )
 
-        record_completed_round(
+        while budget.available_budget > 0 and (
+            budget.max_rounds is None or num_rounds < budget.max_rounds
+        ):
+            round_started = time.perf_counter()
+            profiling = {}
+
+            # Call once per round so all consumers share the same consistent epoch view.
+            # Implementations must guarantee the returned iterable supports multiple
+            # iterations with the same sequence (see Dataset.get_observations_iterable).
+            with profile_operation(profiling, "dataset/get_observations"):
+                observations = list(dataset.get_observations_iterable())
+
+            # Dispatch surrogate update based on its declared strategy:
+            # - updates_from_latest() True  -> incremental update on new observations only
+            # - updates_from_latest() False -> full refit using the shared round iterable,
+            #   guaranteeing the surrogate sees the same consistent data as acquisition/sampler.
+            if surrogate.updates_from_latest():
+                with profile_operation(profiling, "surrogate/update"):
+                    surrogate.update(dataset.get_latest_observations_iterable())
+            else:
+                with profile_operation(profiling, "surrogate/fit"):
+                    surrogate.fit(observations)
+            profiling.update(surrogate.get_fit_profiling())
+
+            # Only couple the acquisition to the surrogate once it has been fitted.
+            # Before fitting, acquisition falls back to its unfitted behaviour (e.g.
+            # returning zero scores), enabling random candidate selection on cold start.
+            if surrogate.is_fitted():
+                with profile_operation(profiling, "acquisition/update"):
+                    acquisition.update(surrogate, observations)
+
+            # Let the sampler build its candidate pool from the current acquisition,
+            # observations, and oracle cost model.
+            with profile_operation(profiling, "sampler/sample"):
+                samples = sampler.sample(
+                    acquisition=acquisition,
+                    observations=observations,
+                    cost_fn=oracle.get_costs,
+                )
+
+            # Get the current round budget and pass the same oracle cost model to
+            # the selector for ranking/filtering.
+            with profile_operation(profiling, "budget/get_round_budget"):
+                round_budget = budget.get_round_budget(num_rounds)
+
+            with profile_operation(profiling, "selector/select"):
+                selected_samples = list(
+                    selector(
+                        samples,
+                        acquisition=acquisition,
+                        cost_fn=oracle.get_costs,
+                        round_budget=round_budget,
+                    )
+                )
+            # Keep the selector's per-candidate scores for this round's record so the
+            # run writer can persist them and diagnostics can summarize them.
+            score_drain = getattr(selector, "drain_selection_scores", None)
+            selection_scores = score_drain() if callable(score_drain) else None
+
+            # No candidates selected for this round; terminate to avoid stalling.
+            if not selected_samples:
+                break
+
+            # Query oracle to obtain total cost for the samples.
+            with profile_operation(profiling, "oracle/get_costs"):
+                costs = oracle.get_costs(selected_samples)
+            total_cost = sum(costs)
+
+            # Check if we can afford this query before consuming budget.
+            with profile_operation(profiling, "budget/can_afford"):
+                can_afford = budget.can_afford(total_cost)
+            if not can_afford:
+                # Budget exhausted - stop iteration.
+                break
+
+            # Consume budget and query oracle for new observations.
+            # Filter out any observations with invalid targets (None, NaN, or infinite)
+            # before adding to the dataset.
+            # Budget is consumed regardless: a failed evaluation still costs compute time.
+            with profile_operation(profiling, "budget/consume"):
+                budget.consume(total_cost)
+
+            with profile_operation(profiling, "oracle/query"):
+                new_observations = list(oracle.query(selected_samples))
+            _validate_oracle_results(selected_samples, new_observations)
+
+            with profile_operation(profiling, "oracle/filter_observations"):
+                valid_observations = filter_finite_target_observations(new_observations)
+            num_dropped = len(new_observations) - len(valid_observations)
+            if num_dropped > 0:
+                _logger.warning(
+                    "Dropped %d/%d oracle observation(s) with invalid targets "
+                    "(None, NaN, or infinite). Budget was already consumed.",
+                    num_dropped,
+                    len(new_observations),
+                )
+
+            with profile_operation(profiling, "dataset/add_observations"):
+                dataset.add_observations(valid_observations)
+            observations_after = list(dataset.get_observations_iterable())
+            total_observations = len(observations_after)
+
+            num_rounds += 1
+            metrics: dict[str, int | float] = {
+                "active_learning/round": num_rounds,
+                "active_learning/samples/proposed": len(samples),
+                "active_learning/samples/selected": len(selected_samples),
+                "active_learning/observations/new": len(valid_observations),
+                "active_learning/observations/dropped": num_dropped,
+                "active_learning/observations/total": total_observations,
+                "active_learning/cost/round": total_cost,
+                "active_learning/cost/cumulative": initial_budget
+                - budget.available_budget,
+                "active_learning/budget/round": round_budget,
+                "active_learning/budget/remaining": budget.available_budget,
+            }
+
+            preliminary_record = RoundRecord(
+                round_index=num_rounds,
+                observations_before=observations,
+                observations_after=observations_after,
+                sampled_candidates=samples,
+                selected_candidates=selected_samples,
+                selected_costs=costs,
+                queried_observations=new_observations,
+                valid_observations=valid_observations,
+                round_budget=round_budget,
+                initial_budget=initial_budget,
+                cumulative_cost=initial_budget - budget.available_budget,
+                remaining_budget=budget.available_budget,
+                metrics=metrics,
+                profiling=profiling,
+                diagnostics={},
+                selection_scores=selection_scores,
+            )
+            with profile_operation(profiling, "diagnostics/total"):
+                (
+                    diagnostic_metrics,
+                    diagnostic_figures,
+                    surrogate_prequential_history,
+                ) = collect_round_diagnostics(
+                    record=preliminary_record,
+                    surrogate=surrogate,
+                    acquisition=acquisition,
+                    sampler=sampler,
+                    selector=selector,
+                    oracle=oracle,
+                    dataset=dataset,
+                    budget=budget,
+                    enabled=diagnostics_enabled,
+                    include_figures=(
+                        num_rounds % diagnostics_config.figure_interval == 0
+                    ),
+                    max_points=diagnostics_config.max_points,
+                    prequential_history=surrogate_prequential_history,
+                )
+            profiling["profiling/round/total_s"] = time.perf_counter() - round_started
+            record = replace(
+                preliminary_record,
+                profiling=dict(profiling),
+                diagnostics=diagnostic_metrics,
+            )
+
+            record_completed_round(
+                logger=logger,
+                run_writer=run_writer,
+                record=record,
+                figures=diagnostic_figures,
+            )
+    except BaseException:
+        # BaseException, not Exception: reaching the Slurm wall clock arrives as
+        # a KeyboardInterrupt via scripts/run_with_sigterm_flush.py.
+        record_partial_round(
+            logger=logger,
+            round_index=num_rounds + 1,
+            profiling=profiling,
+            enabled=diagnostics_enabled,
+            max_points=diagnostics_config.max_points,
+            dataset=dataset,
+            surrogate=surrogate,
+            acquisition=acquisition,
+            sampler=sampler,
+            selector=selector,
+            oracle=oracle,
+            budget=budget,
+        )
+        raise
+    finally:
+        _finish_run_logging(
             logger=logger,
             run_writer=run_writer,
-            record=record,
-            figures=diagnostic_figures,
+            num_rounds=num_rounds,
+            total_cost=initial_budget - budget.available_budget,
+            budget_remaining=budget.available_budget,
+            elapsed_time_s=time.perf_counter() - run_started,
+            num_observations=len(dataset.get_observations_iterable()),
         )
 
-    total_cost = initial_budget - budget.available_budget
-    elapsed_time_s = time.perf_counter() - run_started
-    num_observations = len(dataset.get_observations_iterable())
-
-    _finish_run_logging(
-        logger=logger,
-        run_writer=run_writer,
-        num_rounds=num_rounds,
-        total_cost=total_cost,
-        budget_remaining=budget.available_budget,
-        elapsed_time_s=elapsed_time_s,
-        num_observations=num_observations,
-    )
-
-    return dataset, total_cost, num_rounds
+    return dataset, initial_budget - budget.available_budget, num_rounds
 
 
 def _start_run_logging(
