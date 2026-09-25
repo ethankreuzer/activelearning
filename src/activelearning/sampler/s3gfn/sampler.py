@@ -27,6 +27,10 @@ import torch
 from torch import Tensor
 
 from activelearning.acquisition.cost_utility import cost_weighting_from_cost_fn
+from activelearning.sampler.reward_transform import (
+    RewardTransform,
+    apply_reward_transform,
+)
 from activelearning.sampler.sampler import Sampler
 from activelearning.sampler.s3gfn._optional import (
     require_linear_schedule_with_warmup,
@@ -125,6 +129,7 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
         learning_rate: float = 1.0e-4,
         log_z_learning_rate: float = 1.0e-3,
         beta: float = 50.0,
+        reward_transform: RewardTransform = "exponential",
         aux_coefficient: float = 1.0e-4,
         buffer_size: int = 6400,
         sa_threshold: float = 4.0,
@@ -201,6 +206,10 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
         beta : float, optional
             Reward inverse temperature used to convert acquisition scores into
             RTB log rewards.
+        reward_transform : {"exponential", "power"}, optional
+            Shape of the reward built from the acquisition score; see
+            :mod:`activelearning.sampler.reward_transform`. ``beta`` is that
+            transform's parameter, so its usable range differs between the two.
         aux_coefficient : float, optional
             Weight of the negative replay contrastive loss. Zero disables the
             negative replay buffer and auxiliary loss.
@@ -299,6 +308,7 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
         self.learning_rate = learning_rate
         self.log_z_learning_rate = log_z_learning_rate
         self.beta = beta
+        self.reward_transform = reward_transform
         self.aux_coefficient = aux_coefficient
         self.buffer_size = buffer_size
         self.sa_threshold = sa_threshold
@@ -505,10 +515,24 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
                 f"{type(acquisition).__name__} does not support singleton scoring. "
                 "S3GFNSampler requires an acquisition with score()."
             )
-        if (
-            getattr(acquisition, "score_scale", "value") == "log"
-            and self.beta > _LOG_SCORE_BETA_WARNING
-        ):
+        log_scale_acquisition = getattr(acquisition, "score_scale", "value") == "log"
+        if log_scale_acquisition and self.reward_transform == "power":
+            raise ValueError(
+                f"{type(acquisition).__name__} already returns log-scale scores, so "
+                "the 'power' reward transform would take the logarithm twice. Use one "
+                "or the other: the transform keeps score() on the value scale for the "
+                "selector, which is usually what you want."
+            )
+        if self.reward_transform == "power" and self.beta > _LOG_SCORE_BETA_WARNING:
+            warnings.warn(
+                f"The 'power' reward transform reads beta as an exponent, so "
+                f"beta={self.beta:g} makes R proportional to acquisition**{self.beta:g}. "
+                "Such a large exponent concentrates the reward on very few molecules; "
+                "beta below 1 is the usual range for this transform.",
+                UserWarning,
+                stacklevel=2,
+            )
+        if log_scale_acquisition and self.beta > _LOG_SCORE_BETA_WARNING:
             warnings.warn(
                 f"{type(acquisition).__name__} returns log-scale scores, so the RTB "
                 f"target log R = beta * score gives R proportional to "
@@ -838,7 +862,12 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
                 ),
             )
         ]
-        raw_scores = _score_candidates(acquisition, candidates, cost_fn=cost_fn)
+        raw_scores = _score_candidates(
+            acquisition,
+            candidates,
+            cost_fn=cost_fn,
+            transform=self.reward_transform,
+        )
 
         input_ids = model.encode_smiles(canonical_smiles)
         labels = synthesizability.classify_batch(canonical_smiles)
@@ -1148,8 +1177,9 @@ def _score_candidates(
     candidates: Sequence[Candidate],
     *,
     cost_fn: Callable[[Sequence[Candidate]], list[float]] | None,
+    transform: RewardTransform,
 ) -> list[float]:
-    """Score candidates and optionally apply inverse-cost weighting."""
+    """Score candidates, optionally inverse-cost weighted, and shape the reward."""
     scores = (
         acquisition.score(candidates)
         if cost_fn is None
@@ -1163,4 +1193,4 @@ def _score_candidates(
     score_values = [float(score) for score in scores]
     if not all(math.isfinite(score) for score in score_values):
         raise ValueError("Acquisition returned a non-finite score.")
-    return score_values
+    return apply_reward_transform(transform, score_values)

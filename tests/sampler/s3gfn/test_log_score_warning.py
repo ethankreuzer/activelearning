@@ -19,7 +19,7 @@ def _acquisition(scale: str) -> SimpleNamespace:
     [("log", 100.0, True), ("log", 1.0, False), ("value", 100.0, False)],
 )
 def test_warns_only_for_log_scores_with_large_beta(scale: str, beta: float, warns: bool) -> None:
-    sampler = SimpleNamespace(beta=beta)
+    sampler = SimpleNamespace(beta=beta, reward_transform="exponential")
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         sampler_module.S3GFNSampler._validate_acquisition(sampler, _acquisition(scale))
@@ -28,7 +28,7 @@ def test_warns_only_for_log_scores_with_large_beta(scale: str, beta: float, warn
 
 
 def test_acquisition_without_score_scale_is_treated_as_value() -> None:
-    sampler = SimpleNamespace(beta=100.0)
+    sampler = SimpleNamespace(beta=100.0, reward_transform="exponential")
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         sampler_module.S3GFNSampler._validate_acquisition(

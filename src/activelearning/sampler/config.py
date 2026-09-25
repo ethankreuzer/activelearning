@@ -14,6 +14,7 @@ from activelearning.sampler.exact_grid_sampler import ExactGridSampler
 from activelearning.sampler.hypercube_sampler import HypercubeSampler
 from activelearning.sampler.sampler import Sampler
 from activelearning.sampler.pool_file_sampler import PoolFileSampler
+from activelearning.sampler.reward_transform import RewardTransform
 from activelearning.sampler.gflownet.config_utils import compose_gflownet_conf
 from activelearning.sampler.gflownet.grid_sampler import GFlowNetGridSampler
 from activelearning.sampler.gflownet.gflownet_sampler import GFlowNetSampler
@@ -333,6 +334,10 @@ class S3GFNSamplerConfig(BaseModel):
     Learning rate for the log-partition estimate.
     beta : float, default=50.0
     GFlowNet loss temperature parameter.
+    reward_transform : {"exponential", "power"}, default="exponential"
+    Shape of the reward built from the acquisition score; see
+    :mod:`activelearning.sampler.reward_transform`. ``beta`` is that transform's
+    parameter, so its usable range differs between the two.
     aux_coefficient : float, default=1e-4
     Weight of the auxiliary loss.
     buffer_size : int, default=6400
@@ -385,6 +390,7 @@ class S3GFNSamplerConfig(BaseModel):
     learning_rate: PositiveFloat = 1.0e-4
     log_z_learning_rate: PositiveFloat = 1.0e-3
     beta: PositiveFloat = 50.0
+    reward_transform: RewardTransform = "exponential"
     aux_coefficient: float = Field(default=1.0e-4, ge=0.0)
     buffer_size: int = Field(default=6400, gt=0)
     sa_threshold: float = Field(default=4.0, ge=0.0)
@@ -463,6 +469,7 @@ class S3GFNSamplerConfig(BaseModel):
             learning_rate=self.learning_rate,
             log_z_learning_rate=self.log_z_learning_rate,
             beta=self.beta,
+            reward_transform=self.reward_transform,
             aux_coefficient=self.aux_coefficient,
             buffer_size=self.buffer_size,
             sa_threshold=self.sa_threshold,
