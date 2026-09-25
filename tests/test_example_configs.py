@@ -499,6 +499,52 @@ def test_molecule_s3gfn_minimol_ampc_variational_single_fidelity_config_parses()
 
 
 @pytest.mark.parametrize(
+    ("overlay_name", "reward_transform", "beta"),
+    [
+        pytest.param("reward_power", "power", 0.5, id="power"),
+        pytest.param("reward_exponential", "exponential", 100.0, id="exponential"),
+    ],
+)
+def test_ampc_single_fidelity_reward_transform_overlays_parse(
+    overlay_name: str,
+    reward_transform: str,
+    beta: float,
+) -> None:
+    """Both reward-shape arms must keep the acquisition on the value scale."""
+    ampc_directory = REPOSITORY_ROOT / "config" / "ampc"
+    config = parse_config(
+        load_config(
+            path=[
+                str(
+                    ampc_directory
+                    / "s3gfn_minimol_ampc_variational_single_fidelity.yaml"
+                ),
+                str(ampc_directory / "overrides" / f"{overlay_name}.yaml"),
+            ]
+        ),
+        ActiveLearningConfig,
+    )
+
+    assert config.sampler.reward_transform == reward_transform
+    assert config.sampler.beta == pytest.approx(beta)
+    # S3GFNSampler rejects log-scale scores under 'power', and 'exponential' on log
+    # scores is the power arm by another route, so both arms need value scores.
+    assert config.acquisition.log_output is False
+    # Starting a run truncates round_history.jsonl, so the arms must not share one.
+    assert config.run_writer.output_dir == Path(
+        f"outputs/ampc/sf_{overlay_name}/seed_42"
+    )
+    # Everything else stays the base run, so only the reward shape differs.
+    assert (
+        config.surrogate.training_params.variational_objective
+        == "PredictiveLogLikelihood"
+    )
+    assert config.acquisition.type == "QLowerBoundMaxValueEntropy"
+    assert config.budget.available_budget == pytest.approx(100000.0)
+    assert config.run_writer.write_sample_scores is True
+
+
+@pytest.mark.parametrize(
     "config_directory",
     ["ampc", "molecules"],
 )

@@ -1,0 +1,49 @@
+# Reward-shape arm for the single-fidelity AmpC experiment: R = IG ** beta.
+#
+#   activelearning config/ampc/s3gfn_minimol_ampc_variational_single_fidelity.yaml \
+#                  config/ampc/overrides/reward_power.yaml
+#
+# Pairs with reward_exponential.yaml, the same run under R = exp(beta * IG). The
+# two arms differ only in the three settings below; the 10M initial dataset, the
+# fixed-feature MiniMol encoder and its cache, PredictiveLogLikelihood, GIBBON,
+# the Dock3 oracle and the budget all come from the base config unchanged.
+
+acquisition:
+  # The transform takes the logarithm itself, so the acquisition has to stay on
+  # the value scale: log_output=true alongside reward_transform=power is rejected
+  # outright (S3GFNSampler._validate_acquisition), because it would log twice.
+  # This also means score() stays a value for CostAwareSelector, which divides by
+  # cost -- meaningful for values, not for logs.
+  log_output: false
+
+sampler:
+  # R = IG ** beta, so the reward ratio between two molecules follows the ratio of
+  # their information gains rather than their difference. That is the point of this
+  # arm: GIBBON spans orders of magnitude, so on an absolute scale almost the whole
+  # pool sits within a rounding error of the bottom and no beta separates it.
+  reward_transform: power
+  # beta is the exponent here, not an inverse temperature, so its usable range is
+  # nothing like the exponential arm's. 0.5 gives R proportional to sqrt(IG).
+  beta: 0.5
+  # Known limit of this arm: with ~10M candidates most raw GIBBON values underflow
+  # to exactly 0 (see diagnostics/mes_gibbon), and the transform floors that tail at
+  # max * exp(-20) rather than letting it reach -inf, which the squared RTB residual
+  # could not absorb. The underflowed mass is therefore flat -- ranked together, a
+  # factor e^10 below the best molecule at beta=0.5 -- so this arm separates the top
+  # of the pool but not within the tail. The base config's log_output=true is what
+  # keeps that tail ordered, at the cost of not being a power arm at all.
+
+logger:
+  # Lists are replaced on merge, so the whole logger is restated as one value.
+  type: MultiLogger
+  loggers:
+    - type: ConsoleLogger
+      project_name: ampc_reward_transform
+      run_name: ampc-sf-reward-power-beta0.5
+    - type: WandbLogger
+      project_name: ampc_reward_transform
+      run_name: ampc-sf-reward-power-beta0.5
+
+run_writer:
+  # An output_dir of its own: starting a run truncates round_history.jsonl in it.
+  output_dir: outputs/ampc/sf_reward_power/seed_${runtime.seed}

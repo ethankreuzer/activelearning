@@ -1,0 +1,42 @@
+# Reward-shape arm for the single-fidelity AmpC experiment: R = exp(beta * IG).
+#
+#   activelearning config/ampc/s3gfn_minimol_ampc_variational_single_fidelity.yaml \
+#                  config/ampc/overrides/reward_exponential.yaml
+#
+# Pairs with reward_power.yaml, the same run under R = IG ** beta. The two arms
+# differ only in the three settings below; the 10M initial dataset, the fixed-feature
+# MiniMol encoder and its cache, PredictiveLogLikelihood, GIBBON, the Dock3 oracle
+# and the budget all come from the base config unchanged.
+
+acquisition:
+  # Value-scale information gain, matching the power arm so the two differ only in
+  # the shape of the reward. This is also what the exponential transform means:
+  # exp(beta * log IG) would be IG ** beta, the power arm by another route.
+  log_output: false
+
+sampler:
+  # R = exp(beta * IG), so the reward ratio between two molecules follows the
+  # *difference* of their information gains. This is the arrangement the power arm
+  # is meant to beat: with ~10M candidates most raw GIBBON values underflow to
+  # exactly 0 (see diagnostics/mes_gibbon), all the absolute gaps sit in the top
+  # percentile, and the rest of the pool should be generated at close to prior
+  # frequency whatever beta is set to.
+  reward_transform: exponential
+  # beta is an inverse temperature here. 100 is the value this config carried before
+  # it moved to log-scale scores, kept so this arm stays comparable to those runs.
+  beta: 100
+
+logger:
+  # Lists are replaced on merge, so the whole logger is restated as one value.
+  type: MultiLogger
+  loggers:
+    - type: ConsoleLogger
+      project_name: ampc_reward_transform
+      run_name: ampc-sf-reward-exponential-beta100
+    - type: WandbLogger
+      project_name: ampc_reward_transform
+      run_name: ampc-sf-reward-exponential-beta100
+
+run_writer:
+  # An output_dir of its own: starting a run truncates round_history.jsonl in it.
+  output_dir: outputs/ampc/sf_reward_exponential/seed_${runtime.seed}
