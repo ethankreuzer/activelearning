@@ -63,8 +63,12 @@ def _power_scores(scores: list[float]) -> list[float]:
     largest = max(scores, default=0.0)
     if largest <= 0.0:
         return [0.0] * len(scores)
-    floor = largest * math.exp(-MAX_LOG_SCORE_SPREAD)
-    return [math.log(max(score, floor)) for score in scores]
+    # Floor in log space: ``largest * exp(-spread)`` underflows to 0 for denormal scores.
+    log_floor = math.log(largest) - MAX_LOG_SCORE_SPREAD
+    return [
+        max(math.log(score), log_floor) if score > 0.0 else log_floor
+        for score in scores
+    ]
 
 
 _REWARD_TRANSFORMS: dict[str, Callable[[list[float]], list[float]]] = {
