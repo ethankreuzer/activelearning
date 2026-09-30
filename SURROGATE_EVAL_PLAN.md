@@ -13,8 +13,8 @@ the ELBO vs PLL problem is in `SURROGATE_ELBO_VS_PLL.md`; read that first.
 
 - [x] Step 1: generate the 100k GP-MoLFormer prior sample (done 2026-09-30, job 4317115)
 - [ ] Step 2: dock a subset with `Dock3Oracle` (count undecided)
-- [ ] Step 3: build the train / held-out split of the 10M set
-- [ ] Step 4: fit script (fit once, save surrogate state)
+- [ ] Step 3: pick the seeded 100k `train` eval subsample (no held-out split; see below)
+- [ ] Step 4: fit script (fit once on the full 10M, save surrogate state)
 - [ ] Step 5: eval script (load state, score all sets, log to W&B)
 - [ ] Step 6: run ELBO and PLL through steps 4–5 and compare
 
@@ -46,9 +46,8 @@ Tick boxes and add dated notes under each step as work lands.
 
 | Set | Source | Labels | Notes |
 |---|---|---|---|
-| `train` | 100k random rows of the training split | docking score | Shows under/over-fitting only |
-| `heldout` | 100k random rows held out of the 10M set | docking score | Same distribution, never trained on |
-| `ampc_331k` | `data/ampc_subset_331k.csv` | `score`, `pprop` | ~30× tail-enriched; weight by `ipw` to get library-level stats. May be in-sample for the encoder (see below) |
+| `train` | seeded 100k random rows of the 10M training set | docking score | How well the fit does on its own data, at library rates. The model is underfit, not overfit, so this is the fit-quality check |
+| `ampc_331k` | `data/ampc_subset_331k.csv` | `score`, `pprop` | Held-out: treated as disjoint from the 10M set (user, 2026-09-30; any overlap is expected to be tiny). Covers the full pProp range with the whole potent tail (~30× enriched); weight by `ipw` for library-level stats. May be in-sample for the encoder (see below) |
 | `olivier_invitro` | `data/Olivier_Invitro.csv` | experimental activity (check columns) | Judge by ranking of actives, not by error, if no docking score |
 | `gpmolformer_prior` | Step 1 output, 100k | docked subset from step 2 | The set that matters most |
 
@@ -128,20 +127,25 @@ Mechanics once decided:
   Failures return `NaN`; keep them and report the failure rate.
 - Can run in parallel with steps 3–5.
 
-## Step 3: train / held-out split
+## Step 3: `train` eval subsample (no held-out split)
 
-- From the base config's initial dataset (`data/10M_unif_random_subset.csv`), hold
-  out a seeded random 100k rows. Train on the rest.
-- Also save a seeded 100k subsample of the training rows for the `train` eval set.
-- Store the split as index files so every fit uses the same split. Check how the
-  base config loads the initial dataset and whether the feature cache
-  (`cache/ampc/...npy`) is keyed by row order, so the split doesn't invalidate it.
+Decided 2026-09-30: **no train / held-out split of the 10M set.** With
+`num_inducing: 64` the GP cannot memorise 10M rows (it is underfit, not overfit), so
+a held-out slice of the same distribution would show almost the same error as the
+training rows and cost a refit on modified data. The 331k set already plays the
+held-out role and covers the whole pProp range, including the full tail.
+
+- Fit on the full 10M, as the earlier size studies did.
+- Draw a seeded random 100k rows of the 10M set as the `train` eval set and save the
+  row indices so every arm uses the same rows.
+- The overlap between the 331k and the 10M set is assumed tiny; the eval job may
+  report the exact count once, cheaply.
 
 ## Step 4: fit script
 
 - `scripts/surrogate_eval_fit.py`: build the surrogate from the config exactly as
   `activelearning.main` does (`ActiveLearningConfig` → `.build()`), fit on the
-  training split, save the surrogate state and the resolved config.
+  full 10M, save the surrogate state and the resolved config.
 - Reuse what `scripts/surrogate_dataset_size_study.py` already does for fitting and
   saving where possible.
 - Needs a whole node for 10M (~478 GB peak RAM; see memory note). One fit takes
@@ -175,7 +179,7 @@ that the GIBBON candidate set falls back to a 100k stratified subset when the 10
 OOMs (19 GiB); record which support was used.
 
 Logging: one W&B run per surrogate arm in project `ampc-surrogate-eval`, summary
-metrics and histograms under a per-set prefix (`heldout/...`, `gpmolformer_prior/...`).
+metrics and histograms under a per-set prefix (`ampc_331k/...`, `gpmolformer_prior/...`).
 Keep full per-molecule tables as CSVs on disk (331k rows is too heavy for W&B tables);
 optionally log them as artifacts.
 
