@@ -15,6 +15,7 @@ the ELBO vs PLL problem is in `SURROGATE_ELBO_VS_PLL.md`; read that first.
 - [ ] Step 2: dock all 100k generated molecules with `Dock3Oracle` (CPU-only job array). Scripts and jobs written and linted, not run; tests not run
 - [ ] Step 3: pick the `train` eval subsets: seeded 100k random + top 10k by `y` (no held-out split; see below). Written into the fit script, not run
 - [ ] Step 4: fit script (fit once on the full 10M, save surrogate state). Written and linted, not run; its tests have not been run (need a `salloc`)
+- [ ] Step 2b: label the 331k set: map its `pprop` to binding probabilities with `HitRateModel` and write the `val` subset. Script and job written and linted, not run; tests not run
 - [ ] Step 5: extend the fit script into one fit + evaluation job: per-epoch tracking, then final evaluation on all sets, logged to W&B (design below; nothing written yet)
 - [ ] Step 6: run ELBO and PLL through steps 4–5 and compare
 
@@ -154,6 +155,31 @@ Open points: the docking environment (`dockenv.sh`, `dock64` under `/project/rrg
 was only used before on GPU-node jobs and in a smoke test under account
 `def-bengioy_cpu`; check that a first task works before trusting all 40. The first
 array task's log shows the per-chunk timing, which replaces the estimate above.
+
+## Step 2b: label the 331k set and build `val`
+
+Written (not run; tests not run): `scripts/make_val_set.py`, `jobs/make_val_set.sh`,
+`tests/scripts/test_make_val_set.py`. Submit `sbatch jobs/make_val_set.sh` from the repo
+root (1 CPU, 8 GB, 30 min, `def-yvesbrun_cpu`, no GPU; expected to take seconds to a
+few minutes, not measured).
+
+- Reads the oracle's hit-rate settings from the base config's `oracle:` section
+  (`hitrate_params`, `score_pprop_table`, `hitrate_target: ampc`, `pki_threshold: 6.5`),
+  so they match what labelled the 10M training set.
+- `y = HitRateModel.hit_rate_from_pprop(pprop, 6.5)`, from the CSV's `pprop` as chosen.
+  As a cross-check it also writes `y_from_score = hit_rate(score, 6.5)`, the oracle's own
+  score -> pProp (lookup table) -> y path. The CSV's `pprop` is rank-based and the oracle
+  uses the table, so the two may differ slightly, most at the extremes (pProp caps at
+  7.0 and scores outside the table's range are clamped). **Read the summary JSON first:**
+  `y_vs_y_from_score_max_abs_diff` and `..._pearson`, and `scores_outside_table_range`.
+- Outputs under `data/` (gitignored): `ampc_331k_with_y.csv` (all rows, plus `y` and
+  `y_from_score`), `ampc_val_20k.csv` (the `val` subset, plus a `weight` column),
+  `ampc_val_20k.json` (summary) and `ampc_val_20k.png` (y vs pProp, and the two routes
+  to y against each other; y is not monotone in pProp, which the plot should show).
+- `val` = every row with `pprop >= 3.5` (3,153) plus a seeded random 17,000 of the
+  others. Sampled rows get `weight = ipw * (n_others / n_sampled)`, which estimates the
+  full set's weighted statistics (exactly preserves the non-hit weight total only when
+  `ipw` is constant among them). Hit rows keep their `ipw`.
 
 ## Step 3: `train` eval subsample (no held-out split)
 
