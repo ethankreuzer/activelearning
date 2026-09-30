@@ -11,8 +11,8 @@ the ELBO vs PLL problem is in `SURROGATE_ELBO_VS_PLL.md`; read that first.
 
 ## Status
 
-- [ ] Step 1: generate the 10k GP-MoLFormer prior sample
-- [ ] Step 2: dock 2k of it with `Dock3Oracle`
+- [ ] Step 1: generate the 100k GP-MoLFormer prior sample (script + job written, not run)
+- [ ] Step 2: dock a subset with `Dock3Oracle` (count undecided)
 - [ ] Step 3: build the train / held-out split of the 10M set
 - [ ] Step 4: fit script (fit once, save surrogate state)
 - [ ] Step 5: eval script (load state, score all sets, log to W&B)
@@ -38,7 +38,8 @@ Tick boxes and add dated notes under each step as work lands.
 - **Four evaluation sets**, including generated molecules, because S3-GFN trains on
   generated molecules: if the other sets look fine but the generated set does not,
   the approach fails.
-- **Dock 2k** of the generated sample once, so the generated set has real labels.
+- **Generate 100k** from the prior; **dock a subset** once so the generated set has
+  real labels. How many and how they are chosen is still undecided (see step 2).
 - **W&B project: `ampc-surrogate-eval`.**
 
 ## Evaluation sets
@@ -49,7 +50,7 @@ Tick boxes and add dated notes under each step as work lands.
 | `heldout` | 100k random rows held out of the 10M set | docking score | Same distribution, never trained on |
 | `ampc_331k` | `data/ampc_subset_331k.csv` | `score`, `pprop` | ~30× tail-enriched; weight by `ipw` to get library-level stats. May be in-sample for the encoder (see below) |
 | `olivier_invitro` | `data/Olivier_Invitro.csv` | experimental activity (check columns) | Judge by ranking of actives, not by error, if no docking score |
-| `gpmolformer_prior` | Step 1 output, 10k | 2k docked in step 2 | The set that matters most |
+| `gpmolformer_prior` | Step 1 output, 100k | docked subset from step 2 | The set that matters most |
 
 Encoder caveat: `minimol_ampc_encoder/model/meta.json` and `MODEL_CARD.md` say the
 checkpoint was trained on `ampc_subset_331k.csv`, but the user believes the checkpoint
@@ -59,51 +60,56 @@ set (and possibly Olivier) tests generalization.
 
 ## Step 1: generate the prior sample
 
-Goal: `data/gpmolformer_prior_10k.csv`, 10k unique molecules drawn from the
-**untrained** GP-MoLFormer prior, filtered exactly as `S3GFNSampler` filters its
-own samples, with a fixed seed.
+Goal: `data/gpmolformer_prior_100k.csv`, 100k unique molecules from the
+**untrained** GP-MoLFormer prior, fixed seed, reused by every experiment. 100k matches
+the S3-GFN pool size per round (`sampler.n_samples`), so the top 1% is a real tail
+and reward quantiles are stable down to the top 0.1%.
 
-Known so far:
-- `src/activelearning/sampler/s3gfn/model.py`: `S3GFNModel.from_pretrained()` loads
-  `ibm-research/GP-MoLFormer-Uniq` (tokenizer `ibm-research/MoLFormer-XL-both-10pct`)
-  as both policy and prior, with `deterministic_eval=True`. `generate(count,
-  max_length, temperature)` samples and drops sequences that never emit EOS. Before
-  any training the policy equals the prior, so sampling it gives the starting
-  distribution of S3-GFN.
-- SA filter: `activelearning.sampler.s3gfn.synthesizability`
-  (`SAScoreSynthesizability`, `passes_sa_threshold`).
+Written (2026-09-30), not yet run:
+- `scripts/generate_prior_sample.py`: builds `S3GFNSampler` from the config with
+  `n_train_steps=0`, `n_samples`, `seed` overridden, and calls `sampler.sample()`.
+  With no training steps the sampler draws straight from the pretrained prior, so the
+  sample goes through exactly the real pool pipeline: RDKit canonicalization
+  (non-isomeric), rejection of invalid / unterminated / disconnected molecules,
+  deduplication. Writes `SMILES, sa_score, passes_sa` and a `.json` record (seed,
+  model, `max_length`, temperature, attempts / invalid / duplicate counts, timings).
+  Refuses to overwrite without `--overwrite`.
+- `jobs/generate_prior_sample.sh`: one A100, 4 CPUs, 32G, 2 h, logs to
+  `slurm_logs/gpmolformer_prior_100k_%j.*`. Submit with
+  `sbatch jobs/generate_prior_sample.sh` from the repo root.
 
-To do:
-1. Find the `S3GFNSampler` class (not yet located; `grep -rn "class S3GFNSampler"
-   src/`) and read its post-generation pipeline: RDKit validity, canonicalization,
-   deduplication, SA threshold, and anything else applied before scoring.
-2. Read the sampler section of
-   `config/ampc/s3gfn_minimol_ampc_variational_single_fidelity.yaml` for
-   `max_length`, `temperature`, the SA threshold, model paths and dtype.
-3. Write `scripts/generate_prior_sample.py`:
-   - takes the config path (reuse its sampler settings), `--n 10000`, `--seed`,
-     `--output`;
-   - loads the model through `S3GFNModel.from_pretrained` with the config's
-     arguments;
-   - generates in batches, calling the **sampler's own** filter functions (import,
-     don't copy), until 10k unique canonical SMILES pass;
-   - writes `SMILES, sa_score` plus a run record (seed, config, counts generated /
-     invalid / duplicate / SA-rejected), since the rejection rates are themselves
-     useful;
-   - draws a seeded 2k subset to `data/gpmolformer_prior_2k_dock.csv`.
-4. Write `jobs/generate_prior_sample.sh` (one GPU, e.g.
-   `--account=def-yvesbrun_gpu --gres=gpu:a100:1`), offline env vars as above.
-   Check that the GP-MoLFormer weights are in the HF cache on the login node first.
-5. Add a small test under `tests/scripts/` using a stub model (runs only in `salloc`).
+Facts found while writing it:
+- **The real S3-GFN pool is not SA-filtered.** `sa_threshold` (4.0 in the base config)
+  only splits training molecules into positive/negative replay buffers
+  (`_prepare_batch`); `_generate_final_candidates` applies no SA filter. So the sample
+  is not SA-filtered either; `passes_sa` records it (strict `<`, via
+  `passes_sa_threshold`).
+- Generation settings come from the base config: `ibm-research/GP-MoLFormer-Uniq`,
+  tokenizer `ibm-research/MoLFormer-XL-both-10pct`, `max_length: 80`,
+  `generation_batch_size: 128`, temperature 1.0, bf16. Both are in the HF cache.
+- The sampler is seeded per round by `seed + round_index` (round 0 here).
 
-## Step 2: dock 2k molecules
+To do: run it; check the `.json` for invalid / duplicate rates and `generation_s`;
+optionally a small `tests/scripts/` test for `write_sample`.
 
-- Use `Dock3Oracle` (or `SlurmDock3Oracle` to shard over an array) on
-  `data/gpmolformer_prior_2k_dock.csv`, with the same oracle settings as the base
-  config so the labels match the training target.
-- Output `data/gpmolformer_prior_2k_docked.csv`: SMILES, raw docking score,
-  probability of binding (the observed target), failure flag. Failures return `NaN`;
-  keep them and report the failure rate.
+## Step 2: dock a subset
+
+**Count and selection: undecided (user will choose later).** Considerations:
+- A hit (pProp ≥ 3.5) is ~the top 0.03% of the library by definition, so a purely
+  random docked subset of ~2k contains about one hit, likely zero. It tests average
+  error and calibration on generated molecules, not whether the reward recognises
+  good ones.
+- Option discussed: half random (unbiased error / calibration) and half the
+  top-ranked molecules by the current ELBO surrogate's mean or acquisition (tests
+  whether what the reward would push S3-GFN toward really docks well). That half is
+  biased toward one model's preferences.
+
+Mechanics once decided:
+- Use `Dock3Oracle` (or `SlurmDock3Oracle` to shard over an array) with the same
+  oracle settings as the base config so the labels match the training target.
+- Output `data/gpmolformer_prior_docked.csv`: SMILES, raw docking score, probability
+  of binding (the observed target), selection group (random / top), failure flag.
+  Failures return `NaN`; keep them and report the failure rate.
 - Can run in parallel with steps 3–5.
 
 ## Step 3: train / held-out split
@@ -145,7 +151,7 @@ weighting on `ampc_331k`):
 - calibration: fraction of |y − μ| / σ_total below 1 and 2 (target ≈ 68% / 95%);
 - `olivier_invitro`: how actives rank by mean and by acquisition value;
 - `gpmolformer_prior`: spread of reward (a flat reward means S3-GFN has nothing to
-  learn), and on the docked 2k whether reward and mean track the true label;
+  learn), and on the docked subset whether reward and mean track the true label;
 - learned hyperparameters: σ², outputscale, lengthscale, KL.
 
 Fix the acquisition's seed so the max-value samples are identical across arms. Note
