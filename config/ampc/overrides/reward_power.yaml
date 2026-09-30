@@ -23,13 +23,15 @@ sampler:
   # pool sits within a rounding error of the bottom and no beta separates it.
   reward_transform: power
   # beta is the exponent here, not an inverse temperature, so its usable range is
-  # nothing like the exponential arm's. 0.5 gives R proportional to sqrt(IG).
-  beta: 0.5
+  # nothing like the exponential arm's. 1.0 gives R proportional to IG, the same
+  # sharpness as the base config (log_output=true, exponential, beta=1), so this arm
+  # differs from it only by the floor below.
+  beta: 1.0
   # Known limit of this arm: with ~10M candidates most raw GIBBON values underflow
   # to exactly 0 (see diagnostics/mes_gibbon), and the transform floors that tail at
   # max * exp(-20) rather than letting it reach -inf, which the squared RTB residual
   # could not absorb. The underflowed mass is therefore flat -- ranked together, a
-  # factor e^10 below the best molecule at beta=0.5 -- so this arm separates the top
+  # factor e^20 below the best molecule at beta=1 -- so this arm separates the top
   # of the pool but not within the tail. The base config's log_output=true is what
   # keeps that tail ordered, at the cost of not being a power arm at all.
 
@@ -39,10 +41,10 @@ logger:
   loggers:
     - type: ConsoleLogger
       project_name: ampc_reward_transform
-      run_name: ampc-sf-reward-power-beta0.5
+      run_name: ampc-sf-reward-power-beta1
     - type: WandbLogger
       project_name: ampc_reward_transform
-      run_name: ampc-sf-reward-power-beta0.5
+      run_name: ampc-sf-reward-power-beta1
 
 run_writer:
   # An output_dir of its own: starting a run truncates round_history.jsonl in it.
