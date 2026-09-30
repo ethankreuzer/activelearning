@@ -11,7 +11,7 @@ the ELBO vs PLL problem is in `SURROGATE_ELBO_VS_PLL.md`; read that first.
 
 ## Status
 
-- [ ] Step 1: generate the 100k GP-MoLFormer prior sample (script + job written, not run)
+- [x] Step 1: generate the 100k GP-MoLFormer prior sample (done 2026-09-30, job 4317115)
 - [ ] Step 2: dock a subset with `Dock3Oracle` (count undecided)
 - [ ] Step 3: build the train / held-out split of the 10M set
 - [ ] Step 4: fit script (fit once, save surrogate state)
@@ -65,7 +65,8 @@ Goal: `data/gpmolformer_prior_100k.csv`, 100k unique molecules from the
 the S3-GFN pool size per round (`sampler.n_samples`), so the top 1% is a real tail
 and reward quantiles are stable down to the top 0.1%.
 
-Written (2026-09-30), not yet run:
+Written and committed 2026-09-30 (`9a0ac1f`); submitted as Slurm job **4317115**
+(log: `slurm_logs/gpmolformer_prior_100k_4317115.out/.err`):
 - `scripts/generate_prior_sample.py`: builds `S3GFNSampler` from the config with
   `n_train_steps=0`, `n_samples`, `seed` overridden, and calls `sampler.sample()`.
   With no training steps the sampler draws straight from the pretrained prior, so the
@@ -89,8 +90,23 @@ Facts found while writing it:
   `generation_batch_size: 128`, temperature 1.0, bf16. Both are in the HF cache.
 - The sampler is seeded per round by `seed + round_index` (round 0 here).
 
-To do: run it; check the `.json` for invalid / duplicate rates and `generation_s`;
-optionally a small `tests/scripts/` test for `write_sample`.
+Result (job 4317115, finished 2026-09-30): `data/gpmolformer_prior_100k.csv`
+(gitignored, under `data/`) and `data/gpmolformer_prior_100k.json`.
+
+| | |
+|---|---|
+| Unique molecules | 100,000 |
+| Pass SA (`sa_score < 4`) | 92,769 (92.8%) |
+| Sequences generated | 102,400 (2,366 invalid = 2.3%; 9 duplicates) |
+| Generation time | 970 s; SA scoring 37 s |
+
+- The sample is kept unfiltered; filter at analysis time with `passes_sa`. The 92.8k
+  passing molecules are enough, so no top-up was needed. Report reward statistics
+  both for all molecules (what gets docked) and for the SA-passing subset (the only
+  molecules that get reward-driven updates during S3-GFN training).
+- The job took about 17 minutes against a 2 h limit; a 30 min limit is enough for
+  reruns of the same size.
+- Still optional: a small `tests/scripts/` test for `write_sample`.
 
 ## Step 2: dock a subset
 
