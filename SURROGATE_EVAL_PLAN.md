@@ -13,7 +13,7 @@ the ELBO vs PLL problem is in `SURROGATE_ELBO_VS_PLL.md`; read that first.
 
 - [x] Step 1: generate the 100k GP-MoLFormer prior sample (done 2026-09-30, job 4317115)
 - [ ] Step 2: dock a subset with `Dock3Oracle` (count undecided)
-- [ ] Step 3: pick the seeded 100k `train` eval subsample (no held-out split; see below)
+- [ ] Step 3: pick the `train` eval subsets: seeded 100k random + top 10k by `y` (no held-out split; see below)
 - [ ] Step 4: fit script (fit once on the full 10M, save surrogate state)
 - [ ] Step 5: eval script (load state, score all sets, log to W&B)
 - [ ] Step 6: run ELBO and PLL through steps 4–5 and compare
@@ -46,7 +46,8 @@ Tick boxes and add dated notes under each step as work lands.
 
 | Set | Source | Labels | Notes |
 |---|---|---|---|
-| `train` | seeded 100k random rows of the 10M training set | docking score | How well the fit does on its own data, at library rates. The model is underfit, not overfit, so this is the fit-quality check |
+| `train_random` | seeded 100k random rows of the 10M training set | `y` | How well the fit does on its own data, at library rates. The model is underfit, not overfit, so this is the fit-quality check |
+| `train_top` | the 10k rows of the 10M set with the highest `y` (0.1%) | `y` | How the fit does on the best training molecules. Requested by the user; report separately from `train_random` |
 | `ampc_331k` | `data/ampc_subset_331k.csv` | `score`, `pprop` | Held-out: treated as disjoint from the 10M set (user, 2026-09-30; any overlap is expected to be tiny). Covers the full pProp range with the whole potent tail (~30× enriched); weight by `ipw` for library-level stats. May be in-sample for the encoder (see below) |
 | `olivier_invitro` | `data/Olivier_Invitro.csv` | experimental activity (check columns) | Judge by ranking of actives, not by error, if no docking score |
 | `gpmolformer_prior` | Step 1 output, 100k | docked subset from step 2 | The set that matters most |
@@ -136,8 +137,17 @@ training rows and cost a refit on modified data. The 331k set already plays the
 held-out role and covers the whole pProp range, including the full tail.
 
 - Fit on the full 10M, as the earlier size studies did.
-- Draw a seeded random 100k rows of the 10M set as the `train` eval set and save the
-  row indices so every arm uses the same rows.
+- `train_random`: a seeded random 100k rows of the 10M set.
+- `train_top`: the 10k rows with the highest `y`, found with a full pass over the 10M
+  column (compute node, not the login node). Ties at the cut-off are broken by row
+  order so the set is deterministic. 10k is a starting choice (top 0.1%); change it if
+  the top of `y` turns out to be flat or too small.
+- Save both sets' row indices so every arm scores the same rows.
+- **"Highest scoring" means highest `y`**, the probability of binding that the
+  surrogate fits. The training CSV has only `SMILE, y, fidelity` (no raw docking
+  score or pProp), and `y` is not monotone in the docking score (see CLAUDE.md), so
+  the top of `y` need not be the best-docking molecules. The `ampc_331k` set has the
+  raw `score` and `pprop`, so the best-docking view comes from there.
 - The overlap between the 331k and the 10M set is assumed tiny; the eval job may
   report the exact count once, cheaply.
 
