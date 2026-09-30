@@ -13,8 +13,8 @@ the ELBO vs PLL problem is in `SURROGATE_ELBO_VS_PLL.md`; read that first.
 
 - [x] Step 1: generate the 100k GP-MoLFormer prior sample (done 2026-09-30, job 4317115)
 - [ ] Step 2: dock a subset with `Dock3Oracle` (count undecided)
-- [ ] Step 3: pick the `train` eval subsets: seeded 100k random + top 10k by `y` (no held-out split; see below)
-- [ ] Step 4: fit script (fit once on the full 10M, save surrogate state)
+- [ ] Step 3: pick the `train` eval subsets: seeded 100k random + top 10k by `y` (no held-out split; see below). Written into the fit script, not run
+- [ ] Step 4: fit script (fit once on the full 10M, save surrogate state). Written and linted, not run; its tests have not been run (need a `salloc`)
 - [ ] Step 5: eval script (load state, score all sets, log to W&B)
 - [ ] Step 6: run ELBO and PLL through steps 4–5 and compare
 
@@ -152,6 +152,31 @@ held-out role and covers the whole pProp range, including the full tail.
   report the exact count once, cheaply.
 
 ## Step 4: fit script
+
+Written 2026-09-30 (not yet run): `scripts/surrogate_eval_fit.py`,
+`jobs/surrogate_eval_fit.sh`, `tests/scripts/test_surrogate_eval_fit.py` (tests not
+yet run). Submit one arm per objective from the repo root:
+
+```sh
+sbatch jobs/surrogate_eval_fit.sh VariationalELBO
+sbatch jobs/surrogate_eval_fit.sh PredictiveLogLikelihood
+```
+
+Each writes `outputs/ampc/surrogate_eval/<objective>/` with `surrogate_state.pt`,
+`train_random.csv`, `train_top.csv` (written before the fit), `resolved_config.json`
+and `fit_summary.json` (fit time, data size, learned noise / outputscale /
+lengthscales / y mean and std). It logs that summary to W&B project
+`ampc-surrogate-eval` through `log_to_wandb()`, the one place to change what is
+tracked; `WANDB_MODE=offline` on compute nodes, then `wandb sync`.
+
+Open design point for step 5: `load_state_dict()` on an unfitted surrogate defers
+the state until `fit()` runs, and `fit()` then re-encodes all 10M rows (from the
+feature cache) and builds the model instead of training. So an eval that reloads a
+saved state still needs a whole node, because GIBBON's candidate set is built from
+the training data. Decide whether the eval reloads that way, or whether the fit job
+also saves what the acquisition needs.
+
+Original notes:
 
 - `scripts/surrogate_eval_fit.py`: build the surrogate from the config exactly as
   `activelearning.main` does (`ActiveLearningConfig` → `.build()`), fit on the
