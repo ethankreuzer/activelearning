@@ -298,6 +298,26 @@ def test_write_per_molecule_csv_round_trips(tmp_path: Path) -> None:
     assert not path.with_name("val_set.csv.tmp").exists()
 
 
+def test_final_metrics_config_nests_scalars_beside_the_train_time() -> None:
+    """Final scalars become a nested config record, never step metrics."""
+    record = fit_script.final_metrics_config(
+        {
+            "val_set/final/nll": 8.5,
+            "val_set/final/pearson": 0.87,
+            "train_top/std_total/mean": 0.014,
+            "run/fit/seconds": 801.0,
+        },
+        train_time_seconds=801.0,
+    )
+
+    assert record == {
+        "train_time_seconds": 801.0,
+        "val_set": {"final": {"nll": 8.5, "pearson": 0.87}},
+        "train_top": {"std_total": {"mean": 0.014}},
+        "run": {"fit": {"seconds": 801.0}},
+    }
+
+
 def test_epoch_callback_logs_one_step_per_epoch() -> None:
     """The callback writes every set's metrics and commits exactly one step."""
     observations = [Observation(x=f"C{i}", y=0.1 * i) for i in range(4)]

@@ -29,7 +29,9 @@ arm differ only in one argument::
 
 Run it on a whole GPU node through ``jobs/surrogate_eval_fit.sh``, never on the
 login node. Pass ``--wandb-project`` to log to W&B (run with ``WANDB_MODE=offline``
-on compute nodes and ``wandb sync`` afterwards).
+on compute nodes and ``wandb sync`` afterwards). Only the per-epoch curves and the
+figures are logged as charts; every once-per-run scalar (the final metrics, the
+learned hyperparameters and the train time) is stored in the run config.
 """
 
 from __future__ import annotations
@@ -427,6 +429,37 @@ def log_scalars(logger: Any, metrics: Mapping[str, float]) -> None:
     """Buffer every scalar metric on the logger."""
     for key, value in metrics.items():
         logger.log_metric(key, value)
+
+
+def final_metrics_config(
+    metrics: Mapping[str, float], *, train_time_seconds: float
+) -> dict[str, Any]:
+    """Nest the once-per-run scalars into a record for the run configuration.
+
+    A value logged once has no curve, so as a step metric it would only produce a
+    single-point chart. These go next to the hyperparameters instead.
+
+    Parameters
+    ----------
+    metrics : Mapping[str, float]
+        Final scalars keyed by ``/``-separated paths, e.g. ``val_set/final/nll``.
+    train_time_seconds : float
+        Wall-clock time of the surrogate fit.
+
+    Returns
+    -------
+    dict[str, Any]
+        ``train_time_seconds`` plus the metrics nested by their path segments, e.g.
+        ``{"val_set": {"final": {"nll": ...}}}``.
+    """
+    record: dict[str, Any] = {"train_time_seconds": float(train_time_seconds)}
+    for key, value in metrics.items():
+        *parents, leaf = key.split("/")
+        node = record
+        for parent in parents:
+            node = node.setdefault(parent, {})
+        node[leaf] = value
+    return record
 
 
 def log_figures(logger: Any, figures: Mapping[str, Any]) -> None:
@@ -1228,7 +1261,11 @@ def main(argv: Sequence[str] | None = None) -> None:
                     out_dir / "eval" / f"{eval_set.name}.csv", eval_set, columns
                 )
 
-        log_scalars(logger, final_metrics)
+        # The final scalars are single values, not curves: they go with the
+        # hyperparameters, and only the figures are committed as a step.
+        logger.log_config(
+            final_metrics_config(final_metrics, train_time_seconds=fit_seconds)
+        )
         log_figures(logger, final_figures)
         epochs = int(training_params.get("epochs") or 0)
         logger.log_step(epochs + 1)
