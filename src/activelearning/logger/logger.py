@@ -1,5 +1,6 @@
 import json
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
 from datetime import datetime
 from numbers import Real
 from typing import Any
@@ -178,16 +179,41 @@ class WandbLogger(Logger):
         Name of the wandb project.
     run_name : str, optional
         Name of this specific run. Defaults to a timestamp if not provided.
+    entity : str, optional
+        Team or user the run belongs to. When omitted, wandb resolves it from the
+        environment, which on a shared machine may not be the intended account.
+    tags : sequence of str, optional
+        Tags attached to the run.
+    group : str, optional
+        Group the run belongs to, for showing related runs together.
     """
 
     def __init__(
-        self, project_name: str, run_name: str | None = None, **kwargs: Any
+        self,
+        project_name: str,
+        run_name: str | None = None,
+        entity: str | None = None,
+        tags: Sequence[str] | None = None,
+        group: str | None = None,
+        **kwargs: Any,
     ) -> None:
         super().__init__(project_name, run_name, **kwargs)
         import wandb  # type: ignore[import-not-found]  # optional dependency
 
         self._wandb = wandb
-        self.run = wandb.init(project=self.project_name, name=self.run_name)
+        # Only the options that were actually given are forwarded, so wandb keeps its
+        # own defaults for the rest.
+        init_kwargs: dict[str, Any] = {
+            "project": self.project_name,
+            "name": self.run_name,
+        }
+        if entity is not None:
+            init_kwargs["entity"] = entity
+        if tags is not None:
+            init_kwargs["tags"] = list(tags)
+        if group is not None:
+            init_kwargs["group"] = group
+        self.run = wandb.init(**init_kwargs)
         self._buffer: dict[str, Any] = {}
 
     def log_config(self, config: dict[str, Any]) -> None:

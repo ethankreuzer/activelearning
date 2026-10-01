@@ -31,9 +31,18 @@ class WandbLoggerConfig(BaseModel):
     type: Literal["WandbLogger"] = "WandbLogger"
     project_name: str
     run_name: str | None = None
+    entity: str | None = None
+    tags: list[str] | None = None
+    group: str | None = None
 
     def build(self) -> Logger:
-        return WandbLogger(project_name=self.project_name, run_name=self.run_name)
+        return WandbLogger(
+            project_name=self.project_name,
+            run_name=self.run_name,
+            entity=self.entity,
+            tags=self.tags,
+            group=self.group,
+        )
 
 
 class CometLoggerConfig(BaseModel):

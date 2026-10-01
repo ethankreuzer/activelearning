@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from math import sqrt
 from typing import Any
 
@@ -21,6 +21,12 @@ from activelearning.surrogate.objectives import (
     resolve_variational_objective,
 )
 from activelearning.utils.types import Candidate, Observation
+
+
+#: Called at the end of every training epoch with the zero-based epoch index and the
+#: mean training loss over that epoch. Used for monitoring only: it must not mutate the
+#: model, and any evaluation inside it belongs under ``torch.no_grad()``.
+EpochCallback = Callable[[int, float], None]
 
 
 def _synchronize_profile_device(device: torch.device) -> None:
@@ -184,6 +190,7 @@ class VariationalGPSurrogate(BoTorchGPSurrogate):
         self._y_mean = 0.0
         self._y_std = 1.0
         self._fit_profiling: dict[str, float] = {}
+        self._epoch_callback: EpochCallback | None = None
         batch_size = getattr(training_params, "batch_size", None)
         if batch_size is not None and batch_size < 1:
             raise ValueError("training_params.batch_size must be positive.")
@@ -193,6 +200,22 @@ class VariationalGPSurrogate(BoTorchGPSurrogate):
             optimize_hyperparameters=False,
             is_multi_fidelity=is_multi_fidelity,
         )
+
+    def set_epoch_callback(self, callback: EpochCallback | None) -> None:
+        """Install a monitoring callback invoked at the end of every training epoch.
+
+        The callback is a no-op by default, so the active-learning loop is unchanged.
+        It runs after the optimizer step, with the model left in whatever mode the
+        callback leaves it: each epoch re-enters ``train()``, so evaluating inside the
+        callback is safe as long as it does so under ``torch.no_grad()``.
+
+        Parameters
+        ----------
+        callback : EpochCallback or None
+            Called as ``callback(epoch_index, mean_epoch_loss)``. ``None`` removes any
+            previously installed callback.
+        """
+        self._epoch_callback = callback
 
     def bind_runtime_context(self, runtime_context: RuntimeContext) -> None:
         """Bind runtime settings to the encoder and variational GP stack."""
@@ -345,6 +368,150 @@ class VariationalGPSurrogate(BoTorchGPSurrogate):
             "mean": mean.cpu().tolist(),
             "std": std.cpu().tolist(),
         }
+
+    def predict_encoded(
+        self,
+        features: torch.Tensor,
+        *,
+        observation_noise: bool = True,
+        chunk_size: int | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Predict on features that are already encoded, without re-encoding them.
+
+        :meth:`predict` re-encodes its candidates on every call, which is unaffordable
+        for a monitoring callback that runs once per epoch. This takes the encoded
+        matrix directly and returns CPU tensors rather than Python lists, since the
+        evaluation sets run to hundreds of thousands of rows.
+
+        Parameters
+        ----------
+        features : torch.Tensor
+            Encoded rows, shaped ``(n, feature_dim)`` in model space.
+        observation_noise : bool, default=True
+            Whether to include the likelihood's noise. ``True`` gives the total
+            predictive standard deviation; ``False`` gives the latent one, which is
+            what the acquisition sees.
+        chunk_size : int, optional
+            Rows scored per posterior call. ``None`` scores them all at once.
+
+        Returns
+        -------
+        dict[str, torch.Tensor]
+            ``mean`` and ``std``, each a one-dimensional CPU tensor on the original
+            target scale.
+
+        Raises
+        ------
+        RuntimeError
+            If the surrogate has not been fitted.
+        ValueError
+            If ``chunk_size`` is not positive.
+        """
+        if self._gp_model is None or self._likelihood is None:
+            raise RuntimeError("Surrogate has not been fitted yet.")
+        if chunk_size is not None and chunk_size < 1:
+            raise ValueError("chunk_size must be positive.")
+        model = self.get_model()
+        self._gp_model.eval()
+        self._likelihood.eval()
+        rows = features.shape[0]
+        step = chunk_size or max(rows, 1)
+        means: list[torch.Tensor] = []
+        deviations: list[torch.Tensor] = []
+        with torch.no_grad():
+            for start in range(0, rows, step):
+                chunk = features[start : start + step].to(
+                    device=self.device, dtype=self.dtype
+                )
+                posterior = model.posterior(chunk, observation_noise=observation_noise)
+                means.append(posterior.mean.reshape(-1).cpu())
+                deviations.append(posterior.variance.sqrt().reshape(-1).cpu())
+        if not means:
+            empty = torch.empty(0, dtype=self.dtype)
+            return {"mean": empty, "std": empty.clone()}
+        return {"mean": torch.cat(means), "std": torch.cat(deviations)}
+
+    def evaluate_objective(
+        self,
+        features: torch.Tensor,
+        targets: torch.Tensor,
+        *,
+        num_data: int | None = None,
+        chunk_size: int | None = None,
+    ) -> float:
+        """Evaluate the training objective as a loss on an arbitrary set of rows.
+
+        The objective is the one the surrogate is being fitted with, so the value is
+        comparable with the training loss and across epochs, but **not across arms**:
+        ``VariationalELBO`` and ``PredictiveLogLikelihood`` are different functionals.
+        Use an objective-independent metric to compare two arms.
+
+        ``num_data`` only scales the KL term, so passing the training-set size (the
+        default) keeps the KL contribution identical to the training loss and to every
+        other evaluation set, whatever their sizes. Chunked evaluation takes the
+        size-weighted mean, which is exact for the same reason: the KL term is the same
+        constant in every chunk.
+
+        Parameters
+        ----------
+        features : torch.Tensor
+            Encoded rows, shaped ``(n, feature_dim)`` in model space.
+        targets : torch.Tensor
+            Targets on the original scale, shaped ``(n,)``. They are standardized here
+            with the fit's own statistics.
+        num_data : int, optional
+            Dataset size used to scale the KL term. Defaults to the number of training
+            rows.
+        chunk_size : int, optional
+            Rows per objective call. ``None`` evaluates them all at once.
+
+        Returns
+        -------
+        float
+            The loss, i.e. the negated objective, or ``nan`` for an empty input.
+
+        Raises
+        ------
+        RuntimeError
+            If the surrogate has not been fitted.
+        ValueError
+            If the inputs disagree in length or ``chunk_size`` is not positive.
+        """
+        if self._gp_model is None or self._likelihood is None or self._train_X is None:
+            raise RuntimeError("Surrogate has not been fitted yet.")
+        if chunk_size is not None and chunk_size < 1:
+            raise ValueError("chunk_size must be positive.")
+        if features.shape[0] != targets.shape[0]:
+            raise ValueError(
+                f"features has {features.shape[0]} rows but targets has "
+                f"{targets.shape[0]}."
+            )
+        rows = features.shape[0]
+        if rows == 0:
+            return float("nan")
+        objective = build_variational_objective(
+            resolve_variational_objective(self._training),
+            self._likelihood,
+            self._gp_model,
+            num_data if num_data is not None else int(self._train_X.shape[0]),
+        )
+        self._gp_model.eval()
+        self._likelihood.eval()
+        step = chunk_size or rows
+        total = 0.0
+        with torch.no_grad():
+            for start in range(0, rows, step):
+                chunk = features[start : start + step].to(
+                    device=self.device, dtype=self.dtype
+                )
+                chunk_targets = targets[start : start + step].to(
+                    device=self.device, dtype=self.dtype
+                )
+                standardized = (chunk_targets - self._y_mean) / self._y_std
+                with gpytorch.settings.cholesky_jitter(1e-1):
+                    loss = -objective(self._gp_model(chunk), standardized)
+                total += float(loss.item()) * chunk.shape[0]
+        return total / rows
 
     def get_fidelity_dimension(self) -> int | None:
         """Return the appended fidelity coordinate in feature space."""
@@ -507,8 +674,9 @@ class VariationalGPSurrogate(BoTorchGPSurrogate):
         batch_size = getattr(self._training, "batch_size", None)
         _synchronize_profile_device(self.device)
         fit_started = time.perf_counter()
+        callback_seconds = 0.0
         if batch_size is None:
-            for _ in range(self._training.epochs):
+            for epoch in range(self._training.epochs):
                 self._gp_model.train()
                 self._likelihood.train()
                 optimizer.zero_grad()
@@ -517,13 +685,18 @@ class VariationalGPSurrogate(BoTorchGPSurrogate):
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(parameters, max_norm=1.0)
                 optimizer.step()
+                if self._epoch_callback is not None:
+                    callback_seconds += self._run_epoch_callback(
+                        epoch, float(loss.item())
+                    )
             fit_key = "profiling/surrogate/gp_fit_full_s"
         else:
             generator = torch.Generator(device="cpu")
             generator.manual_seed(self.runtime_context.seed)
-            for _ in range(self._training.epochs):
+            for epoch in range(self._training.epochs):
                 self._gp_model.train()
                 self._likelihood.train()
+                epoch_loss_total: torch.Tensor | None = None
                 permutation = torch.randperm(
                     num_data,
                     generator=generator,
@@ -548,11 +721,59 @@ class VariationalGPSurrogate(BoTorchGPSurrogate):
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(parameters, max_norm=1.0)
                     optimizer.step()
+                    # The last batch of an epoch is short, so weight by its real size.
+                    # Accumulated on device: one `.item()` per batch would force a CUDA
+                    # synchronization on every one of the ~1000 steps in an epoch.
+                    weighted = loss.detach() * batch_indices.numel()
+                    epoch_loss_total = (
+                        weighted
+                        if epoch_loss_total is None
+                        else epoch_loss_total + weighted
+                    )
+                if self._epoch_callback is not None:
+                    mean_epoch_loss = (
+                        float("nan")
+                        if epoch_loss_total is None
+                        else float(epoch_loss_total.item()) / num_data
+                    )
+                    callback_seconds += self._run_epoch_callback(epoch, mean_epoch_loss)
             fit_key = "profiling/surrogate/gp_fit_minibatched_s"
         _synchronize_profile_device(self.device)
-        self._fit_profiling[fit_key] = time.perf_counter() - fit_started
+        # Monitoring must not inflate the fit timing, which is compared across runs.
+        self._fit_profiling[fit_key] = (
+            time.perf_counter() - fit_started - callback_seconds
+        )
+        if callback_seconds:
+            self._fit_profiling["profiling/surrogate/epoch_callback_s"] = (
+                callback_seconds
+            )
         self._gp_model.eval()
         self._likelihood.eval()
+
+    def _run_epoch_callback(self, epoch: int, mean_loss: float) -> float:
+        """Invoke the epoch callback if installed and return the seconds it took.
+
+        Parameters
+        ----------
+        epoch : int
+            Zero-based index of the epoch that just finished.
+        mean_loss : float
+            Mean training loss over the epoch, on the standardized target scale.
+
+        Returns
+        -------
+        float
+            Wall-clock seconds spent in the callback, ``0.0`` when none is installed.
+            The caller subtracts this from the fit timing so monitoring does not
+            inflate it.
+        """
+        if self._epoch_callback is None:
+            return 0.0
+        _synchronize_profile_device(self.device)
+        started = time.perf_counter()
+        self._epoch_callback(epoch, mean_loss)
+        _synchronize_profile_device(self.device)
+        return time.perf_counter() - started
 
     def get_fit_profiling(self) -> dict[str, float]:
         """Return feature-encoding and GP-fit timings from the latest fit."""

@@ -12,11 +12,11 @@ the ELBO vs PLL problem is in `SURROGATE_ELBO_VS_PLL.md`; read that first.
 ## Status
 
 - [x] Step 1: generate the 100k GP-MoLFormer prior sample (done 2026-09-30, job 4317115)
-- [ ] Step 2: dock all 100k generated molecules with `Dock3Oracle` (CPU-only job array). Scripts and jobs written and linted, not run; tests not run
+- [x] Step 2: dock all 100k generated molecules with `Dock3Oracle` (done 2026-09-30, array job 4321174; merged 2026-10-01). Tests still not run
 - [ ] Step 3: pick the `train` eval subsets: seeded 100k random + top 10k by `y` (no held-out split; see below). Written into the fit script, not run
-- [ ] Step 4: fit script (fit once on the full 10M, save surrogate state). Written and linted, not run; its tests have not been run (need a `salloc`)
-- [ ] Step 2b: label the 331k set: map its `pprop` to binding probabilities with `HitRateModel` and write the `val` subset. Script and job written and linted, not run; tests not run
-- [ ] Step 5: extend the fit script into one fit + evaluation job: per-epoch tracking, then final evaluation on all sets, logged to W&B (design below; nothing written yet)
+- [ ] Step 4: fit script (fit once on the full 10M, save surrogate state). Written and tested; folded into step 5's job, so it is ticked when an arm runs
+- [x] Step 2b: label the 331k set and write the `val` subset (done 2026-09-30, job 4321393). Tests still not run. See the label-route discrepancy noted under the step
+- [x] Step 5: one fit + evaluation job with per-epoch tracking and a final evaluation on all sets, logged to W&B. Written 2026-10-01; tests pass in a `salloc`. No arm has been run yet
 - [ ] Step 6: run ELBO and PLL through steps 4–5 and compare
 
 Tick boxes and add dated notes under each step as work lands.
@@ -156,6 +156,25 @@ was only used before on GPU-node jobs and in a smoke test under account
 `def-bengioy_cpu`; check that a first task works before trusting all 40. The first
 array task's log shows the per-chunk timing, which replaces the estimate above.
 
+Result (array job 4321174, finished 2026-09-30): all 40 tasks COMPLETED, each shard
+2,500/2,500 molecules processed, 38-58 min per task (the 4 h limit was generous).
+Merged 2026-10-01 into `data/gpmolformer_prior_100k_docked.csv` (100,000 rows;
+`SMILES, sa_score, passes_sa, y, raw_score, pprop, failure_reason`).
+
+| | |
+|---|---|
+| Docked successfully (`y` not NaN) | 89,783 (89.8%) |
+| `dock64_no_pose_or_score` | 9,598 |
+| `ligbuild_db2_timeout` | 445 |
+| `ligbuild_build_db2_index_error` | 118 |
+| `ligbuild_no_tgz` | 52 |
+| `ligbuild_protomer_build_failed` | 4 |
+
+The ~10% failure rate is the number to keep in mind when reading `gpmolformer_prior`
+results: the evaluated set is the 89.8k that docked, not the full 100k, and the
+failures are not random (they are biased toward molecules ligbuild cannot build).
+Whether that biases the reward distribution has not been checked.
+
 ## Step 2b: label the 331k set and build `val`
 
 Written (not run; tests not run): `scripts/make_val_set.py`, `jobs/make_val_set.sh`,
@@ -180,6 +199,53 @@ few minutes, not measured).
   others. Sampled rows get `weight = ipw * (n_others / n_sampled)`, which estimates the
   full set's weighted statistics (exactly preserves the non-hit weight total only when
   `ipw` is constant among them). Hit rows keep their `ipw`.
+
+Result (job 4321393, finished 2026-09-30, 3 min 39 s): `data/ampc_331k_with_y.csv`
+(331,480 rows), `data/ampc_val_20k.csv` (20,153 rows: 3,153 hits + 17,000 others),
+`data/ampc_val_20k.json`, `data/ampc_val_20k.png`. Verified 2026-10-01 that the job
+read its hit-rate settings from the `Dock3Oracle` block of
+`config/ampc/s3gfn_minimol_ampc_variational_single_fidelity.yaml`
+(`ampc_hitrate_fits/fitted_params.json`, target `ampc`, `full_scores.df`,
+`pki_threshold: 6.5`) — the same settings the oracle uses in the loop, unmodified
+since 2026-09-09. No `y` is non-finite and no score fell outside the table range.
+
+### Open: the two routes to `y` disagree (noted 2026-10-01, deferred)
+
+The cross-check in `ampc_val_20k.png` shows the two routes are not interchangeable:
+
+- Route A (the `y` column, what `val` uses): CSV `pprop` -> `hit_rate_from_pprop` -> y.
+- Route B (`y_from_score`, the oracle's own path): CSV `score` -> lookup table ->
+  pProp -> `hit_rate` -> y.
+
+Route B sits **above** route A across the whole range (y ~ 0.00 -> 0.03, 0.20 -> 0.27,
+converging near the top): mean abs diff 0.059, Pearson 0.986. Separately, a handful of
+top-ranked rows break off entirely — route A 0.57-0.67 vs route B 0.09-0.39, giving the
+0.476 max abs diff. Example (first CSV row): pProp 7.0, score -106.72, `y` = 0.570,
+`y_from_score` = 0.094.
+
+Unverified hypothesis for the outliers: the CSV's `pprop` is capped at 7.0 while `y`
+peaks near pProp 6.3 and falls after it, so if the table route assigns those molecules
+a pProp above 7.0 their y slides further down the falling side. Not checked.
+
+**Also unverified: which route produced the 10M training set's `y`.** The training CSV
+has only `SMILE, y, fidelity` (no score, no pProp), so the route is not recorded there
+and was not traced. If the 10M used route A, `val` matches it and there is nothing to
+fix.
+
+Judged **not blocking for this experiment** (user, 2026-10-01), because step 6 is a
+two-arm comparison: ELBO and PLL are scored against identical `val` labels, so any
+label bias is common to both arms and cancels in the comparison. What it does touch:
+
+- absolute RMSE / bias / calibration on `val` (a ~0.06 systematic label shift is real
+  error the model cannot be blamed for), and
+- **comparing `val` numbers against `gpmolformer_prior` numbers**, since
+  `gpmolformer_prior` is labelled by route B (real docking through `Dock3Oracle`) while
+  `val` is labelled by route A. Cross-set comparisons inherit the offset; within-set,
+  cross-arm comparisons do not.
+
+To resolve later: trace how the 10M was labelled (file reading, no allocation needed),
+then relabel `val` from the `y_from_score` column already present in
+`ampc_331k_with_y.csv` if it turns out the training set used route B.
 
 ## Step 3: `train` eval subsample (no held-out split)
 
@@ -278,6 +344,31 @@ Reading the numbers: `train_top` is restricted to the highest `y` and `val` is t
 enriched, so R² and Pearson there are depressed by range restriction even for a decent
 model. Read them next to the bias and the figure; `train_random` and the weighted `val`
 numbers are the library-level view.
+
+### As built (2026-10-01)
+
+`scripts/surrogate_eval_fit.py` now fits and evaluates in one process;
+`scripts/surrogate_eval_metrics.py` holds the metrics and figures.
+`VariationalGPSurrogate` gained `set_epoch_callback`, `predict_encoded` and
+`evaluate_objective`; `WandbLogger` gained `entity`, `tags` and `group`.
+
+- W&B entity `models-mila5723`, project `ampc-surrogate-eval`, group
+  `surrogate-eval-step5`, run `<objective>-<jobid>`.
+- Per-epoch keys `<set>/epoch/{nll,rmse,bias,std_mean,pearson,r2,objective_loss,count}`
+  for `train_random`, `train_top`, `val_set`, plus `train/epoch/minibatch_loss`.
+  `objective_loss` is a within-arm convergence check only: ELBO and PLL are different
+  functionals. `nll` is the cross-arm comparison; `rmse` and `std_mean` decompose it.
+- Final keys `<set>/final/*`, `<set>/figures/*`, `gp_molformer_set/{acquisition_score,
+  log_reward,std_total,std_latent}/*`, `run/{fit,hyperparameters,acquisition}/*`.
+- Reward: `exponential`, `beta=100` (`overrides/reward_exponential.yaml`). The transform
+  is the identity, so `log R = 100 * score` is logged; `R` itself reaches `e**100`.
+- Guards that cost nothing and would otherwise fail late or silently: the script refuses
+  to start unless the acquisition is GIBBON with `log_space=true, log_output=false`;
+  it refuses if the encoder feature cache is missing (encoding an eval set first would
+  publish that small set as the cache); it asserts the encoded training matrix has one
+  row per observation before indexing it; and it raises if `acquisition.update()` left
+  no BoTorch acqf, since `score()` then returns a constant `1.0` that looks exactly like
+  the flat-reward finding the study is hunting for.
 
 **W&B**: run name and a top-level config key state the objective (PLL or ELBO), plus tags;
 log every hyperparameter (`num_inducing`, `epochs`, `lr`, `batch_size`, seeds, the learned
