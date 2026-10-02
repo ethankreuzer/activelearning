@@ -180,6 +180,12 @@ class TestWandbLogger:
         wandb_logger.log_config(config)
         mock_run.config.update.assert_called_once_with(config)
 
+    def test_log_summary_writes_run_summary_without_logging_a_step(self, logger):
+        wandb_logger, mock, mock_run = logger
+        wandb_logger.log_summary({"val_set/final/nll": 8.5})
+        mock_run.summary.update.assert_called_once_with({"val_set/final/nll": 8.5})
+        mock_run.log.assert_not_called()
+
     def test_log_metric_buffered(self, logger):
         wandb_logger, mock, mock_run = logger
         wandb_logger.log_metric("surrogate/general/loss", 0.5)

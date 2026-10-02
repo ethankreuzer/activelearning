@@ -34,6 +34,11 @@ from activelearning.surrogate.dkl.config import (
 )
 from activelearning.surrogate.dummy_mean_surrogate import DummyMeanSurrogate
 from activelearning.surrogate.encoder_config import FixedEncoderConfig
+from activelearning.surrogate.inducing_init import (
+    DEFAULT_STRATA_FRACTIONS,
+    DEFAULT_STRATA_QUANTILES,
+    validate_strata,
+)
 from activelearning.surrogate.objectives import (
     DEFAULT_VARIATIONAL_OBJECTIVE,
     VariationalObjective,
@@ -293,7 +298,22 @@ class VariationalGPSurrogateConfig(BaseModel):
     target_fidelity: int | None = None
     num_inducing: int = Field(default=64, ge=1)
     standardize_outputs: bool = True
+    inducing_init: Literal["random", "stratified", "kmeans"] = "random"
+    inducing_strata_quantiles: list[float] = Field(
+        default_factory=lambda: list(DEFAULT_STRATA_QUANTILES)
+    )
+    inducing_strata_fractions: list[float] = Field(
+        default_factory=lambda: list(DEFAULT_STRATA_FRACTIONS)
+    )
+    inducing_kmeans_max_rows: int = Field(default=200_000, ge=1)
+    inducing_init_seed: int = 0
     _is_multi_fidelity: bool = PrivateAttr(default=False)
+
+    @model_validator(mode="after")
+    def _validate_inducing_strata(self) -> "VariationalGPSurrogateConfig":
+        """Reject inconsistent stratum boundaries and point shares."""
+        validate_strata(self.inducing_strata_quantiles, self.inducing_strata_fractions)
+        return self
 
     @property
     def is_multi_fidelity(self) -> bool:
@@ -334,6 +354,11 @@ class VariationalGPSurrogateConfig(BaseModel):
             target_fidelity=self.target_fidelity,
             num_inducing=self.num_inducing,
             standardize_outputs=self.standardize_outputs,
+            inducing_init=self.inducing_init,
+            inducing_strata_quantiles=tuple(self.inducing_strata_quantiles),
+            inducing_strata_fractions=tuple(self.inducing_strata_fractions),
+            inducing_kmeans_max_rows=self.inducing_kmeans_max_rows,
+            inducing_init_seed=self.inducing_init_seed,
         )
 
 

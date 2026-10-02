@@ -49,6 +49,20 @@ class Logger(ABC):
             Dictionary of configuration keys and values to log.
         """
 
+    def log_summary(self, values: dict[str, Any]) -> None:
+        """Record one-off scalars that should not become charts.
+
+        A scalar logged once through :meth:`log_metric` appears as a one-point chart
+        on backends that chart every metric. Backends with a run summary store these
+        there instead; the default records them as configuration.
+
+        Parameters
+        ----------
+        values : dict[str, Any]
+            Scalar values keyed by name.
+        """
+        self.log_config(values)
+
     @abstractmethod
     def log_metric(self, key: str, value: Any) -> None:
         """Log a scalar metric value.
@@ -225,6 +239,19 @@ class WandbLogger(Logger):
             Dictionary of configuration keys and values to log.
         """
         self.run.config.update(config)
+
+    def log_summary(self, values: dict[str, Any]) -> None:
+        """Write one-off scalars to the run summary, which creates no chart.
+
+        They show in the runs table and the Overview under their own names and can
+        be sorted and filtered there.
+
+        Parameters
+        ----------
+        values : dict[str, Any]
+            Scalar values keyed by name.
+        """
+        self.run.summary.update(values)
 
     def log_metric(self, key: str, value: Any) -> None:
         """Buffer a metric to be logged at the next log_step call.
@@ -507,6 +534,17 @@ class MultiLogger(Logger):
         """
         for logger in self._loggers:
             logger.log_config(config)
+
+    def log_summary(self, values: dict[str, Any]) -> None:
+        """Forward log_summary to all child loggers.
+
+        Parameters
+        ----------
+        values : dict[str, Any]
+            Scalar values keyed by name.
+        """
+        for logger in self._loggers:
+            logger.log_summary(values)
 
     def log_metric(self, key: str, value: Any) -> None:
         """Forward log_metric to all child loggers.

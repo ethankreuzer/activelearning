@@ -508,6 +508,26 @@ def log_scalars(logger: Any, metrics: Mapping[str, float]) -> None:
         logger.log_metric(key, value)
 
 
+def log_final_scalars(logger: Any, metrics: Mapping[str, float]) -> None:
+    """Record every one-off scalar in the run summary, never as a chart metric.
+
+    A scalar logged once as a metric becomes a one-point chart, which clutters the
+    Charts tab. In the summary it appears in the runs table and the Overview under its
+    own name, where it can be sorted and filtered, and no chart is created. A
+    non-finite value is stored as ``None``.
+
+    Parameters
+    ----------
+    logger : Logger
+        Receives one ``log_summary`` call.
+    metrics : Mapping[str, float]
+        Scalars keyed by their metric name.
+    """
+    logger.log_summary(
+        {key: value if math.isfinite(value) else None for key, value in metrics.items()}
+    )
+
+
 def log_figures(logger: Any, figures: Mapping[str, Any]) -> None:
     """Buffer every figure on the logger."""
     for key, figure in figures.items():
@@ -1207,6 +1227,10 @@ def _run_configuration(
         "lr": training.get("lr"),
         "batch_size": training.get("batch_size"),
         "num_inducing": surrogate_cfg.get("num_inducing"),
+        "inducing_init": surrogate_cfg.get("inducing_init"),
+        "inducing_strata_quantiles": surrogate_cfg.get("inducing_strata_quantiles"),
+        "inducing_strata_fractions": surrogate_cfg.get("inducing_strata_fractions"),
+        "inducing_init_seed": surrogate_cfg.get("inducing_init_seed"),
         "standardize_outputs": surrogate_cfg.get("standardize_outputs"),
         "target_fidelity": surrogate_cfg.get("target_fidelity"),
         "encoder_type": dict(surrogate_cfg.get("encoder", {})).get("type"),
@@ -1424,6 +1448,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             "fit_seconds": fit_seconds,
             "objective": training_params.get("variational_objective"),
             "num_inducing": dict(resolved.get("surrogate", {})).get("num_inducing"),
+            "inducing_init": dict(resolved.get("surrogate", {})).get("inducing_init"),
             "epochs": training_params.get("epochs"),
             "lr": training_params.get("lr"),
             "batch_size": training_params.get("batch_size"),
@@ -1520,9 +1545,10 @@ def main(argv: Sequence[str] | None = None) -> None:
                     out_dir / "eval" / f"{eval_set.name}.csv", eval_set, columns
                 )
 
-        # The final scalars are logged as metrics at the step after the last epoch
-        # (the train time is `run/fit/seconds`), together with the figures.
-        log_scalars(logger, final_metrics)
+        # One-off scalars (including the train time, `run/fit/seconds`) go in the run
+        # summary, not the Charts tab; only the figures are logged, at the step after
+        # the last epoch. The per-epoch curves are the only scalars charted.
+        log_final_scalars(logger, final_metrics)
         log_figures(logger, final_figures)
         epochs = int(training_params.get("epochs") or 0)
         logger.log_step(args.epoch_offset + epochs + 1)

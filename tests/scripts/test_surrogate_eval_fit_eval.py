@@ -388,24 +388,33 @@ def test_write_per_molecule_csv_round_trips(tmp_path: Path) -> None:
     assert not path.with_name("val_set.csv.tmp").exists()
 
 
-def test_log_scalars_logs_every_final_scalar_as_a_metric() -> None:
-    """Final scalars are logged as metrics under their own keys."""
+def test_log_final_scalars_goes_to_summary_not_metrics() -> None:
+    """One-off scalars land in the run summary under their own keys, not as metrics."""
     metrics = {
         "val_set/final/nll": 8.5,
-        "val_set/final/pearson": 0.87,
-        "train_top/std_total/mean": 0.014,
+        "train_top/std_latent/mean": 0.07,
         "run/fit/seconds": 801.0,
+        "val_set/final/bias": float("nan"),
     }
-    logged: dict[str, float] = {}
+    summaries: list[dict[str, float | None]] = []
 
     class _Recorder:
+        def log_summary(self, values: dict[str, float | None]) -> None:
+            summaries.append(values)
+
         def log_metric(self, key: str, value: float) -> None:
-            validate_log_key(key)
-            logged[key] = value
+            raise AssertionError(f"scalar {key} was logged as a chart metric")
 
-    fit_script.log_scalars(_Recorder(), metrics)
+    fit_script.log_final_scalars(_Recorder(), metrics)
 
-    assert logged == metrics
+    assert summaries == [
+        {
+            "val_set/final/nll": 8.5,
+            "train_top/std_latent/mean": 0.07,
+            "run/fit/seconds": 801.0,
+            "val_set/final/bias": None,
+        }
+    ]
 
 
 def test_epoch_callback_logs_one_step_per_epoch() -> None:

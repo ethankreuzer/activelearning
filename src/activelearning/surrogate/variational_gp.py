@@ -9,6 +9,7 @@ from typing import Any
 
 import gpytorch
 import torch
+from torch import Tensor
 from botorch.models.model import Model
 from botorch.posteriors.gpytorch import GPyTorchPosterior
 from torch.optim import Adam
@@ -16,6 +17,14 @@ from torch.optim import Adam
 from activelearning.runtime import RuntimeContext
 from activelearning.surrogate.botorch_surrogate import BoTorchGPSurrogate
 from activelearning.surrogate.encoder import FixedEncoder
+from activelearning.surrogate.inducing_init import (
+    DEFAULT_STRATA_FRACTIONS,
+    DEFAULT_STRATA_QUANTILES,
+    INDUCING_INIT_MODES,
+    select_kmeans,
+    select_stratified,
+    validate_strata,
+)
 from activelearning.surrogate.objectives import (
     build_variational_objective,
     resolve_variational_objective,
@@ -160,6 +169,11 @@ class VariationalGPSurrogate(BoTorchGPSurrogate):
         target_fidelity: int | None = None,
         num_inducing: int = 64,
         standardize_outputs: bool = True,
+        inducing_init: str = "random",
+        inducing_strata_quantiles: tuple[float, ...] = DEFAULT_STRATA_QUANTILES,
+        inducing_strata_fractions: tuple[float, ...] = DEFAULT_STRATA_FRACTIONS,
+        inducing_kmeans_max_rows: int = 200_000,
+        inducing_init_seed: int = 0,
     ) -> None:
         """Initialize a fixed-feature variational GP surrogate.
 
@@ -177,6 +191,20 @@ class VariationalGPSurrogate(BoTorchGPSurrogate):
             Number of learned inducing-point locations.
         standardize_outputs : bool, default=True
             Whether to standardize targets during GP fitting.
+        inducing_init : {"random", "stratified", "kmeans"}, default="random"
+            Where the inducing points start. ``random`` draws uniform training rows.
+            ``stratified`` and ``kmeans`` split the rows into strata by target rank and
+            give each a fixed share of the points, as random rows or as k-means centres
+            (see :mod:`activelearning.surrogate.inducing_init`). The locations are
+            learned afterwards either way.
+        inducing_strata_quantiles : tuple of float
+            Target-quantile boundaries of the strata.
+        inducing_strata_fractions : tuple of float
+            Share of the inducing points in each stratum.
+        inducing_kmeans_max_rows : int, default=200000
+            Largest number of rows of one stratum that k-means is fitted to.
+        inducing_init_seed : int, default=0
+            Seed of the generator behind the stratified and k-means draws.
         """
         if is_multi_fidelity and target_fidelity is None:
             raise ValueError("target_fidelity must be set when is_multi_fidelity=True.")
@@ -184,11 +212,29 @@ class VariationalGPSurrogate(BoTorchGPSurrogate):
             raise ValueError("encoder.feature_dim must be positive.")
         if num_inducing < 1:
             raise ValueError("num_inducing must be positive.")
+        if inducing_init not in INDUCING_INIT_MODES:
+            raise ValueError(
+                f"inducing_init must be one of {INDUCING_INIT_MODES}, "
+                f"got {inducing_init!r}."
+            )
+        if inducing_init != "random" and is_multi_fidelity:
+            raise ValueError(
+                "Stratified and k-means inducing-point initialization is "
+                "single-fidelity only."
+            )
+        validate_strata(inducing_strata_quantiles, inducing_strata_fractions)
+        if inducing_kmeans_max_rows < 1:
+            raise ValueError("inducing_kmeans_max_rows must be positive.")
 
         self._encoder = encoder
         self._training = training_params
         self._target_fidelity_level = target_fidelity if is_multi_fidelity else None
         self._num_inducing = num_inducing
+        self._inducing_init = inducing_init
+        self._inducing_strata_quantiles = tuple(inducing_strata_quantiles)
+        self._inducing_strata_fractions = tuple(inducing_strata_fractions)
+        self._inducing_kmeans_max_rows = inducing_kmeans_max_rows
+        self._inducing_init_seed = inducing_init_seed
         self._standardize_outputs = standardize_outputs
         self._gp_model: _VariationalGP | None = None
         self._likelihood: gpytorch.likelihoods.GaussianLikelihood | None = None
@@ -601,23 +647,42 @@ class VariationalGPSurrogate(BoTorchGPSurrogate):
             return None
         return self._encode_fidelity_level(self._target_fidelity_level)
 
+    def _initial_inducing_points(self) -> Tensor:
+        """Return the starting inducing locations chosen by ``inducing_init``."""
+        assert self._train_X is not None and self._model_train_Y is not None
+        if self._inducing_init == "random":
+            sample_indices = torch.randint(
+                self._train_X.shape[0],
+                (self._num_inducing,),
+                device=self._train_X.device,
+            )
+            points = self._train_X[sample_indices]
+        elif self._inducing_init == "stratified":
+            points = select_stratified(
+                self._train_X,
+                self._model_train_Y,
+                self._num_inducing,
+                self._inducing_strata_quantiles,
+                self._inducing_strata_fractions,
+                seed=self._inducing_init_seed,
+            )
+        else:
+            points = select_kmeans(
+                self._train_X,
+                self._model_train_Y,
+                self._num_inducing,
+                self._inducing_strata_quantiles,
+                self._inducing_strata_fractions,
+                max_rows=self._inducing_kmeans_max_rows,
+                seed=self._inducing_init_seed,
+            )
+        return points.to(device=self.device, dtype=self.dtype).clone()
+
     def _build_variational_model(self) -> None:
         """Build the GP, likelihood, and BoTorch adapter."""
         input_dim = self._encoder.feature_dim + (1 if self._is_multi_fidelity else 0)
         assert self._train_X is not None
-        sample_indices = torch.randint(
-            self._train_X.shape[0],
-            (self._num_inducing,),
-            device=self._train_X.device,
-        )
-        inducing_points = (
-            self._train_X[sample_indices]
-            .to(
-                device=self.device,
-                dtype=self.dtype,
-            )
-            .clone()
-        )
+        inducing_points = self._initial_inducing_points()
         inducing_points += 1e-3 * torch.randn_like(inducing_points)
         self._gp_model = _VariationalGP(
             input_dim=input_dim,
