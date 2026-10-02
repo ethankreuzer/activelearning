@@ -37,16 +37,6 @@ class _FakeSurrogate:
             "std": torch.full((count,), scale),
         }
 
-    def evaluate_objective(
-        self,
-        features: torch.Tensor,
-        targets: torch.Tensor,
-        *,
-        num_data: int | None = None,
-        chunk_size: int | None = None,
-    ) -> float:
-        return 0.25
-
     def get_encoded_train_data(self) -> torch.Tensor:
         return torch.zeros((self._encoded_rows, 3))
 
@@ -69,12 +59,51 @@ def test_every_epoch_metric_key_is_valid() -> None:
     surrogate = _FakeSurrogate(8)
     sets = [_eval_set(name, 8) for name in fit_script.PER_EPOCH_SETS]
 
-    metrics = fit_script.epoch_metrics(surrogate, sets, num_data=100, chunk_size=4)
+    metrics = fit_script.epoch_metrics(surrogate, sets, chunk_size=4)
     metrics["train/epoch/minibatch_loss"] = 0.5
+    for name in fit_script.PER_EPOCH_HYPERPARAMETERS:
+        metrics[f"train/epoch/{name}"] = 0.5
 
     assert metrics
     for key in metrics:
         validate_log_key(key)
+
+
+def test_epoch_metrics_track_the_latent_std_and_skip_the_empty_pairs() -> None:
+    """The latent std is a curve of its own, and the uninformative pairs are left out."""
+    surrogate = _FakeSurrogate(8)
+    sets = [_eval_set(name, 8) for name in fit_script.PER_EPOCH_SETS]
+
+    metrics = fit_script.epoch_metrics(surrogate, sets, chunk_size=4)
+
+    for name in fit_script.PER_EPOCH_SETS:
+        # The fake predicts a total std of 1.0 and a latent std of 0.5.
+        assert metrics[f"{name}/epoch/std_mean"] == pytest.approx(1.0)
+        assert metrics[f"{name}/epoch/std_latent_mean"] == pytest.approx(0.5)
+        assert f"{name}/epoch/count" not in metrics
+        assert f"{name}/epoch/objective_loss" not in metrics
+    for name, metric in fit_script.SKIPPED_EPOCH_METRICS:
+        assert f"{name}/epoch/{metric}" not in metrics
+    assert "val_set/epoch/r2" in metrics
+    assert "train_top/epoch/bias" in metrics
+
+
+def test_epoch_metrics_add_weighted_metrics_only_for_a_weighted_set() -> None:
+    """Only a set that carries weights reports the weighted metrics."""
+    surrogate = _FakeSurrogate(8)
+    plain = _eval_set("train_top", 8)
+    weighted = fit_script.EvalSet(
+        name="val_set",
+        smiles=plain.smiles,
+        targets=plain.targets,
+        features=plain.features,
+        weights=np.linspace(1.0, 2.0, 8),
+    )
+
+    metrics = fit_script.epoch_metrics(surrogate, [plain, weighted], chunk_size=4)
+
+    assert "val_set/epoch/weighted_rmse" in metrics
+    assert "train_top/epoch/weighted_rmse" not in metrics
 
 
 def test_every_final_metric_and_figure_key_is_valid() -> None:
@@ -88,24 +117,46 @@ def test_every_final_metric_and_figure_key_is_valid() -> None:
     scores = np.linspace(1e-30, 1.0, 12)
 
     metrics, figures = fit_script.final_set_outputs(
-        eval_set,
-        predictions,
-        extra_distributions={
-            "acquisition_score": (scores, "information gain"),
-            "log_reward": (100.0 * scores, "log reward"),
-        },
+        eval_set, predictions, scores=scores, final_metrics=True
     )
 
     assert metrics and figures
     for key in list(metrics) + list(figures):
         validate_log_key(key)
+    name = fit_script.GENERATED_SET
+    assert f"{name}/final/pearson" in metrics
+    assert f"{name}/acquisition_score/fraction_zero" in metrics
+    assert f"{name}/std_latent/top1pct_y_mean" in metrics
+    assert f"{name}/figures/acquisition_score_vs_observed" in figures
+    assert f"{name}/figures/error_by_std_latent" in figures
+    # Dropped as duplicates: the total-std and log-reward summaries and figures.
+    assert not any("std_total" in key or "log_reward" in key for key in metrics)
+    assert f"{name}/figures/std_total" not in figures
+    assert f"{name}/figures/log_reward" not in figures
+
+
+def test_final_set_outputs_skip_final_metrics_and_figures_on_request() -> None:
+    """A set tracked every epoch reports no `final/` copy; figures can be turned off."""
+    eval_set = _eval_set("val_set", 12)
+    predictions = {
+        "mean": np.linspace(0.0, 1.0, 12),
+        "std_total": np.full(12, 0.2),
+        "std_latent": np.full(12, 0.1),
+    }
+
+    metrics, figures = fit_script.final_set_outputs(
+        eval_set, predictions, figures=False
+    )
+
+    assert figures == {}
+    assert not any("/final/" in key for key in metrics)
+    assert metrics["val_set/std_latent/mean"] == pytest.approx(0.1)
 
 
 def test_run_level_metric_keys_are_valid() -> None:
     """The fit and hyperparameter keys are the ones that raised before."""
     keys = [
         "run/fit/seconds",
-        "run/fit/n_observations",
         "run/acquisition/update_seconds",
         "run/acquisition/fallback_active",
         *(
@@ -114,12 +165,13 @@ def test_run_level_metric_keys_are_valid() -> None:
                 "noise",
                 "noise_std_original_scale",
                 "outputscale",
+                "prior_std_original_scale",
+                "variational_covar_eig_min",
+                "variational_covar_eig_max",
                 "mean_constant",
                 "lengthscale_min",
                 "lengthscale_median",
                 "lengthscale_max",
-                "y_mean",
-                "y_std",
             )
         ),
     ]
@@ -128,18 +180,19 @@ def test_run_level_metric_keys_are_valid() -> None:
         validate_log_key(key)
 
 
-def test_filter_generated_set_keeps_only_docked_and_sa_passing() -> None:
-    """A molecule must both dock and pass SA to be evaluated."""
+def test_filter_generated_set_keeps_the_docked_and_flags_sa_passing() -> None:
+    """Every docked molecule is kept; the mask marks the ones that also pass SA."""
     smiles = ["docked_sa", "docked_no_sa", "failed_sa", "failed_no_sa"]
     targets = np.array([0.5, 0.6, float("nan"), float("nan")])
     passes_sa = ["1", "0", "1", "0"]
 
-    kept, kept_targets, counts = fit_script.filter_generated_set(
+    kept, kept_targets, sa_mask, counts = fit_script.filter_generated_set(
         smiles, targets, passes_sa
     )
 
-    assert kept == ["docked_sa"]
-    assert kept_targets.tolist() == [0.5]
+    assert kept == ["docked_sa", "docked_no_sa"]
+    assert kept_targets.tolist() == [0.5, 0.6]
+    assert sa_mask.tolist() == [True, False]
     assert counts == {
         "n_total": 4,
         "n_docked": 2,
@@ -152,6 +205,43 @@ def test_filter_generated_set_rejects_mismatched_lengths() -> None:
     """Misaligned columns would silently mislabel molecules."""
     with pytest.raises(ValueError, match="Length mismatch"):
         fit_script.filter_generated_set(["a", "b"], np.array([0.1]), ["1", "1"])
+
+
+def test_subset_eval_set_keeps_the_masked_molecules_aligned() -> None:
+    """SMILES, targets, features and weights are all cut by the same mask."""
+    full = fit_script.EvalSet(
+        name="gp_molformer_docked_set",
+        smiles=("a", "b", "c"),
+        targets=np.array([0.1, 0.2, 0.3]),
+        features=torch.arange(6.0).reshape(3, 2),
+        weights=np.array([1.0, 2.0, 3.0]),
+    )
+
+    subset = fit_script.subset_eval_set(
+        full, np.array([True, False, True]), "gp_molformer_set"
+    )
+
+    assert subset.name == "gp_molformer_set"
+    assert subset.smiles == ("a", "c")
+    assert subset.targets.tolist() == [0.1, 0.3]
+    assert subset.features.tolist() == [[0.0, 1.0], [4.0, 5.0]]
+    assert subset.weights is not None and subset.weights.tolist() == [1.0, 3.0]
+
+
+def test_subset_eval_set_rejects_a_misaligned_mask() -> None:
+    """A mask of the wrong length would silently select the wrong molecules."""
+    with pytest.raises(ValueError, match="Mask of shape"):
+        fit_script.subset_eval_set(
+            _eval_set("val_set", 3), np.array([True, False]), "subset"
+        )
+
+
+def test_parse_float_column_marks_unparsable_entries_as_nan() -> None:
+    """A blank or malformed weight becomes nan rather than raising."""
+    parsed = fit_script.parse_float_column(["1.5", "", "x"])
+
+    assert parsed[0] == 1.5
+    assert math.isnan(parsed[1]) and math.isnan(parsed[2])
 
 
 def test_reward_columns_match_the_s3gfn_target() -> None:
@@ -298,24 +388,24 @@ def test_write_per_molecule_csv_round_trips(tmp_path: Path) -> None:
     assert not path.with_name("val_set.csv.tmp").exists()
 
 
-def test_final_metrics_config_nests_scalars_beside_the_train_time() -> None:
-    """Final scalars become a nested config record, never step metrics."""
-    record = fit_script.final_metrics_config(
-        {
-            "val_set/final/nll": 8.5,
-            "val_set/final/pearson": 0.87,
-            "train_top/std_total/mean": 0.014,
-            "run/fit/seconds": 801.0,
-        },
-        train_time_seconds=801.0,
-    )
-
-    assert record == {
-        "train_time_seconds": 801.0,
-        "val_set": {"final": {"nll": 8.5, "pearson": 0.87}},
-        "train_top": {"std_total": {"mean": 0.014}},
-        "run": {"fit": {"seconds": 801.0}},
+def test_log_scalars_logs_every_final_scalar_as_a_metric() -> None:
+    """Final scalars are logged as metrics under their own keys."""
+    metrics = {
+        "val_set/final/nll": 8.5,
+        "val_set/final/pearson": 0.87,
+        "train_top/std_total/mean": 0.014,
+        "run/fit/seconds": 801.0,
     }
+    logged: dict[str, float] = {}
+
+    class _Recorder:
+        def log_metric(self, key: str, value: float) -> None:
+            validate_log_key(key)
+            logged[key] = value
+
+    fit_script.log_scalars(_Recorder(), metrics)
+
+    assert logged == metrics
 
 
 def test_epoch_callback_logs_one_step_per_epoch() -> None:
@@ -336,10 +426,12 @@ def test_epoch_callback_logs_one_step_per_epoch() -> None:
     callback = fit_script.make_epoch_callback(
         _Recorder(),
         surrogate,
-        static_sets=[_eval_set("val_set", 4)],
+        static_sets=[
+            _eval_set("val_set", 4),
+            _eval_set(fit_script.GENERATED_SET, 4),
+        ],
         train_row_sets={"train_random": np.array([0, 1]), "train_top": np.array([3])},
         observations=observations,
-        num_data=4,
         chunk_size=2,
     )
 
@@ -350,4 +442,39 @@ def test_epoch_callback_logs_one_step_per_epoch() -> None:
     assert logged["train/epoch/minibatch_loss"] == 1.0
     for name in fit_script.PER_EPOCH_SETS:
         assert f"{name}/epoch/pearson" in logged
-        assert f"{name}/epoch/objective_loss" in logged
+        assert f"{name}/epoch/std_latent_mean" in logged
+
+
+def test_epoch_callback_offsets_a_warm_started_run() -> None:
+    """The starting point lands on the earlier run's last step, without a loss."""
+    observations = [Observation(x=f"C{i}", y=0.1 * i) for i in range(4)]
+    steps: list[int] = []
+    logged: list[set[str]] = []
+    buffer: set[str] = set()
+
+    class _Recorder:
+        def log_metric(self, key: str, value: float) -> None:
+            buffer.add(key)
+
+        def log_step(self, step: int) -> None:
+            steps.append(step)
+            logged.append(set(buffer))
+            buffer.clear()
+
+    callback = fit_script.make_epoch_callback(
+        _Recorder(),
+        _FakeSurrogate(4),
+        static_sets=[_eval_set("val_set", 4)],
+        train_row_sets={"train_random": np.array([0, 1])},
+        observations=observations,
+        chunk_size=2,
+        epoch_offset=50,
+    )
+
+    callback(-1, float("nan"))
+    callback(0, 1.5)
+
+    assert steps == [49, 50]
+    assert "train/epoch/minibatch_loss" not in logged[0]
+    assert "val_set/epoch/pearson" in logged[0]
+    assert "train/epoch/minibatch_loss" in logged[1]

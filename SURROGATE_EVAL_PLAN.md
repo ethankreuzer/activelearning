@@ -17,7 +17,8 @@ the ELBO vs PLL problem is in `SURROGATE_ELBO_VS_PLL.md`; read that first.
 - [ ] Step 4: fit script (fit once on the full 10M, save surrogate state). Written and tested; folded into step 5's job, so it is ticked when an arm runs
 - [x] Step 2b: label the 331k set and write the `val` subset (done 2026-09-30, job 4321393). Tests still not run. See the label-route discrepancy noted under the step
 - [x] Step 5: one fit + evaluation job with per-epoch tracking and a final evaluation on all sets, logged to W&B. Written 2026-10-01; tests pass in a `salloc`. No arm has been run yet
-- [ ] Step 6: run ELBO and PLL through steps 4–5 and compare
+- [ ] Step 6: run ELBO and PLL through steps 4–5 and compare. Both arms ran 2026-10-01 (jobs 4419799 ELBO, 4419800 PLL) and are synced to W&B; results are under Step 7. **PLL had not converged at 50 epochs** (see "Logging review" under Step 5), so its means are partly undertrained. No decision yet
+- [ ] Step 7: ELBO fit, then a PLL phase from the saved ELBO state. Planned 2026-10-01; **code written 2026-10-02, tests not run, no arm submitted**. Resume from "As built" in the section at the end
 
 Tick boxes and add dated notes under each step as work lands.
 
@@ -370,6 +371,91 @@ numbers are the library-level view.
   no BoTorch acqf, since `score()` then returns a constant `1.0` that looks exactly like
   the flat-reward finding the study is hunting for.
 
+**Where the final scalars go (changed 2026-10-02):** every scalar is a logged metric.
+The `<set>/final/*`, `<set>/std_*/*`, `run/*` values are logged with `log_metric` at
+step `epochs + 1`, so they are in the run summary under their slash names. The two
+2026-10-01 runs (`36hrvpco`, `arcu5jom`) predate this: commit `43e6bde` put their final
+scalars in the run **config** instead (dotted names, e.g.
+`gp_molformer_set.final.pearson`). Backfilled 2026-10-02: the 96 final scalars of each
+run were copied from `outputs/ampc/surrogate_eval/<objective>/eval_summary.json` into
+its W&B run **summary** through the API (summary only, no history step, so they show
+in the runs table and Overview but have no auto-generated chart). The config copies
+were left in place.
+The config now holds only inputs (objective, hyperparameter settings, seeds).
+
+### Logging review and changes (2026-10-02)
+
+Everything the two 2026-10-01 runs logged was reviewed (96 final scalars, 25 per-epoch
+curves, 28 figures, and the curves' history from W&B), and the scripts were changed to
+match. **Written and linted, tests not run** (they need a `salloc`):
+
+```sh
+uv run --no-sync pytest tests/scripts/test_surrogate_eval_metrics.py \
+  tests/scripts/test_surrogate_eval_fit_eval.py tests/scripts/test_surrogate_eval_fit.py
+```
+
+What the old logs showed once read closely:
+
+- **PLL had not converged at 50 epochs.** Val Pearson was still rising about 0.001 per
+  epoch (0.732 at epoch 39, 0.745 at 49) and the minibatch loss was still falling. ELBO
+  was flat by epoch 45. Part of "PLL has worse means" may be undertraining: give the PLL
+  arm more epochs (`surrogate.training_params.epochs=N`) before reading its means.
+- **Most generated molecules get a GIBBON score of exactly zero**: 83,789 of 83,811
+  under ELBO, 58,198 (69%) under PLL. The logged mean / std / max hid this.
+- **Val NLL under PLL rises while everything else improves** (7.8 at epoch 0, 23.2 at
+  epoch 49): a mean NLL is driven by a few badly overconfident molecules.
+- **The PLL latent std on the generated set is bimodal** (a main group near 0.0045 and
+  a second near 0.05). Only the histogram shows it.
+- The PLL latent std has a minimum of exactly 0.001 on three sets. This is consistent
+  with gpytorch's float32 minimum variance (1e-6), but the cause was **not verified**.
+
+Removed as uninformative or duplicated:
+
+- `<set>/final/*` for `train_random`, `train_top`, `val_set` (identical to the last
+  epoch's `<set>/epoch/*`). Kept for the generated sets, because those are the columns
+  the earlier runs are read by.
+- `<set>/std_total/*` and its figures (equal to `std_latent` under PLL, the noise
+  constant under ELBO), `log_reward/*` and its figure (100 x the acquisition score).
+- Every `count`; `<set>/epoch/objective_loss`; `train_top` `r2`; `train_random` `bias`;
+  the mean / std / min of the acquisition score.
+- `n_total`, `n_docked`, `n_sa_pass`, `n_evaluated`, `n_observations`, `y_mean`, `y_std`
+  as metrics: they are data constants and are in the run config.
+
+Keys now (all logged metrics; `<set>` is `train_random`, `train_top`, `val_set`,
+`gp_molformer_set`):
+
+- Per epoch, `<set>/epoch/`: `nll`, `nll_median`, `rmse`, `bias`, `std_mean` (total),
+  `std_latent_mean`, `pearson`, `r2`, `coverage_1std`, `coverage_2std` (target 0.68 /
+  0.95, total std), `spearman_std_error` (rank correlation of latent std with absolute
+  error). `val_set` also has `weighted_rmse`, `weighted_bias`, `weighted_pearson`,
+  `weighted_r2` from the CSV's `weight` column (library-level numbers).
+- Per epoch, `train/epoch/`: `minibatch_loss`, `noise_std_original_scale`,
+  `outputscale`, `lengthscale_median`, `variational_covar_eig_max`.
+- **The generated set now has per-epoch curves**: it is encoded before the fit.
+- Final, all sets: `<set>/std_latent/{mean,median,max,top1pct_y_mean,rest_mean}` (the
+  last two compare the top 1% of molecules by `y` with the rest).
+- Final, generated sets: `<set>/final/*` (the per-epoch metric set),
+  `<set>/acquisition_score/{fraction_zero,median,p99,p999,max,spearman_y}`,
+  `<set>/final/reward_overflow_count`.
+- **New set `gp_molformer_docked_set`**: every docked generated molecule (89,783),
+  SA-passing or not, since the real pool is not SA-filtered. Final scalars and a
+  per-molecule CSV (with `passes_sa`) only, no figures and no per-epoch curve.
+  `gp_molformer_set` keeps its meaning (docked and SA-passing, 83,811).
+- `run/hyperparameters/`: adds `prior_std_original_scale` and
+  `variational_covar_eig_{min,max}` (whitened covariance of the inducing values; the
+  prior is the identity, so a latent std above the prior std needs an eigenvalue
+  above 1).
+- Figures per set: `predicted_vs_observed` (now a log-coloured density of every
+  molecule, not 5,000 dots), `std_latent` histogram, `std_latent_vs_observed`,
+  `error_by_std_latent`, `error_by_std_total` (error in ten equal-count groups of the
+  predicted std; on the identity line when the std has the right size). Generated set
+  also: `acquisition_score` histogram with the log panel floored at 1e-12 and the zero
+  share in the title, and `acquisition_score_vs_observed`.
+
+Consequences for later runs: new runs are not key-for-key comparable with `36hrvpco`
+and `arcu5jom` on the removed keys; the per-epoch keys that existed before keep their
+names and meaning, so the curves still overlay. `--max-figure-points` is gone.
+
 **W&B**: run name and a top-level config key state the objective (PLL or ELBO), plus tags;
 log every hyperparameter (`num_inducing`, `epochs`, `lr`, `batch_size`, seeds, the learned
 noise / outputscale / lengthscales, y mean and std). Full per-molecule tables stay as CSVs
@@ -399,3 +485,208 @@ natural gradients for q(u) with Adam for hyperparameters; target transform
 
 Later: also sample from a partly trained S3-GFN policy, since the distribution shifts
 away from the prior during training.
+
+## Step 7: ELBO fit, then a PLL phase (planned 2026-10-01, not implemented)
+
+**Resume here.** The code was written on 2026-10-02 (see "As built" below); the tests
+have not been run and neither arm has been submitted. The design below was worked out
+against the code on 2026-10-01 but not reviewed line by line by the user.
+
+### Why
+
+The first ELBO/PLL pair (10M rows, 64 inducing points, 50 epochs, lr 1e-3, seed 42):
+
+| | ELBO | PLL |
+|---|---|---|
+| W&B run (`models-mila5723/ampc-surrogate-eval`) | `36hrvpco` | `arcu5jom` |
+| output dir under `outputs/ampc/surrogate_eval/` | `VariationalELBO/` | `PredictiveLogLikelihood/` |
+| val Pearson / R² / RMSE | 0.872 / 0.68 / 0.068 | 0.745 / 0.24 / 0.105 |
+| latent std, `train_random` vs `train_top` | 0.0021 vs 0.0033 | 0.0066 vs 0.065 |
+| learned noise std (original scale) | 0.0136 | 0.0002 (at the 1e-4 floor) |
+| GIBBON score on generated set, mean / max | 3.7e-44 / 3.1e-39 | 4.8e-5 / 0.045 |
+| `train_top` bias | -0.18 | -0.27 |
+
+ELBO has the better mean but a flat, tiny latent std, so GIBBON is unusable. PLL has a
+std that tracks error and usable GIBBON scores, but a worse mean. Both underpredict the
+top molecules. The idea: keep ELBO's mean and get PLL-style variances by loading the
+saved ELBO model and continuing training with the PLL objective.
+
+### What exists and what is missing
+
+- The ELBO model is saved: `outputs/ampc/surrogate_eval/VariationalELBO/surrogate_state.pt`
+  (GP + likelihood parameters and the target mean/std; no optimizer state). The PLL arm
+  has the same file.
+- Nothing can resume from it. `VariationalGPSurrogate.fit()` restores a loaded state
+  *instead of* training (`src/activelearning/surrogate/variational_gp.py`, the
+  `pending_state` branch), and `scripts/surrogate_eval_fit.py` has no option to load a
+  state and refuses to overwrite an existing `surrogate_state.pt`.
+
+### Two arms from the same ELBO checkpoint
+
+- **`all`**: every parameter keeps training under PLL. The mean is free to drift toward
+  the PLL-only result; the per-epoch curves show how long ELBO's fit survives.
+- **`variance`**: train only the variational covariance (`chol_variational_covar`) and
+  the noise; freeze inducing locations, variational mean, kernel hyperparameters and
+  mean constant. The predictive mean then stays exactly ELBO's and only the variances
+  move.
+
+### Planned changes
+
+1. `src/activelearning/surrogate/variational_gp.py`
+   - New `warm_start_from(state_dict, *, trainable="all")`, `trainable` in
+     `{"all", "variance"}`, one-shot for the next `fit()`.
+   - In `fit()`, a third branch after the model is built: load the state with the
+     existing `load_state_dict`; re-standardize `_model_train_Y` with the loaded
+     `_y_mean`/`_y_std`; for `variance`, set `requires_grad_(False)` on everything
+     except the two parameters above; call the epoch callback once with epoch `-1` to
+     report the starting point; then `_train_variational_gp(...)` unchanged (it already
+     optimizes only `requires_grad` parameters and reads the objective from
+     `training_params`).
+   - The existing load-then-`fit()` behaviour (restore, no training) stays as it is.
+2. `scripts/surrogate_eval_fit.py`
+   - Flags `--init-state PATH`, `--trainable {all,variance}`, `--epoch-offset INT`.
+   - Fail before loading data if the state file is missing or is the output dir's own.
+   - Log epochs at `epoch + offset`: with offset 50 the starting point lands on step 49
+     (the ELBO run's last step) and the PLL epochs on 50–99.
+   - Record `init_state`, `trainable`, `epoch_offset` in the run config and
+     `fit_summary.json`.
+3. New `jobs/surrogate_eval_elbo_then_pll.sh <all|variance> [extra args]`: a copy of
+   `jobs/surrogate_eval_fit.sh` with objective `PredictiveLogLikelihood`, the three new
+   flags, output dir `outputs/ampc/surrogate_eval/ELBO_then_PLL_<mode>/`, same W&B
+   group, tags `surrogate-eval,ELBO_then_PLL,<mode>`. PLL phase defaults to 50 epochs;
+   change with `surrogate.training_params.epochs=N`.
+4. Tests in `tests/surrogate/test_variational_gp.py` (warm start trains; `variance`
+   leaves the mean and the frozen parameters unchanged while the covariance moves;
+   ELBO→PLL switch runs; bad `trainable` raises) and argument checks in
+   `tests/scripts/test_surrogate_eval_fit.py`.
+
+Accepted limitations: Adam restarts cold (constant lr, no scheduler), and the minibatch
+generator re-seeds, so the PLL phase replays the shuffles of epochs 0–49.
+
+### Latent-variance diagnostics (noted 2026-10-02; items 1-5 written the same day, tests not run)
+
+Reviewed 2026-10-02 against `scripts/surrogate_eval_fit.py` and the two existing runs:
+what was logged showed how big the latent std is, but not whether it is right, and the
+per-epoch curves did not show the latent std at all. The five items below are now in
+`surrogate_eval_fit.py` and `surrogate_eval_metrics.py` (key names under "Logging
+review and changes" in Step 5); the `variance` arm is judged almost entirely on items
+1 and 2. The description below is of the state *before* that change.
+
+Logged today: per set at the end, mean / std / min / max and a histogram of
+`std_latent` and `std_total`, plus the learned noise and outputscale; GIBBON score and
+log-reward distributions on the generated set; per epoch `nll`, `rmse`, `bias`,
+`std_mean`, `pearson`, `r2`; per-molecule CSVs with `y, mean, std_total, std_latent`.
+
+Missing, in order of importance:
+
+1. **Latent std per epoch.** The per-epoch `std_mean` is the *total* std
+   (`epoch_metrics` predicts with `observation_noise=True`). Under ELBO that is almost
+   all noise (0.0138 total vs 0.0021 latent), so the curve hides the latent std. Log
+   `<set>/epoch/std_latent_mean` and the noise (original scale) per epoch.
+2. **Whether latent std tracks error.** No metric exists; the "PLL std tracks error"
+   conclusion rests only on the `train_top` vs `train_random` averages. Add, per set, a
+   rank correlation between `std_latent` and `|y − mean|`, and a figure of mean absolute
+   error per `std_latent` decile.
+3. **Calibration.** Step 5 specified the fraction of molecules with
+   `|y − mean| / std_total` below 1 and 2 (target 68% / 95%); it was never implemented.
+   The only calibration signal today is the NLL, which a few outliers dominate (93 on
+   `train_top` under ELBO).
+4. **Latent std where GIBBON needs it.** On `gp_molformer_set`: latent std of the
+   top-`y` molecules (e.g. top 1%) against the rest, and whether the GIBBON score ranks
+   high-`y` molecules above the others (rank correlation of score with `y`).
+5. **Why the variance is what it is.** Log the prior std
+   (`sqrt(outputscale) × y_std`) as a reference and the smallest / largest eigenvalue of
+   the variational covariance `S`. A latent std above the prior std means `S` has grown
+   past the prior. This is inferred for the PLL run (latent std 0.065 on `train_top` vs
+   a prior std of about 0.004) but **not verified** from the saved state.
+
+Still not built, although Step 5 lists them for the per-molecule CSVs: `s² / σ²` and the
+distance to the nearest inducing point.
+
+For the two existing runs, items 2, 3 and 4 need no refit: they can be computed from
+`outputs/ampc/surrogate_eval/<objective>/eval/*.csv` in a short job (not on the login
+node). That has not been done. Items 1 and 5 only appear in new runs.
+
+Background for reading these numbers (model as implemented, whitened
+`VariationalStrategy`, `A(x) = L⁻¹ K_zx`):
+
+```
+mean            μ(x)  = c + A(x)·m
+latent variance s²(x) = [k(x,x) − A(x)·A(x)] + A(x)ᵀ S A(x)
+total variance  s²(x) + σ²
+ELBO per point  −(y−μ)²/(2σ²) − ½ log σ² − s²(x)/(2σ²)
+PLL per point   −(y−μ)²/(2(σ²+s²(x))) − ½ log(σ²+s²(x))
+```
+
+Only `S` and the noise leave the mean untouched, and only `S` moves the latent std that
+GIBBON sees. The KL term is divided by N = 10M in both objectives, so it barely
+constrains `S`. ELBO only penalises `s²` and puts the misfit in `σ²`; PLL routes the
+misfit through `s²(x)` and drives `σ²` to its floor, at the cost of the mean.
+
+### As built (2026-10-02)
+
+Written, linted and byte-compiled; **tests not run** (they need a `salloc`):
+
+```sh
+uv run --no-sync pytest tests/surrogate/test_variational_gp.py \
+  tests/scripts/test_surrogate_eval_fit.py tests/scripts/test_surrogate_eval_fit_eval.py \
+  tests/scripts/test_surrogate_eval_metrics.py
+```
+
+Then, from the repo root:
+
+```sh
+sbatch jobs/surrogate_eval_elbo_then_pll.sh variance
+sbatch jobs/surrogate_eval_elbo_then_pll.sh all
+# afterwards, from the login node:
+wandb sync outputs/ampc/surrogate_eval/ELBO_then_PLL_<mode>/wandb/offline-run-*
+```
+
+- `VariationalGPSurrogate.warm_start_from(state_dict, *, trainable="all")`: one-shot
+  for the next `fit()`. `fit()` loads the state, re-standardizes the targets with the
+  loaded mean/std, freezes parameters for `variance` (everything except
+  `chol_variational_covar` and the noise), reports the loaded model through the epoch
+  callback as epoch `-1` with a `nan` loss, then trains as usual. Load-then-`fit()`
+  (restore without training) is unchanged.
+- `scripts/surrogate_eval_fit.py`: `--init-state PATH`, `--trainable {all,variance}`,
+  `--epoch-offset INT`. It refuses a missing state file or the output directory's own
+  one before loading data, requires an offset of at least 1 with `--init-state` (the
+  starting point is logged at step `offset - 1`), and records all three in the run
+  config and `fit_summary.json`. The final scalars and figures go to step
+  `offset + epochs + 1`.
+- `jobs/surrogate_eval_elbo_then_pll.sh <all|variance> [extra args]`: objective
+  `PredictiveLogLikelihood`, initial state
+  `outputs/ampc/surrogate_eval/VariationalELBO/surrogate_state.pt`, offset 50, output
+  `outputs/ampc/surrogate_eval/ELBO_then_PLL_<mode>/`. `INIT_STATE` and `EPOCH_OFFSET`
+  can be overridden from the environment.
+- Training settings of the PLL phase are the base config's, unchanged (user,
+  2026-10-02): **50 epochs**, lr 1e-3, batch 10,000, gradient clipping at norm 1.0.
+  The from-scratch PLL run was still improving at 50 epochs, so check the per-epoch
+  latent-std curve for a plateau; extend with `surrogate.training_params.epochs=N`.
+- W&B: same project `ampc-surrogate-eval`, **group `surrogate-eval-step7`** (not the
+  step-5 group planned above), tags `surrogate-eval,ELBO_then_PLL,<mode>`. Filter on
+  the config keys `trainable` and `init_state`.
+- The runs use the 2026-10-02 logging, so they carry keys the two 2026-10-01 runs
+  lack. **The two old runs will not be rerun for this** (user, 2026-10-02). What still
+  compares: the per-epoch `nll`, `rmse`, `bias`, `std_mean`, `pearson`, `r2` curves,
+  `<set>/std_latent/{mean,max}`, `acquisition_score/max` and `gp_molformer_set/final/*`
+  keep their names. The ELBO baseline for the new metrics comes free: step 49 of each
+  Step 7 run is the loaded ELBO model scored with the new logging. Only the
+  from-scratch PLL run lacks the new metrics; its new *final* scalars (coverage, rank
+  correlations, score quantiles and zero fraction) can be computed from
+  `outputs/ampc/surrogate_eval/PredictiveLogLikelihood/eval/*.csv` without a refit if
+  wanted (not done).
+- Tests added: warm start loads then trains; `variance` moves only the covariance and
+  the noise and leaves the predicted mean unchanged; a bad `trainable` raises; the
+  warm start applies to one fit only; argument checks; the epoch offset.
+
+### How to check the result
+
+- Step 49 of each new run reproduces the ELBO finals (val Pearson 0.872, val RMSE
+  0.0682, `train_random` `std_mean` 0.0138). If not, the load is wrong.
+- `variance` arm: Pearson / RMSE / bias constant over all epochs; std and NLL change.
+- Outcome: latent std on `train_top` vs `train_random`, val NLL, and the GIBBON score
+  distribution on the generated set, against both existing arms.
+
+Neither arm is expected to fix the underprediction of the top molecules; that is the
+target transform / inducing-point initialisation work listed under Step 6.

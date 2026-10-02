@@ -88,19 +88,141 @@ def test_prediction_metrics_values_are_hand_computable() -> None:
 
     result = metrics.prediction_metrics(targets, mean, std)
 
-    assert result["count"] == 2.0
     assert result["rmse"] == pytest.approx(1.0)
     assert result["bias"] == pytest.approx(0.0)
     assert result["std_mean"] == pytest.approx(2.0)
+    # Both errors are 1.0: inside one std for both molecules (stds 1.0 and 3.0).
+    assert result["coverage_1std"] == pytest.approx(1.0)
+    assert result["coverage_2std"] == pytest.approx(1.0)
+    assert "count" not in result
+    assert "std_latent_mean" not in result
+
+
+def test_prediction_metrics_coverage_counts_targets_inside_the_interval() -> None:
+    """Errors of 0.5, 1.5 and 2.5 stds give coverages of 1/3 and 2/3."""
+    result = metrics.prediction_metrics(
+        [0.5, 1.5, 2.5], [0.0, 0.0, 0.0], [1.0, 1.0, 1.0]
+    )
+
+    assert result["coverage_1std"] == pytest.approx(1.0 / 3.0)
+    assert result["coverage_2std"] == pytest.approx(2.0 / 3.0)
+
+
+def test_prediction_metrics_median_nll_ignores_one_overconfident_outlier() -> None:
+    """One badly overconfident molecule moves the mean NLL but not the median."""
+    targets = [0.0, 0.0, 0.0, 0.0, 100.0]
+    mean = [0.0] * 5
+    std = [1.0] * 5
+
+    result = metrics.prediction_metrics(targets, mean, std)
+
+    assert result["nll_median"] == pytest.approx(0.5 * math.log(2.0 * math.pi))
+    assert result["nll"] > 100.0 * result["nll_median"]
+
+
+def test_prediction_metrics_reports_whether_the_latent_std_tracks_the_error() -> None:
+    """A latent std that rises with the error has a rank correlation of 1."""
+    targets = [0.0, 0.0, 0.0, 0.0]
+    mean = [0.1, 0.2, 0.3, 0.4]
+
+    tracking = metrics.prediction_metrics(
+        targets, mean, [1.0] * 4, latent_std=[0.01, 0.02, 0.03, 0.04]
+    )
+    inverted = metrics.prediction_metrics(
+        targets, mean, [1.0] * 4, latent_std=[0.04, 0.03, 0.02, 0.01]
+    )
+    constant = metrics.prediction_metrics(
+        targets, mean, [1.0] * 4, latent_std=[0.02] * 4
+    )
+
+    assert tracking["std_latent_mean"] == pytest.approx(0.025)
+    assert tracking["spearman_std_error"] == pytest.approx(1.0)
+    assert inverted["spearman_std_error"] == pytest.approx(-1.0)
+    assert math.isnan(constant["spearman_std_error"])
+
+
+def test_rank_correlation_depends_only_on_the_order() -> None:
+    """A monotone but nonlinear relation still has a rank correlation of 1."""
+    first = np.array([1.0, 2.0, 3.0, 4.0])
+
+    assert metrics.rank_correlation(first, first**3) == pytest.approx(1.0)
+    assert math.isnan(metrics.rank_correlation([1.0], [2.0]))
+
+
+def test_weighted_prediction_metrics_match_the_unweighted_ones_for_equal_weights() -> (
+    None
+):
+    """Equal weights reproduce the plain RMSE, bias, Pearson and R-squared."""
+    targets = np.array([0.0, 1.0, 2.0, 4.0])
+    mean = np.array([0.5, 0.5, 2.5, 3.0])
+    plain = metrics.prediction_metrics(targets, mean, np.ones(4))
+
+    weighted = metrics.weighted_prediction_metrics(targets, mean, np.full(4, 7.0))
+
+    assert weighted["weighted_rmse"] == pytest.approx(plain["rmse"])
+    assert weighted["weighted_bias"] == pytest.approx(plain["bias"])
+    assert weighted["weighted_pearson"] == pytest.approx(plain["pearson"])
+    assert weighted["weighted_r2"] == pytest.approx(plain["r2"])
+
+
+def test_weighted_prediction_metrics_follow_the_heavy_molecules() -> None:
+    """A molecule with zero weight does not contribute to the error."""
+    weighted = metrics.weighted_prediction_metrics(
+        [0.0, 1.0, 5.0], [0.0, 1.0, 0.0], [1.0, 1.0, 0.0]
+    )
+
+    assert weighted["weighted_rmse"] == pytest.approx(0.0)
+    assert weighted["weighted_bias"] == pytest.approx(0.0)
+
+
+def test_weighted_prediction_metrics_are_nan_without_weight() -> None:
+    """All-zero weights leave every metric undefined instead of dividing by zero."""
+    weighted = metrics.weighted_prediction_metrics([0.0, 1.0], [0.0, 1.0], [0.0, 0.0])
+
+    assert all(math.isnan(value) for value in weighted.values())
+
+
+def test_score_stats_report_the_zero_fraction_and_the_tail() -> None:
+    """Mostly-zero scores are summarized by their zero share, not by a mean."""
+    scores = np.array([0.0] * 8 + [1e-30, 0.5])
+    targets = np.arange(10.0)
+
+    result = metrics.score_stats(scores, targets)
+
+    assert result["fraction_zero"] == pytest.approx(0.8)
+    assert result["median"] == 0.0
+    assert result["max"] == pytest.approx(0.5)
+    assert result["p999"] <= result["max"]
+    assert result["spearman_y"] > 0.0
+
+
+def test_score_stats_are_nan_without_finite_scores() -> None:
+    """Nothing finite gives nan statistics, without raising."""
+    result = metrics.score_stats([float("nan")], [1.0])
+
+    assert all(math.isnan(value) for value in result.values())
+
+
+def test_top_fraction_split_means_separate_the_highest_targets() -> None:
+    """The top group is the highest-target share; the rest is everything else."""
+    targets = np.arange(100.0)
+    values = np.where(targets >= 90.0, 2.0, 1.0)
+
+    top, rest = metrics.top_fraction_split_means(values, targets, fraction=0.1)
+
+    assert top == pytest.approx(2.0)
+    assert rest == pytest.approx(1.0)
 
 
 def test_prediction_metrics_drops_rows_that_are_not_finite_everywhere() -> None:
     """A nan in any of the three inputs removes that row from all of them."""
     result = metrics.prediction_metrics(
-        [0.0, float("nan"), 2.0], [0.0, 1.0, 2.0], [1.0, 1.0, float("nan")]
+        [0.0, float("nan"), 2.0], [0.5, 1.0, 2.0], [1.0, 1.0, float("nan")]
     )
 
-    assert result["count"] == 1.0
+    # Only the first row survives, with an error of 0.5 and a std of 1.0.
+    assert result["rmse"] == pytest.approx(0.5)
+    assert result["std_mean"] == pytest.approx(1.0)
 
 
 def test_prediction_metrics_rejects_mismatched_lengths() -> None:
@@ -110,11 +232,18 @@ def test_prediction_metrics_rejects_mismatched_lengths() -> None:
 
 
 def test_summary_stats_handles_an_all_nan_input() -> None:
-    """Nothing finite gives a zero count and nan statistics, without raising."""
+    """Nothing finite gives nan statistics, without raising."""
     result = metrics.summary_stats([float("nan"), float("inf")])
 
-    assert result["count"] == 0.0
-    assert math.isnan(result["mean"])
+    assert set(result) == {"mean", "median", "max"}
+    assert all(math.isnan(value) for value in result.values())
+
+
+def test_summary_stats_report_mean_median_and_max() -> None:
+    """The three statistics match their definitions, ignoring non-finite values."""
+    result = metrics.summary_stats([1.0, 2.0, 9.0, float("nan")])
+
+    assert result == {"mean": 4.0, "median": 2.0, "max": 9.0}
 
 
 def test_two_panel_histogram_has_a_linear_and_a_log_panel() -> None:
@@ -147,6 +276,35 @@ def test_two_panel_histogram_reports_dropped_non_positives() -> None:
     assert "dropped 2" in figure.axes[1].get_title()
 
 
+def test_two_panel_histogram_floor_limits_the_log_panel() -> None:
+    """With a floor, the log panel leaves out the vanishing values and counts them."""
+    values = np.array([0.0, 0.0, 1e-200, 1e-3, 1.0])
+
+    figure = metrics.two_panel_histogram(
+        values, title="scores", xlabel="score", log_floor=1e-12
+    )
+
+    title = figure.axes[1].get_title()
+    assert "dropped 3 below 1e-12" in title
+    assert "2 of them zero" in title
+    assert figure.axes[1].get_xlim()[0] > 1e-12 * 1e-3
+
+
+def test_two_panel_histogram_floor_handles_nothing_above_it() -> None:
+    """All values below the floor leave the log panel empty instead of raising."""
+    figure = metrics.two_panel_histogram(
+        np.array([0.0, 1e-200]), title="scores", xlabel="score", log_floor=1e-12
+    )
+
+    assert "no values at or above 1e-12" in figure.axes[1].get_title()
+
+
+def test_two_panel_histogram_rejects_a_non_positive_floor() -> None:
+    """A floor of zero would put zeros back on the log axis."""
+    with pytest.raises(ValueError, match="log_floor must be positive"):
+        metrics.two_panel_histogram([1.0], title="t", xlabel="x", log_floor=0.0)
+
+
 def test_two_panel_histogram_rejects_a_non_positive_bin_count() -> None:
     """A bin count below one is a programming error."""
     with pytest.raises(ValueError, match="bins must be positive"):
@@ -176,18 +334,69 @@ def test_predicted_vs_observed_figure_is_none_without_finite_points() -> None:
     assert figure is None
 
 
-def test_predicted_vs_observed_statistics_ignore_the_point_cap() -> None:
-    """Subsampling for the plot must not change the reported statistics."""
-    targets = np.linspace(0.0, 1.0, 500)
-
-    drawn_all = metrics.predicted_vs_observed_figure(
-        title="s", targets=targets, mean=targets, max_points=500
-    )
-    drawn_few = metrics.predicted_vs_observed_figure(
-        title="s", targets=targets, mean=targets, max_points=10
+def test_predicted_vs_observed_figure_survives_a_single_point() -> None:
+    """A set with no spread still draws, on padded axes."""
+    figure = metrics.predicted_vs_observed_figure(
+        title="one", targets=[0.3], mean=[0.3]
     )
 
-    assert drawn_all is not None and drawn_few is not None
-    assert (
-        drawn_all.axes[0].texts[0].get_text() == drawn_few.axes[0].texts[0].get_text()
+    assert figure is not None
+    low, high = figure.axes[0].get_xlim()
+    assert low < 0.3 < high
+
+
+def test_log_density_figure_draws_floored_values_at_the_floor() -> None:
+    """Scores below the floor, zeros included, are kept and reported."""
+    targets = np.linspace(0.0, 1.0, 6)
+    values = np.array([0.0, 0.0, 1e-200, 1e-6, 1e-3, 1.0])
+
+    figure = metrics.log_density_figure(
+        title="scores", targets=targets, values=values, ylabel="score", floor=1e-12
     )
+
+    assert figure is not None
+    note = figure.axes[0].texts[0].get_text()
+    assert "n = 6" in note
+    assert "3 drawn at the floor" in note
+
+
+def test_log_density_figure_drops_non_positive_values_without_a_floor() -> None:
+    """Without a floor only the positive values can go on a log axis."""
+    figure = metrics.log_density_figure(
+        title="std",
+        targets=[0.0, 1.0, 2.0],
+        values=[0.0, 0.1, 0.2],
+        ylabel="latent std",
+    )
+    empty = metrics.log_density_figure(
+        title="std", targets=[0.0, 1.0], values=[0.0, 0.0], ylabel="latent std"
+    )
+
+    assert figure is not None
+    assert "n = 2" in figure.axes[0].texts[0].get_text()
+    assert empty is None
+
+
+def test_error_by_std_figure_shows_error_rising_with_the_std() -> None:
+    """When the std tracks the error, the group errors increase along the std axis."""
+    std = np.linspace(0.1, 1.0, 100)
+    targets = std.copy()
+    mean = np.zeros(100)
+
+    figure = metrics.error_by_std_figure(
+        title="tracking", targets=targets, mean=mean, std=std, bins=5
+    )
+
+    assert figure is not None
+    rms_line = figure.axes[0].lines[0]
+    assert len(rms_line.get_xdata()) == 5
+    assert np.all(np.diff(rms_line.get_ydata()) > 0.0)
+
+
+def test_error_by_std_figure_is_none_with_fewer_molecules_than_groups() -> None:
+    """Too few molecules to fill the groups returns None rather than empty groups."""
+    figure = metrics.error_by_std_figure(
+        title="few", targets=[0.0, 1.0], mean=[0.0, 1.0], std=[0.1, 0.2], bins=10
+    )
+
+    assert figure is None

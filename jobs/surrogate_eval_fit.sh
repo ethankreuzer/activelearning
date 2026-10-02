@@ -23,6 +23,9 @@
 #
 # Output goes to outputs/ampc/surrogate_eval/<objective>/. Re-running an arm needs
 # --overwrite, since the script refuses to replace an existing surrogate_state.pt.
+# Arguments after the objective are passed through to the script:
+#
+#   sbatch jobs/surrogate_eval_fit.sh VariationalELBO --overwrite
 #
 # After the job, sync the offline run from a login node:
 #
@@ -53,7 +56,9 @@ mkdir -p "${WANDB_DIR}"
 # without underflow. The base config ships log_output=true, whose log-scale scores
 # would make the reward beta below meaningless, so the script refuses to run without
 # these two overrides.
-uv run --no-sync python scripts/surrogate_eval_fit.py \
+# Run as a module so the repo root is on sys.path: the script imports
+# scripts.surrogate_eval_metrics, which `python scripts/...py` can't resolve.
+uv run --no-sync python -m scripts.surrogate_eval_fit \
   config/ampc/s3gfn_minimol_ampc_variational_single_fidelity.yaml \
   "surrogate.training_params.variational_objective=${OBJECTIVE}" \
   acquisition.log_space=true \
@@ -67,4 +72,5 @@ uv run --no-sync python scripts/surrogate_eval_fit.py \
   --wandb-entity models-mila5723 \
   --wandb-group surrogate-eval-step5 \
   --wandb-tags "surrogate-eval,${OBJECTIVE}" \
-  --run-name "${OBJECTIVE}-${SLURM_JOB_ID}"
+  --run-name "${OBJECTIVE}-${SLURM_JOB_ID}" \
+  "${@:2}"

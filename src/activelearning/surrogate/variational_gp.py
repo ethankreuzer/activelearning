@@ -28,6 +28,13 @@ from activelearning.utils.types import Candidate, Observation
 #: model, and any evaluation inside it belongs under ``torch.no_grad()``.
 EpochCallback = Callable[[int, float], None]
 
+#: Parameter sets a warm-started fit may train. ``variance`` trains only the parameters
+#: that leave the predictive mean untouched: the covariance of the inducing values and
+#: the observation noise.
+WARM_START_TRAINABLE = ("all", "variance")
+
+_VARIANCE_ONLY_PARAMETERS = ("chol_variational_covar", "raw_noise")
+
 
 def _synchronize_profile_device(device: torch.device) -> None:
     """Wait for pending CUDA work before measuring a device-bound operation."""
@@ -191,6 +198,7 @@ class VariationalGPSurrogate(BoTorchGPSurrogate):
         self._y_std = 1.0
         self._fit_profiling: dict[str, float] = {}
         self._epoch_callback: EpochCallback | None = None
+        self._warm_start: tuple[dict[str, torch.Tensor], str] | None = None
         batch_size = getattr(training_params, "batch_size", None)
         if batch_size is not None and batch_size < 1:
             raise ValueError("training_params.batch_size must be positive.")
@@ -217,6 +225,47 @@ class VariationalGPSurrogate(BoTorchGPSurrogate):
         """
         self._epoch_callback = callback
 
+    def warm_start_from(
+        self,
+        state_dict: dict[str, torch.Tensor],
+        *,
+        trainable: str = "all",
+    ) -> None:
+        """Make the next ``fit()`` continue training from a saved state.
+
+        This differs from :meth:`load_state_dict` before ``fit()``, which restores the
+        state *instead of* training. Here the state is loaded and training then runs
+        with the configured objective, so a model fitted with one objective can be
+        continued with another. The setting applies to the next ``fit()`` only. The
+        optimizer starts cold: a saved state holds no optimizer state.
+
+        With an epoch callback installed, the loaded model is reported once before
+        training, as epoch ``-1`` with a ``nan`` loss.
+
+        Parameters
+        ----------
+        state_dict : dict[str, torch.Tensor]
+            State from :meth:`get_state_dict` of a surrogate with the same structure.
+            Its output standardization replaces the one computed from the data, so
+            the loaded parameters keep their meaning.
+        trainable : str, default="all"
+            ``"all"`` trains every parameter. ``"variance"`` trains only the covariance
+            of the inducing values and the observation noise and freezes the rest
+            (inducing locations, variational mean, kernel hyperparameters and mean
+            constant), so the predictive mean stays exactly the loaded one.
+
+        Raises
+        ------
+        ValueError
+            If ``trainable`` is not one of :data:`WARM_START_TRAINABLE`.
+        """
+        if trainable not in WARM_START_TRAINABLE:
+            raise ValueError(
+                f"trainable must be one of {WARM_START_TRAINABLE}, got {trainable!r}."
+            )
+        self._warm_start = (state_dict, trainable)
+        self._pending_state_dict = None
+
     def bind_runtime_context(self, runtime_context: RuntimeContext) -> None:
         """Bind runtime settings to the encoder and variational GP stack."""
         super().bind_runtime_context(runtime_context)
@@ -224,7 +273,11 @@ class VariationalGPSurrogate(BoTorchGPSurrogate):
         self._apply_runtime_context()
 
     def fit(self, observations: Iterable[Observation]) -> None:
-        """Rebuild and fit the variational GP on all supplied observations."""
+        """Rebuild and fit the variational GP on all supplied observations.
+
+        A state passed to :meth:`load_state_dict` beforehand is restored instead of
+        training; one passed to :meth:`warm_start_from` is loaded and then trained.
+        """
         self._fit_profiling = {}
         observation_list = list(observations)
         if not observation_list:
@@ -252,13 +305,36 @@ class VariationalGPSurrogate(BoTorchGPSurrogate):
         self._model_train_Y = self._standardize_targets(train_y)
         pending_state = self._pending_state_dict
         self._pending_state_dict = None
+        warm_start = self._warm_start
+        self._warm_start = None
         self._build_variational_model()
         self._apply_runtime_context()
         self._remove_noise_prior()
-        if pending_state is not None:
+        if warm_start is not None:
+            state_dict, trainable = warm_start
+            self.load_state_dict(state_dict)
+            # The loaded parameters were learned on targets standardized with the
+            # loaded statistics, so the targets must be standardized the same way.
+            self._model_train_Y = (train_y - self._y_mean) / self._y_std
+            self._freeze_for_warm_start(trainable)
+            self._run_epoch_callback(-1, float("nan"))
+            self._train_variational_gp(len(observation_list))
+        elif pending_state is not None:
             self.load_state_dict(pending_state)
         else:
             self._train_variational_gp(len(observation_list))
+
+    def _freeze_for_warm_start(self, trainable: str) -> None:
+        """Freeze every parameter a warm-started fit must not train."""
+        assert self._gp_model is not None
+        assert self._likelihood is not None
+        if trainable == "all":
+            return
+        for module in (self._gp_model, self._likelihood):
+            for name, parameter in module.named_parameters():
+                parameter.requires_grad_(
+                    name.rsplit(".", 1)[-1] in _VARIANCE_ONLY_PARAMETERS
+                )
 
     def updates_from_latest(self) -> bool:
         """Return false because the model is rebuilt from all observations."""

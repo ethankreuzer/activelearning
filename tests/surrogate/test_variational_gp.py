@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 from typing import Any
 
@@ -302,3 +303,129 @@ def test_variational_gp_update_refits_supplied_observations() -> None:
     train_x, _ = surrogate.get_train_data()
     assert train_x.shape == (2, 2)
     assert surrogate.is_fitted()
+
+
+def _pll_training() -> VariationalGPTrainingConfig:
+    """Return a short schedule that trains with the predictive log likelihood."""
+    return VariationalGPTrainingConfig(
+        epochs=2, lr=1e-2, variational_objective="PredictiveLogLikelihood"
+    )
+
+
+def _fitted_elbo_state(
+    observations: list[Observation],
+) -> tuple[VariationalGPSurrogate, dict[str, Tensor]]:
+    """Fit a small surrogate with the ELBO and return it with a copy of its state."""
+    torch.manual_seed(0)
+    source = VariationalGPSurrogate(
+        encoder=_NumericFixedEncoder(),
+        training_params=_training(),
+        num_inducing=2,
+    )
+    source.fit(observations)
+    state = source.get_state_dict()
+    assert state is not None
+    return source, {name: value.clone() for name, value in state.items()}
+
+
+_WARM_START_OBSERVATIONS = [
+    Observation(x=[0.0, 0.0], y=10.0),
+    Observation(x=[1.0, 1.0], y=20.0),
+    Observation(x=[0.5, 0.0], y=12.0),
+    Observation(x=[0.0, 1.0], y=17.0),
+]
+
+
+def test_variational_gp_warm_start_loads_the_state_then_trains() -> None:
+    """A warm start reports the loaded model once, then trains every parameter."""
+    _, state = _fitted_elbo_state(_WARM_START_OBSERVATIONS)
+    resumed = VariationalGPSurrogate(
+        encoder=_NumericFixedEncoder(),
+        training_params=_pll_training(),
+        num_inducing=2,
+    )
+    epochs: list[int] = []
+    start: dict[str, Tensor] = {}
+
+    def callback(epoch: int, mean_loss: float) -> None:
+        epochs.append(epoch)
+        if epoch == -1:
+            current = resumed.get_state_dict()
+            assert current is not None
+            start.update({name: value.clone() for name, value in current.items()})
+            assert math.isnan(mean_loss)  # no training step has run yet
+
+    resumed.set_epoch_callback(callback)
+    resumed.warm_start_from(state)
+    resumed.fit(_WARM_START_OBSERVATIONS)
+
+    assert epochs == [-1, 0, 1]
+    for name, value in state.items():
+        assert torch.equal(start[name].to(value), value), name
+    trained = resumed.get_state_dict()
+    assert trained is not None
+    mean_name = "model.variational_strategy._variational_distribution.variational_mean"
+    assert not torch.allclose(trained[mean_name].to(state[mean_name]), state[mean_name])
+    assert resumed._warm_start is None
+
+
+def test_variational_gp_variance_warm_start_keeps_the_mean() -> None:
+    """Training only the variance parameters leaves the predicted mean unchanged."""
+    source, state = _fitted_elbo_state(_WARM_START_OBSERVATIONS)
+    candidates = [Candidate(x=[0.25, 0.25]), Candidate(x=[0.75, 0.75])]
+    resumed = VariationalGPSurrogate(
+        encoder=_NumericFixedEncoder(),
+        training_params=_pll_training(),
+        num_inducing=2,
+    )
+
+    resumed.warm_start_from(state, trainable="variance")
+    resumed.fit(_WARM_START_OBSERVATIONS)
+
+    trained = resumed.get_state_dict()
+    assert trained is not None
+    moved = {
+        name
+        for name, value in state.items()
+        if not torch.equal(trained[name].to(value), value)
+    }
+    assert moved == {
+        "model.variational_strategy._variational_distribution.chol_variational_covar",
+        "likelihood.noise_covar.raw_noise",
+    }
+    source_prediction = source.predict(candidates)
+    resumed_prediction = resumed.predict(candidates)
+    assert resumed_prediction["mean"] == pytest.approx(source_prediction["mean"])
+    assert resumed_prediction["std"] != pytest.approx(source_prediction["std"])
+
+
+def test_variational_gp_warm_start_rejects_an_unknown_trainable_set() -> None:
+    """A misspelled mode fails before any fitting."""
+    surrogate = VariationalGPSurrogate(
+        encoder=_NumericFixedEncoder(),
+        training_params=_pll_training(),
+        num_inducing=2,
+    )
+
+    with pytest.raises(ValueError, match="trainable must be one of"):
+        surrogate.warm_start_from({}, trainable="mean")
+
+
+def test_variational_gp_warm_start_applies_to_one_fit_only() -> None:
+    """The fit after a warm-started one trains from scratch again."""
+    _, state = _fitted_elbo_state(_WARM_START_OBSERVATIONS)
+    surrogate = VariationalGPSurrogate(
+        encoder=_NumericFixedEncoder(),
+        training_params=_pll_training(),
+        num_inducing=2,
+    )
+    epochs: list[int] = []
+    surrogate.set_epoch_callback(lambda epoch, loss: epochs.append(epoch))
+
+    surrogate.warm_start_from(state, trainable="variance")
+    surrogate.fit(_WARM_START_OBSERVATIONS)
+    surrogate.fit(_WARM_START_OBSERVATIONS)
+
+    assert epochs == [-1, 0, 1, 0, 1]
+    assert surrogate._gp_model is not None
+    assert surrogate._gp_model.variational_strategy.inducing_points.requires_grad

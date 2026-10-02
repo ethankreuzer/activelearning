@@ -2,8 +2,9 @@
 
 Steps 4 and 5 of ``SURROGATE_EVAL_PLAN.md``. The script builds the dataset and
 surrogate from a config exactly as ``activelearning.main`` does, fits the surrogate on
-the whole initial dataset while tracking per-epoch metrics on three labelled sets, then
-scores the generated set once at the end. It writes to ``--output-dir``:
+the whole initial dataset while tracking per-epoch metrics on four labelled sets
+(two ``train`` sets, the validation set and the generated set), then scores the
+generated molecules with the acquisition once at the end. It writes to ``--output-dir``:
 
 - ``surrogate_state.pt``: the fitted GP state (inducing points, variational
   distribution, kernel, noise, output standardization);
@@ -27,11 +28,17 @@ arm differ only in one argument::
         acquisition.log_space=true acquisition.log_output=false \\
         --output-dir outputs/ampc/surrogate_eval/elbo
 
+``--init-state`` continues training from a saved ``surrogate_state.pt`` instead of
+starting from scratch (step 7 of the plan: an ELBO fit followed by a PLL phase).
+``--trainable variance`` then trains only the parameters that leave the predictive
+mean untouched, and ``--epoch-offset`` shifts the logged epochs so the continued run
+lines up after the run it starts from.
+
 Run it on a whole GPU node through ``jobs/surrogate_eval_fit.sh``, never on the
 login node. Pass ``--wandb-project`` to log to W&B (run with ``WANDB_MODE=offline``
-on compute nodes and ``wandb sync`` afterwards). Only the per-epoch curves and the
-figures are logged as charts; every once-per-run scalar (the final metrics, the
-learned hyperparameters and the train time) is stored in the run config.
+on compute nodes and ``wandb sync`` afterwards). Every scalar is a logged metric: the per-epoch ones at their epoch, and
+the once-per-run ones (the final metrics, the learned hyperparameters and the train
+time) at the step after the last epoch, so they also land in the run summary.
 """
 
 from __future__ import annotations
@@ -39,6 +46,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import os
 import sys
 import time
@@ -51,10 +59,15 @@ from typing import Any
 import numpy as np
 
 from scripts.surrogate_eval_metrics import (
-    prediction_metrics,
+    error_by_std_figure,
+    log_density_figure,
     predicted_vs_observed_figure,
+    prediction_metrics,
+    score_stats,
     summary_stats,
+    top_fraction_split_means,
     two_panel_histogram,
+    weighted_prediction_metrics,
 )
 
 STATE_FILE = "surrogate_state.pt"
@@ -65,12 +78,41 @@ TRAIN_RANDOM_FILE = "train_random.csv"
 TRAIN_TOP_FILE = "train_top.csv"
 EVAL_CSV_COLUMNS = ("SMILE", "y")
 
-#: Evaluation sets scored after every training epoch. The generated set is excluded:
-#: it is scored once at the end, since it also needs the acquisition.
-PER_EPOCH_SETS = ("train_random", "train_top", "val_set")
-
-#: Name of the generated set, evaluated only after training finishes.
+#: The generated set: the generated molecules that docked and pass the SA filter.
 GENERATED_SET = "gp_molformer_set"
+
+#: Every generated molecule that docked, SA-passing or not. The S3-GFN pool is not
+#: SA-filtered, so this is the population that actually gets docked. Scored only at the
+#: end, without figures.
+GENERATED_DOCKED_SET = "gp_molformer_docked_set"
+
+#: Evaluation sets scored after every training epoch.
+PER_EPOCH_SETS = ("train_random", "train_top", "val_set", GENERATED_SET)
+
+#: ``(set, metric)`` pairs left out of the per-epoch curves because they say nothing:
+#: ``r2`` on a set restricted to the top of the target only restates the bias, and the
+#: bias on a random sample of the training data is always about zero.
+SKIPPED_EPOCH_METRICS = frozenset({("train_top", "r2"), ("train_random", "bias")})
+
+#: Learned hyperparameters tracked every epoch, under ``train/epoch/<name>``.
+PER_EPOCH_HYPERPARAMETERS = (
+    "noise_std_original_scale",
+    "outputscale",
+    "lengthscale_median",
+    "variational_covar_eig_max",
+)
+
+#: Entries of the learned-hyperparameter record that describe the data, not the fit.
+#: They are identical across arms, so they go to the run config rather than the metrics.
+DATA_CONSTANT_HYPERPARAMETERS = ("y_mean", "y_std")
+
+#: Values of ``--trainable``; mirrors ``variational_gp.WARM_START_TRAINABLE`` so the
+#: argument parser does not import the surrogate module.
+WARM_START_TRAINABLE = ("all", "variance")
+
+#: Acquisition scores below this are treated as zero in the log-scale figures, which
+#: otherwise span hundreds of orders of magnitude.
+SCORE_LOG_FLOOR = 1e-12
 
 
 @dataclass(frozen=True)
@@ -88,12 +130,15 @@ class EvalSet:
     features : Any
         Encoded feature matrix (a ``torch.Tensor``), shaped ``(n, feature_dim)``.
         Typed loosely so this module does not import torch at module scope.
+    weights : np.ndarray or None
+        Optional weight per molecule, for sets that over-sample part of the library.
     """
 
     name: str
     smiles: tuple[str, ...]
     targets: np.ndarray
     features: Any
+    weights: np.ndarray | None = None
 
 
 def select_train_eval_rows(
@@ -189,9 +234,13 @@ def learned_hyperparameters(surrogate: Any) -> dict[str, float]:
 
     Noise and output scale are in standardized-target units; the output
     standardization is returned as ``y_mean`` and ``y_std`` so they can be mapped
-    back to the original target scale. Reads the surrogate's private GP modules,
-    since it exposes no public accessor for them, and returns an empty dict for a
-    surrogate without that structure.
+    back to the original target scale. ``prior_std_original_scale`` is the latent
+    standard deviation far from every inducing point, and the two
+    ``variational_covar_eig_*`` values are the extreme eigenvalues of the (whitened)
+    covariance of the inducing values, whose prior is the identity: a latent standard
+    deviation above the prior one requires an eigenvalue above 1. Reads the
+    surrogate's private GP modules, since it exposes no public accessor for them, and
+    returns an empty dict for a surrogate without that structure.
 
     Parameters
     ----------
@@ -205,16 +254,29 @@ def learned_hyperparameters(surrogate: Any) -> dict[str, float]:
     """
     gp_model = getattr(surrogate, "_gp_model", None)
     likelihood = getattr(surrogate, "_likelihood", None)
-    state = surrogate.get_state_dict()
-    if gp_model is None or likelihood is None or state is None:
+    if gp_model is None or likelihood is None:
         return {}
+    state = surrogate.get_state_dict()
+    if state is None:
+        return {}
+    import torch
+
     lengthscale = gp_model.covar_module.base_kernel.lengthscale.detach().flatten()
     noise = float(likelihood.noise.detach().mean())
     y_std = float(state["outcome_std"])
+    outputscale = float(gp_model.covar_module.outputscale.detach())
+    with torch.no_grad():
+        inducing_distribution = (
+            gp_model.variational_strategy._variational_distribution()
+        )
+        eigenvalues = torch.linalg.eigvalsh(inducing_distribution.covariance_matrix)
     return {
         "noise": noise,
         "noise_std_original_scale": noise**0.5 * y_std,
-        "outputscale": float(gp_model.covar_module.outputscale.detach()),
+        "outputscale": outputscale,
+        "prior_std_original_scale": outputscale**0.5 * y_std,
+        "variational_covar_eig_min": float(eigenvalues.min()),
+        "variational_covar_eig_max": float(eigenvalues.max()),
         "mean_constant": float(gp_model.mean_module.constant.detach()),
         "lengthscale_min": float(lengthscale.min()),
         "lengthscale_median": float(lengthscale.median()),
@@ -290,16 +352,29 @@ def load_labelled_csv(
     return smiles, np.asarray(targets, dtype=np.float64), extras
 
 
+def parse_float_column(values: Sequence[str]) -> np.ndarray:
+    """Parse a CSV column as floats, with ``nan`` where an entry does not parse."""
+    parsed: list[float] = []
+    for value in values:
+        try:
+            parsed.append(float(value))
+        except (TypeError, ValueError):
+            parsed.append(float("nan"))
+    return np.asarray(parsed, dtype=np.float64)
+
+
 def filter_generated_set(
     smiles: Sequence[str],
     targets: np.ndarray,
     passes_sa: Sequence[str],
-) -> tuple[list[str], np.ndarray, dict[str, int]]:
-    """Keep the generated molecules that both docked and pass the SA filter.
+) -> tuple[list[str], np.ndarray, np.ndarray, dict[str, int]]:
+    """Keep the generated molecules that docked, and flag those passing the SA filter.
 
     About a tenth of the generated molecules fail to dock and carry a ``nan`` target;
     those failures are biased toward molecules the docking toolchain cannot build, so
-    the surviving fraction is reported rather than assumed.
+    the surviving fraction is reported rather than assumed. The S3-GFN pool is not
+    SA-filtered, so every docked molecule is kept; the SA-passing ones (the only
+    molecules that get reward-driven updates) are marked for the main generated set.
 
     Parameters
     ----------
@@ -312,8 +387,10 @@ def filter_generated_set(
 
     Returns
     -------
-    tuple[list[str], np.ndarray, dict[str, int]]
-        The kept SMILES, their targets, and the counts behind the filter.
+    tuple[list[str], np.ndarray, np.ndarray, dict[str, int]]
+        The docked SMILES, their targets, a boolean mask over them that is true for
+        the SA-passing molecules, and the counts behind the filter (``n_evaluated`` is
+        the number that both docked and pass).
 
     Raises
     ------
@@ -327,18 +404,18 @@ def filter_generated_set(
             f"{len(passes_sa)} sa flags."
         )
     sa_flags = np.asarray(
-        [str(flag).strip() not in ("", "0", "False", "false") for flag in passes_sa]
+        [str(flag).strip() not in ("", "0", "False", "false") for flag in passes_sa],
+        dtype=bool,
     )
     docked = np.isfinite(values)
-    keep = docked & sa_flags
     counts = {
         "n_total": int(values.size),
         "n_docked": int(docked.sum()),
         "n_sa_pass": int(sa_flags.sum()),
-        "n_evaluated": int(keep.sum()),
+        "n_evaluated": int((docked & sa_flags).sum()),
     }
-    kept = [smiles[index] for index in np.flatnonzero(keep)]
-    return kept, values[keep], counts
+    kept = [smiles[index] for index in np.flatnonzero(docked)]
+    return kept, values[docked], sa_flags[docked], counts
 
 
 def reward_columns(
@@ -431,48 +508,49 @@ def log_scalars(logger: Any, metrics: Mapping[str, float]) -> None:
         logger.log_metric(key, value)
 
 
-def final_metrics_config(
-    metrics: Mapping[str, float], *, train_time_seconds: float
-) -> dict[str, Any]:
-    """Nest the once-per-run scalars into a record for the run configuration.
-
-    A value logged once has no curve, so as a step metric it would only produce a
-    single-point chart. These go next to the hyperparameters instead.
-
-    Parameters
-    ----------
-    metrics : Mapping[str, float]
-        Final scalars keyed by ``/``-separated paths, e.g. ``val_set/final/nll``.
-    train_time_seconds : float
-        Wall-clock time of the surrogate fit.
-
-    Returns
-    -------
-    dict[str, Any]
-        ``train_time_seconds`` plus the metrics nested by their path segments, e.g.
-        ``{"val_set": {"final": {"nll": ...}}}``.
-    """
-    record: dict[str, Any] = {"train_time_seconds": float(train_time_seconds)}
-    for key, value in metrics.items():
-        *parents, leaf = key.split("/")
-        node = record
-        for parent in parents:
-            node = node.setdefault(parent, {})
-        node[leaf] = value
-    return record
-
-
 def log_figures(logger: Any, figures: Mapping[str, Any]) -> None:
     """Buffer every figure on the logger."""
     for key, figure in figures.items():
         logger.log_figure(key, figure)
 
 
+def set_metrics(
+    eval_set: EvalSet, predictions: Mapping[str, np.ndarray]
+) -> dict[str, float]:
+    """The metric set of one evaluation set, from its predictions.
+
+    Parameters
+    ----------
+    eval_set : EvalSet
+        The scored set.
+    predictions : Mapping[str, np.ndarray]
+        ``mean``, ``std_total`` and ``std_latent``, as :func:`evaluate_set` returns.
+
+    Returns
+    -------
+    dict[str, float]
+        Metric name to value: the prediction metrics, plus their weighted versions for
+        a set that carries weights.
+    """
+    metrics = prediction_metrics(
+        eval_set.targets,
+        predictions["mean"],
+        predictions["std_total"],
+        latent_std=predictions["std_latent"],
+    )
+    if eval_set.weights is not None:
+        metrics.update(
+            weighted_prediction_metrics(
+                eval_set.targets, predictions["mean"], eval_set.weights
+            )
+        )
+    return metrics
+
+
 def epoch_metrics(
     surrogate: Any,
     eval_sets: Sequence[EvalSet],
     *,
-    num_data: int,
     chunk_size: int,
 ) -> dict[str, float]:
     """Score every per-epoch evaluation set and return its metrics, keyed for W&B.
@@ -483,33 +561,21 @@ def epoch_metrics(
         The surrogate being fitted, mid-training.
     eval_sets : Sequence[EvalSet]
         Sets to score.
-    num_data : int
-        Training-set size, so the objective's KL term matches the training loss.
     chunk_size : int
         Rows per posterior call.
 
     Returns
     -------
     dict[str, float]
-        ``<set>/epoch/<metric>`` to value.
+        ``<set>/epoch/<metric>`` to value, without the pairs in
+        :data:`SKIPPED_EPOCH_METRICS`.
     """
-    import torch
-
     metrics: dict[str, float] = {}
     for eval_set in eval_sets:
-        prediction = surrogate.predict_encoded(
-            eval_set.features, observation_noise=True, chunk_size=chunk_size
-        )
-        mean = prediction["mean"].numpy()
-        std = prediction["std"].numpy()
-        for name, value in prediction_metrics(eval_set.targets, mean, std).items():
-            metrics[f"{eval_set.name}/epoch/{name}"] = value
-        metrics[f"{eval_set.name}/epoch/objective_loss"] = surrogate.evaluate_objective(
-            eval_set.features,
-            torch.as_tensor(eval_set.targets),
-            num_data=num_data,
-            chunk_size=chunk_size,
-        )
+        predictions = evaluate_set(surrogate, eval_set, chunk_size=chunk_size)
+        for name, value in set_metrics(eval_set, predictions).items():
+            if (eval_set.name, name) not in SKIPPED_EPOCH_METRICS:
+                metrics[f"{eval_set.name}/epoch/{name}"] = value
     return metrics
 
 
@@ -567,7 +633,11 @@ def build_train_eval_set(
 
 
 def encode_eval_set(
-    surrogate: Any, name: str, smiles: Sequence[str], targets: np.ndarray
+    surrogate: Any,
+    name: str,
+    smiles: Sequence[str],
+    targets: np.ndarray,
+    weights: np.ndarray | None = None,
 ) -> EvalSet:
     """Encode a set of molecules once, for repeated scoring.
 
@@ -581,20 +651,73 @@ def encode_eval_set(
         Molecule inputs.
     targets : np.ndarray
         Observed targets, aligned with ``smiles``.
+    weights : np.ndarray, optional
+        Weight per molecule, aligned with ``smiles``.
 
     Returns
     -------
     EvalSet
         The encoded set.
+
+    Raises
+    ------
+    ValueError
+        If ``weights`` is given and does not have one entry per molecule.
     """
     from activelearning.utils.types import Candidate
 
+    if weights is not None and len(weights) != len(smiles):
+        raise ValueError(
+            f"{len(weights)} weights for {len(smiles)} molecules in {name}."
+        )
     candidates = [Candidate(x=value, fidelity=None) for value in smiles]
     return EvalSet(
         name=name,
         smiles=tuple(smiles),
         targets=np.asarray(targets, dtype=np.float64),
         features=surrogate.encode_candidates(candidates),
+        weights=None if weights is None else np.asarray(weights, dtype=np.float64),
+    )
+
+
+def subset_eval_set(eval_set: EvalSet, mask: np.ndarray, name: str) -> EvalSet:
+    """Return the molecules of an encoded set selected by a boolean mask.
+
+    Parameters
+    ----------
+    eval_set : EvalSet
+        The encoded set to take from.
+    mask : np.ndarray
+        Boolean mask with one entry per molecule.
+    name : str
+        Name of the new set.
+
+    Returns
+    -------
+    EvalSet
+        The selected molecules, reusing the features already encoded.
+
+    Raises
+    ------
+    ValueError
+        If the mask does not have one entry per molecule.
+    """
+    import torch
+
+    keep = np.asarray(mask, dtype=bool)
+    if keep.shape != (len(eval_set.smiles),):
+        raise ValueError(
+            f"Mask of shape {keep.shape} for {len(eval_set.smiles)} molecules in "
+            f"{eval_set.name}."
+        )
+    rows = np.flatnonzero(keep)
+    indices = torch.as_tensor(rows, device=eval_set.features.device)
+    return EvalSet(
+        name=name,
+        smiles=tuple(eval_set.smiles[int(row)] for row in rows),
+        targets=eval_set.targets[keep],
+        features=eval_set.features.index_select(0, indices),
+        weights=None if eval_set.weights is None else eval_set.weights[keep],
     )
 
 
@@ -605,8 +728,8 @@ def make_epoch_callback(
     static_sets: Sequence[EvalSet],
     train_row_sets: Mapping[str, np.ndarray],
     observations: Sequence[Any],
-    num_data: int,
     chunk_size: int,
+    epoch_offset: int = 0,
 ) -> Callable[[int, float], None]:
     """Build the per-epoch callback that scores the labelled sets and logs them.
 
@@ -621,15 +744,18 @@ def make_epoch_callback(
     surrogate : Any
         The surrogate being fitted.
     static_sets : Sequence[EvalSet]
-        Sets already encoded before the fit, such as ``val_set``.
+        Sets already encoded before the fit: ``val_set`` and the generated set.
     train_row_sets : Mapping[str, np.ndarray]
         Set name to row indices into ``observations``.
     observations : Sequence[Any]
         Training observations.
-    num_data : int
-        Training-set size, used to scale the objective's KL term.
     chunk_size : int
         Rows per posterior call.
+    epoch_offset : int, default=0
+        Added to the epoch index to get the logged step. A warm-started fit reports
+        its starting point as epoch ``-1`` with a ``nan`` loss, so an offset equal to
+        the earlier run's epoch count puts that point on the earlier run's last step
+        and the new epochs after it.
 
     Returns
     -------
@@ -645,12 +771,15 @@ def make_epoch_callback(
                 resolved.append(
                     build_train_eval_set(surrogate, name, observations, rows)
                 )
-        metrics = epoch_metrics(
-            surrogate, resolved, num_data=num_data, chunk_size=chunk_size
-        )
-        metrics["train/epoch/minibatch_loss"] = mean_train_loss
+        metrics = epoch_metrics(surrogate, resolved, chunk_size=chunk_size)
+        if math.isfinite(mean_train_loss):
+            metrics["train/epoch/minibatch_loss"] = mean_train_loss
+        hyperparameters = learned_hyperparameters(surrogate)
+        for name in PER_EPOCH_HYPERPARAMETERS:
+            if name in hyperparameters:
+                metrics[f"train/epoch/{name}"] = hyperparameters[name]
         log_scalars(logger, metrics)
-        logger.log_step(epoch)
+        logger.log_step(epoch + epoch_offset)
 
     return callback
 
@@ -808,8 +937,9 @@ def final_set_outputs(
     eval_set: EvalSet,
     predictions: Mapping[str, np.ndarray],
     *,
-    extra_distributions: Mapping[str, tuple[np.ndarray, str]] = {},
-    max_figure_points: int = 5000,
+    scores: np.ndarray | None = None,
+    final_metrics: bool = False,
+    figures: bool = True,
 ) -> tuple[dict[str, float], dict[str, Any]]:
     """Metrics and figures for one evaluation set after training.
 
@@ -819,11 +949,13 @@ def final_set_outputs(
         The scored set.
     predictions : Mapping[str, np.ndarray]
         ``mean``, ``std_total`` and ``std_latent``.
-    extra_distributions : Mapping[str, tuple[np.ndarray, str]], optional
-        Additional quantities to summarize and histogram, as name to
-        ``(values, axis label)``.
-    max_figure_points : int, default=5000
-        Points drawn in the predicted-vs-observed figure.
+    scores : np.ndarray, optional
+        Acquisition score per molecule, for the generated sets.
+    final_metrics : bool, default=False
+        Also report the prediction metrics under ``<set>/final/``. For a set tracked
+        every epoch they repeat its last epoch, so this is off by default.
+    figures : bool, default=True
+        Whether to build the figures.
 
     Returns
     -------
@@ -831,34 +963,68 @@ def final_set_outputs(
         Scalar metrics and figures, both keyed for W&B.
     """
     name = eval_set.name
-    metrics = {
-        f"{name}/final/{key}": value
-        for key, value in prediction_metrics(
-            eval_set.targets, predictions["mean"], predictions["std_total"]
-        ).items()
-    }
-    figures: dict[str, Any] = {}
-    figure = predicted_vs_observed_figure(
-        title=name,
-        targets=eval_set.targets,
-        mean=predictions["mean"],
-        max_points=max_figure_points,
-    )
-    if figure is not None:
-        figures[f"{name}/figures/predicted_vs_observed"] = figure
+    targets = eval_set.targets
+    latent = predictions["std_latent"]
+    metrics: dict[str, float] = {}
+    if final_metrics:
+        for key, value in set_metrics(eval_set, predictions).items():
+            metrics[f"{name}/final/{key}"] = value
+    for key, value in summary_stats(latent).items():
+        metrics[f"{name}/std_latent/{key}"] = value
+    top_mean, rest_mean = top_fraction_split_means(latent, targets)
+    metrics[f"{name}/std_latent/top1pct_y_mean"] = top_mean
+    metrics[f"{name}/std_latent/rest_mean"] = rest_mean
+    if scores is not None:
+        for key, value in score_stats(scores, targets).items():
+            metrics[f"{name}/acquisition_score/{key}"] = value
+    if not figures:
+        return metrics, {}
 
-    distributions: dict[str, tuple[np.ndarray, str]] = {
-        "std_total": (predictions["std_total"], "total predicted std"),
-        "std_latent": (predictions["std_latent"], "latent predicted std"),
-        **dict(extra_distributions),
+    built: dict[str, Any] = {
+        "predicted_vs_observed": predicted_vs_observed_figure(
+            title=name, targets=targets, mean=predictions["mean"]
+        ),
+        "std_latent": two_panel_histogram(
+            latent, title=f"{name}: std_latent", xlabel="latent predicted std"
+        ),
+        "std_latent_vs_observed": log_density_figure(
+            title=f"{name}: latent std vs observed target",
+            targets=targets,
+            values=latent,
+            ylabel="latent predicted std",
+        ),
+        "error_by_std_latent": error_by_std_figure(
+            title=f"{name}: error by latent std",
+            targets=targets,
+            mean=predictions["mean"],
+            std=latent,
+        ),
+        "error_by_std_total": error_by_std_figure(
+            title=f"{name}: error by total std",
+            targets=targets,
+            mean=predictions["mean"],
+            std=predictions["std_total"],
+        ),
     }
-    for quantity, (values, xlabel) in distributions.items():
-        for key, value in summary_stats(values).items():
-            metrics[f"{name}/{quantity}/{key}"] = value
-        figures[f"{name}/figures/{quantity}"] = two_panel_histogram(
-            values, title=f"{name}: {quantity}", xlabel=xlabel
+    if scores is not None:
+        built["acquisition_score"] = two_panel_histogram(
+            scores,
+            title=f"{name}: acquisition_score",
+            xlabel="GIBBON information gain",
+            log_floor=SCORE_LOG_FLOOR,
         )
-    return metrics, figures
+        built["acquisition_score_vs_observed"] = log_density_figure(
+            title=f"{name}: GIBBON score vs observed target",
+            targets=targets,
+            values=scores,
+            ylabel="GIBBON information gain",
+            floor=SCORE_LOG_FLOOR,
+        )
+    return metrics, {
+        f"{name}/figures/{key}": figure
+        for key, figure in built.items()
+        if figure is not None
+    }
 
 
 def _require_acquisition_settings(resolved: Mapping[str, Any]) -> None:
@@ -933,7 +1099,6 @@ def _parse_args(argv: Sequence[str] | None) -> tuple[argparse.Namespace, list[st
     )
     parser.add_argument("--reward-transform", default="exponential")
     parser.add_argument("--reward-beta", type=float, default=100.0)
-    parser.add_argument("--max-figure-points", type=int, default=5000)
     parser.add_argument(
         "--skip-eval",
         action="store_true",
@@ -959,12 +1124,66 @@ def _parse_args(argv: Sequence[str] | None) -> tuple[argparse.Namespace, list[st
         action="store_true",
         help="Replace an existing fitted state instead of refusing to run.",
     )
+    parser.add_argument(
+        "--init-state",
+        type=Path,
+        default=None,
+        help="Saved surrogate_state.pt to continue training from.",
+    )
+    parser.add_argument(
+        "--trainable",
+        choices=WARM_START_TRAINABLE,
+        default="all",
+        help="With --init-state: 'variance' trains only the inducing covariance and "
+        "the noise, which leaves the predictive mean unchanged.",
+    )
+    parser.add_argument(
+        "--epoch-offset",
+        type=int,
+        default=0,
+        help="Added to the epoch index when logging. With --init-state, set it to the "
+        "epoch count of the run the state came from.",
+    )
     args, config_args = parser.parse_known_args(argv)
     if args.n_train_random < 0 or args.n_train_top < 0:
         parser.error("--n-train-random and --n-train-top must be nonnegative.")
     if args.eval_chunk_size < 1:
         parser.error("--eval-chunk-size must be positive.")
+    if args.epoch_offset < 0:
+        parser.error("--epoch-offset must be nonnegative.")
+    if args.init_state is None and args.trainable != "all":
+        parser.error("--trainable needs --init-state.")
+    if args.init_state is not None and args.epoch_offset < 1:
+        # The starting point is logged at step `epoch_offset - 1`, which must not be
+        # negative.
+        parser.error("--init-state needs --epoch-offset of at least 1.")
     return args, config_args
+
+
+def check_init_state(init_state: Path | None, out_dir: Path) -> None:
+    """Fail fast on an initial state that is missing or is this run's own output.
+
+    Parameters
+    ----------
+    init_state : Path or None
+        The ``--init-state`` argument.
+    out_dir : Path
+        The run's output directory.
+
+    Raises
+    ------
+    SystemExit
+        If the file does not exist, or is the state file this run would write.
+    """
+    if init_state is None:
+        return
+    if not init_state.is_file():
+        raise SystemExit(f"--init-state {init_state} does not exist.")
+    if init_state.resolve() == (out_dir / STATE_FILE).resolve():
+        raise SystemExit(
+            f"--init-state {init_state} is this run's own output; choose a different "
+            "--output-dir so the state it starts from is not overwritten."
+        )
 
 
 def _run_configuration(
@@ -1011,9 +1230,13 @@ def _run_configuration(
         "val_csv": str(args.val_csv),
         "gp_molformer_csv": str(args.gp_molformer_csv),
         "gp_molformer_filter": "docked and passes_sa",
+        "gp_molformer_docked_filter": "docked",
         "val_label_route": "pprop_hit_rate",
         "gp_molformer_label_route": "dock3_oracle",
         "output_dir": str(args.output_dir),
+        "init_state": None if args.init_state is None else str(args.init_state),
+        "trainable": args.trainable,
+        "epoch_offset": args.epoch_offset,
         **dict(sizes),
         "resolved_config": dict(resolved),
     }
@@ -1029,6 +1252,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         raise SystemExit(
             f"{out_dir / STATE_FILE} exists; pass --overwrite to replace it."
         )
+    check_init_state(args.init_state, out_dir)
 
     from omegaconf import OmegaConf
 
@@ -1089,22 +1313,27 @@ def main(argv: Sequence[str] | None = None) -> None:
     # Load both evaluation CSVs before the fit, so a bad path fails in seconds.
     val_smiles: list[str] = []
     val_targets = np.empty(0)
-    generated_smiles: list[str] = []
-    generated_targets = np.empty(0)
+    val_weights = np.empty(0)
+    docked_smiles: list[str] = []
+    docked_targets = np.empty(0)
+    docked_passes_sa = np.empty(0, dtype=bool)
     generated_counts: dict[str, int] = {}
     if not args.skip_eval:
-        val_smiles, val_targets, _ = load_labelled_csv(args.val_csv)
+        val_smiles, val_targets, val_extras = load_labelled_csv(
+            args.val_csv, require_columns=("weight",)
+        )
+        val_weights = parse_float_column(val_extras["weight"])
         raw_smiles, raw_targets, extras = load_labelled_csv(
             args.gp_molformer_csv, require_columns=("passes_sa",)
         )
-        generated_smiles, generated_targets, generated_counts = filter_generated_set(
-            raw_smiles, raw_targets, extras["passes_sa"]
+        docked_smiles, docked_targets, docked_passes_sa, generated_counts = (
+            filter_generated_set(raw_smiles, raw_targets, extras["passes_sa"])
         )
         print(
-            f"Loaded {len(val_smiles)} val rows and {generated_counts['n_evaluated']} "
-            f"of {generated_counts['n_total']} generated rows "
-            f"(docked {generated_counts['n_docked']}, "
-            f"SA-passing {generated_counts['n_sa_pass']}).",
+            f"Loaded {len(val_smiles)} val rows and {generated_counts['n_docked']} "
+            f"docked of {generated_counts['n_total']} generated rows "
+            f"({generated_counts['n_evaluated']} of them SA-passing; "
+            f"SA-passing overall {generated_counts['n_sa_pass']}).",
             flush=True,
         )
 
@@ -1130,10 +1359,21 @@ def main(argv: Sequence[str] | None = None) -> None:
         logger.log_config(_run_configuration(args, resolved, cfg, sizes))
 
         static_sets: list[EvalSet] = []
+        docked_set: EvalSet | None = None
         if not args.skip_eval:
             print(f"Encoding {len(val_smiles)} validation molecules.", flush=True)
             static_sets.append(
-                encode_eval_set(surrogate, "val_set", val_smiles, val_targets)
+                encode_eval_set(
+                    surrogate, "val_set", val_smiles, val_targets, val_weights
+                )
+            )
+            # Encoded before the fit so the generated set gets per-epoch curves too.
+            print(f"Encoding {len(docked_smiles)} generated molecules.", flush=True)
+            docked_set = encode_eval_set(
+                surrogate, GENERATED_DOCKED_SET, docked_smiles, docked_targets
+            )
+            static_sets.append(
+                subset_eval_set(docked_set, docked_passes_sa, GENERATED_SET)
             )
             surrogate.set_epoch_callback(
                 make_epoch_callback(
@@ -1145,14 +1385,25 @@ def main(argv: Sequence[str] | None = None) -> None:
                         "train_top": top_rows,
                     },
                     observations=observations,
-                    num_data=len(observations),
                     chunk_size=args.eval_chunk_size,
+                    epoch_offset=args.epoch_offset,
                 )
             )
 
         # Re-seed so the fit is identical whether or not evaluation is enabled: the
         # inducing points are drawn from the global RNG inside fit().
         set_global_seed(cfg.runtime.seed)
+        import torch
+
+        if args.init_state is not None:
+            print(
+                f"Continuing from {args.init_state} (trainable: {args.trainable}).",
+                flush=True,
+            )
+            surrogate.warm_start_from(
+                torch.load(args.init_state, map_location="cpu", weights_only=True),
+                trainable=args.trainable,
+            )
         print(f"Fitting surrogate on {len(observations)} observations.", flush=True)
         started = time.perf_counter()
         surrogate.fit(observations)
@@ -1163,7 +1414,6 @@ def main(argv: Sequence[str] | None = None) -> None:
         state = surrogate.get_state_dict()
         if state is None:
             raise SystemExit("The fitted surrogate has no state to save.")
-        import torch
 
         torch.save(state, out_dir / STATE_FILE)
         print(f"Saved surrogate state to {out_dir / STATE_FILE}", flush=True)
@@ -1179,6 +1429,9 @@ def main(argv: Sequence[str] | None = None) -> None:
             "batch_size": training_params.get("batch_size"),
             "seed": cfg.runtime.seed,
             "eval_seed": args.eval_seed,
+            "init_state": None if args.init_state is None else str(args.init_state),
+            "trainable": args.trainable,
+            "epoch_offset": args.epoch_offset,
             "n_train_random": int(len(random_rows)),
             "n_train_top": int(len(top_rows)),
             "target_min": float(targets.min()),
@@ -1190,21 +1443,27 @@ def main(argv: Sequence[str] | None = None) -> None:
         write_json(out_dir / SUMMARY_FILE, summary)
         print(f"Wrote {out_dir / SUMMARY_FILE}", flush=True)
 
+        # The target's mean and std describe the data, not the fit: they go with the
+        # other inputs in the run config, like the set sizes logged before the fit.
+        logger.log_config(
+            {
+                name: summary["hyperparameters"][name]
+                for name in DATA_CONSTANT_HYPERPARAMETERS
+                if name in summary["hyperparameters"]
+            }
+        )
         final_metrics: dict[str, float] = {
             "run/fit/seconds": fit_seconds,
-            "run/fit/n_observations": float(len(observations)),
             **{
                 f"run/hyperparameters/{name}": value
                 for name, value in summary["hyperparameters"].items()
+                if name not in DATA_CONSTANT_HYPERPARAMETERS
             },
         }
         final_figures: dict[str, Any] = {}
 
         if not args.skip_eval:
-            print(f"Encoding {len(generated_smiles)} generated molecules.", flush=True)
-            generated_set = encode_eval_set(
-                surrogate, GENERATED_SET, generated_smiles, generated_targets
-            )
+            assert docked_set is not None
             final_metrics.update(
                 update_acquisition(
                     acquisition,
@@ -1213,47 +1472,47 @@ def main(argv: Sequence[str] | None = None) -> None:
                     seed=args.acquisition_seed,
                 )
             )
-            print("Scoring the generated set with GIBBON.", flush=True)
-            scores = score_acquisition(acquisition, generated_set.smiles)
-            rewards = reward_columns(
-                scores, transform=args.reward_transform, beta=args.reward_beta
-            )
-            final_metrics[f"{GENERATED_SET}/final/reward_overflow_count"] = float(
-                np.sum(rewards["log_reward"] > 700.0)
-            )
-            for key, value in generated_counts.items():
-                final_metrics[f"{GENERATED_SET}/final/{key}"] = float(value)
+            print("Scoring the generated molecules with GIBBON.", flush=True)
+            docked_scores = score_acquisition(acquisition, docked_set.smiles)
+            scores_by_set = {
+                GENERATED_SET: docked_scores[docked_passes_sa],
+                GENERATED_DOCKED_SET: docked_scores,
+            }
 
             all_sets = [
                 build_train_eval_set(
                     surrogate, "train_random", observations, random_rows
                 ),
                 build_train_eval_set(surrogate, "train_top", observations, top_rows),
-                static_sets[0],
-                generated_set,
+                *static_sets,
+                docked_set,
             ]
             for eval_set in all_sets:
                 print(f"Evaluating {eval_set.name}.", flush=True)
                 predictions = evaluate_set(
                     surrogate, eval_set, chunk_size=args.eval_chunk_size
                 )
-                extras: dict[str, tuple[np.ndarray, str]] = {}
                 columns = dict(predictions)
-                if eval_set.name == GENERATED_SET:
-                    extras = {
-                        "acquisition_score": (scores, "GIBBON information gain"),
-                        "log_reward": (
-                            rewards["log_reward"],
-                            f"log R = {args.reward_beta:g} * score",
-                        ),
-                    }
+                scores = scores_by_set.get(eval_set.name)
+                if scores is not None:
+                    rewards = reward_columns(
+                        scores, transform=args.reward_transform, beta=args.reward_beta
+                    )
+                    final_metrics[f"{eval_set.name}/final/reward_overflow_count"] = (
+                        float(np.sum(rewards["log_reward"] > 700.0))
+                    )
                     columns["acquisition_score"] = scores
                     columns.update(rewards)
+                if eval_set.name == GENERATED_DOCKED_SET:
+                    columns["passes_sa"] = docked_passes_sa.astype(np.float64)
+                # The generated set keeps its `final/` metrics although it now has
+                # per-epoch curves: they are the columns the earlier runs are read by.
                 metrics, figures = final_set_outputs(
                     eval_set,
                     predictions,
-                    extra_distributions=extras,
-                    max_figure_points=args.max_figure_points,
+                    scores=scores,
+                    final_metrics=scores is not None,
+                    figures=eval_set.name != GENERATED_DOCKED_SET,
                 )
                 final_metrics.update(metrics)
                 final_figures.update(figures)
@@ -1261,14 +1520,12 @@ def main(argv: Sequence[str] | None = None) -> None:
                     out_dir / "eval" / f"{eval_set.name}.csv", eval_set, columns
                 )
 
-        # The final scalars are single values, not curves: they go with the
-        # hyperparameters, and only the figures are committed as a step.
-        logger.log_config(
-            final_metrics_config(final_metrics, train_time_seconds=fit_seconds)
-        )
+        # The final scalars are logged as metrics at the step after the last epoch
+        # (the train time is `run/fit/seconds`), together with the figures.
+        log_scalars(logger, final_metrics)
         log_figures(logger, final_figures)
         epochs = int(training_params.get("epochs") or 0)
-        logger.log_step(epochs + 1)
+        logger.log_step(args.epoch_offset + epochs + 1)
         write_json(out_dir / EVAL_SUMMARY_FILE, final_metrics)
         print(f"Wrote {out_dir / EVAL_SUMMARY_FILE}", flush=True)
     finally:
