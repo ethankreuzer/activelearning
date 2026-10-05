@@ -69,6 +69,12 @@ from scripts.surrogate_eval_metrics import (
     two_panel_histogram,
     weighted_prediction_metrics,
 )
+from scripts.surrogate_eval_transform import (
+    TARGET_TRANSFORMS,
+    IdentityTransform,
+    TargetTransform,
+    build_target_transform,
+)
 
 STATE_FILE = "surrogate_state.pt"
 SUMMARY_FILE = "fit_summary.json"
@@ -85,6 +91,11 @@ GENERATED_SET = "gp_molformer_set"
 #: SA-filtered, so this is the population that actually gets docked. Scored only at the
 #: end, without figures.
 GENERATED_DOCKED_SET = "gp_molformer_docked_set"
+
+#: Kernel rows (candidates times inducing points plus one) per acquisition-scoring
+#: call. Each candidate is its own q=1 batch, so the inducing points are repeated per
+#: candidate. This is the 5,000-candidate chunk at 64 inducing points, known to fit.
+SCORE_KERNEL_ROWS = 5_000 * 65
 
 #: Evaluation sets scored after every training epoch.
 PER_EPOCH_SETS = ("train_random", "train_top", "val_set", GENERATED_SET)
@@ -572,6 +583,7 @@ def epoch_metrics(
     eval_sets: Sequence[EvalSet],
     *,
     chunk_size: int,
+    transform: TargetTransform | None = None,
 ) -> dict[str, float]:
     """Score every per-epoch evaluation set and return its metrics, keyed for W&B.
 
@@ -583,6 +595,8 @@ def epoch_metrics(
         Sets to score.
     chunk_size : int
         Rows per posterior call.
+    transform : TargetTransform, optional
+        The transform the surrogate was fitted through, as :func:`evaluate_set` takes.
 
     Returns
     -------
@@ -592,7 +606,9 @@ def epoch_metrics(
     """
     metrics: dict[str, float] = {}
     for eval_set in eval_sets:
-        predictions = evaluate_set(surrogate, eval_set, chunk_size=chunk_size)
+        predictions = evaluate_set(
+            surrogate, eval_set, chunk_size=chunk_size, transform=transform
+        )
         for name, value in set_metrics(eval_set, predictions).items():
             if (eval_set.name, name) not in SKIPPED_EPOCH_METRICS:
                 metrics[f"{eval_set.name}/epoch/{name}"] = value
@@ -604,6 +620,7 @@ def build_train_eval_set(
     name: str,
     observations: Sequence[Any],
     rows: np.ndarray,
+    targets: np.ndarray,
 ) -> EvalSet:
     """Build an eval set from rows of the surrogate's already-encoded training data.
 
@@ -622,6 +639,10 @@ def build_train_eval_set(
         The training observations the row indices refer to.
     rows : np.ndarray
         Row indices to take.
+    targets : np.ndarray
+        Target per observation, on the original scale. Taken separately because a
+        transformed run replaces ``observation.y`` with the transformed target,
+        while the metrics stay on the original scale.
 
     Returns
     -------
@@ -635,19 +656,23 @@ def build_train_eval_set(
     """
     import torch
 
-    encoded_rows = int(surrogate.get_encoded_train_data().shape[0])
+    # Only the row count is needed: materializing the matrix on the model device
+    # costs ~19 GiB at 10M rows.
+    encoded_rows = surrogate.num_encoded_train_rows()
     if encoded_rows != len(observations):
         raise RuntimeError(
             f"Encoded training matrix has {encoded_rows} rows but there are "
             f"{len(observations)} observations; row indices would be misaligned."
         )
+    if len(targets) != len(observations):
+        raise RuntimeError(
+            f"Got {len(targets)} targets for {len(observations)} observations."
+        )
     indices = torch.as_tensor(np.asarray(rows, dtype=np.int64))
     return EvalSet(
         name=name,
         smiles=tuple(str(observations[int(row)].x) for row in rows),
-        targets=np.asarray(
-            [float(observations[int(row)].y) for row in rows], dtype=np.float64
-        ),
+        targets=np.asarray(targets, dtype=np.float64)[np.asarray(rows, dtype=np.int64)],
         features=surrogate.get_encoded_train_rows(indices),
     )
 
@@ -748,8 +773,10 @@ def make_epoch_callback(
     static_sets: Sequence[EvalSet],
     train_row_sets: Mapping[str, np.ndarray],
     observations: Sequence[Any],
+    targets: np.ndarray,
     chunk_size: int,
     epoch_offset: int = 0,
+    transform: TargetTransform | None = None,
 ) -> Callable[[int, float], None]:
     """Build the per-epoch callback that scores the labelled sets and logs them.
 
@@ -769,6 +796,9 @@ def make_epoch_callback(
         Set name to row indices into ``observations``.
     observations : Sequence[Any]
         Training observations.
+    targets : np.ndarray
+        Target per observation on the original scale, as
+        :func:`build_train_eval_set` takes.
     chunk_size : int
         Rows per posterior call.
     epoch_offset : int, default=0
@@ -776,6 +806,9 @@ def make_epoch_callback(
         its starting point as epoch ``-1`` with a ``nan`` loss, so an offset equal to
         the earlier run's epoch count puts that point on the earlier run's last step
         and the new epochs after it.
+    transform : TargetTransform, optional
+        The transform the surrogate is being fitted through, as :func:`evaluate_set`
+        takes.
 
     Returns
     -------
@@ -789,9 +822,11 @@ def make_epoch_callback(
             resolved.extend(static_sets)
             for name, rows in train_row_sets.items():
                 resolved.append(
-                    build_train_eval_set(surrogate, name, observations, rows)
+                    build_train_eval_set(surrogate, name, observations, rows, targets)
                 )
-        metrics = epoch_metrics(surrogate, resolved, chunk_size=chunk_size)
+        metrics = epoch_metrics(
+            surrogate, resolved, chunk_size=chunk_size, transform=transform
+        )
         if math.isfinite(mean_train_loss):
             metrics["train/epoch/minibatch_loss"] = mean_train_loss
         hyperparameters = learned_hyperparameters(surrogate)
@@ -859,6 +894,25 @@ def update_acquisition(
     }
 
 
+def acquisition_score_chunk_size(num_inducing: int | None) -> int | None:
+    """Candidates per acquisition-scoring call that keep its kernel memory bounded.
+
+    Parameters
+    ----------
+    num_inducing : int, optional
+        Inducing points of the surrogate. ``None`` for a surrogate without any.
+
+    Returns
+    -------
+    int or None
+        Chunk size holding :data:`SCORE_KERNEL_ROWS` kernel rows, or ``None`` to leave
+        the chunking to the acquisition.
+    """
+    if num_inducing is None:
+        return None
+    return max(1, SCORE_KERNEL_ROWS // (int(num_inducing) + 1))
+
+
 def score_acquisition(
     acquisition: Any, smiles: Sequence[str], *, chunk_size: int | None = None
 ) -> np.ndarray:
@@ -890,7 +944,11 @@ def score_acquisition(
 
 
 def evaluate_set(
-    surrogate: Any, eval_set: EvalSet, *, chunk_size: int
+    surrogate: Any,
+    eval_set: EvalSet,
+    *,
+    chunk_size: int,
+    transform: TargetTransform | None = None,
 ) -> dict[str, np.ndarray]:
     """Predict mean and both standard deviations for one evaluation set.
 
@@ -902,24 +960,33 @@ def evaluate_set(
         Set to score.
     chunk_size : int
         Rows per posterior call.
+    transform : TargetTransform, optional
+        The transform the surrogate was fitted through. Its posterior is mapped back
+        to the original target scale, so the metrics compare with untransformed runs.
+        ``None`` means the targets were not transformed.
 
     Returns
     -------
     dict[str, np.ndarray]
         ``mean``, ``std_total`` (with observation noise) and ``std_latent`` (without,
-        which is what the acquisition consumes).
+        which is what the acquisition consumes), on the original target scale.
     """
+    resolved = transform if transform is not None else IdentityTransform()
     total = surrogate.predict_encoded(
         eval_set.features, observation_noise=True, chunk_size=chunk_size
     )
     latent = surrogate.predict_encoded(
         eval_set.features, observation_noise=False, chunk_size=chunk_size
     )
-    return {
-        "mean": total["mean"].numpy(),
-        "std_total": total["std"].numpy(),
-        "std_latent": latent["std"].numpy(),
-    }
+    mean, std_total = resolved.posterior_moments(
+        total["mean"].numpy(), total["std"].numpy()
+    )
+    # The latent spread is mapped through the same posterior mean, so the two
+    # standard deviations stay comparable on the original scale.
+    _, std_latent = resolved.posterior_moments(
+        total["mean"].numpy(), latent["std"].numpy()
+    )
+    return {"mean": mean, "std_total": std_total, "std_latent": std_latent}
 
 
 def write_per_molecule_csv(
@@ -1112,6 +1179,15 @@ def _parse_args(argv: Sequence[str] | None) -> tuple[argparse.Namespace, list[st
         help="Rows per posterior call during evaluation.",
     )
     parser.add_argument(
+        "--target-transform",
+        choices=sorted(TARGET_TRANSFORMS),
+        default="none",
+        help=(
+            "Transform applied to the training targets before the fit. Metrics are "
+            "always reported on the original target scale."
+        ),
+    )
+    parser.add_argument(
         "--acquisition-seed",
         type=int,
         default=42,
@@ -1251,6 +1327,7 @@ def _run_configuration(
         "eval_seed": args.eval_seed,
         "acquisition_seed": args.acquisition_seed,
         "eval_chunk_size": args.eval_chunk_size,
+        "target_transform": args.target_transform,
         "val_csv": str(args.val_csv),
         "gp_molformer_csv": str(args.gp_molformer_csv),
         "gp_molformer_filter": "docked and passes_sa",
@@ -1283,7 +1360,10 @@ def main(argv: Sequence[str] | None = None) -> None:
     from activelearning.main import process_arguments
     from activelearning.runtime import bind_runtime_context
     from activelearning.utils.seeding import set_global_seed
-    from activelearning.utils.types import filter_finite_target_observations
+    from activelearning.utils.types import (
+        Observation,
+        filter_finite_target_observations,
+    )
 
     raw_cfg, cfg, config_paths, _ = process_arguments(config_args)
     resolved = OmegaConf.to_container(raw_cfg, resolve=True)
@@ -1333,6 +1413,35 @@ def main(argv: Sequence[str] | None = None) -> None:
         f"(top target cut-off {targets[top_rows[-1]] if len(top_rows) else 'n/a'}).",
         flush=True,
     )
+
+    # From here on the observations carry the transformed target, because that is what
+    # the GP fits. Every label comes from `targets` instead, which stays on the
+    # original scale, and predictions are mapped back before any metric is computed.
+    # The row CSVs and the row selection above both ran first, so both keep the
+    # original targets.
+    transform = build_target_transform(args.target_transform)
+    if not isinstance(transform, IdentityTransform):
+        try:
+            transform.validate(targets)
+        except ValueError as error:
+            raise SystemExit(str(error)) from error
+        transformed = transform.forward(targets)
+        # Rewritten entry by entry rather than as a new list: `Observation` is frozen,
+        # and at 10M rows a second list would add gigabytes to a job that already
+        # peaks near its memory limit. Each replaced observation is freed at once.
+        for index, value in enumerate(transformed):
+            previous = observations[index]
+            observations[index] = Observation(
+                x=previous.x,
+                y=float(value),
+                fidelity=previous.fidelity,
+                metadata=previous.metadata,
+            )
+        print(
+            f"Fitting on {transform.name}(y): training targets now span "
+            f"{transformed.min():.4f} to {transformed.max():.4f}.",
+            flush=True,
+        )
 
     # Load both evaluation CSVs before the fit, so a bad path fails in seconds.
     val_smiles: list[str] = []
@@ -1409,8 +1518,10 @@ def main(argv: Sequence[str] | None = None) -> None:
                         "train_top": top_rows,
                     },
                     observations=observations,
+                    targets=targets,
                     chunk_size=args.eval_chunk_size,
                     epoch_offset=args.epoch_offset,
+                    transform=transform,
                 )
             )
 
@@ -1457,6 +1568,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             "init_state": None if args.init_state is None else str(args.init_state),
             "trainable": args.trainable,
             "epoch_offset": args.epoch_offset,
+            "target_transform": transform.name,
             "n_train_random": int(len(random_rows)),
             "n_train_top": int(len(top_rows)),
             "target_min": float(targets.min()),
@@ -1497,8 +1609,15 @@ def main(argv: Sequence[str] | None = None) -> None:
                     seed=args.acquisition_seed,
                 )
             )
-            print("Scoring the generated molecules with GIBBON.", flush=True)
-            docked_scores = score_acquisition(acquisition, docked_set.smiles)
+            score_chunk_size = acquisition_score_chunk_size(summary["num_inducing"])
+            print(
+                "Scoring the generated molecules with GIBBON "
+                f"(chunk size {score_chunk_size}).",
+                flush=True,
+            )
+            docked_scores = score_acquisition(
+                acquisition, docked_set.smiles, chunk_size=score_chunk_size
+            )
             scores_by_set = {
                 GENERATED_SET: docked_scores[docked_passes_sa],
                 GENERATED_DOCKED_SET: docked_scores,
@@ -1506,16 +1625,21 @@ def main(argv: Sequence[str] | None = None) -> None:
 
             all_sets = [
                 build_train_eval_set(
-                    surrogate, "train_random", observations, random_rows
+                    surrogate, "train_random", observations, random_rows, targets
                 ),
-                build_train_eval_set(surrogate, "train_top", observations, top_rows),
+                build_train_eval_set(
+                    surrogate, "train_top", observations, top_rows, targets
+                ),
                 *static_sets,
                 docked_set,
             ]
             for eval_set in all_sets:
                 print(f"Evaluating {eval_set.name}.", flush=True)
                 predictions = evaluate_set(
-                    surrogate, eval_set, chunk_size=args.eval_chunk_size
+                    surrogate,
+                    eval_set,
+                    chunk_size=args.eval_chunk_size,
+                    transform=transform,
                 )
                 columns = dict(predictions)
                 scores = scores_by_set.get(eval_set.name)

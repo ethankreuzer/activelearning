@@ -19,6 +19,9 @@ the ELBO vs PLL problem is in `SURROGATE_ELBO_VS_PLL.md`; read that first.
 - [x] Step 5: one fit + evaluation job with per-epoch tracking and a final evaluation on all sets, logged to W&B. Written 2026-10-01; tests pass in a `salloc`. No arm has been run yet
 - [ ] Step 6: run ELBO and PLL through steps 4–5 and compare. Both arms ran 2026-10-01 (jobs 4419799 ELBO, 4419800 PLL) and are synced to W&B; results are under Step 7. **PLL had not converged at 50 epochs** (see "Logging review" under Step 5), so its means are partly undertrained. No decision yet
 - [ ] Step 7: ELBO fit, then a PLL phase from the saved ELBO state. Planned 2026-10-01; **code written 2026-10-02, tests not run, no arm submitted**. Resume from "As built" in the section at the end
+- [x] Step 8: ELBO with stratified and k-means inducing-point init. Both arms ran 2026-10-02 (jobs 4512658 stratified, 4512662 k-means) and are synced to W&B. **No effect**: same means and the same collapsed latent std as the ELBO baseline. Results in the section at the end
+- [ ] Step 9: improve the fit on the high-scoring molecules. **Current direction (user, 2026-10-02). Resume here.** Experiment 1 (larger M, jobs 4532636 M = 256 and 4532639 M = 1024) ran 2026-10-02: **capacity is not the bottleneck** (about 6% of rmse on `train_top` for 16x the inducing points, and the latent std falls rather than rises), so experiment 2 is skipped. Both jobs OOM'd after training in the post-fit evaluation; fixed 2026-10-03. Experiment 3 (target transform) written 2026-10-03, tests pass in a `salloc`, jobs **4562154** (log) and **4562155** (logit) ran at M = 256 and are synced to W&B (`a600kuxi` log, `dk966xfm` logit): **no improvement on the top molecules, slightly worse** (`train_top` bias -0.202 / -0.197 against -0.176 at M = 256; `val_set` top-1% overlap 30% / 39% against 57%). The tail's distance from the bulk is not the bottleneck. Experiments 4 (oversampling) and 5 (natural gradients) remain unwritten; a cheap feature-ceiling check is proposed before 4. See "Result (2026-10-03)" under experiment 3 at the end
+- [ ] Step 10: let a neural network supply the predictive mean, keeping a GP for the variance so the acquisition is unchanged. **Discussed 2026-10-03; options and a recommendation written down, nothing agreed, written or run.** See the section at the end
 
 Tick boxes and add dated notes under each step as work lands.
 
@@ -243,6 +246,15 @@ label bias is common to both arms and cancels in the comparison. What it does to
   `gpmolformer_prior` is labelled by route B (real docking through `Dock3Oracle`) while
   `val` is labelled by route A. Cross-set comparisons inherit the offset; within-set,
   cross-arm comparisons do not.
+
+**Evidence the 10M used route B (2026-10-03, indirect, still not traced).** The
+training targets bottom out at 0.0318 (the target-transform jobs print the range), which
+is where route B puts the lowest-scoring molecules (~0.03) and route A puts them at
+~0.00. `val` (route A) has 10,613 rows below 0.035 averaging 0.009. If this holds, `val`
+is labelled on a different scale from the training set at the low end, every model
+overpredicts those rows by ~0.04, and the relabel below is needed before absolute
+`val_set` bias / rmse / calibration can be trusted. Cross-arm comparisons on `val` are
+still valid. See "Result (2026-10-03)" under Step 9, experiment 3.
 
 To resolve later: trace how the 10M was labelled (file reading, no allocation needed),
 then relabel `val` from the `y_from_score` column already present in
@@ -690,3 +702,489 @@ wandb sync outputs/ampc/surrogate_eval/ELBO_then_PLL_<mode>/wandb/offline-run-*
 
 Neither arm is expected to fix the underprediction of the top molecules; that is the
 target transform / inducing-point initialisation work listed under Step 6.
+
+## Step 8: inducing-point initialisation under ELBO (run 2026-10-02)
+
+The first candidate fix from Step 6: start the 64 inducing points from a stratified
+sample or from k-means centres per stratum instead of the default, so the top molecules
+are represented. Everything else matches the ELBO baseline (10M rows, 64 inducing
+points, 50 epochs, lr 1e-3, batch 10,000, seed 42).
+
+```sh
+sbatch jobs/surrogate_eval_inducing_init.sh stratified   # sets surrogate.inducing_init
+sbatch jobs/surrogate_eval_inducing_init.sh kmeans
+```
+
+| | Stratified | K-means |
+|---|---|---|
+| Slurm job | 4512658 (COMPLETED, 19:09) | 4512662 (COMPLETED, 18:30) |
+| W&B run (`models-mila5723/ampc-surrogate-eval`) | `tvaa2ez8` | `t4xpcg4k` |
+| output dir under `outputs/ampc/surrogate_eval/` | `ELBO_inducing_stratified/` | `ELBO_inducing_kmeans/` |
+
+### Result: no effect
+
+Both runs match the ELBO baseline (`36hrvpco`) on every set-level metric: the same
+mean-fit quality and the same collapsed latent variance. Numbers are from each run's `eval_summary.json` and the last
+epoch in its `wandb-summary.json`; the ELBO→PLL `variance` arm
+(`ELBO_then_PLL_variance/`) is shown as the reference for a latent std that does move.
+
+Latent std, mean per set:
+
+| Set | ELBO baseline | Stratified | K-means | ELBO→PLL `variance` |
+|---|---|---|---|---|
+| `train_random` | 0.00208 | 0.00212 | 0.00210 | 0.0065 |
+| `train_top` | 0.00328 | 0.00303 | 0.00301 | 0.071 |
+| `val_set` | 0.00281 | 0.00269 | 0.00264 | 0.036 |
+| `gp_molformer_set` | 0.00218 | 0.00223 | 0.00220 | 0.0069 |
+| max, any set | 0.0054 | 0.0053 | 0.0053 | 0.117 |
+
+- **Size.** The latent std stays at 0.002–0.003 on every set, against a prior std of
+  about 0.010 (`prior_std_original_scale` 0.00996 / 0.00974) and a learned noise std of
+  0.0136. The total std is still almost all noise.
+- **Top molecules.** On `train_top` the latent std went slightly *down* (0.0033 to
+  0.0030). On `gp_molformer_set` the top 1% by `y` get 0.0029 against 0.0022 for the
+  rest (`variance` arm: 0.048 against 0.0065).
+- **Tracking error.** `spearman_std_error` is 0.23 / 0.22 on `train_random`,
+  0.29 / 0.29 on `val_set`, 0.23 / 0.21 on `gp_molformer_set` (stratified / k-means),
+  and negative on `train_top` (-0.14 / -0.24). The `variance` arm reaches 0.50, 0.45
+  and 0.47 on the first three, and is also negative on `train_top` (-0.51).
+- **Variational covariance.** `variational_covar_eig_max` is 0.0157 / 0.0160, where the
+  prior is 1 (`variance` arm: 456). ELBO shrinks `S` whatever the inducing points start
+  from, which is why moving them does not widen the latent std.
+- **GIBBON.** Still unusable: 99.98% of generated molecules score exactly zero, the max
+  is 5.0e-41 (stratified) and 4.1e-40 (k-means) against the baseline's 3.1e-39, and
+  `acquisition_score/spearman_y` is 0.025 / 0.024 (`variance` arm: 90.3% zero, max
+  0.118, rank correlation 0.37).
+
+Means and calibration:
+
+| | ELBO baseline | Stratified | K-means |
+|---|---|---|---|
+| `val_set` Pearson / R² / RMSE | 0.872 / 0.6805 / 0.0682 | 0.8715 / 0.6801 / 0.0682 | 0.872 / 0.6828 / 0.0679 |
+| `train_top` bias / RMSE | -0.183 / 0.1945 | -0.183 / 0.1946 | -0.182 / 0.1936 |
+| `train_random` Pearson / RMSE | 0.7785 / 0.01375 | 0.7787 / 0.01374 | 0.7793 / 0.01372 |
+| `gp_molformer_set` Pearson / RMSE | 0.7005 / 0.01264 | 0.701 / 0.01262 | 0.701 / 0.01265 |
+| learned noise std (original scale) | 0.01362 | 0.01362 | 0.01360 |
+| mean constant (standardized) | 1.558 | 1.213 | 1.072 |
+
+- **The underprediction of the top molecules is not fixed** (`train_top` bias
+  unchanged), which was the other thing this init was meant to help.
+- **Coverage is badly off on the tail.** Within one total std (target 0.68):
+  `train_top` 0.004, `val_set` 0.065, `train_random` 0.945, `gp_molformer_set` 0.937.
+  Within two (target 0.95): 0.008, 0.162, 0.969, 0.966. Both arms agree to the third
+  decimal.
+- The three runs reach **the same aggregate metrics, not a shown-identical solution**.
+  The fitted parameters differ (mean constant 1.558 / 1.213 / 1.072, smallest
+  lengthscale 6.96 / 8.34 / 6.65), so the init was applied and the models are not the
+  same in parameter space. **Not checked:** whether the trained inducing points end up
+  in the same places, and whether the per-molecule means and latent stds agree across
+  runs (only set-level metrics were compared).
+- This is three initialisations at one seed, M = 64, ELBO, 50 epochs. It does not show
+  that any initialisation gives this result. An alternative reading is that 64 points
+  on 10M rows is so capacity-limited that any sensible placement gives the same coarse
+  fit, which could change at larger M.
+- To settle it (both from files on disk, in a `salloc`): compare the trained inducing
+  points in the three `surrogate_state.pt` files (nearest-neighbour distances between
+  sets, relative to the lengthscales), and correlate the per-molecule means and latent
+  stds across runs from `eval/*.csv`.
+
+Caveat: the baseline run predates the 2026-10-02 logging, so its coverage, rank
+correlations and zero fraction are not in its summary. Its latent std, means, noise and
+GIBBON max are directly comparable and match.
+
+### Conclusion
+
+Inducing-point initialisation at M = 64 under ELBO does not address the variance
+problem or the top-molecule bias. Of the arms run so far, only ELBO→PLL `variance`
+keeps ELBO's mean and gives a latent std that grows on the top molecules. The next
+direction, improving the fit on the top molecules, is Step 9.
+
+## Step 9: improve the fit on the high-scoring molecules (direction set 2026-10-02)
+
+**Resume here.** As of 2026-10-03 experiments 1 and 3 have run and neither fixes the
+top molecules (2 skipped); 4 and 5 are unwritten. The next decision is between
+experiment 4 and the feature-ceiling check proposed at the end of experiment 3.
+
+### Where things stand
+
+- **ELBO→PLL stays the training regimen.** ELBO gives the better mean; the PLL phase
+  (the `variance` arm) is the only thing so far that gives a latent std GIBBON can use.
+- **The ELBO variance collapse is caused by the objective, not by the poor fit on the
+  top molecules.** ELBO puts the misfit in the noise and shrinks the variational
+  covariance everywhere (largest eigenvalue 0.016 against a prior of 1), which is why
+  the Step 8 init runs changed nothing on the variance side. A better mean would not
+  by itself widen the ELBO latent std.
+- **The poor top fit is what limits the ELBO→PLL result.** In the `variance` arm the
+  latent std does grow on the top molecules (0.071 on `train_top` against 0.0065 on
+  `train_random`), because PLL routes misfit into the latent variance. Two defects
+  remain, both traced to the mean being wrong there:
+  - too small for the error: `train_top` bias is -0.18 against a std of 0.07, so only
+    7% of those molecules fall within one std (32% within two);
+  - wrong ordering inside the top set: `spearman_std_error` on `train_top` is -0.51.
+- **The hypothesis that failed (Step 8):** biasing the inducing-point initialisation
+  toward the top molecules would improve their fit and so their latent variance. It
+  did neither (`train_top` bias -0.183 / -0.182 against -0.183).
+
+So the goal of this step is the mean on the top molecules: `train_top` bias and RMSE,
+and `val_set` Pearson / RMSE, without losing the library-level fit on `train_random`
+and `gp_molformer_set`. Each candidate is an ELBO fit first; the ones that help are then
+taken through the PLL `variance` phase and judged on latent std and GIBBON as in Step 7.
+
+### Experiments to run (agreed 2026-10-02)
+
+Five experiments, all ELBO fits in the eval harness (`scripts/surrogate_eval_fit.py`),
+everything else as the ELBO baseline. Checked against the code 2026-10-02: only 1 and 2
+run without new code. **None submitted;** only experiment 1's job script is written.
+
+| # | Experiment | What it tests | Code needed |
+|---|---|---|---|
+| 1 | More inducing points: M = 256, then 1024 | Whether 64 points lack the capacity to fit the top molecules | None: `surrogate.num_inducing=N` override |
+| 2 | Larger M with stratified init | Whether placement toward the top matters once there are points to spare | None: add `surrogate.inducing_init=stratified` to run 1 |
+| 3 | Target transform (log, then logit) | Whether the tail sitting ~30 std out is what the Gaussian fit cannot reach | Yes: the surrogate has no target transform |
+| 4 | Oversampling the top molecules in the minibatches | Whether the loss ignores the top 0.1% because the bulk dominates it | Yes: minibatch sampler |
+| 5 | Natural gradients for q(u) | Whether q(u) is under-optimised | Yes: variational distribution class and optimiser |
+
+Order: 1 first because it is free; 2 only if 1 helps; 3 next (or in parallel), the best
+guess for the real fix; 4 and 5 only if 1-3 fall short. **As of 2026-10-03, 1-3 have
+fallen short** (1: capacity is not the limit; 2: skipped; 3: no help, slightly worse).
+
+1. **More inducing points.** A diagnostic for the capacity reading of Step 8. It does
+   not overturn the 2026-09-30 decision to keep M = 64: adopting a larger M is a
+   separate decision, and its real cost is in the GIBBON calls inside S3-GFN training,
+   not in this job. Fit time and memory at larger M are **not measured** (~13 min is
+   for M = 64). Job script written 2026-10-02, **not submitted**:
+   `jobs/surrogate_eval_num_inducing.sh <M>` (random init pinned, output
+   `outputs/ampc/surrogate_eval/ELBO_num_inducing_<M>/`, W&B group
+   `surrogate-eval-step9`, 12 h limit sized for 1024):
+
+   ```sh
+   sbatch --time=3:00:00 jobs/surrogate_eval_num_inducing.sh 256
+   sbatch jobs/surrogate_eval_num_inducing.sh 1024
+   ```
+
+   **Submitted 2026-10-02:** job **4532636** (M = 256, 3 h limit) and job **4532639**
+   (M = 1024, 12 h limit). Both pending at submission; results not in yet.
+
+   **Record the training time when they finish** (user, 2026-10-02: needed for any
+   decision to raise M). Sources: `fit_seconds` and
+   `profiling/surrogate/gp_fit_minibatched_s` in each run's `fit_summary.json`, and the
+   job's wall time from `sacct -j <id> -X --format=JobID,Elapsed,State`. If the 1024
+   job times out, note that and the epochs it reached instead.
+
+   | M | Job | Fit time (`fit_seconds`) | GP minibatch training | Job wall time | Per epoch |
+   |---|---|---|---|---|---|
+   | 64 (baseline, 4419799) | COMPLETED | 733 s | 659 s | 19:03 | ~13 s |
+   | 256 | 4532636 | 851 s | 765 s | 21:19 | ~15 s |
+   | 1024 | 4532639 | 1208 s | 1167 s | 25:33 | ~23 s |
+
+   Both jobs ended **FAILED**: training and all 50 epochs of evaluation finished, but
+   the post-fit evaluation hit CUDA OOM, so neither has `final/` metrics. Two causes,
+   both fixed 2026-10-03: `build_train_eval_set` moved the whole 10M-row encoded
+   training matrix to the GPU (~19 GiB) just to read its row count, now a
+   `num_encoded_train_rows()` call that copies nothing; and GIBBON scoring used the
+   config's fixed 5,000-candidate chunk, whose memory grows with M because each
+   candidate carries its own copy of the inducing points, now sized from M
+   (5,000 at M = 64, 1,269 at M = 256, 317 at M = 1024). The chunk scaling is in the
+   eval script only: a real active-learning run at large M would still hit this.
+
+   This is the fit cost only. The cost of a larger M inside the active-learning loop
+   (GIBBON calls during S3-GFN training) is separate and is not measured by these jobs.
+   **Result (2026-10-03): capacity is not the bottleneck.** Comparing the last-epoch
+   metrics of M = 64 / 256 / 1024 on `train_top`: bias -0.183 / -0.176 / -0.170, rmse
+   0.1945 / 0.1886 / 0.1836, Pearson 0.535 / 0.549 / 0.560. Sixteen times the inducing
+   points buys about 6% of rmse. The latent std *falls* with M (0.00317 to 0.00306 on
+   `train_top`, and 8-14% on the other sets), so the small coverage gain at 1 and 2 std
+   (0.0062 to 0.0096, 0.0146 to 0.0204) comes from the mean shifting, not from better
+   variances; `spearman_std_error` on `train_top` goes from -0.25 to -0.36, i.e. more
+   confident where it is more wrong. Everything off the top set matches to 1-2%.
+   Fitted hyperparameters do move (outputscale 0.21 / 0.25 / 0.36, median lengthscale
+   36.9 / 33.6 / 30.1), so the capacity is used, just not where it is needed. One seed,
+   last-epoch values, no `final/` metrics. **Experiment 2 is therefore skipped.**
+2. **Larger M with stratified init.** *Skipped: experiment 1 showed no capacity limit.*
+   At M = 64 placement did nothing, possibly because
+   64 points cannot cover both the bulk and the tail. Check
+   `inducing_strata_quantiles` / `inducing_strata_fractions` first: how the points are
+   split across strata today was not looked at.
+3. **Target transform (log or logit).** `y` has mean 0.0396 and std 0.0218 but a max
+   of 0.666, so the top molecules sit nearly 30 standard deviations out in the
+   standardized space the GP fits. A Gaussian likelihood with one noise level,
+   dominated by 10M bulk rows, is expected to underpredict them at any M.
+   **Expectation from the target's shape, not a result.**
+
+   **Built and submitted 2026-10-03** as `jobs/surrogate_eval_target_transform.sh
+   <log|logit>`, job **4562154** (log) and **4562155** (logit), M pinned to 256,
+   output `outputs/ampc/surrogate_eval/ELBO_target_<transform>/`. How the open points
+   were settled:
+   - *Where it lives:* in the eval harness, not the surrogate.
+     `scripts/surrogate_eval_transform.py` holds the transforms;
+     `--target-transform {none,log,logit}` replaces the targets of the training
+     observations just before the fit. The library is untouched.
+   - *Metrics:* reported on the original `y` scale, so they compare directly with the
+     M = 256 run (W&B `0cne37bg`). The GP's Gaussian posterior is mapped back with
+     32-node Gauss-Hermite quadrature, because the mean of the back-transformed
+     distribution is not the back-transform of the mean. `none` bypasses the
+     quadrature, so an untransformed run reproduces the earlier numbers exactly.
+   - *GIBBON and the reward:* they see the **transformed** scale. The acquisition
+     scores and rewards of these two runs are therefore **not** comparable with the
+     untransformed runs; the fit and prediction metrics are.
+   - *Domain:* `y` spans 0.0318 to 0.666, so both transforms are defined; the script
+     validates this and exits rather than producing infinities.
+
+   **Result (2026-10-03): the transforms do not help the top molecules; both are
+   slightly worse than the untransformed fit.** Both jobs COMPLETED (fit 814 s log,
+   823 s logit) and are synced: W&B `a600kuxi` (log), `dk966xfm` (logit). One seed each.
+
+   *Where the numbers come from.* The transform runs' `eval_summary.json` has no
+   `final/*` metrics (74 keys against the baseline's 96; **not investigated**, look in
+   `scripts/surrogate_eval_transform.py` / the final-evaluation path), so everything
+   below was recomputed from the per-molecule `eval/<set>.csv` files (`y`, `mean`,
+   `std_total`, `std_latent`, all on the original `y` scale). The M = 256 untransformed
+   run (4532636) has no `eval/` directory because it OOM'd, so the per-molecule
+   comparison is against the **M = 64** ELBO baseline
+   (`outputs/ampc/surrogate_eval/VariationalELBO/`); its M = 256 last-epoch `train_top`
+   numbers from experiment 1 are given alongside where they exist.
+
+   | Set / metric | ELBO M = 64 | ELBO M = 256 (last epoch) | log, M = 256 | logit, M = 256 |
+   |---|---|---|---|---|
+   | `train_top` bias | -0.183 | -0.176 | -0.202 | -0.197 |
+   | `train_top` rmse | 0.1945 | 0.1886 | 0.2135 | 0.2085 |
+   | `train_top` Pearson | 0.535 | 0.549 | 0.499 | 0.518 |
+   | `train_top` Spearman | 0.452 | | 0.418 | 0.429 |
+   | `train_top` mean prediction (true mean 0.364) | 0.181 | | 0.162 | 0.167 |
+   | `train_top` coverage at 2 std | 0.8% | | 4.1% | 3.0% |
+   | `train_random` rmse | 0.0137 | | 0.0139 | 0.0138 |
+   | `train_random` Pearson | 0.779 | | 0.782 | 0.784 |
+   | `train_random` Spearman | 0.729 | | 0.757 | 0.757 |
+   | `val_set` bias | +0.0126 | | +0.0048 | +0.0067 |
+   | `val_set` rmse | 0.0682 | | 0.0729 | 0.0708 |
+   | `val_set` Pearson | 0.872 | | 0.846 | 0.857 |
+   | `val_set` Spearman | 0.916 | | 0.910 | 0.912 |
+   | `val_set` predicted top 1% ∩ true top 1% (201 rows) | 57% | | 30% | 39% |
+   | `val_set` predicted top 5% ∩ true top 5% | 58% | | 53% | 55% |
+   | `val_set` max prediction (true max 0.666) | 0.376 | | 0.478 | 0.435 |
+
+   Fitted hyperparameters (standardized units of the space each run fits in):
+
+   | | ELBO M = 64 | ELBO M = 256 | log | logit |
+   |---|---|---|---|---|
+   | Median lengthscale | 36.9 | 33.6 | 32.3 | 32.4 |
+   | Noise variance | 0.391 | 0.381 | 0.284 | 0.289 |
+   | Outputscale | 0.207 | 0.253 | 0.128 | 0.137 |
+   | Mean constant | 1.56 | 0.80 | 0.74 | 0.76 |
+
+   `val_set` by true-`y` bin (mean prediction / mean `std_total` / mean z-error
+   `(mean - y) / std_total`):
+
+   | `y` bin | n | mean `y` | ELBO M = 64 | log | logit |
+   |---|---|---|---|---|---|
+   | 0–0.035 | 10,613 | 0.009 | 0.050 / 0.014 / +2.9 | 0.048 / 0.007 / +5.8 | 0.048 / 0.007 / +5.6 |
+   | 0.035–0.05 | 1,281 | 0.042 | 0.095 / 0.014 / +3.8 | 0.087 / 0.013 / +3.2 | 0.088 / 0.013 / +3.3 |
+   | 0.05–0.1 | 3,209 | 0.073 | 0.111 / 0.014 / +2.7 | 0.100 / 0.015 / +1.3 | 0.101 / 0.015 / +1.5 |
+   | 0.1–0.2 | 1,687 | 0.135 | 0.134 / 0.014 / -0.1 | 0.119 / 0.018 / -1.9 | 0.122 / 0.017 / -1.6 |
+   | 0.2–0.3 | 1,466 | 0.272 | 0.198 / 0.014 / -5.3 | 0.178 / 0.026 / -5.2 | 0.184 / 0.023 / -5.0 |
+   | 0.3–0.4 | 1,376 | 0.339 | 0.226 / 0.014 / -8.1 | 0.206 / 0.030 / -6.3 | 0.213 / 0.026 / -6.3 |
+   | 0.4–0.5 | 381 | 0.440 | 0.272 / 0.014 / -12.0 | 0.251 / 0.037 / -6.8 | 0.262 / 0.030 / -7.2 |
+   | 0.5–0.7 | 140 | 0.560 | 0.316 / 0.014 / -17.4 | 0.292 / 0.044 / -8.6 | 0.307 / 0.034 / -9.4 |
+
+   *Interpretation.*
+   - **The hypothesis is rejected.** The transform did pull the tail in: the top target
+     is about 11 std out in log space (`(-0.406 + 3.286) / 0.270`) and 13 in logit,
+     against ~30 on the raw scale. The fit has the same shape anyway: predictions on the
+     top molecules are shrunk about halfway to the bulk. `train_top` rows are training
+     data, so this is underfit, not poor generalisation.
+   - **The GP learned the same function in all three spaces.** Lengthscales are
+     unchanged and in every run the learned noise variance exceeds the outputscale.
+     The labels are deterministic, so that noise is model misfit: a smooth function of
+     these features cannot tell a top molecule from its mediocre neighbours. Together
+     with experiment 1 (capacity) and Step 8 (placement), three different levers now
+     leave the top-molecule bias at -0.17 to -0.20.
+   - **The transform moved capacity toward the bulk.** In log space a difference
+     between 0.032 and 0.04 counts as much as one between 0.3 and 0.4, and nearly all
+     10M rows sit near the floor. Consistent with that: `train_random` Spearman rose
+     (0.729 to 0.757) while the top-1% retrieval on `val_set` fell from 57% to 30% /
+     39% (201 molecules, so well outside sampling noise). Logit sits between raw and
+     log on every metric, as expected of the milder transform.
+   - **The one gain is heteroscedastic uncertainty on the `y` scale, and it is too
+     small.** `std_total` now grows with the prediction (0.007 at the bottom to 0.044 at
+     the top; the baseline is flat at 0.014), which halves the z-error in the top bin
+     (-17 to about -9) and raises `train_top` 2-std coverage from 0.8% to 3–4%. Still
+     badly overconfident. `std_latent` on `train_top` is 0.0048 / 0.0044 against
+     0.0033, so the ELBO variance collapse is unchanged.
+
+   *Caveats.*
+   - **M is confounded in the per-molecule comparison** (baseline M = 64, transforms
+     M = 256). For `train_top` the M = 256 last-epoch numbers are better than M = 64,
+     so the transforms are worse than the like-for-like run too; the `val_set` overlap
+     and the binned table have no M = 256 counterpart. Re-running the untransformed
+     M = 256 evaluation (the OOM is fixed) would close this.
+   - **`val_set` labels go below the training floor.** Training `y` bottoms out at
+     0.0318; `val_set` has 10,613 rows in the 0–0.035 bin averaging 0.009, some at 0.0.
+     No model here can predict below ~0.03, so `val_set` bias and rmse are inflated in
+     every run (the +2.9 to +5.8 z-errors in the lowest bins). This matches the
+     route A / route B offset under Step 2b: see the note added there.
+   - Both jobs hit CUDA OOM building the MES candidate support and retried with the
+     100k stratified support (the existing fallback), then finished. The acquisition
+     scores are on the transformed scale and were not compared.
+
+   **Conclusion: drop target transforms.** They are not adopted for the fit, and neither
+   is taken through the PLL `variance` phase.
+
+   **Proposed next (2026-10-03, not agreed, nothing written):** before spending another
+   10M-row job on experiment 4, check whether the frozen MiniMol features can separate
+   the top molecules at all. Fit a flexible non-GP regressor (or the same GP) on a
+   top-enriched subset of a few hundred thousand rows, in a `salloc`. If that also
+   shrinks the top by half, the ceiling is the features and the fix is a learned
+   encoder (DKL), not experiments 4–5; if it fits the top well, oversampling
+   (experiment 4) is the right next experiment.
+4. **Oversampling the top molecules** (chosen over per-molecule loss weights; see
+   below). Changes the objective, so it comes after 1-3.
+5. **Natural gradients for q(u)** (with Adam for the hyperparameters). An optimiser
+   change, not a model change: it updates the variational mean and covariance in a way
+   that accounts for their geometry, and usually converges in far fewer steps than Adam
+   on those parameters. Expected to help convergence and the variances more than the
+   top-molecule bias, so it is last for this goal. In gpytorch it needs
+   `NaturalVariationalDistribution` and `NGD`, i.e. a different variational
+   distribution class than the current one (not checked against the code).
+
+#### Experiment 4: oversample, not weight (reasoning, 2026-10-02)
+
+The two are the same objective in expectation: drawing a molecule `w` times as often
+is the same as multiplying its loss term by `w`. They differ in gradient noise:
+
+- **Weights on uniform minibatches:** a 10,000-row batch holds about 10 of the top
+  0.1%. Putting a weight of ~100 on those 10 rows makes each step depend on which 10
+  were drawn. Noisy.
+- **Oversampling:** every batch holds a fixed share of top molecules (e.g. 1,000 of
+  10,000), each with weight 1. Same objective, much less noise. Preferred.
+
+What either one means for the model: under ELBO, weighting a molecule's likelihood term
+by `w` is the same as giving that molecule a noise variance of `σ²/w`. So this says
+"fit these molecules more tightly", which is the intent. Consequences to watch:
+
+- The learned noise and the calibration no longer describe the library: the model is
+  fitted as if top molecules were far more common than they are. Read `train_random`
+  and `gp_molformer_set` for the cost.
+- Too strong a weight trades the bulk fit for the tail with only 64 points to spend.
+  Start moderate (top 0.1% as ~10% of each batch, an effective weight of ~100) and
+  treat the share as the knob.
+
+Design choices, not settled: oversample by `y` strata (the inducing-init strata could
+be reused) rather than by a continuous function of `y`, since strata are simpler to
+reason about and to report; and whether the PLL `variance` phase afterwards also
+oversamples or goes back to uniform batches (uniform keeps the variances
+library-calibrated; undecided).
+
+### How to judge an arm
+
+Against the ELBO baseline (`36hrvpco`) and the Step 8 runs, with the 2026-10-02 logging:
+
+- `train_top`: `bias` (now -0.18), `rmse` (0.19), `coverage_1std`.
+- `val_set`: `pearson` (0.872), `rmse` (0.068), and the weighted versions.
+- `train_random` and `gp_molformer_set`: `pearson` / `rmse` must not get worse
+  (0.779 / 0.0137 and 0.701 / 0.0126).
+- After the PLL `variance` phase: latent std on the top 1% against the rest,
+  `spearman_std_error` on `train_top`, and the GIBBON `fraction_zero` and `spearman_y`
+  on the generated set (`variance` arm today: 0.903 and 0.37).
+
+## Step 10: a neural network for the mean, a GP for the variance (discussed 2026-10-03)
+
+**Discussion only: nothing here is agreed, written or run.** It records the options and
+the reasoning so the decision can be made later.
+
+### Why this came up
+
+After Step 8 and Step 9 experiments 1 and 3, three different levers (inducing-point
+placement, 16x the inducing points, log / logit targets) leave the `train_top` bias at
+-0.17 to -0.20, and in every run the learned noise exceeds the signal variance. The
+user's question (2026-10-03): is a GP simply the wrong model for the predictive mean
+here, and if an MLP does the mean, how do we still get variances that work with the
+chosen acquisition?
+
+Reading at the time, **not a measured result**:
+
+- The problem is probably not GPs as such but the model actually fitted: a variational
+  GP with M inducing points is effectively a regression on M basis functions, here 64
+  to 1024 of them over frozen MiniMol features, against 10M deterministic labels. A
+  network or boosted trees would have far more flexibility for the mean.
+- GPs earn their keep at small data, through calibrated uncertainty. At 10M rows that
+  advantage is gone for the mean and the inducing-point approximation is the
+  bottleneck.
+- **Not settled:** the M sweep (about 6% of rmse for 16x the points) is consistent
+  both with "the features cannot separate the top molecules" (then any model on them
+  fails) and with "a stationary kernel in a high-dimensional feature space needs far
+  more than 1024 points" (then a network does fine). The feature-ceiling check proposed
+  under Step 9, experiment 3 — a plain MLP on the cached MiniMol features — tells these
+  apart and is the prerequisite for everything below. The user expects the MLP to do
+  better; that has not been run.
+- The target is awkward for any smooth model: binding probability is not monotone in
+  the docking score, so the top molecules sit in a band of scores, not at an extreme.
+  Predicting the score and applying the known mapping may be easier, but the 10M CSV
+  holds only `y`, so that needs the raw scores.
+
+### What the acquisition needs from the surrogate
+
+GIBBON (`QLowerBoundMaxValueEntropy`) and the multi-fidelity MES variants need:
+
+- a predictive mean and variance at each candidate;
+- a joint covariance across the candidates of a batch (the batch-diversity term);
+- for multi-fidelity, the covariance between a candidate at a cheap fidelity and the
+  same candidate at the target fidelity.
+
+The BoTorch acquisitions also validate in `update()` that the surrogate is a
+`BoTorchGPSurrogate` (or subclass). Anything that stays a GP satisfies all of this
+unchanged; anything else has to present a joint Gaussian itself.
+
+### Options
+
+| # | Option | Who supplies the mean | Where the variance comes from | Works with the acquisition | Main risk |
+|---|---|---|---|---|---|
+| 1 | Network as the GP's mean function, GP on the residuals | The MLP, plus a small GP correction | GP fitted to the MLP's errors | Yes, unchanged | Residuals on rows the MLP trained on are near zero, so the GP is overconfident |
+| 2 | MLP's last hidden layer as the GP's features | GP on learned features | GP in that feature space | Yes, unchanged (a new fixed encoder with cached features) | Mean still goes through M inducing points; variance unreliable away from the data |
+| 3 | Deep kernel learning (`DeepKernelSurrogate` exists) | Network and GP trained jointly | GP head | Yes, unchanged | Known to overfit and collapse features, giving overconfident variance |
+| 4 | Bayesian last layer (a linear-kernel GP on the last hidden layer, closed form) | The MLP exactly | Gaussian over the last-layer weights | In principle; needs a new surrogate class | Variance shrinks like 1/N at 10M rows, so it needs recalibrating |
+| 5 | Deep ensemble | Average of K networks | Disagreement between them | Only through a wrapper that moment-matches to a Gaussian | K times the cost on every scoring call inside S3-GFN training; batch covariance has rank at most K-1 |
+| 6 | Network with a variance head | The MLP | A predicted per-molecule variance | Poorly | No covariance between candidates: no batch diversity, no fidelity coupling |
+
+### Recommendation (not agreed): option 1
+
+- **The mean is the MLP's.** The GP no longer has to fit the top molecules; it only
+  describes where the MLP is wrong.
+- **Nothing downstream changes.** It remains a `VariationalGPSurrogate` with a different
+  mean module, so GIBBON, the selector and the ELBO→PLL `variance` phase carry over.
+- **Multi-fidelity still works.** The network can take the fidelity as an input and the
+  GP keeps the cross-fidelity covariance.
+
+**The design point that decides whether it works: the residuals must be honest.** If the
+MLP is trained on all 10M rows and the GP is fitted to its residuals on those same rows,
+the residuals are near zero and the GP learns that the MLP is never wrong. Ways to get
+residuals from rows the MLP did not see:
+
+- *Hold-out:* train the MLP on, e.g., 9M rows and fit the GP on its errors on the
+  other 1M (which also makes the GP fit cheaper).
+- *Cross-fitting:* two or more folds, each row's residual coming from the network that
+  did not train on it.
+- *Inside the loop:* newly labelled molecules are honest by construction, provided the
+  GP updates each round and the MLP is retrained less often.
+
+With deterministic labels the variance then means "expected MLP error near this
+molecule". Whether those errors are predictable from the features is an empirical
+question; the first check is whether the predicted std tracks the absolute error on
+`val_set` (`spearman_std_error`), then coverage and the GIBBON diagnostics as in Step 7.
+
+Options 1 and 2 combine: the MLP as the mean and its last hidden layer as the features
+the residual GP's kernel works on. Start with option 1 alone on the existing MiniMol
+features; add 2 only if the residual variances turn out uninformative.
+
+### Open before any code
+
+- Run the MLP feature-ceiling check (in a `salloc` or a job; never on the login node).
+  If the MLP also shrinks the top molecules by half, the features are the ceiling and
+  the fix is a trained encoder, not this step.
+- MLP architecture, loss (plain MSE or top-weighted) and the hold-out / cross-fitting
+  scheme: not chosen.
+- Whether the mean network is frozen during the GP fit or trained jointly (jointly is
+  option 3 by another route, with its risks): not chosen; frozen is the default
+  assumption above.
+- How the MLP is retrained inside the active-learning loop, and how often: not designed.
+- Where it lives: a mean module on `VariationalGPSurrogate` plus a config field; not
+  checked against the code.

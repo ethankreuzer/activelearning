@@ -469,6 +469,12 @@ class VariationalGPSurrogate(BoTorchGPSurrogate):
             dtype=self.dtype,
         )
 
+    def num_encoded_train_rows(self) -> int:
+        """Return the number of encoded training rows, without moving them."""
+        if self._train_X is None:
+            raise RuntimeError("Surrogate has not been fitted yet.")
+        return int(self._train_X.shape[0])
+
     def get_encoded_train_data(self) -> torch.Tensor:
         """Return all fixed-feature training rows on the active model device."""
         if self._train_X is None:

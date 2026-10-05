@@ -37,8 +37,8 @@ class _FakeSurrogate:
             "std": torch.full((count,), scale),
         }
 
-    def get_encoded_train_data(self) -> torch.Tensor:
-        return torch.zeros((self._encoded_rows, 3))
+    def num_encoded_train_rows(self) -> int:
+        return self._encoded_rows
 
     def get_encoded_train_rows(self, indices: torch.Tensor) -> torch.Tensor:
         return torch.zeros((indices.numel(), 3))
@@ -272,8 +272,20 @@ def test_build_train_eval_set_rejects_a_misaligned_encoding() -> None:
 
     with pytest.raises(RuntimeError, match="misaligned"):
         fit_script.build_train_eval_set(
-            surrogate, "train_random", observations, np.array([0, 1])
+            surrogate,
+            "train_random",
+            observations,
+            np.array([0, 1]),
+            np.array([0.1, 0.2]),
         )
+
+
+def test_acquisition_score_chunk_size_shrinks_with_inducing_points() -> None:
+    """The chunk keeps the kernel rows per call at the 64-inducing-point baseline."""
+    assert fit_script.acquisition_score_chunk_size(None) is None
+    assert fit_script.acquisition_score_chunk_size(64) == 5000
+    assert fit_script.acquisition_score_chunk_size(1024) == 317
+    assert fit_script.acquisition_score_chunk_size(10_000_000) == 1
 
 
 def test_build_train_eval_set_carries_the_selected_labels() -> None:
@@ -286,7 +298,11 @@ def test_build_train_eval_set_carries_the_selected_labels() -> None:
     surrogate = _FakeSurrogate(3)
 
     eval_set = fit_script.build_train_eval_set(
-        surrogate, "train_top", observations, np.array([2, 0])
+        surrogate,
+        "train_top",
+        observations,
+        np.array([2, 0]),
+        np.array([0.1, 0.2, 0.3]),
     )
 
     assert eval_set.smiles == ("CCC", "CCO")
@@ -441,6 +457,7 @@ def test_epoch_callback_logs_one_step_per_epoch() -> None:
         ],
         train_row_sets={"train_random": np.array([0, 1]), "train_top": np.array([3])},
         observations=observations,
+        targets=np.array([0.1 * i for i in range(4)]),
         chunk_size=2,
     )
 
@@ -476,6 +493,7 @@ def test_epoch_callback_offsets_a_warm_started_run() -> None:
         static_sets=[_eval_set("val_set", 4)],
         train_row_sets={"train_random": np.array([0, 1])},
         observations=observations,
+        targets=np.array([0.1 * i for i in range(4)]),
         chunk_size=2,
         epoch_offset=50,
     )

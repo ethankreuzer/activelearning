@@ -11,7 +11,7 @@
 #SBATCH --time=2:00:00
 #SBATCH --job-name=ampc_eval_fit
 #SBATCH --account=def-yvesbrun_gpu
-#SBATCH --output=slurm_logs/ampc_eval_fit_%j.out
+#SBATCH --output=slurm_logs/ampc_eval_fit_%j.out/bt
 #SBATCH --error=slurm_logs/ampc_eval_fit_%j.err
 #
 # Steps 4 and 5 of SURROGATE_EVAL_PLAN.md: fit the surrogate on the full 10M, track
