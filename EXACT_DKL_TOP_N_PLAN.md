@@ -40,8 +40,7 @@ This is a separate line of work from `SURROGATE_EVAL_PLAN.md`, not another step 
 - [x] `scripts/exact_dkl_top_n.py`, `jobs/exact_dkl_top_n.sh`
 - [x] Tests written
 - [x] **Tests run** (2026-10-05, job 4748349): 84/87 new tests passed; the three failures were test-side and are fixed. 456/459 regression tests passed; the three failures there predate this study.
-- [ ] **Tests re-run after the test fixes** (`scripts/run_exact_dkl_tests.sh`, inside `salloc`) — nothing below
-      this line has been executed
+- [x] **Tests re-run** (2026-10-05): 88/88 new, 458/458 regression, 1906 passed in the full suite. The 7 remaining failures all predate this study and are deselected with reasons in the runner.
 - [ ] Prep job run, manifest and the eight cache triples verified
 - [ ] Smoke run on one arm
 - [ ] The four arms submitted and synced
@@ -352,8 +351,17 @@ by it (`git diff b6afcfa..HEAD` lists none of the files):
 | `test_ampc_single_fidelity_reward_transform_overlays_parse[power]` | test expects `sampler.beta == 0.5`; `config/ampc/overrides/reward_power.yaml` deliberately sets `1.0` and documents why | neither file changed |
 | `test_molecule_s3gfn_minimol_slurm_dock3_config_parses` | `config/molecules/s3gfn_minimol_slurm_dock3.yaml` does not exist | no config added or removed |
 | `test_convert_al_d0`, `test_diagnose_ampc_acquisition`, `test_diagnose_mes_gibbon` | orphaned test modules; `scripts/convert_al_d0.py`, `scripts/diagnose_ampc_acquisition.py`, `scripts/diagnose_mes_gibbon.py` are absent | those scripts were never in this branch |
+| `test_num_workers_auto_resolves_from_slurm` | environment-dependent: `resolve_num_workers` takes `min(cpu_affinity, SLURM_CPUS_PER_TASK)` by design, and the test monkeypatches only the env var, so it needs a host with >= 64 available CPUs | `dock3_oracle.py` and `_parallel.py` unchanged since `0104988` |
+| `test_select_stratified_draws_from_each_stratum`, `test_select_stratified_is_seeded`, `test_select_kmeans_respects_strata_and_subsampling` | the default strata allot `0.1875 * 64 = 12` inducing points to the top 0.1%, but the test's 10,000 rows put only 10 there, so `_allocation` raises | `inducing_init.py` and its test both arrived in `0104988` and are unchanged |
 
-The last three fail at **collection**, which aborts the whole suite — that is why the
+**A finding worth keeping from those last three:** the default strata require the top
+0.1% stratum to hold at least 12 rows, so `inducing_init="stratified"` raises on any
+training set below roughly 12,000 rows. The Step 8 runs used 10M rows, where the top 0.1%
+is 10,000 rows, which is why this never surfaced. It does not affect this study — exact
+DKL has no inducing points — but it would bite anyone trying stratified init at
+n = 2000-3000.
+
+The three orphaned modules fail at **collection**, which aborts the whole suite — that is why the
 full-suite stage reported only errors. `scripts/run_exact_dkl_tests.sh` now deselects the
 two stale assertions and ignores the three orphaned modules, each with its reason inline,
 so a green run is a meaningful signal. **Fixing them is a separate decision**: either

@@ -95,6 +95,36 @@ PREEXISTING_IGNORE=(
   --ignore tests/scripts/test_diagnose_mes_gibbon.py
 )
 
+# Four more pre-existing failures that only the full suite reaches. Again
+# verified against `git diff 0104988..HEAD`: neither source file has changed
+# since this study began.
+#
+#   test_num_workers_auto_resolves_from_slurm
+#     Environment-dependent. resolve_num_workers() takes
+#     min(cpu_affinity, SLURM_CPUS_PER_TASK) on purpose, so no stale env var can
+#     oversubscribe the allocation. The test monkeypatches the env var to 64 but
+#     not the affinity, so it only passes on a host with >= 64 available CPUs.
+#     It fails in any small salloc and would pass on a login node.
+#   test_select_stratified_* / test_select_kmeans_respects_strata_and_subsampling
+#     The default strata are incompatible with the test's dataset size. Quantiles
+#     (0.9, 0.99, 0.999) make stratum 3 the top 0.1%, and fractions
+#     (0.375, 0.25, 0.1875, 0.1875) allot 0.1875 * 64 = 12 inducing points to it.
+#     The test uses 10,000 rows, so that stratum holds 10 -- fewer than its
+#     allotment -- and _allocation raises. The real Step 8 runs used 10M rows,
+#     where the top 0.1% is 10,000 rows, which is why this never surfaced.
+#     Implication worth knowing: inducing_init="stratified" raises on any
+#     training set below roughly 12,000 rows.
+PREEXISTING_FULL_SUITE_DESELECT=(
+  --deselect
+  "tests/applications/molecules/test_dock3_oracle.py::TestDock3OracleConstruction::test_num_workers_auto_resolves_from_slurm"
+  --deselect
+  "tests/surrogate/test_inducing_init.py::test_select_stratified_draws_from_each_stratum"
+  --deselect
+  "tests/surrogate/test_inducing_init.py::test_select_stratified_is_seeded"
+  --deselect
+  "tests/surrogate/test_inducing_init.py::test_select_kmeans_respects_strata_and_subsampling"
+)
+
 status=0
 
 echo "=== New tests for this study ==="
@@ -108,12 +138,18 @@ uv run --no-sync pytest "${REGRESSION_TESTS[@]}" \
 echo
 echo "=== Full suite (pre-existing breakage excluded; see above) ==="
 uv run --no-sync pytest -q \
-  "${PREEXISTING_IGNORE[@]}" "${PREEXISTING_DESELECT[@]}" || status=1
+  "${PREEXISTING_IGNORE[@]}" \
+  "${PREEXISTING_DESELECT[@]}" \
+  "${PREEXISTING_FULL_SUITE_DESELECT[@]}" || status=1
 
 echo
 echo "=== Pre-existing failures, confirmed unrelated to this study ==="
-echo "Run this to see them, and decide separately whether to fix them:"
-echo "  uv run --no-sync pytest tests/test_example_configs.py \\"
+echo "Seven in total, each documented with its reason in this script."
+echo "To see them, and decide separately whether to fix them:"
+echo "  uv run --no-sync pytest \\"
+echo "    tests/test_example_configs.py \\"
+echo "    tests/surrogate/test_inducing_init.py \\"
+echo "    tests/applications/molecules/test_dock3_oracle.py \\"
 echo "    tests/scripts/test_convert_al_d0.py \\"
 echo "    tests/scripts/test_diagnose_ampc_acquisition.py \\"
 echo "    tests/scripts/test_diagnose_mes_gibbon.py"
