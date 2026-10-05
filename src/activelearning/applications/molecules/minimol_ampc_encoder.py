@@ -114,6 +114,7 @@ class MiniMolAmpcSmilesFixedEncoder(MiniMolSmilesFixedEncoder):
         batch_size: int = 100,
         cache_size: int = 4096,
         feature_cache_path: str | Path | None = None,
+        cache_only: bool = False,
     ) -> None:
         """Initialize the fine-tuned MiniMol AmpC fixed encoder.
 
@@ -135,6 +136,10 @@ class MiniMolAmpcSmilesFixedEncoder(MiniMolSmilesFixedEncoder):
         feature_cache_path : Path or str, optional
             Path to a persistent ``.npy`` feature matrix and its JSON
             manifest.
+        cache_only : bool, default=False
+            Whether to forbid live inference, so a request the cache does not
+            cover raises instead of silently re-encoding. Requires
+            ``feature_cache_path``.
         """
         resolved_checkpoint_path = Path(checkpoint_path).expanduser().resolve()
         self.package_path = _resolve_package_path(
@@ -147,6 +152,7 @@ class MiniMolAmpcSmilesFixedEncoder(MiniMolSmilesFixedEncoder):
             cache_size=cache_size,
             feature_cache_path=feature_cache_path,
             checkpoint_path=resolved_checkpoint_path,
+            cache_only=cache_only,
         )
 
     def _build_minimol(self, checkpoint_path: Path | None) -> Any:
@@ -241,6 +247,8 @@ class MiniMolAmpcSmilesEncoder(MiniMolSmilesEncoder):
         latent_dim: int = 32,
         cache_size: int = 4096,
         feature_cache_path: str | Path | None = None,
+        activation: str = "none",
+        cache_only: bool = False,
     ) -> None:
         """Initialize the fine-tuned MiniMol AmpC encoder."""
         self.package_path = package_path
@@ -251,6 +259,8 @@ class MiniMolAmpcSmilesEncoder(MiniMolSmilesEncoder):
             cache_size=cache_size,
             feature_cache_path=feature_cache_path,
             checkpoint_path=checkpoint_path,
+            activation=activation,
+            cache_only=cache_only,
         )
         self.package_path = self.fixed_encoder.package_path
 
@@ -261,6 +271,7 @@ class MiniMolAmpcSmilesEncoder(MiniMolSmilesEncoder):
         cache_size: int,
         feature_cache_path: str | Path | None,
         checkpoint_path: str | Path | None,
+        cache_only: bool = False,
     ) -> MiniMolAmpcSmilesFixedEncoder:
         """Construct the fixed AmpC encoder used by DKL."""
         if checkpoint_path is None:
@@ -272,4 +283,5 @@ class MiniMolAmpcSmilesEncoder(MiniMolSmilesEncoder):
             batch_size=batch_size,
             cache_size=cache_size,
             feature_cache_path=feature_cache_path,
+            cache_only=cache_only,
         )

@@ -27,8 +27,9 @@ re-applied inside the GP or kernel. Floating-point tensors follow
 
 from __future__ import annotations
 
+import time
 from abc import abstractmethod
-from typing import Any, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional
 from warnings import warn
 
 import gpytorch
@@ -39,6 +40,16 @@ from activelearning.runtime import RuntimeContext
 from activelearning.surrogate.botorch_surrogate import BoTorchGPSurrogate
 from activelearning.surrogate.encoder import LatentEncoder
 from activelearning.utils.types import Candidate, Observation
+
+#: Called once per training epoch with ``(epoch_index, loss)``. Monitoring only;
+#: it must not mutate the surrogate.
+EpochCallback = Callable[[int, float], None]
+
+
+def _synchronize_profile_device(device: torch.device) -> None:
+    """Block until queued CUDA work finishes so timings are not understated."""
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
 
 
 class DeepKernelSurrogate(BoTorchGPSurrogate):
@@ -123,11 +134,101 @@ class DeepKernelSurrogate(BoTorchGPSurrogate):
             raise TypeError("encoder.latent_dim must be a positive integer.")
         self._encoder = encoder
         self._training = training_params
+        self._epoch_callback: EpochCallback | None = None
+        self._fit_profiling: dict[str, float] = {}
 
         self._target_fidelity_level = target_fidelity if is_multi_fidelity else None
         botorch_kwargs.setdefault("optimize_hyperparameters", False)
         botorch_kwargs.setdefault("is_multi_fidelity", is_multi_fidelity)
         super().__init__(**botorch_kwargs)
+
+    def set_epoch_callback(self, callback: EpochCallback | None) -> None:
+        """Register a callback invoked once per training epoch.
+
+        Parameters
+        ----------
+        callback : callable or None
+            Called as ``callback(epoch, loss)`` at the end of every epoch, where
+            ``epoch`` is zero-based and ``loss`` is the GP loss for that epoch.
+            ``None`` clears a previously registered callback.
+
+        Returns
+        -------
+        None
+            The callback is stored on the surrogate in place.
+        """
+        self._epoch_callback = callback
+
+    def get_fit_profiling(self) -> dict[str, float]:
+        """Return wall-clock seconds for the stages of the most recent fit.
+
+        Returns
+        -------
+        dict[str, float]
+            Seconds keyed by stage. Empty until :meth:`fit` has run.
+        """
+        return dict(self._fit_profiling)
+
+    def predict_encoded(
+        self,
+        features: torch.Tensor,
+        *,
+        observation_noise: bool = True,
+        chunk_size: int | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Predict on features that are already in model space.
+
+        :meth:`predict` re-encodes its candidates on every call, which is both
+        slow and, with a persistent feature cache keyed by an ordered prefix,
+        liable to miss the cache entirely when called in chunks. This takes the
+        model-space matrix directly and returns CPU tensors rather than Python
+        lists, since the evaluation sets run to hundreds of thousands of rows.
+
+        Parameters
+        ----------
+        features : torch.Tensor
+            Model-space rows, shaped ``(n, d)``. For an encoder kernel these are
+            the *pre-encoder* features, matching :meth:`encode_candidates`.
+        observation_noise : bool, default=True
+            Whether to include the likelihood's noise. ``True`` gives the total
+            predictive standard deviation; ``False`` gives the latent one, which
+            is what the acquisition sees.
+        chunk_size : int, optional
+            Rows per posterior call. ``None`` scores them all at once.
+
+        Returns
+        -------
+        dict[str, torch.Tensor]
+            ``mean`` and ``std``, each a one-dimensional CPU tensor on the
+            original target scale.
+
+        Raises
+        ------
+        RuntimeError
+            If the surrogate has not been fitted.
+        ValueError
+            If ``chunk_size`` is not positive.
+        """
+        if chunk_size is not None and chunk_size < 1:
+            raise ValueError("chunk_size must be positive.")
+        model = self.get_model()
+        self._set_eval_mode()
+        rows = features.shape[0]
+        step = chunk_size or max(rows, 1)
+        means: list[torch.Tensor] = []
+        deviations: list[torch.Tensor] = []
+        with torch.no_grad():
+            for start in range(0, rows, step):
+                chunk = features[start : start + step].to(
+                    device=self.device, dtype=self.dtype
+                )
+                posterior = model.posterior(chunk, observation_noise=observation_noise)
+                means.append(posterior.mean.reshape(-1).cpu())
+                deviations.append(posterior.variance.sqrt().reshape(-1).cpu())
+        if not means:
+            empty = torch.empty(0, dtype=self.dtype)
+            return {"mean": empty, "std": empty.clone()}
+        return {"mean": torch.cat(means), "std": torch.cat(deviations)}
 
     def bind_runtime_context(self, runtime_context: RuntimeContext) -> None:
         """Move the DKL stack onto the shared runtime device and dtype.
@@ -177,10 +278,16 @@ class DeepKernelSurrogate(BoTorchGPSurrogate):
         None
             The fitted model is stored on the surrogate in place.
         """
+        self._fit_profiling = {}
         obs_list = list(observations)
         if not obs_list:
             return
+        encode_start = time.perf_counter()
         self._train_X, self._train_Y = self._parse_observations(obs_list)
+        _synchronize_profile_device(self.device)
+        self._fit_profiling["profiling/surrogate/encoder_features_s"] = (
+            time.perf_counter() - encode_start
+        )
         self._train_Y = self._prepare_targets(self._train_Y)
         self._build_model(self._train_X, self._train_Y)
         self._apply_runtime_context()
@@ -233,6 +340,20 @@ class DeepKernelSurrogate(BoTorchGPSurrogate):
         """Optional hook for target standardisation. No-op by default."""
         return train_Y
 
+    def _training_targets(self) -> torch.Tensor:
+        """Return the targets the GP objective is evaluated against.
+
+        Subclasses whose model holds the targets in a transformed space must
+        override this, or the objective is maximised in one space while
+        ``posterior()`` un-transforms as though it were the other.
+
+        Returns
+        -------
+        torch.Tensor
+            One-dimensional targets on the active device and dtype.
+        """
+        return self._train_Y.squeeze(-1).to(device=self.device, dtype=self.dtype)
+
     @property
     def _has_mlm_loss(self) -> bool:
         """Return whether the encoder provides an MLM auxiliary objective."""
@@ -245,7 +366,7 @@ class DeepKernelSurrogate(BoTorchGPSurrogate):
         optimizer = self._make_optimizer()
         all_params = [p for group in optimizer.param_groups for p in group["params"]]
         train_X = self._train_X.to(device=self.device, dtype=self.dtype)
-        targets = self._train_Y.squeeze(-1).to(device=self.device, dtype=self.dtype)
+        targets = self._training_targets()
         has_mlm_loss = self._has_mlm_loss
         mlm_tokens = None
         if has_mlm_loss:
@@ -258,7 +379,9 @@ class DeepKernelSurrogate(BoTorchGPSurrogate):
 
         self._warn_if_mlm_configuration_is_ignored()
 
-        for _ in range(self._training.epochs):
+        callback_seconds = 0.0
+        train_start = time.perf_counter()
+        for epoch in range(self._training.epochs):
             self._set_train_mode()
             optimizer.zero_grad()
             mlm_loss = None
@@ -270,8 +393,40 @@ class DeepKernelSurrogate(BoTorchGPSurrogate):
             (gp_loss if mlm_loss is None else mlm_loss + gp_loss).backward()
             torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
             optimizer.step()
+            callback_seconds += self._run_epoch_callback(epoch, float(gp_loss.item()))
 
+        _synchronize_profile_device(self.device)
+        self._fit_profiling["profiling/surrogate/gp_fit_full_s"] = (
+            time.perf_counter() - train_start - callback_seconds
+        )
+        self._fit_profiling["profiling/surrogate/epoch_callback_s"] = callback_seconds
         self._set_eval_mode()
+
+    def _run_epoch_callback(self, epoch: int, loss: float) -> float:
+        """Invoke the epoch callback and return the seconds it consumed.
+
+        The callback evaluates monitoring metrics, which can cost more than the
+        epoch itself, so its time is reported separately and subtracted from the
+        training timing.
+
+        Parameters
+        ----------
+        epoch : int
+            Zero-based epoch index.
+        loss : float
+            GP loss for the epoch.
+
+        Returns
+        -------
+        float
+            Wall-clock seconds spent inside the callback, or ``0.0`` when none
+            is registered.
+        """
+        if self._epoch_callback is None:
+            return 0.0
+        callback_start = time.perf_counter()
+        self._epoch_callback(epoch, loss)
+        return time.perf_counter() - callback_start
 
     def _run_mlm_pretraining(
         self,

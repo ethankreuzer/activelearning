@@ -1,0 +1,145 @@
+# Exact-DKL top-n surrogate study: an exact GP over a trainable layer on the
+# fine-tuned MiniMol AmpC representations, fitted on only the top-n
+# highest-scoring molecules of the 10M set.
+#
+# This config exists for scripts/exact_dkl_top_n.py, which builds only the
+# dataset, surrogate and acquisition. The sampler, oracle, selector and budget
+# sections below are never built, but ActiveLearningConfig validates the whole
+# file -- including that the encoder's input_representation matches the oracle's
+# mol_repr -- so they must stay present and valid.
+#
+# Prerequisites:
+#   - uv sync --extra molecules
+#   - the intact collaborator package and checkpoint under minimol_ampc_encoder/
+#   - scripts/exact_dkl_prepare.py has been run, so the top-n CSVs and the
+#     per-set MiniMol feature caches exist
+#
+# Per-arm overrides (see jobs/exact_dkl_top_n.sh):
+#   dataset.initial_data.path=data/ampc_top_<n>.csv
+#   surrogate.encoder.feature_cache_path=cache/ampc/exact_dkl_top_n/top_<n>.npy
+#   acquisition.type=QMultiFidelityMaxValueEntropy   (the qMFMES arms)
+
+runtime:
+  device: cuda
+  # float64, unlike the variational config's 32. That 32 was chosen for 10M
+  # rows; here the Cholesky is 3000 x 3000 (72 MB in float64, free), and float32
+  # is where psd_safe_cholesky's jitter escalation starts to bite on a Matern
+  # kernel over a trained embedding. The training loop papers over it with
+  # cholesky_jitter(1e-1); posterior() has no such context. Pinned identically
+  # across all four arms, and logged, because it doubles the memory being
+  # extrapolated.
+  precision: 64
+  seed: 42
+
+dataset:
+  type: ListDataset
+  initial_data:
+    # Overridden per arm; the default is the smaller of the two training sets.
+    path: data/ampc_top_2000.csv
+    x_columns: SMILE
+    y_column: y
+    fidelity_column: fidelity
+
+surrogate:
+  # Exact GP: no inducing points, no minibatching. The encoder below lives
+  # inside the covariance module (EncoderKernel), so its parameters are trained
+  # on the exact marginal log likelihood jointly with the kernel
+  # hyperparameters and the likelihood noise.
+  type: ExactDKLSurrogate
+  target_fidelity: 1
+  encoder:
+    type: MiniMolAmpcSmilesEncoder
+    checkpoint_path: minimol_ampc_encoder/model/final.pt
+    package_path: minimol_ampc_encoder
+    device: cpu  # Never used: inference is disabled by cache_only.
+    batch_size: 64  # Never used: inference is disabled by cache_only below.
+    cache_size: 0  # The persistent per-set cache is the only cache needed.
+    # A cache miss here is a loud error rather than hours of silent MiniMol
+    # inference, which would destroy the timing measurement this study exists
+    # to produce.
+    cache_only: true
+    # One trainable layer: Linear(512, 256) followed by GELU. Without the
+    # activation the kernel only learns a low-rank metric on the fingerprints;
+    # with it the feature map is nonlinear, which is the point of DKL.
+    latent_dim: 256
+    activation: gelu
+    # Overridden per arm. Each n needs its own cache: the cache matches a full
+    # ordered prefix of its manifest, so a 2000-row request against a 3000-row
+    # cache does not match.
+    feature_cache_path: cache/ampc/exact_dkl_top_n/top_2000.npy
+  training_params:
+    # Full-batch Adam, so epochs == gradient steps. The DKLTrainingConfig
+    # default of 50 would be 50 steps for a 131k-parameter layer plus the
+    # kernel hyperparameters; at n <= 3000 a step is one n x n Cholesky, so
+    # 1000 steps still finishes in well under a minute.
+    epochs: 1000
+    lr: 1.0e-3
+  standardize_outputs: true
+
+acquisition:
+  # GIBBON by default; the qMFMES arms override `type`. The script scores
+  # GIBBON twice, once on the value scale and once on the log scale, so
+  # log_output is set per scoring pass rather than here.
+  type: QLowerBoundMaxValueEntropy
+  candidate_set_spec:
+    # The support for max-value sampling is the training set itself. At
+    # n <= 3000 the fallback never triggers, so both acquisitions see exactly
+    # the fitted molecules.
+    type: TrainDataCandidateSetSpec
+    fallback_size: 100000
+    seed: 42
+  num_mv_samples: 10
+  score_chunk_size: 5000
+  maximize: true
+  log_space: true
+  log_output: false
+
+sampler:
+  type: S3GFNSampler
+  n_samples: 100000
+  fidelities: [1]
+  model_name_or_path: ibm-research/GP-MoLFormer-Uniq
+  tokenizer_name_or_path: ibm-research/MoLFormer-XL-both-10pct
+  trust_remote_code: true
+  performance_mode: optimized
+  max_length: 80
+  batch_size: 64
+  replay_batch_size: 64
+  generation_batch_size: 128
+  n_train_steps: 2500
+  num_warmup_steps: 10
+  beta: 1.0
+  aux_coefficient: 0.001
+  sa_threshold: 4.0
+
+selector:
+  type: CostAwareSelector
+
+oracle:
+  type: Dock3Oracle
+  mol_repr: smiles
+  indock_template: /home/ethankrz/dock_smiles/ampc_dockfiles/INDOCK
+  dockfiles_dir: /home/ethankrz/dock_smiles/ampc_dockfiles
+  fidelity_costs:
+    1: 1.0
+  fidelity_confidences:
+    1: 1.0
+  num_workers: null
+  ligbuild_timeout: 150
+  hitrate_params: ampc_hitrate_fits/fitted_params.json
+  score_pprop_table: ampc_hitrate_fits/data/full_scores.df
+  hitrate_target: ampc
+  pki_threshold: 6.5
+
+budget:
+  available_budget: 100000.0
+  schedule:
+    type: constant
+    value: 10000.0
+
+logger:
+  # Stripped by the script, which builds its own run logger from the
+  # --wandb-* flags.
+  type: ConsoleLogger
+  project_name: ampc-exact-dkl-top-n
+  run_name: exact-dkl-top-n

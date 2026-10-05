@@ -1,0 +1,22 @@
+# qMFMES arm of the exact-DKL top-n study.
+#
+# Merged on top of config/ampc/exact_dkl_top_n.yaml. The base ships GIBBON, so
+# this replaces the acquisition type and states the qMFMES sampling parameters
+# explicitly rather than inheriting defaults silently.
+#
+# The base's `log_space` and `log_output` keys survive the OmegaConf merge but
+# QMultiFidelityMaxValueEntropyConfig has no such fields, and the acquisition
+# configs do not set `extra`, so pydantic's default drops them. That is correct
+# but implicit, which is why this arm is an overlay file instead of a dotlist
+# override: the acquisition an arm actually ran is readable in one place.
+
+acquisition:
+  type: QMultiFidelityMaxValueEntropy
+  # Config defaults, stated for the record. num_fantasies is inert while no
+  # points are pending -- qMaxValueEntropy.set_X_pending(None) restores the
+  # un-fantasized model -- so at q=1 the per-candidate cost is driven by
+  # num_mv_samples * num_y_samples.
+  num_fantasies: 16
+  num_mv_samples: 10
+  num_y_samples: 128
+  maximize: true

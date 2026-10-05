@@ -45,14 +45,12 @@ from __future__ import annotations
 
 import argparse
 import csv
-import json
 import math
 import os
 import sys
 import time
 import warnings
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -69,6 +67,23 @@ from scripts.surrogate_eval_metrics import (
     two_panel_histogram,
     weighted_prediction_metrics,
 )
+from scripts.surrogate_eval_io import (
+    GENERATED_DOCKED_SET,
+    GENERATED_SET,
+    SCORE_LOG_FLOOR,
+    EvalSet,
+    build_run_logger,
+    filter_generated_set,
+    load_labelled_csv,
+    log_figures,
+    log_final_scalars,
+    log_scalars,
+    parse_float_column,
+    select_train_eval_rows,
+    subset_eval_set,
+    write_json,
+    write_per_molecule_csv,
+)
 from scripts.surrogate_eval_transform import (
     TARGET_TRANSFORMS,
     IdentityTransform,
@@ -84,13 +99,6 @@ TRAIN_RANDOM_FILE = "train_random.csv"
 TRAIN_TOP_FILE = "train_top.csv"
 EVAL_CSV_COLUMNS = ("SMILE", "y")
 
-#: The generated set: the generated molecules that docked and pass the SA filter.
-GENERATED_SET = "gp_molformer_set"
-
-#: Every generated molecule that docked, SA-passing or not. The S3-GFN pool is not
-#: SA-filtered, so this is the population that actually gets docked. Scored only at the
-#: end, without figures.
-GENERATED_DOCKED_SET = "gp_molformer_docked_set"
 
 #: Kernel rows (candidates times inducing points plus one) per acquisition-scoring
 #: call. Each candidate is its own q=1 batch, so the inducing points are repeated per
@@ -120,87 +128,6 @@ DATA_CONSTANT_HYPERPARAMETERS = ("y_mean", "y_std")
 #: Values of ``--trainable``; mirrors ``variational_gp.WARM_START_TRAINABLE`` so the
 #: argument parser does not import the surrogate module.
 WARM_START_TRAINABLE = ("all", "variance")
-
-#: Acquisition scores below this are treated as zero in the log-scale figures, which
-#: otherwise span hundreds of orders of magnitude.
-SCORE_LOG_FLOOR = 1e-12
-
-
-@dataclass(frozen=True)
-class EvalSet:
-    """A labelled evaluation set whose features have already been encoded.
-
-    Attributes
-    ----------
-    name : str
-        Set name, used as the first segment of every metric key.
-    smiles : tuple[str, ...]
-        Molecule inputs, aligned with ``targets``.
-    targets : np.ndarray
-        Observed target per molecule.
-    features : Any
-        Encoded feature matrix (a ``torch.Tensor``), shaped ``(n, feature_dim)``.
-        Typed loosely so this module does not import torch at module scope.
-    weights : np.ndarray or None
-        Optional weight per molecule, for sets that over-sample part of the library.
-    """
-
-    name: str
-    smiles: tuple[str, ...]
-    targets: np.ndarray
-    features: Any
-    weights: np.ndarray | None = None
-
-
-def select_train_eval_rows(
-    targets: Sequence[float] | np.ndarray,
-    n_random: int,
-    n_top: int,
-    seed: int,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Select the random and the highest-target rows used as ``train`` eval sets.
-
-    The two selections are independent: a row can appear in both, which is
-    expected to be rare (about ``n_random * n_top / len(targets)`` rows).
-
-    Parameters
-    ----------
-    targets : Sequence[float] or np.ndarray
-        Finite target value per training row.
-    n_random : int
-        Number of rows in the seeded random selection, without replacement.
-    n_top : int
-        Number of rows with the highest target. Ties at the cut-off are broken
-        by row order, so the selection is deterministic.
-    seed : int
-        Seed of the random selection.
-
-    Returns
-    -------
-    tuple[np.ndarray, np.ndarray]
-        Row indices of the random selection (ascending) and of the top
-        selection (highest target first).
-
-    Raises
-    ------
-    ValueError
-        If ``targets`` is not one-dimensional or is empty, or either count is
-        negative.
-    """
-    values = np.asarray(targets, dtype=np.float64)
-    if values.ndim != 1 or values.size == 0:
-        raise ValueError("targets must be a non-empty one-dimensional sequence.")
-    if n_random < 0 or n_top < 0:
-        raise ValueError("n_random and n_top must be nonnegative.")
-    random_rows = np.sort(
-        np.random.default_rng(seed).choice(
-            values.size,
-            size=min(n_random, values.size),
-            replace=False,
-        )
-    )
-    top_rows = np.argsort(-values, kind="stable")[:n_top]
-    return random_rows, top_rows
 
 
 def write_eval_csv(
@@ -297,138 +224,6 @@ def learned_hyperparameters(surrogate: Any) -> dict[str, float]:
     }
 
 
-def write_json(path: Path, payload: Mapping[str, Any]) -> None:
-    """Write ``payload`` as sorted, indented JSON, atomically."""
-    tmp_path = path.with_name(path.name + ".tmp")
-    tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
-    os.replace(tmp_path, path)
-
-
-def load_labelled_csv(
-    path: Path,
-    *,
-    smiles_column: str = "SMILES",
-    label_column: str = "y",
-    require_columns: Sequence[str] = (),
-) -> tuple[list[str], np.ndarray, dict[str, list[str]]]:
-    """Read a CSV of labelled molecules.
-
-    Parameters
-    ----------
-    path : Path
-        CSV to read.
-    smiles_column : str, default="SMILES"
-        Column holding the molecule input.
-    label_column : str, default="y"
-        Column holding the target.
-    require_columns : Sequence[str], default=()
-        Extra columns that must be present and are returned verbatim.
-
-    Returns
-    -------
-    tuple[list[str], np.ndarray, dict[str, list[str]]]
-        The SMILES, the targets (``nan`` where they do not parse) and the extras.
-
-    Raises
-    ------
-    FileNotFoundError
-        If ``path`` does not exist.
-    ValueError
-        If a required column is missing.
-    """
-    if not path.exists():
-        raise FileNotFoundError(f"{path} does not exist.")
-    smiles: list[str] = []
-    targets: list[float] = []
-    extras: dict[str, list[str]] = {name: [] for name in require_columns}
-    with path.open(newline="") as handle:
-        reader = csv.DictReader(handle)
-        missing = [
-            name
-            for name in (smiles_column, label_column, *require_columns)
-            if name not in (reader.fieldnames or [])
-        ]
-        if missing:
-            raise ValueError(
-                f"{path} is missing column(s) {missing}; it has {reader.fieldnames}."
-            )
-        for row in reader:
-            smiles.append(row[smiles_column])
-            try:
-                targets.append(float(row[label_column]))
-            except (TypeError, ValueError):
-                targets.append(float("nan"))
-            for name in require_columns:
-                extras[name].append(row[name])
-    return smiles, np.asarray(targets, dtype=np.float64), extras
-
-
-def parse_float_column(values: Sequence[str]) -> np.ndarray:
-    """Parse a CSV column as floats, with ``nan`` where an entry does not parse."""
-    parsed: list[float] = []
-    for value in values:
-        try:
-            parsed.append(float(value))
-        except (TypeError, ValueError):
-            parsed.append(float("nan"))
-    return np.asarray(parsed, dtype=np.float64)
-
-
-def filter_generated_set(
-    smiles: Sequence[str],
-    targets: np.ndarray,
-    passes_sa: Sequence[str],
-) -> tuple[list[str], np.ndarray, np.ndarray, dict[str, int]]:
-    """Keep the generated molecules that docked, and flag those passing the SA filter.
-
-    About a tenth of the generated molecules fail to dock and carry a ``nan`` target;
-    those failures are biased toward molecules the docking toolchain cannot build, so
-    the surviving fraction is reported rather than assumed. The S3-GFN pool is not
-    SA-filtered, so every docked molecule is kept; the SA-passing ones (the only
-    molecules that get reward-driven updates) are marked for the main generated set.
-
-    Parameters
-    ----------
-    smiles : Sequence[str]
-        Molecule inputs.
-    targets : np.ndarray
-        Docked targets, ``nan`` where docking failed.
-    passes_sa : Sequence[str]
-        The ``passes_sa`` column, truthy for molecules below the SA threshold.
-
-    Returns
-    -------
-    tuple[list[str], np.ndarray, np.ndarray, dict[str, int]]
-        The docked SMILES, their targets, a boolean mask over them that is true for
-        the SA-passing molecules, and the counts behind the filter (``n_evaluated`` is
-        the number that both docked and pass).
-
-    Raises
-    ------
-    ValueError
-        If the three inputs differ in length.
-    """
-    values = np.asarray(targets, dtype=np.float64)
-    if not (len(smiles) == values.size == len(passes_sa)):
-        raise ValueError(
-            f"Length mismatch: {len(smiles)} smiles, {values.size} targets, "
-            f"{len(passes_sa)} sa flags."
-        )
-    sa_flags = np.asarray(
-        [str(flag).strip() not in ("", "0", "False", "false") for flag in passes_sa],
-        dtype=bool,
-    )
-    docked = np.isfinite(values)
-    counts = {
-        "n_total": int(values.size),
-        "n_docked": int(docked.sum()),
-        "n_sa_pass": int(sa_flags.sum()),
-        "n_evaluated": int((docked & sa_flags).sum()),
-    }
-    kept = [smiles[index] for index in np.flatnonzero(docked)]
-    return kept, values[docked], sa_flags[docked], counts
-
-
 def reward_columns(
     scores: np.ndarray, *, transform: str, beta: float
 ) -> dict[str, np.ndarray]:
@@ -469,80 +264,6 @@ def reward_columns(
         "log_reward": log_reward,
         "reward": reward,
     }
-
-
-def build_run_logger(
-    *,
-    project: str | None,
-    run_name: str,
-    entity: str | None = None,
-    tags: Sequence[str] | None = None,
-    group: str | None = None,
-) -> Any:
-    """Build the logger the run uses, falling back to the console without a project.
-
-    Parameters
-    ----------
-    project : str or None
-        W&B project. ``None`` selects a ``ConsoleLogger`` instead, so the script runs
-        end to end without W&B.
-    run_name : str
-        Run name.
-    entity : str, optional
-        W&B team or user. Without it wandb resolves the account from the environment.
-    tags : Sequence[str], optional
-        Run tags.
-    group : str, optional
-        Run group, for showing the arms of one study together.
-
-    Returns
-    -------
-    Any
-        A ``Logger``.
-    """
-    from activelearning.logger.logger import ConsoleLogger, WandbLogger
-
-    if project is None:
-        return ConsoleLogger(project_name="surrogate-eval", run_name=run_name)
-    return WandbLogger(
-        project_name=project,
-        run_name=run_name,
-        entity=entity,
-        tags=tags,
-        group=group,
-    )
-
-
-def log_scalars(logger: Any, metrics: Mapping[str, float]) -> None:
-    """Buffer every scalar metric on the logger."""
-    for key, value in metrics.items():
-        logger.log_metric(key, value)
-
-
-def log_final_scalars(logger: Any, metrics: Mapping[str, float]) -> None:
-    """Record every one-off scalar in the run summary, never as a chart metric.
-
-    A scalar logged once as a metric becomes a one-point chart, which clutters the
-    Charts tab. In the summary it appears in the runs table and the Overview under its
-    own name, where it can be sorted and filtered, and no chart is created. A
-    non-finite value is stored as ``None``.
-
-    Parameters
-    ----------
-    logger : Logger
-        Receives one ``log_summary`` call.
-    metrics : Mapping[str, float]
-        Scalars keyed by their metric name.
-    """
-    logger.log_summary(
-        {key: value if math.isfinite(value) else None for key, value in metrics.items()}
-    )
-
-
-def log_figures(logger: Any, figures: Mapping[str, Any]) -> None:
-    """Buffer every figure on the logger."""
-    for key, figure in figures.items():
-        logger.log_figure(key, figure)
 
 
 def set_metrics(
@@ -722,47 +443,6 @@ def encode_eval_set(
         targets=np.asarray(targets, dtype=np.float64),
         features=surrogate.encode_candidates(candidates),
         weights=None if weights is None else np.asarray(weights, dtype=np.float64),
-    )
-
-
-def subset_eval_set(eval_set: EvalSet, mask: np.ndarray, name: str) -> EvalSet:
-    """Return the molecules of an encoded set selected by a boolean mask.
-
-    Parameters
-    ----------
-    eval_set : EvalSet
-        The encoded set to take from.
-    mask : np.ndarray
-        Boolean mask with one entry per molecule.
-    name : str
-        Name of the new set.
-
-    Returns
-    -------
-    EvalSet
-        The selected molecules, reusing the features already encoded.
-
-    Raises
-    ------
-    ValueError
-        If the mask does not have one entry per molecule.
-    """
-    import torch
-
-    keep = np.asarray(mask, dtype=bool)
-    if keep.shape != (len(eval_set.smiles),):
-        raise ValueError(
-            f"Mask of shape {keep.shape} for {len(eval_set.smiles)} molecules in "
-            f"{eval_set.name}."
-        )
-    rows = np.flatnonzero(keep)
-    indices = torch.as_tensor(rows, device=eval_set.features.device)
-    return EvalSet(
-        name=name,
-        smiles=tuple(eval_set.smiles[int(row)] for row in rows),
-        targets=eval_set.targets[keep],
-        features=eval_set.features.index_select(0, indices),
-        weights=None if eval_set.weights is None else eval_set.weights[keep],
     )
 
 
@@ -987,37 +667,6 @@ def evaluate_set(
         total["mean"].numpy(), latent["std"].numpy()
     )
     return {"mean": mean, "std_total": std_total, "std_latent": std_latent}
-
-
-def write_per_molecule_csv(
-    path: Path, eval_set: EvalSet, columns: Mapping[str, np.ndarray]
-) -> None:
-    """Write one row per molecule with its label and every computed column.
-
-    Parameters
-    ----------
-    path : Path
-        Destination CSV, written atomically.
-    eval_set : EvalSet
-        The set, supplying SMILES and targets.
-    columns : Mapping[str, np.ndarray]
-        Extra columns, each aligned with the set.
-    """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    names = list(columns)
-    tmp_path = path.with_name(path.name + ".tmp")
-    with tmp_path.open("w", newline="") as handle:
-        writer = csv.writer(handle)
-        writer.writerow(["SMILES", "y", *names])
-        for index, smiles in enumerate(eval_set.smiles):
-            writer.writerow(
-                [
-                    smiles,
-                    repr(float(eval_set.targets[index])),
-                    *(repr(float(columns[name][index])) for name in names),
-                ]
-            )
-    os.replace(tmp_path, path)
 
 
 def final_set_outputs(

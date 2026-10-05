@@ -1505,3 +1505,106 @@ class TestSingleFidelityMaxValueEntropy:
         assert acq._build_botorch_acquisition() == "fallback-acquisition"
         assert full_build.call_count == 1
         assert fallback_build.call_count == 2
+
+
+# ===================================================================
+# Public score_encoded
+# ===================================================================
+
+
+class TestPublicScoreEncoded:
+    """Verify scoring rows that are already in model space.
+
+    ``score()`` re-encodes its candidates once per chunk. When the surrogate's
+    encoder is backed by a persistent cache keyed to one exact ordered input,
+    a chunk is not such an input, so chunked scoring through ``score()``
+    silently falls back to live encoding. ``score_encoded`` is the way out, and
+    these tests pin its equivalence and its refusal to guess.
+    """
+
+    def test_matches_score_on_the_same_candidates(
+        self,
+        fitted_surrogate: BoTorchGPSurrogate,
+        single_fidelity_observations: list[Observation],
+        candidates: list[Candidate],
+    ) -> None:
+        """The encoded path must agree with the candidate path exactly."""
+        acq = StubAnalytic()
+        acq.update(fitted_surrogate, single_fidelity_observations)
+        features = fitted_surrogate.encode_candidates(candidates)
+        assert acq.score_encoded(features) == pytest.approx(acq.score(candidates))
+
+    def test_chunking_does_not_change_the_scores(
+        self,
+        fitted_surrogate: BoTorchGPSurrogate,
+        single_fidelity_observations: list[Observation],
+        candidates: list[Candidate],
+    ) -> None:
+        """Chunk size is a memory bound, never a result change."""
+        acq = StubAnalytic()
+        acq.update(fitted_surrogate, single_fidelity_observations)
+        features = fitted_surrogate.encode_candidates(candidates)
+        unchunked = acq.score_encoded(features)
+        assert acq.score_encoded(features, chunk_size=1) == pytest.approx(unchunked)
+        assert acq.score_encoded(features, chunk_size=2) == pytest.approx(unchunked)
+
+    def test_never_encodes_candidates(
+        self,
+        fitted_surrogate: BoTorchGPSurrogate,
+        single_fidelity_observations: list[Observation],
+        candidates: list[Candidate],
+    ) -> None:
+        """Regression for the cache-miss trap: no encoding during scoring."""
+        acq = StubAnalytic()
+        acq.update(fitted_surrogate, single_fidelity_observations)
+        features = fitted_surrogate.encode_candidates(candidates)
+
+        calls = 0
+        original = fitted_surrogate.encode_candidates
+
+        def counting_encode(items: Any) -> torch.Tensor:
+            nonlocal calls
+            calls += 1
+            return original(items)
+
+        fitted_surrogate.encode_candidates = counting_encode  # type: ignore[method-assign]
+        try:
+            acq.score_encoded(features, chunk_size=1)
+        finally:
+            fitted_surrogate.encode_candidates = original  # type: ignore[method-assign]
+        assert calls == 0
+
+    def test_works_for_q_batch_acquisitions(
+        self,
+        fitted_surrogate: BoTorchGPSurrogate,
+        single_fidelity_observations: list[Observation],
+        candidates: list[Candidate],
+    ) -> None:
+        """Each row is scored as a q-batch of one, as ``score()`` does."""
+        acq = StubQBatch()
+        acq.update(fitted_surrogate, single_fidelity_observations)
+        features = fitted_surrogate.encode_candidates(candidates)
+        assert acq.score_encoded(features) == pytest.approx(acq.score(candidates))
+
+    def test_returns_the_uniform_fallback_before_update(
+        self, candidates: list[Candidate]
+    ) -> None:
+        """Matches ``score()``'s documented pre-update contract."""
+        acq = StubAnalytic()
+        features = torch.zeros((len(candidates), 2))
+        assert acq.score_encoded(features) == [1.0] * len(candidates)
+
+    def test_empty_input_returns_no_scores(self) -> None:
+        """An empty set is not an error."""
+        assert StubAnalytic().score_encoded(torch.zeros((0, 2))) == []
+
+    @pytest.mark.parametrize("shape", [(4,), (2, 1, 2)])
+    def test_rejects_a_non_matrix(self, shape: tuple[int, ...]) -> None:
+        """A q-dimension is added here, so the caller must pass ``(n, d)``."""
+        with pytest.raises(ValueError, match="two-dimensional"):
+            StubAnalytic().score_encoded(torch.zeros(shape))
+
+    def test_rejects_a_non_positive_chunk_size(self) -> None:
+        """A zero chunk would score nothing and report it as a result."""
+        with pytest.raises(ValueError, match="chunk_size must be positive"):
+            StubAnalytic().score_encoded(torch.zeros((2, 2)), chunk_size=0)

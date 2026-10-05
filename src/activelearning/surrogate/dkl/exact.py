@@ -73,6 +73,25 @@ class ExactDKLSurrogate(DeepKernelSurrogate):
     def _make_mll(self, num_data: int) -> ExactMarginalLogLikelihood:
         return ExactMarginalLogLikelihood(self.model.likelihood, self.model)
 
+    def _training_targets(self) -> torch.Tensor:
+        """Return the standardized targets ``SingleTaskGP`` actually holds.
+
+        BoTorch applies the outcome transform inside ``SingleTaskGP.__init__``,
+        so ``model.train_targets`` is standardized while ``self._train_Y`` is
+        not. The exact marginal log likelihood has to see the same space the
+        model's parameters live in; against raw targets the fit is driven to the
+        raw-target scale and ``posterior()`` then un-standardizes a mean that
+        was never standardized.
+
+        Returns
+        -------
+        torch.Tensor
+            The model's own training targets, on the active device and dtype.
+            Identical to ``self._train_Y`` when ``standardize_outputs=False``,
+            since BoTorch then stores the targets unchanged.
+        """
+        return self.model.train_targets.to(device=self.device, dtype=self.dtype)
+
     def _gp_forward(self, model_X: torch.Tensor) -> Any:
         return self.model(model_X.to(device=self.device, dtype=self.dtype))
 

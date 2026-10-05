@@ -173,6 +173,14 @@ class MiniMolSmilesEncoderConfig(_MiniMolCacheConfig):
     checkpoint_path : Path, optional
         Optional predictor state-dict checkpoint loaded over MiniMol's bundled
         pretrained weights.
+    activation : {"none", "gelu", "relu"}, default="none"
+        Activation applied after the projection. ``"none"`` keeps the projection
+        linear, so the kernel it feeds only learns a low-rank metric on the
+        fingerprints; an activation makes the feature map nonlinear.
+    cache_only : bool, default=False
+        Whether to forbid live MiniMol inference, so a request the persistent
+        cache does not cover as an exact ordered prefix raises instead of
+        silently re-encoding. Requires ``feature_cache_path``.
     """
 
     type: Literal["MiniMolSmilesEncoder"] = "MiniMolSmilesEncoder"
@@ -181,6 +189,8 @@ class MiniMolSmilesEncoderConfig(_MiniMolCacheConfig):
     latent_dim: int = Field(default=32, ge=1)
     cache_size: int = Field(default=4096, ge=0)
     checkpoint_path: Path | None = None
+    activation: Literal["none", "gelu", "relu"] = "none"
+    cache_only: bool = False
 
     def build(self) -> "MiniMolSmilesEncoder":
         """Instantiate the configured MiniMol SMILES encoder.
@@ -205,6 +215,8 @@ class MiniMolSmilesEncoderConfig(_MiniMolCacheConfig):
             cache_size=self.cache_size,
             feature_cache_path=self.feature_cache_path,
             checkpoint_path=self.checkpoint_path,
+            activation=self.activation,
+            cache_only=self.cache_only,
         )
 
 
@@ -234,6 +246,14 @@ class MiniMolAmpcSmilesEncoderConfig(_MiniMolCacheConfig):
         Maximum number of fingerprints retained in the in-memory LRU cache.
     feature_cache_path : Path, optional
         Persistent ``.npy`` feature matrix path with a JSON manifest beside it.
+    activation : {"none", "gelu", "relu"}, default="none"
+        Activation applied after the projection. ``"none"`` keeps the projection
+        linear, so the kernel it feeds only learns a low-rank metric on the
+        fingerprints; an activation makes the feature map nonlinear.
+    cache_only : bool, default=False
+        Whether to forbid live MiniMol inference, so a request the persistent
+        cache does not cover as an exact ordered prefix raises instead of
+        silently re-encoding. Requires ``feature_cache_path``.
     """
 
     type: Literal["MiniMolAmpcSmilesEncoder"] = "MiniMolAmpcSmilesEncoder"
@@ -244,6 +264,8 @@ class MiniMolAmpcSmilesEncoderConfig(_MiniMolCacheConfig):
     batch_size: int = Field(default=100, ge=1)
     latent_dim: int = Field(default=32, ge=1)
     cache_size: int = Field(default=4096, ge=0)
+    activation: Literal["none", "gelu", "relu"] = "none"
+    cache_only: bool = False
 
     def build(self) -> "MiniMolAmpcSmilesEncoder":
         """Instantiate the fine-tuned MiniMol AmpC encoder.
@@ -272,17 +294,28 @@ class MiniMolAmpcSmilesEncoderConfig(_MiniMolCacheConfig):
             latent_dim=self.latent_dim,
             cache_size=self.cache_size,
             feature_cache_path=self.feature_cache_path,
+            activation=self.activation,
+            cache_only=self.cache_only,
         )
 
 
 class MiniMolSmilesFixedEncoderConfig(_MiniMolCacheConfig):
-    """Configuration for fixed stock MiniMol SMILES representations."""
+    """Configuration for fixed stock MiniMol SMILES representations.
+
+    Parameters
+    ----------
+    cache_only : bool, default=False
+        Whether to forbid live MiniMol inference, so a request the persistent
+        cache does not cover as an exact ordered prefix raises instead of
+        silently re-encoding. Requires ``feature_cache_path``.
+    """
 
     type: Literal["MiniMolSmilesFixedEncoder"] = "MiniMolSmilesFixedEncoder"
     input_representation: ClassVar[str] = "smiles"
     batch_size: int = Field(default=100, ge=1)
     cache_size: int = Field(default=4096, ge=0)
     checkpoint_path: Path | None = None
+    cache_only: bool = False
 
     def build(self) -> "MiniMolSmilesFixedEncoder":
         """Build the configured stock MiniMol fixed encoder."""
@@ -295,11 +328,20 @@ class MiniMolSmilesFixedEncoderConfig(_MiniMolCacheConfig):
             cache_size=self.cache_size,
             feature_cache_path=self.feature_cache_path,
             checkpoint_path=self.checkpoint_path,
+            cache_only=self.cache_only,
         )
 
 
 class MiniMolAmpcSmilesFixedEncoderConfig(_MiniMolCacheConfig):
-    """Configuration for fixed MiniMol AmpC ``pooled512`` representations."""
+    """Configuration for fixed MiniMol AmpC ``pooled512`` representations.
+
+    Parameters
+    ----------
+    cache_only : bool, default=False
+        Whether to forbid live MiniMol inference, so a request the persistent
+        cache does not cover as an exact ordered prefix raises instead of
+        silently re-encoding. Requires ``feature_cache_path``.
+    """
 
     type: Literal["MiniMolAmpcSmilesFixedEncoder"] = "MiniMolAmpcSmilesFixedEncoder"
     input_representation: ClassVar[str] = "smiles"
@@ -308,6 +350,7 @@ class MiniMolAmpcSmilesFixedEncoderConfig(_MiniMolCacheConfig):
     device: str | None = "cpu"
     batch_size: int = Field(default=100, ge=1)
     cache_size: int = Field(default=4096, ge=0)
+    cache_only: bool = False
 
     def build(self) -> "MiniMolAmpcSmilesFixedEncoder":
         """Build the configured MiniMol AmpC fixed encoder."""
@@ -322,6 +365,7 @@ class MiniMolAmpcSmilesFixedEncoderConfig(_MiniMolCacheConfig):
             batch_size=self.batch_size,
             cache_size=self.cache_size,
             feature_cache_path=self.feature_cache_path,
+            cache_only=self.cache_only,
         )
 
 

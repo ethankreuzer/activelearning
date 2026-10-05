@@ -26,11 +26,24 @@ from activelearning.applications.molecules._optional import (
 )
 from activelearning.surrogate.encoder import FixedEncoder, LatentEncoder
 
-__all__ = ["MiniMolSmilesEncoder", "MiniMolSmilesFixedEncoder"]
+__all__ = [
+    "MINIMOL_ACTIVATIONS",
+    "MiniMolSmilesEncoder",
+    "MiniMolSmilesFixedEncoder",
+]
 
 MINIMOL_FINGERPRINT_DIM = 512
 _FEATURE_CACHE_FORMAT_VERSION = 2
 _HASH_CHUNK_SIZE = 1024 * 1024
+
+#: Activations available on the trainable DKL projection. ``"none"`` keeps the
+#: projection linear, which makes the kernel a learned Mahalanobis metric on the
+#: fingerprints rather than a genuinely non-stationary one.
+MINIMOL_ACTIVATIONS: Mapping[str, Callable[[], nn.Module]] = {
+    "none": nn.Identity,
+    "gelu": nn.GELU,
+    "relu": nn.ReLU,
+}
 
 
 @contextmanager
@@ -222,6 +235,7 @@ class MiniMolSmilesFixedEncoder(FixedEncoder):
         cache_size: int = 4096,
         feature_cache_path: str | Path | None = None,
         checkpoint_path: str | Path | None = None,
+        cache_only: bool = False,
     ) -> None:
         """Initialize the fixed MiniMol encoder.
 
@@ -239,10 +253,18 @@ class MiniMolSmilesFixedEncoder(FixedEncoder):
         checkpoint_path : Path or str, optional
             Optional predictor state-dict checkpoint to load over MiniMol's
             bundled pretrained weights.
+        cache_only : bool, default=False
+            Whether to forbid live MiniMol inference entirely. With a persistent
+            cache a request that is not an exact ordered prefix of the cached
+            input falls back to live encoding, which is correct but silent and
+            slow. When a caller depends on the cache -- in particular when it is
+            timing the run -- that fallback is a defect, so this turns it into an
+            error. Requires ``feature_cache_path``.
         Raises
         ------
         ValueError
-            If ``batch_size`` is not positive or ``cache_size`` is negative.
+            If ``batch_size`` is not positive, ``cache_size`` is negative, or
+            ``cache_only`` is set without a ``feature_cache_path``.
         FileNotFoundError
             If ``checkpoint_path`` is provided but does not point to a file.
         ImportError
@@ -252,6 +274,8 @@ class MiniMolSmilesFixedEncoder(FixedEncoder):
             raise ValueError("batch_size must be positive.")
         if cache_size < 0:
             raise ValueError("cache_size must be non-negative.")
+        if cache_only and feature_cache_path is None:
+            raise ValueError("cache_only requires a feature_cache_path.")
         resolved_checkpoint_path = (
             Path(checkpoint_path).expanduser() if checkpoint_path is not None else None
         )
@@ -282,6 +306,7 @@ class MiniMolSmilesFixedEncoder(FixedEncoder):
         self.cache_size = cache_size
         self.feature_cache_path = resolved_feature_cache_path
         self.checkpoint_path = resolved_checkpoint_path
+        self.cache_only = cache_only
         self._minimol: Any | None = None
         self._minimol_lock = threading.Lock()
         self._fingerprint_cache: OrderedDict[str, Tensor] = OrderedDict()
@@ -338,7 +363,23 @@ class MiniMolSmilesFixedEncoder(FixedEncoder):
         )
 
     def _ensure_minimol_loaded(self) -> Any:
-        """Construct MiniMol once, only when live extraction needs it."""
+        """Construct MiniMol once, only when live extraction needs it.
+
+        Raises
+        ------
+        RuntimeError
+            If ``cache_only`` is set, since reaching this point means the
+            persistent cache did not cover the request.
+        """
+        if self.cache_only:
+            raise RuntimeError(
+                "This MiniMol encoder is cache-only, but it was asked to encode "
+                f"SMILES that the feature cache {self.feature_cache_path} does not "
+                "cover as an exact ordered prefix. Live inference is disabled "
+                "because falling back to it silently would take hours and "
+                "invalidate any timing measurement. Rebuild the cache for this "
+                "exact ordered input, or construct the encoder without cache_only."
+            )
         if self._minimol is None:
             with self._minimol_lock:
                 if self._minimol is None:
@@ -717,6 +758,12 @@ class MiniMolSmilesEncoder(LatentEncoder):
     hidden states from a PyTorch module. The fingerprints are kept frozen and
     passed through a trainable linear projection so the DKL surrogate can
     adapt the representation during fitting.
+
+    An optional activation follows that projection. Without one the projection
+    is linear, so the kernel it feeds only learns a low-rank metric on the
+    fingerprints; with one the feature map is nonlinear and the kernel becomes
+    non-stationary in fingerprint space, which is the point of deep kernel
+    learning.
     """
 
     def __init__(
@@ -727,24 +774,35 @@ class MiniMolSmilesEncoder(LatentEncoder):
         cache_size: int = 4096,
         feature_cache_path: str | Path | None = None,
         checkpoint_path: str | Path | None = None,
+        activation: str = "none",
+        cache_only: bool = False,
     ) -> None:
         """Initialize the MiniMol encoder and trainable projection."""
         super().__init__()
         if latent_dim < 1:
             raise ValueError("latent_dim must be positive.")
+        if activation not in MINIMOL_ACTIVATIONS:
+            raise ValueError(
+                f"Unknown activation {activation!r}; expected one of "
+                f"{sorted(MINIMOL_ACTIVATIONS)}."
+            )
 
         self.fixed_encoder = self._build_fixed_encoder(
             batch_size=batch_size,
             cache_size=cache_size,
             feature_cache_path=feature_cache_path,
             checkpoint_path=checkpoint_path,
+            cache_only=cache_only,
         )
         self.batch_size = self.fixed_encoder.batch_size
         self.latent_dim = latent_dim
         self.cache_size = self.fixed_encoder.cache_size
         self.feature_cache_path = self.fixed_encoder.feature_cache_path
         self.checkpoint_path = self.fixed_encoder.checkpoint_path
+        self.cache_only = self.fixed_encoder.cache_only
         self.projection = nn.Linear(MINIMOL_FINGERPRINT_DIM, latent_dim)
+        self.activation_name = activation
+        self.activation = MINIMOL_ACTIVATIONS[activation]()
 
     def prepare_inputs(
         self,
@@ -756,7 +814,11 @@ class MiniMolSmilesEncoder(LatentEncoder):
         return self.fixed_encoder.encode(values, device=device)
 
     def forward(self, model_inputs: Tensor) -> Tensor:
-        """Project MiniMol fingerprints into the DKL latent space."""
+        """Project MiniMol fingerprints into the DKL latent space.
+
+        Applies the configured activation after the projection. The default
+        ``"none"`` is :class:`torch.nn.Identity`, so the output is unchanged.
+        """
         if model_inputs.ndim != 2:
             raise ValueError(
                 "MiniMol fingerprints must be 2-D (B, 512), got "
@@ -771,7 +833,7 @@ class MiniMolSmilesEncoder(LatentEncoder):
             device=self.projection.weight.device,
             dtype=self.projection.weight.dtype,
         )
-        return self.projection(projection_inputs)
+        return self.activation(self.projection(projection_inputs))
 
     def _build_fixed_encoder(
         self,
@@ -780,6 +842,7 @@ class MiniMolSmilesEncoder(LatentEncoder):
         cache_size: int,
         feature_cache_path: str | Path | None,
         checkpoint_path: str | Path | None,
+        cache_only: bool = False,
     ) -> MiniMolSmilesFixedEncoder:
         """Construct the fixed MiniMol encoder used by DKL."""
         return MiniMolSmilesFixedEncoder(
@@ -787,4 +850,5 @@ class MiniMolSmilesEncoder(LatentEncoder):
             cache_size=cache_size,
             feature_cache_path=feature_cache_path,
             checkpoint_path=checkpoint_path,
+            cache_only=cache_only,
         )

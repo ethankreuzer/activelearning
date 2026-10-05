@@ -377,6 +377,61 @@ class BoTorchAcquisitionBase(Acquisition, ABC):
             return raw_scores
         return cost_weighting(raw_scores, cand_list)
 
+    def score_encoded(
+        self,
+        features: torch.Tensor,
+        *,
+        chunk_size: Optional[int] = None,
+    ) -> list[float]:
+        """Score rows that are already in model space, without re-encoding them.
+
+        :meth:`score` encodes each chunk of candidates on every call. When the
+        surrogate's encoder is backed by a persistent feature cache keyed by an
+        ordered prefix of its inputs, a chunk is not such a prefix, so chunked
+        scoring misses the cache and silently falls back to live encoding. This
+        takes the encoded matrix directly, leaving the caller to encode each
+        evaluation set once.
+
+        Parameters
+        ----------
+        features : torch.Tensor
+            Model-space rows shaped ``(n, d)``, as returned by the surrogate's
+            ``encode_candidates``. Each row is scored as a q-batch of one.
+        chunk_size : int, optional
+            Rows per acquisition call. ``None`` scores them all at once.
+
+        Returns
+        -------
+        list[float]
+            One score per row, in input order. All ``1.0`` when called before
+            ``update()``, matching :meth:`score`.
+
+        Raises
+        ------
+        ValueError
+            If ``features`` is not two-dimensional, or ``chunk_size`` is not
+            positive.
+        """
+        if features.ndim != 2:
+            raise ValueError(
+                f"features must be two-dimensional (n, d), got {tuple(features.shape)}."
+            )
+        if chunk_size is not None and chunk_size < 1:
+            raise ValueError("chunk_size must be positive.")
+        rows = features.shape[0]
+        if rows == 0:
+            return []
+        if self._botorch_acqf is None:
+            return [1.0] * rows
+
+        step = chunk_size or rows
+        scores: list[float] = []
+        for start in range(0, rows, step):
+            X = features[start : start + step].unsqueeze(1)
+            scores.extend(self._score_encoded(X))
+            del X
+        return scores
+
 
 class AnalyticBoTorchAcquisition(BoTorchAcquisitionBase):
     """Intermediate base class for analytic BoTorch acquisition functions.
