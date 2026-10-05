@@ -39,7 +39,8 @@ This is a separate line of work from `SURROGATE_EVAL_PLAN.md`, not another step 
 - [x] `config/ampc/exact_dkl_top_n.yaml` and the qMFMES overlay
 - [x] `scripts/exact_dkl_top_n.py`, `jobs/exact_dkl_top_n.sh`
 - [x] Tests written
-- [ ] **Tests run** (`scripts/run_exact_dkl_tests.sh`, inside `salloc`) — nothing below
+- [x] **Tests run** (2026-10-05, job 4748349): 84/87 new tests passed; the three failures were test-side and are fixed. 456/459 regression tests passed; the three failures there predate this study.
+- [ ] **Tests re-run after the test fixes** (`scripts/run_exact_dkl_tests.sh`, inside `salloc`) — nothing below
       this line has been executed
 - [ ] Prep job run, manifest and the eight cache triples verified
 - [ ] Smoke run on one arm
@@ -314,3 +315,47 @@ Against the ELBO baseline (W&B `36hrvpco`, M=64, fitted on all 10M rows):
 - n=2000 and 3000 are close together, so the fitted exponent will be poorly constrained.
   A third n (say 6000 or 8000) would help, and the stage profile from these two says
   whether it is affordable.
+
+## Test run 2026-10-05 (allocation 4748349)
+
+**New tests: 84/87 passed.** All three failures were in the tests, not the code, and are
+fixed:
+
+- `test_run_peaks_take_the_maximum_across_stages` — the fake CUDA reader shared one queue
+  between the allocated and reserved peak readers, so the second stage read the first
+  stage's value. The fake now has a queue per reader.
+- `test_epoch_callback_logs_only_the_loss_and_hyperparameters` — the fake surrogate had no
+  `is_fitted()`, which `exact_dkl_hyperparameters` guards on. Added to the fake.
+- `TestPredictEncoded::test_agrees_with_predict` — the test compared
+  `predict_encoded(observation_noise=True)` against `predict()`. But
+  `BoTorchGPSurrogate.predict` calls `model.posterior(test_X)` with no
+  `observation_noise`, taking BoTorch's default of `False`, so it returns the **latent**
+  std. The failure showed a constant variance offset of 0.1716 across all four rows —
+  exactly one homoscedastic noise term. The test now compares against the latent call and
+  additionally asserts the offset is constant and equals `noise * y_std**2`, which is a
+  stronger check than the original: it would catch the outcome transform being applied to
+  the noise twice.
+
+**The standardization fix is confirmed.** `TestExactTargetSpace` passed in full:
+`model.train_targets` is centred with unit variance, `_training_targets()` returns the
+model's own targets and *not* `_train_Y`, predictions stay on the 1–4 target scale, and
+the `standardize_outputs=False` path is unchanged. This was the one thing in the study
+that could not be verified by reading the source.
+
+**Regression: 456/459 passed.** `tests/scripts/test_surrogate_eval_fit.py` and
+`test_surrogate_eval_fit_eval.py` passed unchanged, so the shared-helper extraction and
+its re-export list are complete. The three failures predate this study and are untouched
+by it (`git diff b6afcfa..HEAD` lists none of the files):
+
+| failure | cause | not ours because |
+|---|---|---|
+| `test_ampc_single_fidelity_reward_transform_overlays_parse[power]` | test expects `sampler.beta == 0.5`; `config/ampc/overrides/reward_power.yaml` deliberately sets `1.0` and documents why | neither file changed |
+| `test_molecule_s3gfn_minimol_slurm_dock3_config_parses` | `config/molecules/s3gfn_minimol_slurm_dock3.yaml` does not exist | no config added or removed |
+| `test_convert_al_d0`, `test_diagnose_ampc_acquisition`, `test_diagnose_mes_gibbon` | orphaned test modules; `scripts/convert_al_d0.py`, `scripts/diagnose_ampc_acquisition.py`, `scripts/diagnose_mes_gibbon.py` are absent | those scripts were never in this branch |
+
+The last three fail at **collection**, which aborts the whole suite — that is why the
+full-suite stage reported only errors. `scripts/run_exact_dkl_tests.sh` now deselects the
+two stale assertions and ignores the three orphaned modules, each with its reason inline,
+so a green run is a meaningful signal. **Fixing them is a separate decision**: either
+delete the orphaned test files and update the stale assertion, or restore the missing
+scripts and config.

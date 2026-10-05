@@ -18,12 +18,30 @@ from scripts.stage_profiler import MIB, StageProfiler, write_stage_csv
 
 
 class _FakeCuda:
-    """Scriptable CUDA reader that records the order of its calls."""
+    """Scriptable CUDA reader that records the order of its calls.
 
-    def __init__(self, *, allocated: list[int], peaks: list[int]) -> None:
+    Each queue yields one value per stage and then repeats its last value, so a
+    test only has to script the stages it actually cares about.
+    """
+
+    def __init__(
+        self,
+        *,
+        allocated: list[int],
+        peak_allocated: list[int],
+        peak_reserved: list[int] | None = None,
+    ) -> None:
         self.calls: list[str] = []
         self._allocated = list(allocated)
-        self._peaks = list(peaks)
+        self._peak_allocated = list(peak_allocated)
+        self._peak_reserved = list(
+            peak_reserved if peak_reserved is not None else peak_allocated
+        )
+
+    @staticmethod
+    def _next(queue: list[int]) -> int:
+        """Pop the next value, repeating the last one once exhausted."""
+        return queue.pop(0) if len(queue) > 1 else queue[0]
 
     def synchronize(self) -> None:
         self.calls.append("synchronize")
@@ -33,15 +51,15 @@ class _FakeCuda:
 
     def allocated_bytes(self) -> int:
         self.calls.append("allocated")
-        return self._allocated.pop(0)
+        return self._next(self._allocated)
 
     def peak_allocated_bytes(self) -> int:
         self.calls.append("peak_allocated")
-        return self._peaks.pop(0)
+        return self._next(self._peak_allocated)
 
     def peak_reserved_bytes(self) -> int:
         self.calls.append("peak_reserved")
-        return self._peaks[0] if self._peaks else 0
+        return self._next(self._peak_reserved)
 
 
 class _Clock:
@@ -68,7 +86,7 @@ def _profiler(**kwargs: object) -> StageProfiler:
 
 def test_stage_records_time_and_every_memory_column() -> None:
     """A CUDA stage reports seconds plus all four memory quantities."""
-    cuda = _FakeCuda(allocated=[10 * MIB], peaks=[50 * MIB, 50 * MIB])
+    cuda = _FakeCuda(allocated=[10 * MIB], peak_allocated=[50 * MIB])
     profiler = _profiler(cuda_reader=cuda)
     with profiler.stage("gp_fit"):
         pass
@@ -83,7 +101,7 @@ def test_stage_records_time_and_every_memory_column() -> None:
 
 def test_cuda_peaks_are_reset_at_start_and_read_at_end() -> None:
     """The reset must precede the body and the peak read must follow it."""
-    cuda = _FakeCuda(allocated=[0], peaks=[1, 1])
+    cuda = _FakeCuda(allocated=[0], peak_allocated=[1])
     profiler = _profiler(cuda_reader=cuda)
     with profiler.stage("gp_fit"):
         cuda.calls.append("body")
@@ -96,7 +114,7 @@ def test_cuda_peaks_are_reset_at_start_and_read_at_end() -> None:
 
 def test_nested_stage_is_refused() -> None:
     """A nested reset would destroy the enclosing stage's peak."""
-    profiler = _profiler(cuda_reader=_FakeCuda(allocated=[0, 0], peaks=[1, 1, 1, 1]))
+    profiler = _profiler(cuda_reader=_FakeCuda(allocated=[0], peak_allocated=[1]))
     with pytest.raises(RuntimeError, match="while 'outer' is open"):
         with profiler.stage("outer"):
             with profiler.stage("inner"):
@@ -105,7 +123,7 @@ def test_nested_stage_is_refused() -> None:
 
 def test_timing_only_emits_no_cuda_columns() -> None:
     """An aggregate stage reports no CUDA peak rather than a wrong one."""
-    cuda = _FakeCuda(allocated=[0], peaks=[1, 1])
+    cuda = _FakeCuda(allocated=[0], peak_allocated=[1])
     profiler = _profiler(cuda_reader=cuda)
     with profiler.timing_only("run_total"):
         with profiler.stage("gp_fit"):
@@ -120,7 +138,7 @@ def test_timing_only_emits_no_cuda_columns() -> None:
 
 def test_timing_only_may_enclose_a_measured_stage() -> None:
     """The aggregate wrapper does not trip the no-nesting rule."""
-    profiler = _profiler(cuda_reader=_FakeCuda(allocated=[0], peaks=[1, 1]))
+    profiler = _profiler(cuda_reader=_FakeCuda(allocated=[0], peak_allocated=[1]))
     with profiler.timing_only("run_total"):
         with profiler.stage("gp_fit"):
             pass
@@ -145,7 +163,7 @@ def test_host_rss_delta_is_the_attributable_number() -> None:
 
 def test_metric_and_peak_keys_are_valid_log_keys() -> None:
     """Every emitted key must survive the logger's key validation."""
-    cuda = _FakeCuda(allocated=[0], peaks=[1, 1])
+    cuda = _FakeCuda(allocated=[0], peak_allocated=[1])
     profiler = _profiler(cuda_reader=cuda)
     with profiler.stage("score_gibbon_value_ampc_331k"):
         pass
@@ -157,7 +175,7 @@ def test_metric_and_peak_keys_are_valid_log_keys() -> None:
 
 def test_run_peaks_take_the_maximum_across_stages() -> None:
     """The run-level peak is the largest any single stage reached."""
-    cuda = _FakeCuda(allocated=[0, 0], peaks=[30 * MIB, 30 * MIB, 70 * MIB, 70 * MIB])
+    cuda = _FakeCuda(allocated=[0], peak_allocated=[30 * MIB, 70 * MIB])
     profiler = _profiler(cuda_reader=cuda)
     with profiler.stage("small"):
         pass
@@ -168,7 +186,7 @@ def test_run_peaks_take_the_maximum_across_stages() -> None:
 
 def test_measurements_survive_an_exception_in_the_body() -> None:
     """A stage that raises still records, so a failed run keeps its numbers."""
-    profiler = _profiler(cuda_reader=_FakeCuda(allocated=[0], peaks=[1, 1]))
+    profiler = _profiler(cuda_reader=_FakeCuda(allocated=[0], peak_allocated=[1]))
     with pytest.raises(ValueError):
         with profiler.stage("gp_fit"):
             raise ValueError("boom")
@@ -177,7 +195,7 @@ def test_measurements_survive_an_exception_in_the_body() -> None:
 
 def test_csv_column_order_is_stable(tmp_path: Path) -> None:
     """The CSV is the extrapolation input, so its columns are part of the contract."""
-    profiler = _profiler(cuda_reader=_FakeCuda(allocated=[0], peaks=[1, 1]))
+    profiler = _profiler(cuda_reader=_FakeCuda(allocated=[0], peak_allocated=[1]))
     with profiler.stage("gp_fit"):
         pass
     path = tmp_path / "stage_profile.csv"

@@ -149,19 +149,48 @@ class TestEpochCallback:
 class TestPredictEncoded:
     """The encoded prediction path is what keeps the feature cache usable."""
 
-    def test_agrees_with_predict(self) -> None:
-        """Same rows, same posterior -- only the input representation differs."""
+    def test_agrees_with_predict_on_the_latent_posterior(self) -> None:
+        """``predict()`` omits the likelihood noise, so the latent call matches it.
+
+        ``BoTorchGPSurrogate.predict`` calls ``model.posterior(test_X)`` without
+        ``observation_noise``, taking BoTorch's default of ``False``. The
+        equivalent encoded call is therefore the latent one, not the total.
+        """
         surrogate = _surrogate(standardize_outputs=True)
         surrogate.fit(_observations())
         candidates = [Candidate(x=molecule) for molecule in MOLECULES]
         expected = surrogate.predict(candidates)
         encoded = surrogate.predict_encoded(
-            surrogate.encode_candidates(candidates), observation_noise=True
+            surrogate.encode_candidates(candidates), observation_noise=False
         )
         assert encoded["mean"].tolist() == pytest.approx(
             list(expected["mean"]), rel=1e-5
         )
         assert encoded["std"].tolist() == pytest.approx(list(expected["std"]), rel=1e-5)
+
+    def test_observation_noise_adds_one_homoscedastic_term(self) -> None:
+        """``std_total`` must exceed ``std_latent`` by the noise, counted once.
+
+        A constant variance offset across every row is what a single Gaussian
+        likelihood noise looks like. A varying offset would mean the outcome
+        transform had been applied to the noise twice.
+        """
+        surrogate = _surrogate(standardize_outputs=True)
+        surrogate.fit(_observations())
+        features = surrogate.encode_candidates(
+            [Candidate(x=molecule) for molecule in MOLECULES]
+        )
+        total = surrogate.predict_encoded(features, observation_noise=True)
+        latent = surrogate.predict_encoded(features, observation_noise=False)
+        offsets = total["std"] ** 2 - latent["std"] ** 2
+        assert torch.all(offsets > 0)
+        assert offsets.tolist() == pytest.approx(
+            [float(offsets[0])] * len(MOLECULES), rel=1e-6
+        )
+        # And it is the model's own learned noise, on the original target scale.
+        noise = float(surrogate.get_model().likelihood.noise.detach().mean())
+        y_std = float(surrogate.get_model().outcome_transform.stdvs.reshape(-1)[0])
+        assert float(offsets[0]) == pytest.approx(noise * y_std**2, rel=1e-4)
 
     def test_chunking_does_not_change_the_result(self) -> None:
         """Chunk size bounds memory; it must not alter the posterior."""

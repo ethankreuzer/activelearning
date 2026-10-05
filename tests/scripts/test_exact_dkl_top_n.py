@@ -24,9 +24,14 @@ from scripts.surrogate_eval_io import EvalSet, prediction_outputs, score_outputs
 class _FakeSurrogate:
     """Stand-in exposing only what the evaluation path calls."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, fitted: bool = False) -> None:
         self.predict_calls = 0
         self.predict_encoded_calls = 0
+        self._fitted = fitted
+
+    def is_fitted(self) -> bool:
+        # The hyperparameter reader guards on this, so the fake must answer it.
+        return self._fitted
 
     def predict_encoded(
         self,
