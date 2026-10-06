@@ -41,9 +41,24 @@ This is a separate line of work from `SURROGATE_EVAL_PLAN.md`, not another step 
 - [x] Tests written
 - [x] **Tests run** (2026-10-05, job 4748349): 84/87 new tests passed; the three failures were test-side and are fixed. 456/459 regression tests passed; the three failures there predate this study.
 - [x] **Tests re-run** (2026-10-05): 88/88 new, 458/458 regression, 1906 passed in the full suite. The 7 remaining failures all predate this study and are deselected with reasons in the runner.
-- [ ] Prep job run, manifest and the eight cache triples verified
-- [ ] Smoke run on one arm
-- [ ] The four arms submitted and synced
+- [x] **Prep job run** (2026-10-05, job 4749378, 9:50 on 1xA100/16 CPU/64 GB). All eight
+      sets encoded and `prep_manifest.json` written. Verified: every sidecar is
+      `complete: true` with `feature_dim: 512`; every sidecar `row_count` and
+      `input_sha256` matches its `prep_manifest.json` entry; every `.npy` is exactly
+      `128 + rows * 512 * 4` bytes. `train_2000`/`train_3000` are descending-`y` prefixes
+      whose last row equals the manifest's `top_<n>` cutoff. The arms load
+      `data/ampc_top_<n>.csv` while the caches were built from the cache-dir copies, which
+      differ in columns (`SMILE,y,fidelity` vs `SMILES,y`) -- the *ordered SMILES lists*
+      were compared directly and hash identically, so the prefix match holds and no arm
+      runs MiniMol inference. `gp_molformer_set` is 83,811 of 100,000 nominal rows
+      (92,769 passed SA, 89,783 docked, 83,811 evaluated); that attrition is the dataset's.
+- [ ] Smoke run on one arm — in flight as job `4759972` (2000-gibbon). The other three
+      arms were submitted at the same time and are `scontrol hold` (`4759973` 2000-qmfmes,
+      `4759974` 3000-gibbon, `4759975` 3000-qmfmes); release them with `scontrol release`
+      once this arm clears the fit stage and logs its first eval.
+- [ ] The four arms submitted and synced — submitted; each run is `WANDB_MODE=offline`, so
+      every arm still needs `wandb sync outputs/ampc/exact_dkl_top_n/<n>_<arm>/wandb/offline-run-*`
+      from a login node.
 
 ## The grid: 4 runs
 
