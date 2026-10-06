@@ -527,6 +527,16 @@ def _parse_args(argv: Sequence[str] | None) -> tuple[argparse.Namespace, list[st
             "smoke run; it invalidates the timing measurement."
         ),
     )
+    parser.add_argument(
+        "--skip-scoring",
+        action="store_true",
+        help=(
+            "Fit and predict only, skipping every acquisition update and scoring "
+            "pass. For a fit-scalability sweep: per-candidate scoring cost grows "
+            "with n, so at large n scoring dominates the runtime being measured. "
+            "Sets that are only scored are freed without writing a CSV."
+        ),
+    )
     args, leftover = parser.parse_known_args(list(argv) if argv is not None else None)
     if args.eval_chunk_size < 1 or args.score_chunk_size < 1:
         raise SystemExit("--eval-chunk-size and --score-chunk-size must be positive.")
@@ -794,7 +804,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 },
             )
 
-            for scoring in plan:
+            for scoring in [] if args.skip_scoring else plan:
                 acquisition = acquisitions[scoring.name]
                 with warnings.catch_warnings(record=True) as caught:
                     warnings.simplefilter("always")
@@ -810,10 +820,23 @@ def main(argv: Sequence[str] | None = None) -> None:
                 final_metrics.update(check_acquisition_guards(acquisition, scoring))
                 flush_stage_profile()
 
-            final_metrics.update(_check_gibbon_max_values(acquisitions, plan))
+            if not args.skip_scoring:
+                final_metrics.update(_check_gibbon_max_values(acquisitions, plan))
 
             for study_set in STUDY_SETS:
                 eval_set = eval_sets[study_set.name]
+                if args.skip_scoring and not study_set.predict:
+                    # Nothing left to do for a scored-only set: free its features
+                    # so the measured peak stays the peak of one set at a time.
+                    eval_sets[study_set.name] = EvalSet(
+                        name=eval_set.name,
+                        smiles=eval_set.smiles,
+                        targets=eval_set.targets,
+                        features=None,
+                        weights=eval_set.weights,
+                    )
+                    del eval_set
+                    continue
                 columns: dict[str, np.ndarray] = {}
                 if study_set.predict:
                     with profiler.stage(f"predict_{study_set.name}"):
@@ -825,7 +848,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                     metrics, figures = prediction_outputs(eval_set, predictions)
                     final_metrics.update(metrics)
                     final_figures.update(figures)
-                if study_set.score:
+                if study_set.score and not args.skip_scoring:
                     for scoring in plan:
                         with profiler.stage(f"score_{scoring.name}_{study_set.name}"):
                             scores = np.asarray(
