@@ -52,13 +52,22 @@ This is a separate line of work from `SURROGATE_EVAL_PLAN.md`, not another step 
       were compared directly and hash identically, so the prefix match holds and no arm
       runs MiniMol inference. `gp_molformer_set` is 83,811 of 100,000 nominal rows
       (92,769 passed SA, 89,783 docked, 83,811 evaluated); that attrition is the dataset's.
-- [ ] Smoke run on one arm — in flight as job `4759972` (2000-gibbon). The other three
-      arms were submitted at the same time and are `scontrol hold` (`4759973` 2000-qmfmes,
-      `4759974` 3000-gibbon, `4759975` 3000-qmfmes); release them with `scontrol release`
-      once this arm clears the fit stage and logs its first eval.
-- [ ] The four arms submitted and synced — submitted; each run is `WANDB_MODE=offline`, so
-      every arm still needs `wandb sync outputs/ampc/exact_dkl_top_n/<n>_<arm>/wandb/offline-run-*`
-      from a login node.
+- [~] Smoke run on one arm — **dropped deliberately on 2026-10-05.** The gate was written
+      before the test suite and the prep verification existed. With both green, holding the
+      other three costs an extra full queue cycle in the success case (`2Q + 2T` serial vs
+      `Q + T` parallel) and saves nothing in the failure case: a bug would live in the
+      shared config or script, so all four fail identically and you fix once and resubmit
+      once either way. A path or config error fails in seconds, and the late-stage failures
+      the gate would have caught are the ones now covered by
+      `test_missing_prepared_artifacts_are_all_reported_at_once`,
+      `test_training_cache_row_count_must_match`, the `cache_only` guards and the
+      target-space fix. Only residual exposure is fairshare burn if all four run to the 3 h
+      wall and fail late.
+- [ ] The four arms submitted and synced — all four submitted and eligible (`4759972`
+      2000-gibbon, `4759973` 2000-qmfmes, `4759974` 3000-gibbon, `4759975` 3000-qmfmes).
+      Each run is `WANDB_MODE=offline`, so every arm still needs
+      `wandb sync outputs/ampc/exact_dkl_top_n/<n>_<arm>/wandb/offline-run-*` from a login
+      node.
 
 ## The grid: 4 runs
 
