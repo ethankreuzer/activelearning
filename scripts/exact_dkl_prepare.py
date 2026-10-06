@@ -5,7 +5,10 @@ Run once, before any arm. It does two things:
 1. **Writes the training subsets.** The top-n highest-scoring molecules of the
    10M set become their own CSVs, so an arm never loads 10M rows. That matters:
    the study measures peak memory, and loading the full set would dominate the
-   measurement it exists to produce.
+   measurement it exists to produce. ``--strat-sizes`` additionally writes the
+   stratified farthest-point sets described in :mod:`scripts.stratified_fps`,
+   which keep half the budget in the top tail and spread the rest over the
+   target distribution.
 2. **Builds one MiniMol feature cache per evaluation set.** The 20.5 GB cache at
    ``cache/ampc/s3gfn_minimol_ampc_fingerprints.npy`` is bound by ``input_sha256``
    to the exact ordered 10M row list, so no subset can use it. Each set gets its
@@ -536,6 +539,99 @@ def encode_set(
     }
 
 
+def build_stratified_sets(
+    *,
+    smiles: Sequence[str],
+    targets: np.ndarray,
+    fidelities: Sequence[str],
+    args: argparse.Namespace,
+    cache_dir: Path,
+    manifest_entries: dict[str, Any],
+) -> tuple[list[ResolvedSet], dict[str, Any]]:
+    """Write the stratified farthest-point training sets and resolve them.
+
+    The candidate pool the selection draws from is itself published as the
+    ``strat_pool`` set, so the features the selection used are the same ones a
+    later run would load, and a changed pool fails loudly instead of silently
+    re-encoding.
+
+    Parameters
+    ----------
+    smiles : Sequence[str]
+        All SMILES of the training CSV, in file order.
+    targets : np.ndarray
+        All targets of the training CSV.
+    fidelities : Sequence[str]
+        All fidelity values of the training CSV.
+    args : argparse.Namespace
+        Parsed options, read for the stratification settings, the encoder and
+        the data directory.
+    cache_dir : Path
+        Directory holding the per-set caches.
+    manifest_entries : dict[str, Any]
+        Mutated in place to record the pool's manifest entry.
+
+    Returns
+    -------
+    tuple[list[ResolvedSet], dict[str, Any]]
+        One resolved set per requested size, and the selection diagnostics.
+    """
+    from scripts.stratified_fps import select_stratified_rows
+
+    def encode_rows(rows: np.ndarray) -> np.ndarray:
+        """Publish the pool's feature cache and return its features."""
+        pool = resolve_training_set(
+            "strat_pool",
+            args.training_csv,
+            smiles=smiles,
+            targets=targets,
+            rows=rows,
+        )
+        write_resolved_csv(cache_dir / "strat_pool.csv", pool)
+        cache_path = cache_dir / "strat_pool.npy"
+        manifest_entries["strat_pool"] = encode_set(
+            pool,
+            cache_path,
+            encoder_factory=lambda *, feature_cache_path: build_fixed_encoder(
+                checkpoint_path=args.checkpoint_path,
+                package_path=args.package_path,
+                device=args.encoder_device,
+                batch_size=args.encoder_batch_size,
+                feature_cache_path=feature_cache_path,
+            ),
+            overwrite=args.overwrite,
+        )
+        return np.load(cache_path, mmap_mode="r")
+
+    rows_per_size, diagnostics = select_stratified_rows(
+        targets,
+        args.strat_sizes,
+        encode_rows=encode_rows,
+        quantiles=args.strat_quantiles,
+        top_fraction=args.strat_top_fraction,
+        pool_multiple=args.strat_pool_multiple,
+        seed=args.strat_seed,
+        device=args.encoder_device,
+    )
+
+    resolved: list[ResolvedSet] = []
+    for size, rows in sorted(rows_per_size.items()):
+        csv_path = args.data_dir / f"ampc_strat_{size}.csv"
+        if not args.skip_subsets:
+            write_training_csv(csv_path, smiles, targets, fidelities, rows)
+            _logger.info("wrote %s", csv_path)
+        resolved.append(
+            resolve_training_set(
+                f"strat_{size}",
+                csv_path,
+                smiles=smiles,
+                targets=targets,
+                rows=rows,
+            )
+        )
+    return resolved, diagnostics
+
+
 def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     """Parse the prep-script options."""
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
@@ -560,6 +656,45 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument("--n-train-random", type=int, default=100_000)
     parser.add_argument("--n-train-top", type=int, default=10_000)
     parser.add_argument("--eval-seed", type=int, default=42)
+    parser.add_argument(
+        "--strat-sizes",
+        type=str,
+        default="",
+        help=(
+            "Comma-separated sizes of the stratified farthest-point training "
+            "sets, written as data/ampc_strat_<n>.csv. Empty disables them. "
+            "All sizes share one candidate pool, so the smaller sets come out "
+            "as subsets of the larger ones."
+        ),
+    )
+    parser.add_argument(
+        "--strat-quantiles",
+        type=str,
+        default="50,75,90,95,99,99.75",
+        help=(
+            "Percentile positions of the inner target-band edges. The default "
+            "gives seven bands that each hold at least 25k rows of the 10M set, "
+            "the last cutting the top 0.25%% so the top band is the top 25000 "
+            "molecules the largest top-n arm trained on."
+        ),
+    )
+    parser.add_argument(
+        "--strat-top-fraction",
+        type=float,
+        default=0.5,
+        help="Share of each stratified size's budget given to the top band.",
+    )
+    parser.add_argument(
+        "--strat-pool-multiple",
+        type=int,
+        default=15,
+        help=(
+            "Candidates drawn per selected point within each band. Only the "
+            "pool is encoded, so this sets the inference cost: farthest-point "
+            "sampling over a whole band of the 10M set is not tractable."
+        ),
+    )
+    parser.add_argument("--strat-seed", type=int, default=42)
     parser.add_argument(
         "--checkpoint-path",
         type=Path,
@@ -595,6 +730,29 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
             f"--n-train-top ({args.n_train_top}) must cover the largest training "
             f"size ({max(args.train_sizes)}), since the top-n sets are prefixes of it."
         )
+
+    args.strat_sizes = tuple(
+        int(value) for value in args.strat_sizes.split(",") if value.strip()
+    )
+    if any(size < 1 for size in args.strat_sizes):
+        raise SystemExit(
+            "--strat-sizes must be a comma-separated list of positive ints."
+        )
+    args.strat_quantiles = tuple(
+        float(value) for value in args.strat_quantiles.split(",") if value.strip()
+    )
+    if args.strat_sizes:
+        if not args.strat_quantiles:
+            raise SystemExit("--strat-quantiles must not be empty.")
+        if not 0.0 <= args.strat_top_fraction <= 1.0:
+            raise SystemExit("--strat-top-fraction must lie in [0, 1].")
+        if args.strat_pool_multiple < 1:
+            raise SystemExit("--strat-pool-multiple must be at least 1.")
+        if args.skip_caches:
+            raise SystemExit(
+                "--strat-sizes needs the encoder: the selection picks points by "
+                "distance in feature space, so it cannot run with --skip-caches."
+            )
     args.selected_sets = (
         None
         if args.sets is None
@@ -614,6 +772,12 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     resolved_sets: list[ResolvedSet] = []
     cutoffs: dict[str, float] = {}
+    # Declared up front: the stratified selection publishes its candidate pool's
+    # cache while choosing, so its manifest entry exists before the main
+    # encoding loop below reaches the sets it produced.
+    manifest_entries: dict[str, Any] = {}
+    strat_diagnostics: dict[str, Any] = {}
+    strat_names: list[str] = []
 
     if not args.skip_subsets or not args.skip_caches:
         _logger.info("reading %s", args.training_csv)
@@ -669,6 +833,18 @@ def main(argv: Sequence[str] | None = None) -> None:
                 rows=top_rows,
             )
         )
+        if args.strat_sizes:
+            strat_sets, strat_diagnostics = build_stratified_sets(
+                smiles=smiles,
+                targets=targets,
+                fidelities=fidelities,
+                args=args,
+                cache_dir=cache_dir,
+                manifest_entries=manifest_entries,
+            )
+            resolved_sets.extend(strat_sets)
+            strat_names = [entry.name for entry in strat_sets]
+
         del smiles, targets, fidelities
 
     for spec in eval_set_specs(
@@ -680,6 +856,28 @@ def main(argv: Sequence[str] | None = None) -> None:
         resolved_sets.append(resolve_set(spec))
         _logger.info("resolved %s: %d rows", spec.name, len(resolved_sets[-1].smiles))
 
+    if strat_names:
+        # The stratified draw is unconstrained, so a bulk-band pick can land on
+        # a molecule an evaluation set also holds. The expected count is the
+        # product of the two sets' shares of the 10M pool -- a few hundred rows
+        # at most -- but it is measured rather than assumed, because the whole
+        # point of these sets is that the off-train metrics become meaningful.
+        from scripts.stratified_fps import count_overlap
+
+        by_name = {entry.name: entry for entry in resolved_sets}
+        overlaps: dict[str, dict[str, int]] = {}
+        for name in [entry for entry in strat_names if entry in by_name]:
+            selected = by_name[name].smiles
+            overlaps[name] = {
+                other.name: count_overlap(selected, other.smiles)
+                for other in resolved_sets
+                if other.name != name and not other.name.startswith("strat_")
+            }
+            _logger.info("%s overlaps evaluation sets: %s", name, overlaps[name])
+        strat_diagnostics["eval_overlap"] = overlaps
+
+    # After the overlap counts, which need every evaluation set resolved even
+    # when only the new sets are being encoded.
     if args.selected_sets is not None:
         unknown = args.selected_sets - {entry.name for entry in resolved_sets}
         if unknown:
@@ -688,7 +886,6 @@ def main(argv: Sequence[str] | None = None) -> None:
             entry for entry in resolved_sets if entry.name in args.selected_sets
         ]
 
-    manifest_entries: dict[str, Any] = {}
     for resolved in resolved_sets:
         write_resolved_csv(cache_dir / f"{resolved.name}.csv", resolved)
         if args.skip_caches:
@@ -732,6 +929,11 @@ def main(argv: Sequence[str] | None = None) -> None:
     )
     if cutoffs:
         existing.setdefault("target_cutoffs", {}).update(cutoffs)
+    if args.strat_sizes:
+        existing["stratified"] = {
+            "sizes": list(args.strat_sizes),
+            **strat_diagnostics,
+        }
     write_json(manifest_path, existing)
     _logger.info("wrote %s", manifest_path)
 
