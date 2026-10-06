@@ -52,6 +52,13 @@ OUTPUT_DIR="outputs/ampc/exact_dkl_top_n/${N}_${ARM}"
 export WANDB_DIR="${OUTPUT_DIR}"
 mkdir -p "${WANDB_DIR}" slurm_logs
 
+# --score-chunk-size is small on purpose, and is NOT the variational config's 5000.
+# Scoring adds a q-dimension (score_encoded unsqueezes each row to (chunk, 1, d)), so
+# GPyTorch's exact-GP posterior carries a copy of all n training inputs per batch
+# element: chunk x (n+1) x 512 x 8 bytes in float64. At 5000 that is 38 GiB for
+# n=2000 and 57 GiB for n=3000, which OOMs a 40 GB A100; at 128 it is ~1.6 GiB.
+# --eval-chunk-size can stay large because predict_encoded passes (chunk, d) with no
+# q-dimension, so its concatenation is (n + chunk, d) and costs megabytes.
 # shellcheck disable=SC2086  # OVERLAY is intentionally unquoted: empty = no overlay
 uv run --no-sync python -m scripts.exact_dkl_top_n \
   config/ampc/exact_dkl_top_n.yaml ${OVERLAY} \
@@ -60,7 +67,7 @@ uv run --no-sync python -m scripts.exact_dkl_top_n \
   --output-dir "${OUTPUT_DIR}" \
   --cache-dir cache/ampc/exact_dkl_top_n \
   --eval-chunk-size 5000 \
-  --score-chunk-size 5000 \
+  --score-chunk-size 128 \
   --acquisition-seed 42 \
   --wandb-project ampc-exact-dkl-top-n \
   --wandb-entity models-mila5723 \
