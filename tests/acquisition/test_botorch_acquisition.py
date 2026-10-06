@@ -1574,6 +1574,40 @@ class TestPublicScoreEncoded:
             fitted_surrogate.encode_candidates = original  # type: ignore[method-assign]
         assert calls == 0
 
+    def test_moves_each_chunk_to_the_surrogate(
+        self,
+        fitted_surrogate: BoTorchGPSurrogate,
+        single_fidelity_observations: list[Observation],
+        candidates: list[Candidate],
+    ) -> None:
+        """Regression: features kept off the model's device or dtype still score.
+
+        The exact-DKL study holds its evaluation sets on the CPU and fits on
+        the GPU. The dtype stands in for the device here, since both go
+        through the same move and the suite has to run without a GPU.
+        """
+        acq = StubAnalytic()
+        acq.update(fitted_surrogate, single_fidelity_observations)
+        features = fitted_surrogate.encode_candidates(candidates)
+        foreign_dtype = (
+            torch.float32 if fitted_surrogate.dtype == torch.float64 else torch.float64
+        )
+
+        seen: list[torch.Tensor] = []
+        original = acq._score_encoded
+
+        def recording_score(X: torch.Tensor) -> list[float]:
+            seen.append(X)
+            return original(X)
+
+        acq._score_encoded = recording_score  # type: ignore[method-assign]
+        scores = acq.score_encoded(features.to(foreign_dtype), chunk_size=2)
+
+        assert seen
+        assert all(X.dtype == fitted_surrogate.dtype for X in seen)
+        assert all(X.device == fitted_surrogate.device for X in seen)
+        assert scores == pytest.approx(acq.score(candidates), rel=1e-4, abs=1e-6)
+
     def test_works_for_q_batch_acquisitions(
         self,
         fitted_surrogate: BoTorchGPSurrogate,

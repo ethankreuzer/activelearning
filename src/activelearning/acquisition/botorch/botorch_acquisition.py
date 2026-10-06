@@ -397,6 +397,8 @@ class BoTorchAcquisitionBase(Acquisition, ABC):
         features : torch.Tensor
             Model-space rows shaped ``(n, d)``, as returned by the surrogate's
             ``encode_candidates``. Each row is scored as a q-batch of one.
+            May live on another device or dtype than the surrogate; each
+            chunk is moved to the surrogate's before it is scored.
         chunk_size : int, optional
             Rows per acquisition call. ``None`` scores them all at once.
 
@@ -425,9 +427,14 @@ class BoTorchAcquisitionBase(Acquisition, ABC):
             return [1.0] * rows
 
         step = chunk_size or rows
+        surrogate = self._botorch_surrogate
         scores: list[float] = []
         for start in range(0, rows, step):
+            # Moved one chunk at a time, so a set held on the CPU never has to
+            # fit on the model's device whole.
             X = features[start : start + step].unsqueeze(1)
+            if surrogate is not None:
+                X = X.to(device=surrogate.device, dtype=surrogate.dtype)
             scores.extend(self._score_encoded(X))
             del X
         return scores
