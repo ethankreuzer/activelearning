@@ -16,7 +16,7 @@
 #
 # Per-arm overrides (see jobs/exact_dkl_top_n.sh):
 #   dataset.initial_data.path=data/ampc_top_<n>.csv
-#   surrogate.encoder.feature_cache_path=cache/ampc/exact_dkl_top_n/top_<n>.npy
+#   surrogate.encoder.feature_cache_path=cache/ampc/exact_dkl_top_n/train_<n>.npy
 #   acquisition.type=QMultiFidelityMaxValueEntropy   (the qMFMES arms)
 
 runtime:
@@ -66,7 +66,7 @@ surrogate:
     # Overridden per arm. Each n needs its own cache: the cache matches a full
     # ordered prefix of its manifest, so a 2000-row request against a 3000-row
     # cache does not match.
-    feature_cache_path: cache/ampc/exact_dkl_top_n/top_2000.npy
+    feature_cache_path: cache/ampc/exact_dkl_top_n/train_2000.npy
   training_params:
     # Full-batch Adam, so epochs == gradient steps. The DKLTrainingConfig
     # default of 50 would be 50 steps for a 131k-parameter layer plus the
