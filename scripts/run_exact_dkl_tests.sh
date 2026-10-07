@@ -52,6 +52,7 @@ NEW_TESTS=(
   tests/surrogate/dkl/test_dkl_noise_bound.py
   tests/surrogate/dkl/test_dkl_prior_mean.py
   tests/surrogate/dkl/test_dkl_restore.py
+  tests/acquisition/test_chunked_max_values.py
   tests/scripts/test_exact_dkl_rescore.py
 )
 

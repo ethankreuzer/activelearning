@@ -38,13 +38,19 @@ from botorch.utils.probability.utils import standard_normal_log_hazard
 from botorch.utils.safe_math import logmeanexp
 from torch import Tensor
 
+from activelearning.acquisition.botorch.chunked_max_values import (
+    ChunkedMaxValueSamplingMixin,
+)
+
 
 def _log_u(gamma: Tensor, log_rho2: Tensor) -> Tensor:
     """``log(rho2 * r * (gamma + r))`` with ``r = phi(gamma) / Phi(gamma)``, stably."""
     # log r = log(phi(gamma) / Phi(gamma)) = log-hazard at -gamma.
     log_r = standard_normal_log_hazard(-gamma)
     # gamma + r > 0 mathematically; the clamp only guards rounding.
-    log_gamma_plus_r = torch.log((gamma + log_r.exp()).clamp_min(torch.finfo(gamma.dtype).tiny))
+    log_gamma_plus_r = torch.log(
+        (gamma + log_r.exp()).clamp_min(torch.finfo(gamma.dtype).tiny)
+    )
     return log_rho2 + log_r + log_gamma_plus_r
 
 
@@ -126,7 +132,11 @@ def _gamma_and_log_rho2(
         X, observation_noise=True, posterior_transform=self.posterior_transform
     )
     variance_m = posterior_m.variance.clamp_min(CLAMP_LB).squeeze(-1).double()
-    mean_M, variance_M, covar_mM = mean_M.double(), variance_M.double(), covar_mM.double()
+    mean_M, variance_M, covar_mM = (
+        mean_M.double(),
+        variance_M.double(),
+        covar_mM.double(),
+    )
     mvs = torch.transpose(self.posterior_max_values, 0, 1).double()
     gamma = (mvs - mean_M) / variance_M.sqrt()
     tiny = torch.finfo(gamma.dtype).tiny
@@ -177,8 +187,14 @@ def _log_output_compute_information_gain(
     return logmeanexp(log_acq, dim=1).unsqueeze(0)
 
 
-class LogSpaceQLowerBoundMaxValueEntropy(qLowerBoundMaxValueEntropy):
-    """``qLowerBoundMaxValueEntropy`` with a log-space information gain."""
+class LogSpaceQLowerBoundMaxValueEntropy(
+    ChunkedMaxValueSamplingMixin, qLowerBoundMaxValueEntropy
+):
+    """``qLowerBoundMaxValueEntropy`` with a log-space information gain.
+
+    Its max-value samples are drawn from chunked posterior marginals, so a large
+    candidate set does not build a joint covariance.
+    """
 
     _compute_information_gain = _log_space_compute_information_gain
 
@@ -191,8 +207,14 @@ class LogSpaceQMultiFidelityLowerBoundMaxValueEntropy(
     _compute_information_gain = _log_space_compute_information_gain
 
 
-class LogOutputQLowerBoundMaxValueEntropy(qLowerBoundMaxValueEntropy):
-    """``qLowerBoundMaxValueEntropy`` returning the log information gain."""
+class LogOutputQLowerBoundMaxValueEntropy(
+    ChunkedMaxValueSamplingMixin, qLowerBoundMaxValueEntropy
+):
+    """``qLowerBoundMaxValueEntropy`` returning the log information gain.
+
+    Its max-value samples are drawn from chunked posterior marginals, so a large
+    candidate set does not build a joint covariance.
+    """
 
     _compute_information_gain = _log_output_compute_information_gain
 

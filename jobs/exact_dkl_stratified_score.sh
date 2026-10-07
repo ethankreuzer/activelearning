@@ -21,7 +21,13 @@
 #
 # Cost: no fit, but the n x n Cholesky is paid once and every scored chunk is a
 # solve against all n training molecules. Scoring at n=25000 has not been
-# measured; the smaller top-n arms scored all three sets in minutes.
+# measured; the n=3000 arm scored ampc_331k in about 100 s per pass, and the
+# cost per candidate grows with n.
+#
+# --score-chunk-size is small for the reason given in jobs/exact_dkl_top_n.sh:
+# score_encoded adds a q-dimension, so GPyTorch carries a copy of all n training
+# inputs per candidate in the chunk -- chunk x (n+1) x 512 x 4 bytes in float32,
+# 3.3 GiB at n=25000 and a chunk of 64, with several such temporaries alive.
 #SBATCH --gres=gpu:a100:1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
@@ -103,7 +109,7 @@ uv run --no-sync python -m scripts.exact_dkl_top_n \
   --output-dir "${OUTPUT_DIR}" \
   --cache-dir cache/ampc/exact_dkl_top_n \
   --eval-chunk-size 2000 \
-  --score-chunk-size 2000 \
+  --score-chunk-size 64 \
   --overwrite \
   --wandb-project ampc-exact-dkl-top-n \
   --wandb-entity models-mila5723 \
