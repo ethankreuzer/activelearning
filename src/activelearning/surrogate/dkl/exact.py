@@ -21,6 +21,12 @@ class ExactDKLSurrogate(DeepKernelSurrogate):
     its covar_module, making all BoTorch acquisition functions work out of the
     box. Training jointly optimises encoder, GP kernel, and likelihood noise
     via Adam (ExactMarginalLogLikelihood + MLM loss).
+
+    Away from its training data a GP predicts its prior mean. By default that
+    constant is learned, so it lands near the mean of the training targets --
+    the wrong fallback when the training set is not a sample of the molecules
+    the surrogate will be asked about, such as one enriched in high scorers.
+    ``prior_mean`` pins the constant to a known value instead.
     """
 
     def __init__(
@@ -31,6 +37,7 @@ class ExactDKLSurrogate(DeepKernelSurrogate):
         target_fidelity: Optional[int] = None,
         standardize_outputs: bool = True,
         scale_inputs: bool = False,
+        prior_mean: Optional[float] = None,
     ) -> None:
         """Initialize an exact-GP DKL surrogate.
 
@@ -49,6 +56,10 @@ class ExactDKLSurrogate(DeepKernelSurrogate):
             Whether to standardize regression targets before GP training.
         scale_inputs : bool, default=False
             Whether BoTorch should normalize model-space inputs.
+        prior_mean : float, optional
+            Fixed GP prior mean on the original target scale, held constant
+            during the fit. ``None`` learns the constant with the other
+            hyperparameters.
         """
         super().__init__(
             encoder=encoder,
@@ -58,6 +69,7 @@ class ExactDKLSurrogate(DeepKernelSurrogate):
             scale_inputs=scale_inputs,
             standardize_outputs=standardize_outputs,
         )
+        self._prior_mean = None if prior_mean is None else float(prior_mean)
 
     def _build_model(self, train_X: torch.Tensor, train_Y: torch.Tensor) -> None:
         gp_input_dim = self._encoder.latent_dim + (1 if self._is_multi_fidelity else 0)
@@ -69,6 +81,32 @@ class ExactDKLSurrogate(DeepKernelSurrogate):
             include_fidelity=self._is_multi_fidelity,
         )
         super()._build_model(train_X, train_Y)
+        if self._prior_mean is not None:
+            self._fix_prior_mean(self._prior_mean)
+
+    def _fix_prior_mean(self, prior_mean: float) -> None:
+        """Pin the GP's constant mean and exclude it from the fit.
+
+        The constant lives in the space the model's targets do, so the value is
+        passed through the outcome transform BoTorch fitted in
+        ``SingleTaskGP.__init__``.
+
+        Parameters
+        ----------
+        prior_mean : float
+            Prior mean on the original target scale.
+        """
+        transform = getattr(self.model, "outcome_transform", None)
+        constant = prior_mean
+        if transform is not None:
+            y_mean = float(transform.means.reshape(-1)[0])
+            y_std = float(transform.stdvs.reshape(-1)[0])
+            constant = (prior_mean - y_mean) / y_std
+        raw_constant = self.model.mean_module.raw_constant
+        with torch.no_grad():
+            raw_constant.fill_(constant)
+        # The optimizer only takes parameters that still require a gradient.
+        raw_constant.requires_grad_(False)
 
     def _make_mll(self, num_data: int) -> ExactMarginalLogLikelihood:
         return ExactMarginalLogLikelihood(self.model.likelihood, self.model)

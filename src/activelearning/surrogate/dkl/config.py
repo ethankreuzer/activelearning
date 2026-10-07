@@ -141,15 +141,27 @@ class ExactDKLSurrogateConfig(DKLSurrogateConfigBase):
 
     The inherited ``encoder`` and ``training_params`` settings define the
     feature representation and joint optimization schedule.
+
+    Parameters
+    ----------
+    prior_mean : float, optional
+        Fixed GP prior mean on the original target scale, such as the mean
+        target of the library the candidates come from. Use it when the training
+        set is not a sample of that library. ``null`` learns the constant.
     """
 
     type: Literal["ExactDKLSurrogate"] = "ExactDKLSurrogate"
+    prior_mean: Optional[float] = None
 
     def _surrogate_class(self) -> type[Surrogate]:
         """Return the exact DKL surrogate class."""
         from activelearning.surrogate.dkl.exact import ExactDKLSurrogate
 
         return ExactDKLSurrogate
+
+    def _additional_build_kwargs(self) -> dict[str, Any]:
+        """Return the exact GP constructor arguments."""
+        return {"prior_mean": self.prior_mean}
 
 
 class VariationalDKLSurrogateConfig(DKLSurrogateConfigBase):
