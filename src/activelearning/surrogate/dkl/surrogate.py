@@ -380,6 +380,7 @@ class DeepKernelSurrogate(BoTorchGPSurrogate):
         self._warn_if_mlm_configuration_is_ignored()
 
         callback_seconds = 0.0
+        noise_clamp_warned = False
         train_start = time.perf_counter()
         for epoch in range(self._training.epochs):
             self._set_train_mode()
@@ -393,6 +394,14 @@ class DeepKernelSurrogate(BoTorchGPSurrogate):
             (gp_loss if mlm_loss is None else mlm_loss + gp_loss).backward()
             torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
             optimizer.step()
+            if self._clamp_noise_to_lower_bound() and not noise_clamp_warned:
+                noise_clamp_warned = True
+                warn(
+                    f"The GP noise reached its lower bound at epoch {epoch} and "
+                    "is being clamped there: the fit is explaining the training "
+                    "targets with almost no noise.",
+                    stacklevel=2,
+                )
             callback_seconds += self._run_epoch_callback(epoch, float(gp_loss.item()))
 
         _synchronize_profile_device(self.device)
@@ -567,6 +576,34 @@ class DeepKernelSurrogate(BoTorchGPSurrogate):
         noise_covar._priors.pop("noise_prior", None)
         with torch.no_grad():
             noise_covar.noise = 0.1
+
+    def _clamp_noise_to_lower_bound(self) -> bool:
+        """Clamp the GP noise back to its lower bound after an optimizer step.
+
+        BoTorch declares the noise constraint with ``transform=None``, which
+        only L-BFGS-B honours through its box bounds. Adam steps the raw
+        parameter freely, so a fit that wants no noise walks it below the bound
+        and then below zero, leaving a negative noise variance. A constraint
+        that has a transform enforces itself and is left alone.
+
+        Returns
+        -------
+        bool
+            Whether the noise was below the bound and had to be clamped.
+        """
+        noise_covar = getattr(
+            getattr(self.model, "likelihood", None), "noise_covar", None
+        )
+        constraint = getattr(noise_covar, "raw_noise_constraint", None)
+        raw_noise = getattr(noise_covar, "raw_noise", None)
+        if constraint is None or raw_noise is None or constraint.enforced:
+            return False
+        lower_bound = float(constraint.lower_bound)
+        with torch.no_grad():
+            if not bool((raw_noise < lower_bound).any()):
+                return False
+            raw_noise.clamp_(min=lower_bound)
+        return True
 
     def _set_train_mode(self) -> None:
         for module in self._runtime_modules():
