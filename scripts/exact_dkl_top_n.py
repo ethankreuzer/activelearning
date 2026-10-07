@@ -52,6 +52,7 @@ from scripts.stage_profiler import (  # noqa: E402
 from scripts.surrogate_eval_io import (  # noqa: E402
     EvalSet,
     build_run_logger,
+    cross_set_outputs,
     evaluate_encoded_set,
     load_labelled_csv,
     log_figures,
@@ -119,6 +120,13 @@ STUDY_SETS = (
     StudySet("olivier_invitro", predict=True, score=True),
     StudySet("ampc_331k", predict=True, score=True),
 )
+
+#: Sets pooled to ask which one the acquisition prefers. One is a sample of the
+#: library the surrogate was fitted from, the other a generated set drawn from
+#: somewhere else, so the split of a pooled top-k says whether the score is
+#: tracking information or just distance from the training data.
+#: ``olivier_invitro`` is left out: it has no target to interpret a pick with.
+CROSS_SET_POOL = frozenset({"ampc_331k", "gp_molformer_set"})
 
 
 @dataclass(frozen=True)
@@ -244,9 +252,47 @@ def exact_dkl_hyperparameters(surrogate: Any) -> dict[str, float]:
         "lengthscale_min": float(lengthscale.min()),
         "lengthscale_median": float(lengthscale.median()),
         "lengthscale_max": float(lengthscale.max()),
+        "lengthscale_dims": float(lengthscale.numel()),
+        "lengthscale_effective_dims": _effective_ard_dims(lengthscale),
         "y_mean": y_mean,
         "y_std": y_std,
     }
+
+
+def _effective_ard_dims(lengthscale: Any) -> float:
+    """How many latent dimensions the ARD kernel actually relies on.
+
+    A dimension is ignored by driving its lengthscale large, so the per-dimension
+    relevance is the inverse lengthscale. The participation ratio of those
+    relevances answers "how many dimensions is this spread over" without a
+    threshold: it is the dimension count when every dimension matters equally,
+    and near 1 when a single one dominates.
+
+    Read against ``lengthscale_dims``, this is the test of whether a width was
+    used or merely allocated -- a 256-wide layer whose GP relies on eight
+    directions has not bought the other 248.
+
+    Parameters
+    ----------
+    lengthscale : Any
+        The kernel's lengthscales as a flat tensor, one per latent dimension.
+
+    Returns
+    -------
+    float
+        Effective number of dimensions, between 1 and the dimension count.
+        ``nan`` when no lengthscale is finite and positive.
+    """
+    values = np.asarray(lengthscale.detach().cpu(), dtype=np.float64).ravel()
+    values = values[np.isfinite(values) & (values > 0.0)]
+    if values.size == 0:
+        return float("nan")
+    relevance = 1.0 / values
+    total = float(relevance.sum())
+    squared = float(np.square(relevance).sum())
+    if squared <= 0.0:
+        return float("nan")
+    return float(total**2 / squared)
 
 
 def make_epoch_callback(
@@ -548,32 +594,59 @@ def check_required_paths(
         )
 
 
-def check_training_cache_matches(training_cache: Path, n_rows: int) -> None:
-    """Fail if the training cache does not hold exactly ``n_rows`` rows.
+def check_training_cache_matches(
+    training_cache: Path,
+    train_smiles: Sequence[str],
+) -> None:
+    """Fail unless the training cache was built from exactly these molecules.
 
     Catches the arm-crossing mistake -- the n=3000 CSV with the n=2000 cache --
     before the fit, where it would otherwise surface as a confusing cache miss.
+
+    The row count alone is not enough. Two selections of the same size are the
+    same length and different molecules, so a cache built for one would load
+    silently against the other and every feature would belong to the wrong
+    molecule, with nothing in the run looking wrong. The manifest's
+    ``input_sha256`` binds the cache to its molecules in order, so it is
+    compared whenever the manifest carries one.
 
     Parameters
     ----------
     training_cache : Path
         The ``.npy`` named in the surrogate config.
-    n_rows : int
-        Rows in the configured training CSV.
+    train_smiles : Sequence[str]
+        SMILES of the configured training set, in file order.
 
     Raises
     ------
     SystemExit
         On a mismatch.
     """
-    import json
+    from scripts.exact_dkl_prepare import hash_ordered_strings
 
     manifest = json.loads(Path(str(training_cache) + ".json").read_text())
     row_count = manifest.get("row_count")
+    n_rows = len(train_smiles)
     if row_count != n_rows:
         raise SystemExit(
             f"The training cache {training_cache} holds {row_count} rows but the "
             f"configured training set has {n_rows}. Point "
+            "surrogate.encoder.feature_cache_path at the cache built for this set."
+        )
+    cached_hash = manifest.get("input_sha256")
+    if cached_hash is None:
+        _logger.warning(
+            "The training cache %s has no input_sha256, so only its row count "
+            "could be checked. Re-run the prep step to bind it to its molecules.",
+            training_cache,
+        )
+        return
+    expected = hash_ordered_strings(train_smiles)
+    if cached_hash != expected:
+        raise SystemExit(
+            f"The training cache {training_cache} holds {row_count} rows, the same "
+            f"count as the configured training set, but different molecules "
+            f"(cache input_sha256={cached_hash}, training set {expected}). Point "
             "surrogate.encoder.feature_cache_path at the cache built for this set."
         )
 
@@ -868,12 +941,23 @@ def main(argv: Sequence[str] | None = None) -> None:
             "This study uses the MiniMolAmpcSmilesEncoder latent encoder; the config "
             f"has {encoder_cfg.get('type')!r}."
         )
-    if encoder_cfg.get("latent_dim") != 256 or encoder_cfg.get("activation") != "gelu":
+    # Stated, not compared against a fixed expectation: the arms sweep the width
+    # deliberately, and an earlier version of this warning named a default no arm
+    # used, which was later read back as a description of what had run.
+    latent_dim = encoder_cfg.get("latent_dim")
+    activation = encoder_cfg.get("activation")
+    _logger.info(
+        "Encoder: %s, activation=%r.",
+        "no trainable layer (the kernel sees the fingerprints directly)"
+        if latent_dim is None
+        else f"one trainable layer of width {latent_dim}",
+        activation,
+    )
+    if activation not in (None, "none"):
         _logger.warning(
-            "The study's arms use latent_dim=256 and activation='gelu'; this run has "
-            "latent_dim=%s activation=%r.",
-            encoder_cfg.get("latent_dim"),
-            encoder_cfg.get("activation"),
+            "activation=%r makes the layer non-linear. Every arm of this study so "
+            "far used activation='none', so results are not comparable to them.",
+            activation,
         )
     if surrogate_cfg.get("prior_mean") is not None:
         _logger.info(
@@ -917,8 +1001,9 @@ def main(argv: Sequence[str] | None = None) -> None:
             n_train = len(observations)
             if n_train == 0:
                 raise SystemExit("The configured training set is empty.")
-            train_smiles = frozenset(str(observation.x) for observation in observations)
-            check_training_cache_matches(training_cache, n_train)
+            ordered_train_smiles = [str(observation.x) for observation in observations]
+            train_smiles = frozenset(ordered_train_smiles)
+            check_training_cache_matches(training_cache, ordered_train_smiles)
             for name, acquisition in acquisitions.items():
                 if not hasattr(acquisition, "score_encoded"):
                     raise SystemExit(
@@ -1061,6 +1146,10 @@ def main(argv: Sequence[str] | None = None) -> None:
             if not args.skip_scoring:
                 final_metrics.update(_check_gibbon_max_values(acquisitions, plan))
 
+            # Scores are kept per set so they can be pooled once the loop ends.
+            # Only the scores, never the features: a float per molecule over
+            # every scored set is a few megabytes, so the peak is unaffected.
+            pooled_scores: dict[str, dict[str, np.ndarray]] = {}
             for study_set in STUDY_SETS:
                 eval_set = eval_sets[study_set.name]
                 if args.skip_scoring and not study_set.predict:
@@ -1101,6 +1190,10 @@ def main(argv: Sequence[str] | None = None) -> None:
                             )
                         flush_stage_profile()
                         columns[f"score_{scoring.name}"] = scores
+                        if study_set.name in CROSS_SET_POOL:
+                            pooled_scores.setdefault(scoring.name, {})[
+                                study_set.name
+                            ] = scores
                         metrics, figures = score_outputs(
                             eval_set,
                             scores,
@@ -1123,6 +1216,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                     weights=eval_set.weights,
                 )
                 del eval_set, columns
+
+            for scoring_name, by_set in sorted(pooled_scores.items()):
+                final_metrics.update(cross_set_outputs(by_set, scoring=scoring_name))
 
         final_metrics.update(profiler.metrics())
         final_metrics.update(profiler.run_peaks())

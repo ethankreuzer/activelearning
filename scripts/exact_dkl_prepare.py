@@ -551,9 +551,10 @@ def build_stratified_sets(
     """Write the stratified farthest-point training sets and resolve them.
 
     The candidate pool the selection draws from is itself published as the
-    ``strat_pool`` set, so the features the selection used are the same ones a
+    ``<label>_pool`` set, so the features the selection used are the same ones a
     later run would load, and a changed pool fails loudly instead of silently
-    re-encoding.
+    re-encoding. The label namespaces every output, so a selection made with
+    different settings never overwrites an earlier one.
 
     Parameters
     ----------
@@ -578,18 +579,21 @@ def build_stratified_sets(
     """
     from scripts.stratified_fps import select_stratified_rows
 
+    label = args.strat_label
+    pool_name = f"{label}_pool"
+
     def encode_rows(rows: np.ndarray) -> np.ndarray:
         """Publish the pool's feature cache and return its features."""
         pool = resolve_training_set(
-            "strat_pool",
+            pool_name,
             args.training_csv,
             smiles=smiles,
             targets=targets,
             rows=rows,
         )
-        write_resolved_csv(cache_dir / "strat_pool.csv", pool)
-        cache_path = cache_dir / "strat_pool.npy"
-        manifest_entries["strat_pool"] = encode_set(
+        write_resolved_csv(cache_dir / f"{pool_name}.csv", pool)
+        cache_path = cache_dir / f"{pool_name}.npy"
+        manifest_entries[pool_name] = encode_set(
             pool,
             cache_path,
             encoder_factory=lambda *, feature_cache_path: build_fixed_encoder(
@@ -610,19 +614,20 @@ def build_stratified_sets(
         quantiles=args.strat_quantiles,
         top_fraction=args.strat_top_fraction,
         pool_multiple=args.strat_pool_multiple,
+        band_fill=args.strat_band_fill,
         seed=args.strat_seed,
         device=args.encoder_device,
     )
 
     resolved: list[ResolvedSet] = []
     for size, rows in sorted(rows_per_size.items()):
-        csv_path = args.data_dir / f"ampc_strat_{size}.csv"
+        csv_path = args.data_dir / f"ampc_{label}_{size}.csv"
         if not args.skip_subsets:
             write_training_csv(csv_path, smiles, targets, fidelities, rows)
             _logger.info("wrote %s", csv_path)
         resolved.append(
             resolve_training_set(
-                f"strat_{size}",
+                f"{label}_{size}",
                 csv_path,
                 smiles=smiles,
                 targets=targets,
@@ -662,7 +667,7 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         default="",
         help=(
             "Comma-separated sizes of the stratified farthest-point training "
-            "sets, written as data/ampc_strat_<n>.csv. Empty disables them. "
+            "sets, written as data/ampc_<label>_<n>.csv. Empty disables them. "
             "All sizes share one candidate pool, so the smaller sets come out "
             "as subsets of the larger ones."
         ),
@@ -686,12 +691,36 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--strat-pool-multiple",
-        type=int,
-        default=15,
+        default="15",
         help=(
-            "Candidates drawn per selected point within each band. Only the "
-            "pool is encoded, so this sets the inference cost: farthest-point "
-            "sampling over a whole band of the 10M set is not tractable."
+            "Candidates drawn per selected point within each band, as one "
+            "number for every band or a comma-separated number per band. Only "
+            "the pool is encoded, so this sets the inference cost: "
+            "farthest-point sampling over a whole band of the 10M set is not "
+            "tractable. A band with a large budget sees a smaller share of its "
+            "rows at a fixed multiple, so the bulk bands can be widened alone."
+        ),
+    )
+    parser.add_argument(
+        "--strat-band-fill",
+        choices=("even", "proportional"),
+        default="even",
+        help=(
+            "How the lower bands split what the top band leaves. 'even' gives "
+            "each the same count, which over-represents the sparse middle; "
+            "'proportional' gives each its share of the library, so the "
+            "training set mirrors the pool the surrogate is later asked to "
+            "score."
+        ),
+    )
+    parser.add_argument(
+        "--strat-label",
+        default="strat",
+        help=(
+            "Namespaces the selection's outputs: data/ampc_<label>_<n>.csv and "
+            "the <label>_<n> and <label>_pool caches. Change it whenever the "
+            "selection settings change, so a new mix cannot overwrite an "
+            "earlier one and leave its arms unreproducible."
         ),
     )
     parser.add_argument("--strat-seed", type=int, default=42)
@@ -741,13 +770,35 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     args.strat_quantiles = tuple(
         float(value) for value in args.strat_quantiles.split(",") if value.strip()
     )
+    try:
+        multiples = tuple(
+            int(value)
+            for value in str(args.strat_pool_multiple).split(",")
+            if value.strip()
+        )
+    except ValueError as error:
+        raise SystemExit(
+            "--strat-pool-multiple must be an int or a comma-separated list of "
+            f"ints; got {args.strat_pool_multiple!r}."
+        ) from error
+    # One number applies to every band; the per-band form is checked against the
+    # band count in select_stratified_rows, which is where the bands are cut.
+    args.strat_pool_multiple = multiples[0] if len(multiples) == 1 else multiples
+    if not args.strat_label.strip():
+        raise SystemExit("--strat-label must not be empty.")
     if args.strat_sizes:
         if not args.strat_quantiles:
             raise SystemExit("--strat-quantiles must not be empty.")
         if not 0.0 <= args.strat_top_fraction <= 1.0:
             raise SystemExit("--strat-top-fraction must lie in [0, 1].")
-        if args.strat_pool_multiple < 1:
-            raise SystemExit("--strat-pool-multiple must be at least 1.")
+        if not multiples or any(multiple < 1 for multiple in multiples):
+            raise SystemExit("every --strat-pool-multiple must be at least 1.")
+        if len(multiples) not in (1, len(args.strat_quantiles) + 1):
+            raise SystemExit(
+                f"--strat-pool-multiple has {len(multiples)} entries, but "
+                f"{len(args.strat_quantiles)} quantiles cut "
+                f"{len(args.strat_quantiles) + 1} bands."
+            )
         if args.skip_caches:
             raise SystemExit(
                 "--strat-sizes needs the encoder: the selection picks points by "
@@ -871,7 +922,10 @@ def main(argv: Sequence[str] | None = None) -> None:
             overlaps[name] = {
                 other.name: count_overlap(selected, other.smiles)
                 for other in resolved_sets
-                if other.name != name and not other.name.startswith("strat_")
+                # Siblings of the same draw are nested, so their overlap is a
+                # foregone conclusion and only the evaluation sets are counted.
+                if other.name != name
+                and not other.name.startswith(f"{args.strat_label}_")
             }
             _logger.info("%s overlaps evaluation sets: %s", name, overlaps[name])
         strat_diagnostics["eval_overlap"] = overlaps
@@ -930,7 +984,16 @@ def main(argv: Sequence[str] | None = None) -> None:
     if cutoffs:
         existing.setdefault("target_cutoffs", {}).update(cutoffs)
     if args.strat_sizes:
-        existing["stratified"] = {
+        # Keyed by label for anything but the original selection, so a new mix
+        # records its own provenance instead of overwriting the old one. The
+        # default label keeps the plain key that existing readers expect.
+        key = (
+            "stratified"
+            if args.strat_label == "strat"
+            else f"stratified_{args.strat_label}"
+        )
+        existing[key] = {
+            "label": args.strat_label,
             "sizes": list(args.strat_sizes),
             **strat_diagnostics,
         }

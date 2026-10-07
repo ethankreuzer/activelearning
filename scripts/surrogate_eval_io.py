@@ -35,6 +35,10 @@ GENERATED_DOCKED_SET = "gp_molformer_docked_set"
 #: zero, so the score figures clamp at this floor before taking a logarithm.
 SCORE_LOG_FLOOR = 1e-12
 
+#: Round budgets the acquisition is scored at. A selection can look strong at
+#: the first and wash out by the second, so both are reported.
+SCORE_SELECTION_BUDGETS: tuple[int, ...] = (100, 1000)
+
 
 @dataclass(frozen=True)
 class EvalSet:
@@ -566,16 +570,27 @@ def score_outputs(
         ``<set>/figures/<scoring>/<name>``.
     """
     from scripts.surrogate_eval_metrics import (
+        acquisition_enrichment,
         log_density_figure,
+        score_degeneracy,
         score_stats,
         two_panel_histogram,
     )
 
     name = eval_set.name
     values = np.asarray(scores, dtype=np.float64)
+    measured = dict(score_stats(values, eval_set.targets))
+    if eval_set.has_targets:
+        # What a round of this size would actually select. Reported per budget
+        # because a selection can look good at 100 and wash out by 1000.
+        for budget in SCORE_SELECTION_BUDGETS:
+            measured.update(acquisition_enrichment(values, eval_set.targets, k=budget))
+    if log_floor is not None:
+        # Value scale only: these weight the scores against each other, and the
+        # log column is negative and so cannot be normalised.
+        measured.update(score_degeneracy(values, floor=log_floor))
     metrics = {
-        f"{name}/acquisition/{scoring}/{key}": value
-        for key, value in score_stats(values, eval_set.targets).items()
+        f"{name}/acquisition/{scoring}/{key}": value for key, value in measured.items()
     }
     metrics[f"{name}/acquisition/{scoring}/count"] = float(values.size)
     metrics[f"{name}/acquisition/{scoring}/n_nonfinite"] = float(
@@ -600,3 +615,41 @@ def score_outputs(
             if figure is not None:
                 built[f"{name}/figures/{scoring}/vs_observed"] = figure
     return metrics, built
+
+
+def cross_set_outputs(
+    scores_by_set: Mapping[str, np.ndarray],
+    *,
+    scoring: str,
+) -> dict[str, float]:
+    """Where the highest-scoring molecules come from, once the sets are pooled.
+
+    Each set is scored on its own, so nothing in the per-set metrics says which
+    set the acquisition would pick from if it had to choose. Pooling them and
+    ranking answers that, and a top-k drawn overwhelmingly from the set the
+    surrogate was not fitted near is the signature of a score that rewards
+    distance from the training data rather than information about the target.
+
+    Parameters
+    ----------
+    scores_by_set : Mapping[str, np.ndarray]
+        Acquisition scores per set name. Fewer than two sets yields nothing,
+        since there is no provenance to split.
+    scoring : str
+        Key segment naming the scoring, such as ``gibbon_value``.
+
+    Returns
+    -------
+    dict[str, float]
+        Metrics keyed ``pooled/acquisition/<scoring>/top{k}/<set>_share``.
+    """
+    from scripts.surrogate_eval_metrics import cross_set_top_k_shares
+
+    if len(scores_by_set) < 2:
+        return {}
+    return {
+        f"pooled/acquisition/{scoring}/{key}": value
+        for key, value in cross_set_top_k_shares(
+            scores_by_set, ks=SCORE_SELECTION_BUDGETS
+        ).items()
+    }

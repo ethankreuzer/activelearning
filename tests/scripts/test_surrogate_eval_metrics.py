@@ -444,3 +444,126 @@ def test_top_fraction_overlap_ignores_unlabelled_molecules() -> None:
 
     assert metrics.top_fraction_overlap(targets, mean, fraction=0.5) == 1.0
     assert math.isnan(metrics.top_fraction_overlap([float("nan")], [1.0]))
+
+
+class TestAcquisitionEnrichment:
+    """What a round of a given size would actually select."""
+
+    def test_a_perfect_ranker_reaches_the_ceiling(self) -> None:
+        targets = [0.0, 0.1, 0.2, 0.9, 0.8]
+        # Scores ordered exactly like the targets.
+        result = metrics.acquisition_enrichment(targets, targets, k=2)
+
+        assert result["top2_achievable_fraction"] == pytest.approx(1.0)
+        assert result["top2_y_mean"] == pytest.approx(0.85)
+
+    def test_the_worst_ranker_scores_near_zero(self) -> None:
+        targets = [0.0, 0.1, 0.2, 0.9, 0.8]
+        scores = [-value for value in targets]
+
+        result = metrics.acquisition_enrichment(scores, targets, k=2)
+
+        assert result["top2_y_mean"] == pytest.approx(0.05)
+        assert result["top2_enrichment"] < 1.0
+
+    def test_enrichment_is_one_for_a_selection_that_mirrors_the_pool(self) -> None:
+        targets = [0.0, 1.0] * 50
+        # A score that ignores the target picks a representative half.
+        scores = list(range(100))
+
+        result = metrics.acquisition_enrichment(scores, targets, k=50)
+
+        assert result["top50_enrichment"] == pytest.approx(1.0, abs=0.05)
+
+    def test_in_true_top_counts_the_genuinely_best(self) -> None:
+        targets = list(np.linspace(0.0, 1.0, 100))
+
+        result = metrics.acquisition_enrichment(
+            targets, targets, k=10, top_fraction=0.1
+        )
+
+        assert result["top10_in_true_top"] == pytest.approx(1.0)
+
+    def test_a_budget_larger_than_the_pool_takes_the_pool(self) -> None:
+        result = metrics.acquisition_enrichment([1.0, 2.0], [0.5, 0.7], k=50)
+
+        assert result["top50_y_mean"] == pytest.approx(0.6)
+        assert result["top50_achievable_fraction"] == pytest.approx(1.0)
+
+    def test_molecules_without_a_target_are_dropped(self) -> None:
+        result = metrics.acquisition_enrichment(
+            [9.0, 1.0, 2.0], [float("nan"), 0.2, 0.4], k=1
+        )
+
+        assert result["top1_y_mean"] == pytest.approx(0.4)
+
+    def test_an_empty_pool_is_all_nan(self) -> None:
+        result = metrics.acquisition_enrichment([], [], k=10)
+
+        assert all(math.isnan(value) for value in result.values())
+
+    def test_misaligned_inputs_are_rejected(self) -> None:
+        with pytest.raises(ValueError, match="must align"):
+            metrics.acquisition_enrichment([1.0, 2.0], [1.0], k=1)
+
+
+class TestScoreDegeneracy:
+    """Whether the acquisition distinguishes more than a handful of molecules."""
+
+    def test_a_single_spike_has_a_support_of_one(self) -> None:
+        scores = [1e-12] * 999 + [1.0]
+
+        result = metrics.score_degeneracy(scores)
+
+        assert result["effective_support"] == pytest.approx(1.0, abs=0.01)
+        assert result["n_mass90"] == pytest.approx(1.0)
+        assert result["fraction_at_floor"] == pytest.approx(0.999)
+
+    def test_a_flat_score_is_spread_over_everything(self) -> None:
+        result = metrics.score_degeneracy([0.5] * 100, floor=0.0)
+
+        assert result["effective_support"] == pytest.approx(100.0)
+        assert result["effective_support_fraction"] == pytest.approx(1.0)
+
+    def test_the_floor_is_counted_with_a_tolerance(self) -> None:
+        # The clamp arrives through a cast, so exact equality is not safe.
+        result = metrics.score_degeneracy([1e-12, 1e-12, 1.0])
+
+        assert result["fraction_at_floor"] == pytest.approx(2.0 / 3.0)
+
+    def test_an_all_zero_score_is_degenerate_not_nan(self) -> None:
+        result = metrics.score_degeneracy([0.0] * 10)
+
+        assert result["effective_support"] == 0.0
+        assert result["fraction_at_floor"] == 1.0
+
+    def test_an_empty_score_is_all_nan(self) -> None:
+        assert all(math.isnan(value) for value in metrics.score_degeneracy([]).values())
+
+
+class TestCrossSetTopKShares:
+    """Which set the acquisition prefers once the sets are pooled."""
+
+    def test_a_set_that_dominates_takes_the_whole_top(self) -> None:
+        result = metrics.cross_set_top_k_shares(
+            {"library": [0.0] * 100, "generated": [1.0] * 100}, ks=(10,)
+        )
+
+        assert result["top10/generated_share"] == pytest.approx(1.0)
+        assert result["top10/library_share"] == pytest.approx(0.0)
+        assert result["top10/n"] == 10.0
+
+    def test_interleaved_scores_split_the_top_evenly(self) -> None:
+        result = metrics.cross_set_top_k_shares(
+            {"a": [1.0, 3.0, 5.0, 7.0], "b": [2.0, 4.0, 6.0, 8.0]}, ks=(4,)
+        )
+
+        assert result["top4/a_share"] == pytest.approx(0.5)
+        assert result["top4/b_share"] == pytest.approx(0.5)
+
+    def test_non_finite_scores_are_dropped(self) -> None:
+        result = metrics.cross_set_top_k_shares(
+            {"a": [float("nan"), float("inf")], "b": [1.0, 2.0]}, ks=(2,)
+        )
+
+        assert result["top2/b_share"] == pytest.approx(1.0)

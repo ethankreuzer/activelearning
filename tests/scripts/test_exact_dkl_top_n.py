@@ -373,10 +373,40 @@ def test_training_cache_row_count_must_match(tmp_path: Path) -> None:
 
     cache = tmp_path / "train_2000.npy"
     cache.write_bytes(b"")
-    (tmp_path / "train_2000.npy.json").write_text(json.dumps({"row_count": 2000}))
-    arm.check_training_cache_matches(cache, 2000)
-    with pytest.raises(SystemExit, match="holds 2000 rows but"):
-        arm.check_training_cache_matches(cache, 3000)
+    (tmp_path / "train_2000.npy.json").write_text(json.dumps({"row_count": 2}))
+    arm.check_training_cache_matches(cache, ["CCO", "CCN"])
+    with pytest.raises(SystemExit, match="holds 2 rows but"):
+        arm.check_training_cache_matches(cache, ["CCO", "CCN", "CCC"])
+
+
+def test_training_cache_of_equal_size_but_other_molecules_is_rejected(
+    tmp_path: Path,
+) -> None:
+    """Two selections of one size differ only in which molecules they hold.
+
+    The row count cannot tell them apart, so a cache built for one would load
+    against the other and silently pair every molecule with another's features.
+    """
+    import json
+
+    from scripts.exact_dkl_prepare import hash_ordered_strings
+
+    cache = tmp_path / "balanced_25000.npy"
+    cache.write_bytes(b"")
+    (tmp_path / "balanced_25000.npy.json").write_text(
+        json.dumps(
+            {
+                "row_count": 2,
+                "input_sha256": hash_ordered_strings(["CCO", "CCN"]),
+            }
+        )
+    )
+    arm.check_training_cache_matches(cache, ["CCO", "CCN"])
+    with pytest.raises(SystemExit, match="different molecules"):
+        arm.check_training_cache_matches(cache, ["CCO", "CCC"])
+    # Order is part of the binding: the features are stored row by row.
+    with pytest.raises(SystemExit, match="different molecules"):
+        arm.check_training_cache_matches(cache, ["CCN", "CCO"])
 
 
 def test_score_limit_requires_acknowledging_live_encoding() -> None:

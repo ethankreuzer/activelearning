@@ -19,7 +19,7 @@ measured separately, by its rank correlation with the absolute error.
 from __future__ import annotations
 
 import math
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 
 import numpy as np
 from matplotlib.figure import Figure
@@ -449,6 +449,202 @@ def score_stats(
         "max": float(finite.max()),
         "spearman_y": rank_correlation(scores, targets),
     }
+
+
+def acquisition_enrichment(
+    scores: Sequence[float] | np.ndarray,
+    targets: Sequence[float] | np.ndarray,
+    *,
+    k: int,
+    top_fraction: float = 0.01,
+) -> dict[str, float]:
+    """Score what one round would actually buy, by taking the top ``k``.
+
+    The rank correlation of the score against the target says whether the
+    acquisition orders the whole pool. It does not say whether the molecules a
+    round would *select* are any good, which is the only question a fixed budget
+    asks. This takes the ``k`` highest-scoring molecules and reports the targets
+    they hold.
+
+    ``enrichment`` is scaled so that selecting at random scores 1.0, and
+    ``achievable_fraction`` so that the best possible choice of ``k`` scores
+    1.0 -- the two together separate "better than nothing" from "close to the
+    ceiling".
+
+    Parameters
+    ----------
+    scores : Sequence[float] or np.ndarray
+        Acquisition score per molecule.
+    targets : Sequence[float] or np.ndarray
+        Observed targets, aligned with ``scores``.
+    k : int
+        Round budget: how many molecules the selection would take.
+    top_fraction : float, default=0.01
+        Share of the pool counted as the true top, for ``in_true_top``.
+
+    Returns
+    -------
+    dict[str, float]
+        Keys prefixed ``top{k}_``: ``y_mean``, ``y_median``, ``enrichment``,
+        ``in_true_top``, ``achievable_fraction``. All ``nan`` when no molecule
+        carries both a finite score and a finite target.
+    """
+    keys = ("y_mean", "y_median", "enrichment", "in_true_top", "achievable_fraction")
+    prefix = f"top{int(k)}_"
+    score_values = np.asarray(scores, dtype=np.float64).ravel()
+    target_values = np.asarray(targets, dtype=np.float64).ravel()
+    if score_values.size != target_values.size:
+        raise ValueError(
+            f"scores and targets must align; got {score_values.size} and "
+            f"{target_values.size}."
+        )
+    usable = np.isfinite(score_values) & np.isfinite(target_values)
+    budget = min(int(k), int(usable.sum()))
+    if budget < 1:
+        return {prefix + key: float("nan") for key in keys}
+
+    score_values = score_values[usable]
+    target_values = target_values[usable]
+    # Partial sort: only the top `budget` need to be correct, and these pools
+    # run to hundreds of thousands of rows.
+    chosen = np.argpartition(-score_values, budget - 1)[:budget]
+    chosen_targets = target_values[chosen]
+    pool_mean = float(target_values.mean())
+    best_mean = float(np.sort(target_values)[-budget:].mean())
+    cutoff = np.quantile(target_values, 1.0 - top_fraction)
+
+    chosen_mean = float(chosen_targets.mean())
+    measured = {
+        "y_mean": chosen_mean,
+        "y_median": float(np.median(chosen_targets)),
+        "enrichment": chosen_mean / pool_mean if pool_mean else float("nan"),
+        "in_true_top": float(np.mean(chosen_targets >= cutoff)),
+        "achievable_fraction": chosen_mean / best_mean if best_mean else float("nan"),
+    }
+    return {prefix + key: value for key, value in measured.items()}
+
+
+def score_degeneracy(
+    scores: Sequence[float] | np.ndarray,
+    *,
+    floor: float = 1e-12,
+) -> dict[str, float]:
+    """Measure how much of the pool the acquisition actually distinguishes.
+
+    A reward that is flat at its floor everywhere except a handful of spikes
+    carries almost no gradient: there is nothing for a sampler to climb, and a
+    selection from it is close to arbitrary. ``effective_support`` is the
+    exponential of the Shannon entropy of the normalised scores, i.e. the number
+    of molecules the distribution behaves as though it were spread evenly over.
+
+    Expects scores on the value scale. The log scale is unnormalisable -- its
+    values are negative -- so callers exponentiate first, which for log scores
+    that have underflowed on the value scale recovers the distribution a
+    floored value column has already lost.
+
+    Parameters
+    ----------
+    scores : Sequence[float] or np.ndarray
+        Acquisition score per molecule, on the value scale.
+    floor : float, default=1e-12
+        Value the acquisition clamps to, counted by ``fraction_at_floor``.
+
+    Returns
+    -------
+    dict[str, float]
+        ``fraction_at_floor``, ``entropy_nats``, ``effective_support``,
+        ``effective_support_fraction`` and ``n_mass90`` (how many molecules
+        hold 90% of the total score).
+    """
+    keys = (
+        "fraction_at_floor",
+        "entropy_nats",
+        "effective_support",
+        "effective_support_fraction",
+        "n_mass90",
+    )
+    values = np.asarray(scores, dtype=np.float64).ravel()
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return dict.fromkeys(keys, float("nan"))
+
+    # A tolerance, because the floor arrives through a clamp and a cast.
+    at_floor = float(np.mean(values <= floor * (1.0 + 1e-9)))
+    positive = values[values > 0.0]
+    total = float(positive.sum())
+    if positive.size == 0 or total <= 0.0:
+        return {
+            "fraction_at_floor": at_floor,
+            "entropy_nats": 0.0,
+            "effective_support": 0.0,
+            "effective_support_fraction": 0.0,
+            "n_mass90": 0.0,
+        }
+    weights = positive / total
+    entropy = float(-np.sum(weights * np.log(weights)))
+    descending = np.sort(weights)[::-1]
+    return {
+        "fraction_at_floor": at_floor,
+        "entropy_nats": entropy,
+        "effective_support": float(np.exp(entropy)),
+        "effective_support_fraction": float(np.exp(entropy) / values.size),
+        "n_mass90": float(np.searchsorted(np.cumsum(descending), 0.9) + 1),
+    }
+
+
+def cross_set_top_k_shares(
+    scores_by_set: Mapping[str, Sequence[float] | np.ndarray],
+    *,
+    ks: Sequence[int] = (100, 1000),
+) -> dict[str, float]:
+    """Report where the highest-scoring molecules come from, across sets.
+
+    Scored sets are drawn from different distributions -- a library sample and a
+    generated set, say. Pooling them and ranking by acquisition asks which one
+    the acquisition prefers. A top-k drawn almost entirely from the set the
+    surrogate never saw is a sign the score is rewarding distance from the
+    training data rather than information about the target.
+
+    Parameters
+    ----------
+    scores_by_set : Mapping[str, Sequence[float] or np.ndarray]
+        Acquisition scores per set name.
+    ks : Sequence[int], default=(100, 1000)
+        Budgets to report.
+
+    Returns
+    -------
+    dict[str, float]
+        ``top{k}/{set}_share`` per set and budget, plus ``top{k}/n``. Shares are
+        ``nan`` when no set holds a finite score.
+    """
+    names = sorted(scores_by_set)
+    columns = [
+        np.asarray(scores_by_set[name], dtype=np.float64).ravel() for name in names
+    ]
+    finite = [np.isfinite(column) for column in columns]
+    pooled = np.concatenate([column[mask] for column, mask in zip(columns, finite)])
+    owners = np.concatenate(
+        [
+            np.full(int(mask.sum()), index, dtype=np.int64)
+            for index, mask in enumerate(finite)
+        ]
+    )
+
+    outputs: dict[str, float] = {}
+    for k in ks:
+        budget = min(int(k), int(pooled.size))
+        if budget < 1:
+            outputs[f"top{int(k)}/n"] = 0.0
+            for name in names:
+                outputs[f"top{int(k)}/{name}_share"] = float("nan")
+            continue
+        chosen = np.argpartition(-pooled, budget - 1)[:budget]
+        picked = owners[chosen]
+        outputs[f"top{int(k)}/n"] = float(budget)
+        for index, name in enumerate(names):
+            outputs[f"top{int(k)}/{name}_share"] = float(np.mean(picked == index))
+    return outputs
 
 
 def two_panel_histogram(

@@ -143,6 +143,74 @@ class TestAllocateBandBudgets:
         with pytest.raises(ValueError):
             allocate_band_budgets(sizes, n, top_fraction)
 
+    def test_an_unknown_band_fill_is_rejected(self) -> None:
+        with pytest.raises(ValueError, match="band_fill must be one of"):
+            allocate_band_budgets([100, 100], 10, 0.5, band_fill="weighted")
+
+
+class TestProportionalBandFill:
+    #: Band sizes of the 10M library at the study's quantiles, top band last.
+    LIBRARY = [4_999_194, 2_498_906, 1_500_890, 500_911, 399_881, 75_152, 25_066]
+
+    def test_the_lower_bands_take_their_share_of_the_library(self) -> None:
+        budgets = allocate_band_budgets(
+            self.LIBRARY, 25_000, 0.05, band_fill="proportional"
+        )
+        assert int(budgets.sum()) == 25_000
+        assert budgets[-1] == 1_250
+        # Each lower band's share of the 25000 matches its share of the library
+        # that the top band does not cover, to within a rounding point.
+        lower = np.asarray(self.LIBRARY[:-1], dtype=np.float64)
+        expected = lower / lower.sum() * (25_000 - 1_250)
+        assert np.all(np.abs(budgets[:-1] - expected) <= 1.0)
+
+    def test_it_puts_the_bulk_where_the_library_is(self) -> None:
+        # The whole point of the fill: the half of the library just above the
+        # floor should be about half of the training set, not a seventh of it.
+        proportional = allocate_band_budgets(
+            self.LIBRARY, 25_000, 0.05, band_fill="proportional"
+        )
+        even = allocate_band_budgets(self.LIBRARY, 25_000, 0.05, band_fill="even")
+        # 11904 against 3959: the even fill gives the bottom half of the library
+        # the same count as a band holding 0.75% of it.
+        assert proportional[0] > 2.5 * even[0]
+        assert proportional[0] / (25_000 - proportional[-1]) == pytest.approx(
+            self.LIBRARY[0] / sum(self.LIBRARY[:-1]), abs=1e-3
+        )
+
+    def test_budgets_always_sum_to_n(self) -> None:
+        for n in (1, 7, 13, 1000, 25_000):
+            budgets = allocate_band_budgets(
+                self.LIBRARY, n, 0.05, band_fill="proportional"
+            )
+            assert int(budgets.sum()) == n
+
+    def test_a_tiny_band_takes_its_share_and_not_its_size(self) -> None:
+        # Weights are the band sizes, so a band's share can only exceed its size
+        # once the lower bands as a whole are exhausted. A small band is
+        # therefore under-filled, not capped: it gets the few points its share
+        # of the population earns.
+        budgets = allocate_band_budgets(
+            [10, 10_000, 10_000, 10_000], 1_000, 0.5, band_fill="proportional"
+        )
+        assert int(budgets.sum()) == 1_000
+        assert budgets[-1] == 500
+        assert budgets[0] == 0
+        assert budgets[1:-1].tolist() == [250, 250]
+
+    def test_exhausted_lower_bands_spill_into_the_top_band(self) -> None:
+        budgets = allocate_band_budgets(
+            [5, 5, 10_000], 1_000, 0.5, band_fill="proportional"
+        )
+        assert int(budgets.sum()) == 1_000
+        assert budgets[-1] == 990
+
+    def test_the_even_fill_is_unchanged_by_the_new_default(self) -> None:
+        # The stratified arms must stay reproducible.
+        assert allocate_band_budgets([10_000] * 7, 7_000, 0.5).tolist() == (
+            allocate_band_budgets([10_000] * 7, 7_000, 0.5, band_fill="even").tolist()
+        )
+
 
 class TestFarthestPointSample:
     @pytest.mark.parametrize("seed", [0, 1, 2, 3, 4])
