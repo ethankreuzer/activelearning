@@ -88,6 +88,40 @@ class TestStudyConfiguration:
         )
 
 
+class TestNoProjection:
+    """``latent_dim: null`` is how an arm asks for the unprojected fingerprints."""
+
+    @pytest.mark.parametrize(
+        "config_class", [MiniMolSmilesEncoderConfig, MiniMolAmpcSmilesEncoderConfig]
+    )
+    def test_null_latent_dim_validates(self, config_class: type) -> None:
+        """Both latent MiniMol encoders accept it."""
+        config = config_class.model_validate(
+            {"checkpoint_path": str(CHECKPOINT), "latent_dim": None}
+        )
+        assert config.latent_dim is None
+
+    def test_default_still_projects(self) -> None:
+        """Every shipped config keeps its trainable layer."""
+        assert MiniMolSmilesEncoderConfig().latent_dim == 32
+        assert (
+            MiniMolAmpcSmilesEncoderConfig(checkpoint_path=CHECKPOINT).latent_dim == 32
+        )
+
+    def test_zero_is_still_rejected(self) -> None:
+        """Allowing ``None`` must not loosen the bound on a real width."""
+        with pytest.raises(ValidationError):
+            MiniMolSmilesEncoderConfig(latent_dim=0)
+
+    def test_null_survives_a_dump(self) -> None:
+        """The resolved config of a no-layer arm is written to JSON and read back."""
+        config = MiniMolAmpcSmilesEncoderConfig(
+            checkpoint_path=CHECKPOINT, latent_dim=None
+        )
+        restored = MiniMolAmpcSmilesEncoderConfig.model_validate(config.model_dump())
+        assert restored.latent_dim is None
+
+
 class TestValidation:
     """A typo must stop the run rather than quietly change the model."""
 

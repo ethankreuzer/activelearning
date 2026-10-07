@@ -289,6 +289,7 @@ class DeepKernelSurrogate(BoTorchGPSurrogate):
             time.perf_counter() - encode_start
         )
         self._train_Y = self._prepare_targets(self._train_Y)
+        self._calibrate_encoder_inputs()
         self._build_model(self._train_X, self._train_Y)
         self._apply_runtime_context()
         self._remove_noise_prior()
@@ -560,6 +561,18 @@ class DeepKernelSurrogate(BoTorchGPSurrogate):
                 "multi-fidelity DKL surrogate."
             )
         return float(self._fidelity_confidences[fidelity_level])
+
+    def _calibrate_encoder_inputs(self) -> None:
+        """Let the encoder set any data-dependent input scaling before the fit.
+
+        Optional: only encoders that define ``calibrate_inputs`` take part. It
+        receives the training inputs without the fidelity column.
+        """
+        calibrate = getattr(self._encoder, "calibrate_inputs", None)
+        if not callable(calibrate):
+            return
+        train_X = self._train_X[:, :-1] if self._is_multi_fidelity else self._train_X
+        calibrate(train_X)
 
     def _remove_noise_prior(self) -> None:
         """Remove BoTorch LogNormalPrior from the GP noise and initialise to 0.1.

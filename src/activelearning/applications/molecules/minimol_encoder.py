@@ -35,6 +35,9 @@ __all__ = [
 MINIMOL_FINGERPRINT_DIM = 512
 _FEATURE_CACHE_FORMAT_VERSION = 2
 _HASH_CHUNK_SIZE = 1024 * 1024
+#: Training rows used to set the input scale of an unprojected encoder: 2000
+#: rows are two million pairwise distances, plenty for a median.
+_CALIBRATION_ROWS = 2000
 
 #: Activations available on the trainable DKL projection. ``"none"`` keeps the
 #: projection linear, which makes the kernel a learned Mahalanobis metric on the
@@ -764,13 +767,21 @@ class MiniMolSmilesEncoder(LatentEncoder):
     fingerprints; with one the feature map is nonlinear and the kernel becomes
     non-stationary in fingerprint space, which is the point of deep kernel
     learning.
+
+    ``latent_dim=None`` removes the projection altogether: the kernel then sees
+    the fingerprints themselves, divided by one fixed scalar, and the encoder
+    has no trainable parameters. Nothing in the fit can then move dissimilar
+    molecules together. The scalar is set by :meth:`calibrate_inputs` to the
+    median pairwise distance of the training fingerprints, so the kernel's
+    lengthscales start at the scale of the data. It rescales every direction
+    alike and leaves the fingerprint geometry as MiniMol produced it.
     """
 
     def __init__(
         self,
         *,
         batch_size: int = 100,
-        latent_dim: int = 32,
+        latent_dim: int | None = 32,
         cache_size: int = 4096,
         feature_cache_path: str | Path | None = None,
         checkpoint_path: str | Path | None = None,
@@ -779,12 +790,17 @@ class MiniMolSmilesEncoder(LatentEncoder):
     ) -> None:
         """Initialize the MiniMol encoder and trainable projection."""
         super().__init__()
-        if latent_dim < 1:
+        if latent_dim is not None and latent_dim < 1:
             raise ValueError("latent_dim must be positive.")
         if activation not in MINIMOL_ACTIVATIONS:
             raise ValueError(
                 f"Unknown activation {activation!r}; expected one of "
                 f"{sorted(MINIMOL_ACTIVATIONS)}."
+            )
+        if latent_dim is None and activation != "none":
+            raise ValueError(
+                "latent_dim=None feeds the fingerprints to the kernel unprojected, "
+                f"so there is no projection for activation {activation!r} to follow."
             )
 
         self.fixed_encoder = self._build_fixed_encoder(
@@ -795,12 +811,21 @@ class MiniMolSmilesEncoder(LatentEncoder):
             cache_only=cache_only,
         )
         self.batch_size = self.fixed_encoder.batch_size
-        self.latent_dim = latent_dim
+        self.latent_dim = MINIMOL_FINGERPRINT_DIM if latent_dim is None else latent_dim
         self.cache_size = self.fixed_encoder.cache_size
         self.feature_cache_path = self.fixed_encoder.feature_cache_path
         self.checkpoint_path = self.fixed_encoder.checkpoint_path
         self.cache_only = self.fixed_encoder.cache_only
-        self.projection = nn.Linear(MINIMOL_FINGERPRINT_DIM, latent_dim)
+        self.projection = (
+            None
+            if latent_dim is None
+            else nn.Linear(MINIMOL_FINGERPRINT_DIM, latent_dim)
+        )
+        if latent_dim is None:
+            # A buffer, so it follows the runtime device and dtype and is saved
+            # with the surrogate state. Registered only here, so the state of an
+            # encoder with a projection keeps the keys it always had.
+            self.register_buffer("input_scale", torch.ones(()))
         self.activation_name = activation
         self.activation = MINIMOL_ACTIVATIONS[activation]()
 
@@ -818,6 +843,8 @@ class MiniMolSmilesEncoder(LatentEncoder):
 
         Applies the configured activation after the projection. The default
         ``"none"`` is :class:`torch.nn.Identity`, so the output is unchanged.
+        Without a projection the fingerprints are returned divided by
+        ``input_scale``.
         """
         if model_inputs.ndim != 2:
             raise ValueError(
@@ -829,11 +856,42 @@ class MiniMolSmilesEncoder(LatentEncoder):
                 "MiniMol fingerprints must have width "
                 f"{MINIMOL_FINGERPRINT_DIM}, got {model_inputs.shape[-1]}."
             )
+        if self.projection is None:
+            return model_inputs / self.input_scale.to(
+                device=model_inputs.device, dtype=model_inputs.dtype
+            )
         projection_inputs = model_inputs.to(
             device=self.projection.weight.device,
             dtype=self.projection.weight.dtype,
         )
         return self.activation(self.projection(projection_inputs))
+
+    def calibrate_inputs(self, model_inputs: Tensor) -> None:
+        """Set ``input_scale`` from the training fingerprints.
+
+        A no-op with a projection, whose weights already set the scale of the
+        latent space. Without one, the scale is the median pairwise Euclidean
+        distance over at most ``_CALIBRATION_ROWS`` training rows, so a typical
+        pair of training molecules sits at distance one. Raw fingerprint
+        distances are otherwise many lengthscales long at initialization, the
+        kernel matrix is numerically the identity, and a few thousand small
+        Adam steps cannot move the lengthscales far enough to recover.
+
+        Parameters
+        ----------
+        model_inputs : Tensor
+            Training fingerprints, shaped ``(n, 512)``.
+        """
+        if self.projection is not None or model_inputs.shape[0] < 2:
+            return
+        rows = model_inputs.detach()
+        if rows.shape[0] > _CALIBRATION_ROWS:
+            generator = torch.Generator().manual_seed(0)
+            chosen = torch.randperm(rows.shape[0], generator=generator)
+            rows = rows[chosen[:_CALIBRATION_ROWS].to(rows.device)]
+        median = torch.pdist(rows.to(dtype=torch.float64)).median()
+        if bool(torch.isfinite(median)) and float(median) > 0.0:
+            self.input_scale.fill_(float(median))
 
     def _build_fixed_encoder(
         self,

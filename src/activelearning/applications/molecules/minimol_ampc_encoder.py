@@ -233,8 +233,9 @@ class MiniMolAmpcSmilesEncoder(MiniMolSmilesEncoder):
     """Encode SMILES with the collaborator's fine-tuned MiniMol AmpC trunk.
 
     The fixed ``pooled512`` representation is passed through the same trainable
-    DKL projection used by :class:`MiniMolSmilesEncoder`. The checkpoint's
-    prediction head is not used.
+    DKL projection used by :class:`MiniMolSmilesEncoder`, or reaches the kernel
+    unprojected with ``latent_dim=None``. The checkpoint's prediction head is
+    not used.
     """
 
     def __init__(
@@ -244,7 +245,7 @@ class MiniMolAmpcSmilesEncoder(MiniMolSmilesEncoder):
         package_path: str | Path | None = None,
         device: str | torch.device | None = "cpu",
         batch_size: int = 100,
-        latent_dim: int = 32,
+        latent_dim: int | None = 32,
         cache_size: int = 4096,
         feature_cache_path: str | Path | None = None,
         activation: str = "none",

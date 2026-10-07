@@ -163,8 +163,10 @@ class MiniMolSmilesEncoderConfig(_MiniMolCacheConfig):
     ----------
     batch_size : int, default=100
         Maximum number of SMILES processed by MiniMol per extraction batch.
-    latent_dim : int, default=32
-        Width of the projected latent representation.
+    latent_dim : int or None, default=32
+        Width of the projected latent representation. ``null`` removes the
+        projection: the kernel sees the 512-dimensional fingerprints, rescaled
+        by one fixed scalar, and the encoder has nothing to train.
     cache_size : int, default=4096
         Maximum number of fingerprints retained in the in-memory LRU cache.
         Set to zero to disable the LRU cache.
@@ -186,7 +188,7 @@ class MiniMolSmilesEncoderConfig(_MiniMolCacheConfig):
     type: Literal["MiniMolSmilesEncoder"] = "MiniMolSmilesEncoder"
     input_representation: ClassVar[str] = "smiles"
     batch_size: int = Field(default=100, ge=1)
-    latent_dim: int = Field(default=32, ge=1)
+    latent_dim: int | None = Field(default=32, ge=1)
     cache_size: int = Field(default=4096, ge=0)
     checkpoint_path: Path | None = None
     activation: Literal["none", "gelu", "relu"] = "none"
@@ -240,8 +242,10 @@ class MiniMolAmpcSmilesEncoderConfig(_MiniMolCacheConfig):
         shared package.
     batch_size : int, default=100
         Maximum number of SMILES encoded per inference batch.
-    latent_dim : int, default=32
-        Width of the projected latent representation.
+    latent_dim : int or None, default=32
+        Width of the projected latent representation. ``null`` removes the
+        projection: the kernel sees the 512-dimensional fingerprints, rescaled
+        by one fixed scalar, and the encoder has nothing to train.
     cache_size : int, default=4096
         Maximum number of fingerprints retained in the in-memory LRU cache.
     feature_cache_path : Path, optional
@@ -262,7 +266,7 @@ class MiniMolAmpcSmilesEncoderConfig(_MiniMolCacheConfig):
     package_path: Path | None = None
     device: str | None = "cpu"
     batch_size: int = Field(default=100, ge=1)
-    latent_dim: int = Field(default=32, ge=1)
+    latent_dim: int | None = Field(default=32, ge=1)
     cache_size: int = Field(default=4096, ge=0)
     activation: Literal["none", "gelu", "relu"] = "none"
     cache_only: bool = False

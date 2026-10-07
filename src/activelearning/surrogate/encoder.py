@@ -26,7 +26,9 @@ class LatentEncoder(nn.Module, ABC):
     Subclasses must expose a ``latent_dim`` attribute and implement
     :meth:`forward` to map prepared model inputs to latent feature vectors.
     They may override :meth:`prepare_inputs` when raw domain values require
-    tokenizer- or modality-specific preprocessing.
+    tokenizer- or modality-specific preprocessing, and may define
+    ``calibrate_inputs(model_inputs)``, which DKL surrogates call with the
+    training inputs before each fit to set data-dependent input scaling.
 
     Attributes
     ----------
