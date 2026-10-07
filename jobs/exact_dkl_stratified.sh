@@ -87,6 +87,28 @@ OUTPUT_DIR="outputs/ampc/exact_dkl_top_n/${ARM}"
 export WANDB_DIR="${OUTPUT_DIR}"
 mkdir -p "${WANDB_DIR}" slurm_logs
 
+# A plain-language description of the arm, so a run can be understood on its own
+# months later. wandb reads WANDB_NOTES at init and shows it on the run's
+# Overview page and in the Notes column of the runs table; the same text is kept
+# next to the run's outputs.
+if [[ "${LATENT_DIM}" == none ]]; then
+  LAYER_TEXT="NO trainable layer: the GP kernel sees the 512-d fingerprints directly, divided by one fixed scalar (the median pairwise distance of the training molecules)"
+else
+  LAYER_TEXT="one trainable LINEAR layer of width ${LATENT_DIM} (512 -> ${LATENT_DIM}, no activation) inside the kernel"
+fi
+if [[ -n "${PRIOR_MEAN}" ]]; then
+  MEAN_TEXT="FIXED at ${PRIOR_MEAN} on the original score scale and not trained (0.0395 is the mean score of the 10M library)"
+else
+  MEAN_TEXT="LEARNED with the other hyperparameters (the default)"
+fi
+export WANDB_NOTES="Exact GP (no inducing points, no minibatching) fitted to the ${N}-molecule STRATIFIED farthest-point training set data/ampc_strat_${N}.csv: half the molecules from the top score band, the rest spread evenly over lower score bands.
+Features: frozen MiniMol AmpC fingerprints, then ${LAYER_TEXT}.
+GP prior mean: ${MEAN_TEXT}.
+Other settings: float32, full-batch Adam, acquisition scoring skipped; epochs and learning rate from config/ampc/exact_dkl_top_n.yaml.
+Arm name: ${ARM}. Arms differ from stratified_${N} (width 256, learned mean) only in what the name adds: _d<w> = layer width, _nolayer = no layer, _pm<v> = fixed prior mean.
+Submitted with: sbatch jobs/exact_dkl_stratified.sh $*   (Slurm job ${SLURM_JOB_ID:-unknown})"
+printf '%s\n' "${WANDB_NOTES}" > "${OUTPUT_DIR}/arm_description.txt"
+
 uv run --no-sync python -m scripts.exact_dkl_top_n \
   config/ampc/exact_dkl_top_n.yaml \
   "dataset.initial_data.path=data/ampc_strat_${N}.csv" \
