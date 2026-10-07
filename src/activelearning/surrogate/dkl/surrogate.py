@@ -282,6 +282,11 @@ class DeepKernelSurrogate(BoTorchGPSurrogate):
         obs_list = list(observations)
         if not obs_list:
             return
+        self._build_untrained_model(obs_list)
+        self._joint_train(self._make_mll(len(obs_list)))
+
+    def _build_untrained_model(self, obs_list: list[Observation]) -> None:
+        """Encode the observations and build the model, ready for training."""
         encode_start = time.perf_counter()
         self._train_X, self._train_Y = self._parse_observations(obs_list)
         _synchronize_profile_device(self.device)
@@ -293,7 +298,6 @@ class DeepKernelSurrogate(BoTorchGPSurrogate):
         self._build_model(self._train_X, self._train_Y)
         self._apply_runtime_context()
         self._remove_noise_prior()
-        self._joint_train(self._make_mll(len(obs_list)))
 
     def updates_from_latest(self) -> bool:
         """Report whether fitting can reuse the latest observations.

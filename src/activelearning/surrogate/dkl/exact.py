@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from typing import Any, Optional
 
 import gpytorch
@@ -12,6 +13,7 @@ from torch.optim import Adam
 from activelearning.surrogate.dkl.surrogate import DeepKernelSurrogate
 from activelearning.surrogate.encoder import LatentEncoder
 from activelearning.surrogate.dkl.kernel import EncoderKernel
+from activelearning.utils.types import Observation
 
 
 class ExactDKLSurrogate(DeepKernelSurrogate):
@@ -70,6 +72,47 @@ class ExactDKLSurrogate(DeepKernelSurrogate):
             standardize_outputs=standardize_outputs,
         )
         self._prior_mean = None if prior_mean is None else float(prior_mean)
+
+    def restore(
+        self,
+        observations: Iterable[Observation],
+        state_dict: dict[str, torch.Tensor],
+    ) -> None:
+        """Rebuild a fitted surrogate from its observations and saved state.
+
+        The state dictionary of :meth:`get_state_dict` holds the trained
+        parameters but not the training data an exact GP conditions on. This
+        rebuilds the model on ``observations`` exactly as :meth:`fit` does and
+        loads the saved parameters in place of training, so the result predicts
+        as the surrogate that was saved did.
+
+        Parameters
+        ----------
+        observations : Iterable[Observation]
+            The observations the saved surrogate was fitted to, in any order.
+        state_dict : dict[str, torch.Tensor]
+            The model state returned by :meth:`get_state_dict` after that fit.
+
+        Returns
+        -------
+        None
+            The restored model is stored on the surrogate in place.
+
+        Raises
+        ------
+        ValueError
+            If ``observations`` is empty.
+        RuntimeError
+            If ``state_dict`` does not match the model this surrogate builds,
+            for example because the encoder configuration differs.
+        """
+        self._fit_profiling = {}
+        obs_list = list(observations)
+        if not obs_list:
+            raise ValueError("Cannot restore a surrogate without observations.")
+        self._build_untrained_model(obs_list)
+        self.model.load_state_dict(state_dict)
+        self._set_eval_mode()
 
     def _build_model(self, train_X: torch.Tensor, train_Y: torch.Tensor) -> None:
         gp_input_dim = self._encoder.latent_dim + (1 if self._is_multi_fidelity else 0)

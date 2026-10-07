@@ -51,6 +51,7 @@ NEW_TESTS=(
   tests/test_encoder_config_fields.py
   tests/surrogate/dkl/test_dkl_noise_bound.py
   tests/surrogate/dkl/test_dkl_prior_mean.py
+  tests/surrogate/dkl/test_dkl_restore.py
   tests/scripts/test_exact_dkl_rescore.py
 )
 

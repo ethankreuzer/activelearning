@@ -9,6 +9,7 @@ from identical max-value samples.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -166,12 +167,14 @@ def test_scoring_plan_rejects_an_unsupported_acquisition() -> None:
 
 
 def test_study_sets_cover_prediction_and_score_roles() -> None:
-    """The six sets split into predicted, scored, and one that is both."""
+    """Every set is predicted; the three candidate sets are scored as well."""
     by_name = {study_set.name: study_set for study_set in arm.STUDY_SETS}
-    assert by_name["train_random"].predict and not by_name["train_random"].score
-    assert by_name["ampc_331k"].score and not by_name["ampc_331k"].predict
-    assert by_name["olivier_invitro"].score and not by_name["olivier_invitro"].predict
-    assert by_name["gp_molformer_set"].predict and by_name["gp_molformer_set"].score
+    assert all(study_set.predict for study_set in arm.STUDY_SETS)
+    assert {name for name, study_set in by_name.items() if study_set.score} == {
+        "gp_molformer_set",
+        "olivier_invitro",
+        "ampc_331k",
+    }
     # The first predicted set absorbs the one-off Cholesky, so the order is
     # part of the contract.
     assert arm.STUDY_SETS[0].name == "train_random"
@@ -406,6 +409,79 @@ def test_chunk_sizes_must_be_positive() -> None:
     """A zero chunk size would score nothing and report it as a result."""
     with pytest.raises(SystemExit, match="must be positive"):
         arm._parse_args(["--output-dir", "out", "--eval-chunk-size", "0", "cfg.yaml"])
+
+
+def _write_source_run(run_dir: Path, config: dict[str, Any]) -> Path:
+    """Write the two files a finished run leaves for ``--load-state``."""
+    run_dir.mkdir(parents=True)
+    (run_dir / arm.CONFIG_FILE).write_text(json.dumps(config))
+    state_path = run_dir / arm.STATE_FILE
+    state_path.write_bytes(b"")
+    return state_path
+
+
+SOURCE_CONFIG: dict[str, Any] = {
+    "dataset": {"initial_data": {"path": "data/ampc_strat_25000.csv"}},
+    "surrogate": {
+        "type": "ExactDKLSurrogate",
+        "prior_mean": 0.0395,
+        "encoder": {"latent_dim": None, "activation": "none"},
+    },
+    "runtime": {"device": "cuda", "precision": 32, "seed": 42},
+    "provenance": {"git_commit": "82b5bb3", "git_dirty": False},
+}
+
+
+def test_load_state_defaults_to_fitting() -> None:
+    """Without the option the run fits, as every earlier run did."""
+    args, _ = arm._parse_args(["--output-dir", "out", "cfg.yaml"])
+    assert args.load_state is None
+
+
+def test_state_from_the_same_configuration_is_accepted(tmp_path: Path) -> None:
+    """Commit and device may differ; they do not change what the state means."""
+    state_path = _write_source_run(tmp_path / "source", SOURCE_CONFIG)
+    resolved = {
+        **SOURCE_CONFIG,
+        "runtime": {"device": "cpu", "precision": 32, "seed": 42},
+        "provenance": {"git_commit": "abcdef0", "git_dirty": False},
+    }
+    arm.check_state_matches_config(state_path, resolved)
+
+
+@pytest.mark.parametrize(
+    ("section", "value", "reported"),
+    [
+        ("dataset", {"initial_data": {"path": "data/ampc_strat_10000.csv"}}, "dataset"),
+        (
+            "surrogate",
+            {**SOURCE_CONFIG["surrogate"], "prior_mean": None},
+            "surrogate",
+        ),
+        (
+            "runtime",
+            {"device": "cuda", "precision": 64, "seed": 42},
+            "runtime.precision",
+        ),
+    ],
+)
+def test_state_from_another_configuration_is_rejected(
+    tmp_path: Path, section: str, value: dict[str, Any], reported: str
+) -> None:
+    """Shapes can agree across arms, so a wrong state would load silently."""
+    state_path = _write_source_run(tmp_path / "source", SOURCE_CONFIG)
+    with pytest.raises(SystemExit, match=f"different {reported} than"):
+        arm.check_state_matches_config(state_path, {**SOURCE_CONFIG, section: value})
+
+
+def test_missing_state_or_source_configuration_is_reported(tmp_path: Path) -> None:
+    """Without the source run's config there is nothing to check against."""
+    with pytest.raises(SystemExit, match="does not exist"):
+        arm.check_state_matches_config(tmp_path / arm.STATE_FILE, SOURCE_CONFIG)
+    state_path = _write_source_run(tmp_path / "source", SOURCE_CONFIG)
+    (state_path.parent / arm.CONFIG_FILE).unlink()
+    with pytest.raises(SystemExit, match="is missing"):
+        arm.check_state_matches_config(state_path, SOURCE_CONFIG)
 
 
 def test_run_configuration_records_the_cost_confounders() -> None:

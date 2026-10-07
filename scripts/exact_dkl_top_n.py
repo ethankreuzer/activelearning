@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import logging
 import os
 import subprocess
@@ -113,8 +114,10 @@ STUDY_SETS = (
     StudySet("train_top", predict=True, score=False),
     StudySet("val_set", predict=True, score=False),
     StudySet("gp_molformer_set", predict=True, score=True),
-    StudySet("olivier_invitro", predict=False, score=True),
-    StudySet("ampc_331k", predict=False, score=True),
+    # olivier_invitro has no docking target, so its predictions are written to
+    # its CSV but it gets no accuracy metric and no predicted-vs-observed figure.
+    StudySet("olivier_invitro", predict=True, score=True),
+    StudySet("ampc_331k", predict=True, score=True),
 )
 
 
@@ -575,6 +578,54 @@ def check_training_cache_matches(training_cache: Path, n_rows: int) -> None:
         )
 
 
+def check_state_matches_config(state_path: Path, resolved: Mapping[str, Any]) -> None:
+    """Verify a saved surrogate state came from a run of this configuration.
+
+    The state holds the trained parameters only. Restored onto a different
+    training set, precision or surrogate it would load without error wherever
+    the tensor shapes happen to agree, and every prediction would be wrong.
+
+    Parameters
+    ----------
+    state_path : Path
+        The ``surrogate_state.pt`` to restore, next to the ``resolved_config.json``
+        its run wrote.
+    resolved : Mapping[str, Any]
+        This run's resolved configuration.
+
+    Raises
+    ------
+    SystemExit
+        If the state or its run's configuration is missing, or if that
+        configuration differs from this one in the dataset, the surrogate or
+        the runtime precision.
+    """
+    if not state_path.is_file():
+        raise SystemExit(f"--load-state: {state_path} does not exist.")
+    source_config_path = state_path.parent / CONFIG_FILE
+    if not source_config_path.is_file():
+        raise SystemExit(
+            f"--load-state: {source_config_path} is missing, so the state cannot "
+            "be checked against this run's configuration."
+        )
+    source = json.loads(source_config_path.read_text())
+    differing = [
+        section
+        for section in ("dataset", "surrogate")
+        if source.get(section) != resolved.get(section)
+    ]
+    if dict(source.get("runtime", {})).get("precision") != dict(
+        resolved.get("runtime", {})
+    ).get("precision"):
+        differing.append("runtime.precision")
+    if differing:
+        raise SystemExit(
+            f"--load-state: {state_path} was fitted with a different "
+            f"{', '.join(differing)} than this run is configured with (see "
+            f"{source_config_path}). Pass the overrides that run was given."
+        )
+
+
 def check_acquisition_guards(acquisition: Any, scoring: Scoring) -> dict[str, float]:
     """Verify one updated acquisition and return its support sizes.
 
@@ -671,6 +722,17 @@ def _parse_args(argv: Sequence[str] | None) -> tuple[argparse.Namespace, list[st
             "Sets that are only scored are freed without writing a CSV."
         ),
     )
+    parser.add_argument(
+        "--load-state",
+        type=Path,
+        default=None,
+        help=(
+            "Skip the fit and restore the surrogate from this surrogate_state.pt, "
+            "written by an earlier run of the same config. For scoring an arm "
+            "that was fitted with --skip-scoring without paying for the fit "
+            "again. --output-dir must be a different directory from that run's."
+        ),
+    )
     args, leftover = parser.parse_known_args(list(argv) if argv is not None else None)
     if args.eval_chunk_size < 1 or args.score_chunk_size < 1:
         raise SystemExit("--eval-chunk-size and --score-chunk-size must be positive.")
@@ -738,6 +800,7 @@ def run_configuration(
         "score_chunk_size": args.score_chunk_size,
         "score_limit": args.score_limit,
         "output_dir": str(args.output_dir),
+        "loaded_state": None if args.load_state is None else str(args.load_state),
         **dict(resolved.get("provenance", {})),
         "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
         "slurm_mem_mb": os.environ.get("SLURM_MEM_PER_NODE"),
@@ -774,6 +837,13 @@ def main(argv: Sequence[str] | None = None) -> None:
     resolved = OmegaConf.to_container(raw_cfg, resolve=True)
     resolved.pop("logger", None)
     resolved.pop("run_writer", None)
+    if args.load_state is not None:
+        if args.load_state.resolve().parent == out_dir.resolve():
+            raise SystemExit(
+                "--load-state points into --output-dir; this run would overwrite "
+                "the fit summary and loss curve of the run it restores."
+            )
+        check_state_matches_config(args.load_state, resolved)
     resolved["config_paths"] = [str(path) for path in config_paths]
     resolved["provenance"] = git_provenance()
     if resolved["provenance"]["git_dirty"]:
@@ -906,22 +976,38 @@ def main(argv: Sequence[str] | None = None) -> None:
             )
 
             loss_rows: list[dict[str, float]] = []
-            surrogate.set_epoch_callback(
-                make_epoch_callback(logger, surrogate, loss_rows)
-            )
+            fit_seconds: float | None = None
             set_global_seed(cfg.runtime.seed)
-            fit_started = time.perf_counter()
-            with profiler.stage("gp_fit"):
-                surrogate.fit(observations)
-            fit_seconds = time.perf_counter() - fit_started
-            surrogate.set_epoch_callback(None)
-            flush_stage_profile()
+            if args.load_state is None:
+                surrogate.set_epoch_callback(
+                    make_epoch_callback(logger, surrogate, loss_rows)
+                )
+                fit_started = time.perf_counter()
+                with profiler.stage("gp_fit"):
+                    surrogate.fit(observations)
+                fit_seconds = time.perf_counter() - fit_started
+                surrogate.set_epoch_callback(None)
+                flush_stage_profile()
 
-            torch.save(surrogate.get_state_dict(), out_dir / STATE_FILE)
-            _write_loss_curve(out_dir / LOSS_CURVE_FILE, loss_rows)
+                torch.save(surrogate.get_state_dict(), out_dir / STATE_FILE)
+                _write_loss_curve(out_dir / LOSS_CURVE_FILE, loss_rows)
+            else:
+                _logger.info(
+                    "Restoring the surrogate from %s instead of fitting it.",
+                    args.load_state,
+                )
+                with profiler.stage("gp_restore"):
+                    surrogate.restore(
+                        observations,
+                        torch.load(
+                            args.load_state, map_location="cpu", weights_only=True
+                        ),
+                    )
+                flush_stage_profile()
 
             hyperparameters = exact_dkl_hyperparameters(surrogate)
-            final_metrics["run/fit/seconds"] = fit_seconds
+            if fit_seconds is not None:
+                final_metrics["run/fit/seconds"] = fit_seconds
             final_metrics["run/fit/n_train"] = float(n_train)
             final_metrics["run/fit/epochs"] = float(
                 cfg.surrogate.training_params.epochs
@@ -942,6 +1028,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                 out_dir / FIT_SUMMARY_FILE,
                 {
                     "fit_seconds": fit_seconds,
+                    "loaded_state": (
+                        None if args.load_state is None else str(args.load_state)
+                    ),
                     "n_train": n_train,
                     "epochs": cfg.surrogate.training_params.epochs,
                     "lr": cfg.surrogate.training_params.lr,
