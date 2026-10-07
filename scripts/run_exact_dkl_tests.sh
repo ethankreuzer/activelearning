@@ -47,7 +47,11 @@ NEW_TESTS=(
   tests/scripts/test_exact_dkl_top_n.py
   tests/surrogate/dkl/test_dkl_exact_targets.py
   tests/applications/molecules/test_minimol_encoder_activation.py
+  tests/applications/molecules/test_minimol_encoder_no_projection.py
   tests/test_encoder_config_fields.py
+  tests/surrogate/dkl/test_dkl_noise_bound.py
+  tests/surrogate/dkl/test_dkl_prior_mean.py
+  tests/scripts/test_exact_dkl_rescore.py
 )
 
 # These must pass UNCHANGED after the shared-helper extraction. If any of them
