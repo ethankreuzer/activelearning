@@ -445,3 +445,133 @@ def test_run_configuration_records_the_cost_confounders() -> None:
     assert config["eval_chunk_size"] == 5000
     assert config["n_ampc_331k"] == 331480
     assert config["scorings"] == "gibbon_value,gibbon_log"
+
+
+def test_in_training_mask_marks_exact_smiles_matches() -> None:
+    """Matched on the string, the way the prep job counts overlap."""
+    mask = arm.in_training_mask(("C0", "C1", "C2"), frozenset({"C1", "C9"}))
+    assert mask.tolist() == [False, True, False]
+    assert arm.in_training_mask((), frozenset({"C1"})).shape == (0,)
+
+
+def test_unseen_block_matches_metrics_on_the_unseen_molecules() -> None:
+    """The ``_unseen`` keys are the ordinary metrics on a filtered set."""
+    eval_set = _eval_set("val_set", 40)
+    predictions = _predictions(40)
+    in_train = np.zeros(40, dtype=bool)
+    in_train[::4] = True
+
+    metrics, figures = arm.prediction_outputs_with_unseen(
+        eval_set, predictions, in_train
+    )
+
+    kept = ~in_train
+    expected, _ = prediction_outputs(
+        EvalSet(
+            name="val_set_unseen",
+            smiles=tuple(s for s, keep in zip(eval_set.smiles, kept) if keep),
+            targets=eval_set.targets[kept],
+            features=None,
+        ),
+        {key: values[kept] for key, values in predictions.items()},
+        figures=False,
+    )
+    assert metrics["val_set/final/n_in_train"] == 10.0
+    for key, value in expected.items():
+        assert metrics[key] == pytest.approx(value, nan_ok=True)
+    # The whole-set block is still there, and is what the figures show.
+    assert "val_set/final/rmse" in metrics
+    assert "val_set/final/top1pct_overlap" in metrics
+    assert figures and all(key.startswith("val_set/") for key in figures)
+    for key in (*metrics, *figures):
+        validate_log_key(key)
+
+
+def test_training_molecules_flatter_the_unfiltered_metrics() -> None:
+    """Why the block exists: an exact GP reproduces its training targets.
+
+    Perfect predictions on the training half and a constant error on the rest
+    halve the unfiltered bias; the unseen block reports the real one.
+    """
+    eval_set = _eval_set("val_set", 20)
+    in_train = np.arange(20) < 10
+    mean = np.where(in_train, eval_set.targets, eval_set.targets + 0.2)
+    predictions = {
+        "mean": mean,
+        "std_total": np.full(20, 0.1),
+        "std_latent": np.full(20, 0.1),
+    }
+
+    metrics, _ = arm.prediction_outputs_with_unseen(
+        eval_set, predictions, in_train, figures=False
+    )
+
+    assert metrics["val_set/final/bias"] == pytest.approx(0.1)
+    assert metrics["val_set_unseen/final/bias"] == pytest.approx(0.2)
+
+
+def test_fully_trained_on_set_has_no_unseen_block() -> None:
+    """A top-n arm trains on all of train_top; there is nothing left to report."""
+    eval_set = _eval_set("train_top", 8)
+    metrics, _ = arm.prediction_outputs_with_unseen(
+        eval_set, _predictions(8), np.ones(8, dtype=bool), figures=False
+    )
+    assert metrics["train_top/final/n_in_train"] == 8.0
+    assert not [key for key in metrics if key.startswith("train_top_unseen/")]
+
+
+def test_weights_follow_the_unseen_molecules() -> None:
+    """The validation set's weights must be filtered with its rows."""
+    base = _eval_set("val_set", 12)
+    eval_set = EvalSet(
+        name=base.name,
+        smiles=base.smiles,
+        targets=base.targets,
+        features=base.features,
+        weights=np.linspace(1.0, 2.0, 12),
+    )
+    in_train = np.arange(12) % 3 == 0
+    metrics, _ = arm.prediction_outputs_with_unseen(
+        eval_set, _predictions(12), in_train, figures=False
+    )
+    assert "val_set_unseen/final/weighted_rmse" in metrics
+    assert np.isfinite(metrics["val_set_unseen/final/weighted_rmse"])
+
+
+def test_git_provenance_reports_commit_and_dirty_tree(tmp_path: Path) -> None:
+    """A run from uncommitted edits must say so, not just name the last commit."""
+    import subprocess
+
+    def git(*arguments: str) -> None:
+        subprocess.run(
+            ["git", "-C", str(tmp_path), *arguments],
+            check=True,
+            capture_output=True,
+        )
+
+    git("init", "-q")
+    git("config", "user.email", "test@example.com")
+    git("config", "user.name", "Test")
+    tracked = tmp_path / "code.py"
+    tracked.write_text("x = 1\n")
+    git("add", "code.py")
+    git("commit", "-q", "-m", "first")
+
+    clean = arm.git_provenance(tmp_path)
+    assert len(clean["git_commit"]) == 40
+    assert clean["git_dirty"] is False
+
+    # Untracked files do not count: the real repository always has some.
+    (tmp_path / "notes.txt").write_text("scratch\n")
+    assert arm.git_provenance(tmp_path)["git_dirty"] is False
+
+    tracked.write_text("x = 2\n")
+    dirty = arm.git_provenance(tmp_path)
+    assert dirty["git_dirty"] is True
+    assert dirty["git_commit"] == clean["git_commit"]
+
+
+def test_git_provenance_outside_a_repository_is_unknown(tmp_path: Path) -> None:
+    """A missing repository must not stop a run; the fields are just unknown."""
+    provenance = arm.git_provenance(tmp_path / "absent")
+    assert provenance == {"git_commit": None, "git_dirty": None}

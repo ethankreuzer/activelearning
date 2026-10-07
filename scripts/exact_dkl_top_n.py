@@ -30,6 +30,7 @@ import argparse
 import csv
 import logging
 import os
+import subprocess
 import sys
 import time
 import warnings
@@ -78,6 +79,10 @@ QMFMES_TYPE = "QMultiFidelityMaxValueEntropy"
 
 #: The only charted series. Everything else is a one-off summary scalar.
 PER_EPOCH_HYPERPARAMETERS = ("noise", "outputscale", "lengthscale_median")
+
+#: Appended to a set's name for the metrics computed on only the molecules the
+#: surrogate was not trained on.
+UNSEEN_SUFFIX = "_unseen"
 
 
 @dataclass(frozen=True)
@@ -207,8 +212,9 @@ def exact_dkl_hyperparameters(surrogate: Any) -> dict[str, float]:
     -------
     dict[str, float]
         The learned noise and output scale, the lengthscale spread, the mean
-        constant, and the outcome transform's standardization constants. Empty
-        if the surrogate has not been fitted.
+        constant in standardized and original units, and the outcome
+        transform's standardization constants. Empty if the surrogate has not
+        been fitted.
     """
     if not surrogate.is_fitted():
         return {}
@@ -221,6 +227,7 @@ def exact_dkl_hyperparameters(surrogate: Any) -> dict[str, float]:
     transform = getattr(model, "outcome_transform", None)
     y_mean = 0.0 if transform is None else float(transform.means.reshape(-1)[0])
     y_std = 1.0 if transform is None else float(transform.stdvs.reshape(-1)[0])
+    mean_constant = float(model.mean_module.constant.detach().reshape(-1)[0])
     return {
         "noise": noise,
         # The targets are standardized, so the interpretable noise is on the
@@ -228,7 +235,9 @@ def exact_dkl_hyperparameters(surrogate: Any) -> dict[str, float]:
         "noise_std_original_scale": float(noise**0.5 * y_std),
         "outputscale": outputscale,
         "prior_std_original_scale": float(outputscale**0.5 * y_std),
-        "mean_constant": float(model.mean_module.constant.detach().reshape(-1)[0]),
+        "mean_constant": mean_constant,
+        # What the GP predicts far from every training molecule.
+        "prior_mean_original_scale": y_mean + mean_constant * y_std,
         "lengthscale_min": float(lengthscale.min()),
         "lengthscale_median": float(lengthscale.median()),
         "lengthscale_max": float(lengthscale.max()),
@@ -268,6 +277,131 @@ def make_epoch_callback(
         logger.log_step(epoch)
 
     return callback
+
+
+def git_provenance(repo_dir: Path | None = None) -> dict[str, Any]:
+    """Record which code a run was made with.
+
+    W&B stores the commit too, but not whether the working tree matched it, and
+    a run started from uncommitted edits would otherwise point at a commit that
+    does not contain the code that produced it.
+
+    Parameters
+    ----------
+    repo_dir : Path, optional
+        Repository to inspect. Defaults to the one this script lives in.
+
+    Returns
+    -------
+    dict[str, Any]
+        ``git_commit`` (the full hash) and ``git_dirty`` (whether any tracked
+        file differs from it). Both ``None`` when git cannot be queried.
+        Untracked files are not counted: the repository always holds untracked
+        data directories, so counting them would flag every run.
+    """
+    repo = Path(__file__).resolve().parents[1] if repo_dir is None else repo_dir
+
+    def run(*arguments: str) -> str | None:
+        try:
+            completed = subprocess.run(
+                ["git", "-C", str(repo), *arguments],
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=30,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return completed.stdout
+
+    commit = run("rev-parse", "HEAD")
+    status = run("status", "--porcelain", "--untracked-files=no")
+    return {
+        "git_commit": None if commit is None else commit.strip() or None,
+        "git_dirty": None if status is None else bool(status.strip()),
+    }
+
+
+def in_training_mask(smiles: Sequence[str], train_smiles: frozenset[str]) -> np.ndarray:
+    """Mark the molecules of an evaluation set that the surrogate was trained on.
+
+    Matched on the SMILES string, the same way the prep job counts overlap.
+
+    Parameters
+    ----------
+    smiles : Sequence[str]
+        The evaluation set's molecules.
+    train_smiles : frozenset[str]
+        The training molecules.
+
+    Returns
+    -------
+    np.ndarray
+        Boolean, one entry per molecule, ``True`` where it is a training molecule.
+    """
+    return np.fromiter(
+        (molecule in train_smiles for molecule in smiles),
+        dtype=bool,
+        count=len(smiles),
+    )
+
+
+def prediction_outputs_with_unseen(
+    eval_set: EvalSet,
+    predictions: Mapping[str, np.ndarray],
+    in_train: np.ndarray,
+    *,
+    figures: bool = True,
+) -> tuple[dict[str, float], dict[str, Any]]:
+    """Prediction metrics for a set, and again for its unseen molecules only.
+
+    The evaluation sets are drawn from the same library as the training set, so
+    some of their molecules are training data: all of ``train_top`` for a top-n
+    arm, a tenth of ``val_set`` for the largest stratified one. An exact GP
+    reproduces those almost exactly, which flatters every metric by an amount
+    that grows with n. The ``<set>_unseen`` block is the one to compare across
+    training sets; the unfiltered block is kept because earlier runs and the
+    variational baseline report it.
+
+    Parameters
+    ----------
+    eval_set : EvalSet
+        The set, supplying targets and optional weights.
+    predictions : Mapping[str, np.ndarray]
+        ``mean``, ``std_total`` and ``std_latent``.
+    in_train : np.ndarray
+        Boolean, ``True`` where the molecule is a training molecule.
+    figures : bool, default=True
+        Whether to build the figures, which cover the whole set.
+
+    Returns
+    -------
+    tuple[dict[str, float], dict[str, Any]]
+        The metrics of :func:`prediction_outputs` under ``<set>/``, the count
+        ``<set>/final/n_in_train``, and the same metrics under
+        ``<set>_unseen/`` when at least one molecule is unseen; and the figures.
+    """
+    metrics, built = prediction_outputs(eval_set, predictions, figures=figures)
+    in_train = np.asarray(in_train, dtype=bool)
+    metrics[f"{eval_set.name}/final/n_in_train"] = float(in_train.sum())
+    unseen = ~in_train
+    if unseen.any():
+        subset = EvalSet(
+            name=f"{eval_set.name}{UNSEEN_SUFFIX}",
+            smiles=tuple(
+                molecule for molecule, keep in zip(eval_set.smiles, unseen) if keep
+            ),
+            targets=eval_set.targets[unseen],
+            features=None,
+            weights=None if eval_set.weights is None else eval_set.weights[unseen],
+        )
+        unseen_metrics, _ = prediction_outputs(
+            subset,
+            {key: np.asarray(values)[unseen] for key, values in predictions.items()},
+            figures=False,
+        )
+        metrics.update(unseen_metrics)
+    return metrics, built
 
 
 def load_resolved_set(
@@ -587,6 +721,7 @@ def run_configuration(
         "cache_only": encoder.get("cache_only"),
         "feature_cache_path": encoder.get("feature_cache_path"),
         "standardize_outputs": surrogate.get("standardize_outputs"),
+        "prior_mean": surrogate.get("prior_mean"),
         "epochs": training.get("epochs"),
         "lr": training.get("lr"),
         "num_mv_samples": acquisition.get("num_mv_samples"),
@@ -603,6 +738,7 @@ def run_configuration(
         "score_chunk_size": args.score_chunk_size,
         "score_limit": args.score_limit,
         "output_dir": str(args.output_dir),
+        **dict(resolved.get("provenance", {})),
         "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
         "slurm_mem_mb": os.environ.get("SLURM_MEM_PER_NODE"),
         "slurm_cpus_per_task": os.environ.get("SLURM_CPUS_PER_TASK"),
@@ -639,6 +775,13 @@ def main(argv: Sequence[str] | None = None) -> None:
     resolved.pop("logger", None)
     resolved.pop("run_writer", None)
     resolved["config_paths"] = [str(path) for path in config_paths]
+    resolved["provenance"] = git_provenance()
+    if resolved["provenance"]["git_dirty"]:
+        _logger.warning(
+            "Tracked files differ from commit %s; this run cannot be reproduced "
+            "from the commit alone.",
+            resolved["provenance"]["git_commit"],
+        )
 
     surrogate_cfg = dict(resolved.get("surrogate", {}))
     encoder_cfg = dict(surrogate_cfg.get("encoder", {}))
@@ -661,6 +804,11 @@ def main(argv: Sequence[str] | None = None) -> None:
             "latent_dim=%s activation=%r.",
             encoder_cfg.get("latent_dim"),
             encoder_cfg.get("activation"),
+        )
+    if surrogate_cfg.get("prior_mean") is not None:
+        _logger.info(
+            "The GP prior mean is fixed at %s on the original target scale.",
+            surrogate_cfg.get("prior_mean"),
         )
     plan = scoring_plan(acquisition_type)
     training_cache = Path(str(encoder_cfg.get("feature_cache_path")))
@@ -699,6 +847,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             n_train = len(observations)
             if n_train == 0:
                 raise SystemExit("The configured training set is empty.")
+            train_smiles = frozenset(str(observation.x) for observation in observations)
             check_training_cache_matches(training_cache, n_train)
             for name, acquisition in acquisitions.items():
                 if not hasattr(acquisition, "score_encoded"):
@@ -837,7 +986,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                     )
                     del eval_set
                     continue
-                columns: dict[str, np.ndarray] = {}
+                in_train = in_training_mask(eval_set.smiles, train_smiles)
+                columns: dict[str, np.ndarray] = {"in_train": in_train.astype(float)}
                 if study_set.predict:
                     with profiler.stage(f"predict_{study_set.name}"):
                         predictions = evaluate_encoded_set(
@@ -845,7 +995,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                         )
                     flush_stage_profile()
                     columns.update(predictions)
-                    metrics, figures = prediction_outputs(eval_set, predictions)
+                    metrics, figures = prediction_outputs_with_unseen(
+                        eval_set, predictions, in_train
+                    )
                     final_metrics.update(metrics)
                     final_figures.update(figures)
                 if study_set.score and not args.skip_scoring:

@@ -374,6 +374,43 @@ def top_fraction_split_means(
     return float(top.mean()), float(rest.mean()) if rest.size else float("nan")
 
 
+def top_fraction_overlap(
+    targets: Sequence[float] | np.ndarray,
+    mean: Sequence[float] | np.ndarray,
+    *,
+    fraction: float = 0.01,
+) -> float:
+    """Share of the highest-target molecules that the predictions also rank highest.
+
+    The retrieval question the generative pipeline depends on: of the true top
+    ``fraction`` of a set, how many land in the predicted top ``fraction``. Bias
+    and calibration do not enter; a surrogate that shrinks every top molecule
+    toward the bulk but keeps their order still scores 1.
+
+    Parameters
+    ----------
+    targets : Sequence[float] or np.ndarray
+        Observed targets.
+    mean : Sequence[float] or np.ndarray
+        Predicted means, aligned with ``targets``.
+    fraction : float, default=0.01
+        Share of molecules in each top group (at least one molecule).
+
+    Returns
+    -------
+    float
+        Overlap in ``[0, 1]``; a random ranking gives about ``fraction``. ``nan``
+        when no molecule has a finite target and prediction.
+    """
+    y, mu = _finite_pair(targets, mean)
+    if y.size == 0:
+        return float("nan")
+    n_top = max(1, round(fraction * y.size))
+    top_observed = np.argsort(-y, kind="stable")[:n_top]
+    top_predicted = np.argsort(-mu, kind="stable")[:n_top]
+    return float(np.intersect1d(top_observed, top_predicted).size / n_top)
+
+
 def score_stats(
     scores: Sequence[float] | np.ndarray,
     targets: Sequence[float] | np.ndarray,

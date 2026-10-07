@@ -400,3 +400,47 @@ def test_error_by_std_figure_is_none_with_fewer_molecules_than_groups() -> None:
     )
 
     assert figure is None
+
+
+def test_top_fraction_overlap_is_one_for_a_shrunk_but_ordered_prediction() -> None:
+    """Ranking is all it measures: bias and scale do not enter.
+
+    The variational baseline shrinks its top molecules about halfway to the bulk.
+    If it kept their order, the sampler could still be steered by it, and this is
+    the metric that says so.
+    """
+    targets = np.linspace(0.0, 1.0, 200)
+
+    assert metrics.top_fraction_overlap(targets, 0.5 * targets + 0.3) == 1.0
+
+
+def test_top_fraction_overlap_counts_the_shared_molecules() -> None:
+    """With a 10% group of 10, half retrieved is 0.5."""
+    targets = np.arange(100, dtype=np.float64)
+    mean = targets.copy()
+    # Push five of the true top ten to the bottom of the predicted ranking.
+    mean[95:] = -1.0
+
+    assert metrics.top_fraction_overlap(targets, mean, fraction=0.1) == 0.5
+
+
+def test_top_fraction_overlap_is_zero_for_a_reversed_ranking() -> None:
+    """The exact top-n arms ranked low scorers highest on some sets."""
+    targets = np.arange(100, dtype=np.float64)
+
+    assert metrics.top_fraction_overlap(targets, -targets, fraction=0.1) == 0.0
+
+
+def test_top_fraction_overlap_keeps_at_least_one_molecule() -> None:
+    """A set smaller than 1/fraction still has a top group."""
+    assert metrics.top_fraction_overlap([0.1, 0.9, 0.5], [1.0, 3.0, 2.0]) == 1.0
+    assert metrics.top_fraction_overlap([0.1, 0.9, 0.5], [3.0, 1.0, 2.0]) == 0.0
+
+
+def test_top_fraction_overlap_ignores_unlabelled_molecules() -> None:
+    """Rows without a finite target and prediction are dropped before ranking."""
+    targets = [float("nan"), 0.2, 0.9, 0.4]
+    mean = [99.0, 0.1, 0.8, float("nan")]
+
+    assert metrics.top_fraction_overlap(targets, mean, fraction=0.5) == 1.0
+    assert math.isnan(metrics.top_fraction_overlap([float("nan")], [1.0]))

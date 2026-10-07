@@ -474,6 +474,7 @@ def prediction_outputs(
         predicted_vs_observed_figure,
         prediction_metrics,
         summary_stats,
+        top_fraction_overlap,
         top_fraction_split_means,
         two_panel_histogram,
         weighted_prediction_metrics,
@@ -488,6 +489,9 @@ def prediction_outputs(
         latent_std=predictions["std_latent"],
     ).items():
         metrics[f"{name}/final/{key}"] = value
+    metrics[f"{name}/final/top1pct_overlap"] = top_fraction_overlap(
+        eval_set.targets, predictions["mean"]
+    )
     if eval_set.weights is not None:
         for key, value in weighted_prediction_metrics(
             eval_set.targets, predictions["mean"], eval_set.weights
