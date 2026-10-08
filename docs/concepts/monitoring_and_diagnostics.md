@@ -205,6 +205,51 @@ upstream metrics until the active-learning round ends; internal GFlowNet steps
 do not advance the experiment tracker step. Branin and xTB oracles retain
 their query figures until the same round boundary.
 
+### S3-GFN Per-Step Figures
+
+The policy trains for thousands of steps inside a single `sample()` call, so
+whether a round worked is a question about those steps rather than about the
+round. Four figures answer it, each plotted against the true training-step
+number:
+
+```text
+sampler/s3gfn/acq/trajectory
+sampler/s3gfn/reward/concentration
+sampler/s3gfn/reward/effective_support
+sampler/s3gfn/train/batch_health
+```
+
+- **`acq/trajectory`** plots the max, median and min of `acq` -- the acquisition
+  value itself, before any reward transform -- on a logarithmic axis. Within one
+  round the surrogate is fixed, so `acq` is a fixed function of the molecule and
+  this reads as absolute progress. The median rather than the mean, because an
+  acquisition spanning orders of magnitude has an arithmetic mean equal to its
+  largest element.
+- **`reward/concentration`** plots `max(R)/mean(R)`, `median(R)/mean(R)` and
+  `min(R)/mean(R)`. Ratios, not levels: `log_z` is free and absorbs any constant
+  offset in `log R`, and the `power` transform's floor is recomputed from each
+  batch's own maximum, so the absolute reward level drifts between steps for
+  reasons unrelated to the policy.
+- **`reward/effective_support`** plots
+  `exp(entropy(softmax(beta * score)))`, the number of molecules in a batch the
+  reward effectively spreads over, with the batch's valid-molecule count drawn
+  as the ceiling. Driven toward 1 the step demands a near-degenerate policy and
+  collapse follows; pinned at the batch size the step asks for nothing and the
+  policy stays on its pretrained prior.
+- **`train/batch_health`** plots the valid, synthesizable and unique fractions of
+  each generated batch. Uniqueness is the only one of the three that reveals mode
+  collapse while validity holds.
+
+They are read together. The acquisition rewards molecules the surrogate is
+*uncertain* about, so a policy can raise `acq` by moving away from the data the
+surrogate was fitted on: rising `acq` alongside falling validity or uniqueness is
+that, not learning.
+
+The legacy `sampler/s3gfn/reward/trajectory` plots the **post-transform** score,
+which the loss multiplies by `beta` to get `log R`. Under the `power` transform
+that score is `log(acq)` and therefore negative; the reward itself,
+`exp(beta * score)`, is always positive.
+
 ## Failure Behavior
 
 General and implementation-specific diagnostic computation is best effort. A

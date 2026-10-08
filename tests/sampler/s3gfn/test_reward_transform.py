@@ -119,15 +119,28 @@ def test_power_rejects_negative_scores() -> None:
 def test_exponential_accepts_negative_scores() -> None:
     """The default transform is defined for scores of either sign."""
     scores = [-1.0, 1.0]
-    assert (
-        _score_candidates(
-            _acquisition(scores),
-            _candidates(2),
-            cost_fn=None,
-            transform="exponential",
-        )
-        == scores
+    acq_scores, transformed = _score_candidates(
+        _acquisition(scores),
+        _candidates(2),
+        cost_fn=None,
+        transform="exponential",
     )
+    # The untransformed acq is returned alongside, and exponential is identity.
+    assert acq_scores == scores
+    assert transformed == scores
+
+
+def test_power_returns_the_untransformed_acq_alongside() -> None:
+    """Diagnostics need acq itself, not only the logarithm the loss consumes."""
+    scores = [1.0, 100.0]
+    acq_scores, transformed = _score_candidates(
+        _acquisition(scores),
+        _candidates(2),
+        cost_fn=None,
+        transform="power",
+    )
+    assert acq_scores == scores
+    assert transformed == pytest.approx([math.log(1.0), math.log(100.0)])
 
 
 def test_power_with_a_log_scale_acquisition_is_rejected() -> None:

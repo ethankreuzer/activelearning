@@ -63,7 +63,12 @@ class _PreparedMoleculeBatch:
     input_ids : Tensor
         Padded token ids for ``smiles`` on the model device.
     reward_scores : Tensor
-        Acquisition reward scores associated with ``smiles`` in float32.
+        Transformed acquisition scores associated with ``smiles`` in float32.
+        The loss multiplies these by ``beta`` to obtain ``log R``.
+    acq_scores : tuple[float, ...]
+        The untransformed acquisition values (``acq``) aligned with ``smiles``,
+        kept for diagnostics only. Unlike ``reward_scores`` these do not change
+        meaning with the reward transform, so they are comparable across arms.
     fidelity_indices : Tensor or None
         Optional terminal fidelity-action indices aligned with ``smiles``.
     synthesizable : tuple[bool, ...]
@@ -73,6 +78,7 @@ class _PreparedMoleculeBatch:
     smiles: tuple[str, ...]
     input_ids: Tensor
     reward_scores: Tensor
+    acq_scores: tuple[float, ...]
     synthesizable: tuple[bool, ...]
     fidelity_indices: Tensor | None = None
 
@@ -690,6 +696,11 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
             auxiliary_loss=auxiliary_loss,
             log_z=float(model.log_z.detach().item()),
             raw_reward_scores=prepared.reward_scores.detach().cpu().tolist(),
+            acq_scores=prepared.acq_scores,
+            # Canonical SMILES, so a repeat is the same molecule: this is the only
+            # per-step reading of mode collapse that keeps validity high.
+            unique_count=len(set(prepared.smiles)),
+            beta=self.beta,
         )
         return (
             self.batch_size,
@@ -848,6 +859,7 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
                     dtype=torch.float32,
                     device=empty_ids.device,
                 ),
+                acq_scores=(),
                 synthesizable=(),
                 fidelity_indices=canonical_fidelity_indices,
             )
@@ -862,7 +874,7 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
                 ),
             )
         ]
-        raw_scores = _score_candidates(
+        acq_scores, raw_scores = _score_candidates(
             acquisition,
             candidates,
             cost_fn=cost_fn,
@@ -880,6 +892,7 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
                 dtype=torch.float32,
                 device=input_ids.device,
             ),
+            acq_scores=tuple(acq_scores),
             synthesizable=tuple(labels),
             fidelity_indices=canonical_fidelity_indices,
         )
@@ -1178,8 +1191,18 @@ def _score_candidates(
     *,
     cost_fn: Callable[[Sequence[Candidate]], list[float]] | None,
     transform: RewardTransform,
-) -> list[float]:
-    """Score candidates, optionally inverse-cost weighted, and shape the reward."""
+) -> tuple[list[float], list[float]]:
+    """Score candidates, optionally inverse-cost weighted, and shape the reward.
+
+    Returns
+    -------
+    tuple[list[float], list[float]]
+        The acquisition values exactly as ``acquisition.score`` returned them
+        (``acq``), and the transformed scores the loss multiplies by ``beta``.
+        Both are kept because ``acq`` is a fixed function of the molecule while
+        the transformed score changes meaning with the transform, so diagnostics
+        can plot progress on one scale whatever the reward shape.
+    """
     scores = (
         acquisition.score(candidates)
         if cost_fn is None
@@ -1193,4 +1216,4 @@ def _score_candidates(
     score_values = [float(score) for score in scores]
     if not all(math.isfinite(score) for score in score_values):
         raise ValueError("Acquisition returned a non-finite score.")
-    return apply_reward_transform(transform, score_values)
+    return score_values, apply_reward_transform(transform, score_values)

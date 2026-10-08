@@ -601,6 +601,7 @@ def test_generated_batch_routes_synthesizable_and_negative_replays(
         smiles=("positive", "negative"),
         input_ids=torch.tensor([[1, 2, 0], [1, 3, 0]]),
         reward_scores=torch.tensor([1.0, 0.0]),
+        acq_scores=(1.0, 0.0),
         synthesizable=(True, False),
     )
 
@@ -726,6 +727,11 @@ def test_round_metrics_aggregate_scalars_and_figures(
         "sampler/s3gfn/training_losses",
         "sampler/s3gfn/log_z",
         "sampler/s3gfn/reward/trajectory",
+        "sampler/s3gfn/reward/concentration",
+        "sampler/s3gfn/reward/effective_support",
+        "sampler/s3gfn/train/batch_health",
+        # No acq/trajectory: these steps recorded no acq_scores, and that figure
+        # plots acq itself rather than the post-transform score.
     }
     assert all(isinstance(figure, Figure) for figure in figure_calls.values())
     training_axis = figure_calls["sampler/s3gfn/training_losses"].axes[0]

@@ -28,7 +28,9 @@ score here stays in log space throughout, so no intermediate under- or overflows
 from __future__ import annotations
 
 import math
-from collections.abc import Callable
+import statistics
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from typing import Literal
 
 RewardTransform = Literal["exponential", "power"]
@@ -75,6 +77,75 @@ _REWARD_TRANSFORMS: dict[str, Callable[[list[float]], list[float]]] = {
     "exponential": _exponential_scores,
     "power": _power_scores,
 }
+
+
+@dataclass(frozen=True)
+class RewardConcentration:
+    """How concentrated one batch's reward is across its molecules.
+
+    Attributes
+    ----------
+    ratio_max, ratio_median, ratio_min : float
+        ``R / mean(R)`` for the batch's largest, middle and smallest reward.
+    effective_support : float
+        ``exp(entropy(softmax(beta * score)))``: the number of molecules the
+        reward effectively spreads mass over, from 1.0 when one molecule carries
+        all of it to the batch size when the reward is flat.
+    """
+
+    ratio_max: float
+    ratio_median: float
+    ratio_min: float
+    effective_support: float
+
+
+def reward_concentration(
+    transformed_scores: Sequence[float],
+    beta: float,
+) -> RewardConcentration:
+    """Summarise the reward reweighting one batch asks the policy for.
+
+    Relative trajectory balance drives ``log p_policy = log p_prior +
+    beta * score - log_z`` (:mod:`activelearning.sampler.s3gfn.losses`), so
+    ``softmax(beta * score)`` over the batch is exactly the reweighting of the
+    prior that the step requests, and ``R / mean(R)`` is that weight times the
+    batch size.
+
+    Both are invariant to a constant offset in ``log R``. That matters twice over:
+    ``log_z`` is free and absorbs such an offset anyway, and under ``power`` the
+    floor is recomputed from each batch's own maximum, so the absolute reward
+    level drifts between steps for reasons unrelated to the policy. These
+    summaries describe what the step demands without that drift.
+
+    Parameters
+    ----------
+    transformed_scores : Sequence[float]
+        One batch of post-transform scores, non-empty, as the loss receives them.
+    beta : float
+        The reward's inverse temperature (``exponential``) or exponent
+        (``power``).
+
+    Returns
+    -------
+    RewardConcentration
+        The ratio summary and the effective support.
+    """
+    log_rewards = [beta * float(score) for score in transformed_scores]
+    # Shift by the maximum before exponentiating, so every exponent is <= 0 and
+    # nothing overflows however large beta is.
+    largest = max(log_rewards)
+    exponentials = [math.exp(value - largest) for value in log_rewards]
+    # The largest element contributes exp(0) == 1, so the total is never zero.
+    total = sum(exponentials)
+    weights = [value / total for value in exponentials]
+    count = len(weights)
+    entropy = -sum(weight * math.log(weight) for weight in weights if weight > 0.0)
+    return RewardConcentration(
+        ratio_max=max(weights) * count,
+        ratio_median=float(statistics.median(weights)) * count,
+        ratio_min=min(weights) * count,
+        effective_support=math.exp(entropy),
+    )
 
 
 def apply_reward_transform(
