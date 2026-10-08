@@ -79,7 +79,14 @@
 #SBATCH --mem=510000M
 #SBATCH --time=12:00:00
 #SBATCH --job-name=ampc_reward_shape
-#SBATCH --account=def-alexhg_gpu
+# def-yvesbrun_gpu, despite its lower user-level FairShare. It is the only one of
+# these accounts with a real allocation: account RawShares 14353 and LevelFS 1.57
+# (above 1, so under-served). def-alexhg_gpu and def-pr61079_gpu carry
+# RawShares=1 and NormShares 0.000000, and their LevelFS of inf is an artifact of
+# zero usage against zero shares -- it collapses on first use. `sshare -U -u
+# $USER` hides this, because it prints only the user's share *within* an account;
+# check the account with `sshare -l -A <acct>`.
+#SBATCH --account=def-yvesbrun_gpu
 #SBATCH --output=slurm_logs/ampc_reward_shape_%j.out
 #SBATCH --error=slurm_logs/ampc_reward_shape_%j.err
 
