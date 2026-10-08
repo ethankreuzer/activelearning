@@ -725,3 +725,34 @@ def test_molecule_dkl_exact_multi_fidelity_pool_config_parses() -> None:
     assert config.selector.type == "CostAwareSelector"
     assert config.oracle.type == "XTBIPEAOracle"
     assert config.sampler.fidelities == [1, 2, 3]
+
+
+def test_ampc_reward_shape_config_parses() -> None:
+    """Ensure the reward-shape study config matches the schema.
+
+    Its defining settings are the restored surrogate and the single round, which
+    must go together: ``state_path`` replaces every fit, so a second round would
+    discard what the first observed.
+    """
+    config_path = REPOSITORY_ROOT / "config" / "ampc" / "reward_shape.yaml"
+
+    config = load_and_parse(config_path, ActiveLearningConfig)
+
+    assert config.surrogate.type == "ExactDKLSurrogate"
+    assert config.surrogate.state_path == Path(
+        "outputs/ampc/exact_dkl_top_n/balanced_25000_nolayer/surrogate_state.pt"
+    )
+    assert config.budget.max_rounds == 1
+    # No trainable layer, matching the architecture the saved state was fitted
+    # with; a mismatch here would surface only as a load_state_dict error.
+    assert config.surrogate.encoder.latent_dim is None
+    assert config.surrogate.encoder.activation == "none"
+    # Generated molecules are in no cache, so inference has to be allowed.
+    assert config.surrogate.encoder.cache_only is False
+    # The reward transform needs a value-scale score: `power` logs it itself.
+    assert config.acquisition.type == "QLowerBoundMaxValueEntropy"
+    assert config.acquisition.log_space is True
+    assert config.acquisition.log_output is False
+    assert config.sampler.type == "S3GFNSampler"
+    assert config.sampler.reward_transform == "power"
+    assert config.oracle.type == "Dock3Oracle"

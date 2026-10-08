@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from pathlib import Path
 from typing import Any, Optional
 
 import gpytorch
@@ -40,6 +41,7 @@ class ExactDKLSurrogate(DeepKernelSurrogate):
         standardize_outputs: bool = True,
         scale_inputs: bool = False,
         prior_mean: Optional[float] = None,
+        state_path: Optional[Path] = None,
     ) -> None:
         """Initialize an exact-GP DKL surrogate.
 
@@ -62,6 +64,10 @@ class ExactDKLSurrogate(DeepKernelSurrogate):
             Fixed GP prior mean on the original target scale, held constant
             during the fit. ``None`` learns the constant with the other
             hyperparameters.
+        state_path : Path, optional
+            Saved state from an earlier fit of this same architecture and
+            training set. When given, :meth:`fit` restores it instead of
+            training. ``None`` trains normally.
         """
         super().__init__(
             encoder=encoder,
@@ -72,6 +78,33 @@ class ExactDKLSurrogate(DeepKernelSurrogate):
             standardize_outputs=standardize_outputs,
         )
         self._prior_mean = None if prior_mean is None else float(prior_mean)
+        self._state_path = None if state_path is None else Path(state_path)
+
+    def fit(self, observations: Iterable[Observation]) -> None:
+        """Fit the surrogate, or restore it when a saved state was configured.
+
+        Parameters
+        ----------
+        observations : Iterable[Observation]
+            Observations to fit to, or, when ``state_path`` was given, the
+            observations the saved surrogate was fitted to. An empty iterable
+            leaves the surrogate unchanged.
+
+        Returns
+        -------
+        None
+            The fitted or restored model is stored on the surrogate in place.
+        """
+        if self._state_path is None:
+            super().fit(observations)
+            return
+        obs_list = list(observations)
+        if not obs_list:
+            return
+        self.restore(
+            obs_list,
+            torch.load(self._state_path, map_location="cpu", weights_only=True),
+        )
 
     def restore(
         self,

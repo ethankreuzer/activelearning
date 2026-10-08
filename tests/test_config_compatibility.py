@@ -34,6 +34,38 @@ def _set_dkl_encoder(
     config.surrogate.encoder = OmegaConf.create({"type": encoder_type})
 
 
+_STATE_PATH = "outputs/some_arm/surrogate_state.pt"
+
+
+def test_state_path_rejects_a_multi_round_budget() -> None:
+    """Restoring replaces every fit, so later rounds would learn nothing."""
+
+    def _reuse_a_fitted_surrogate(config: DictConfig) -> None:
+        config.surrogate.state_path = _STATE_PATH
+
+    with pytest.raises(ValidationError, match="state_path.*silently discarded"):
+        _parse_mutated_config(
+            "config/molecules/s3gfn_exact.yaml",
+            _reuse_a_fitted_surrogate,
+        )
+
+
+def test_state_path_is_accepted_for_a_single_round() -> None:
+    """One round is the case the restore exists for."""
+
+    def _reuse_for_one_round(config: DictConfig) -> None:
+        config.surrogate.state_path = _STATE_PATH
+        config.budget.max_rounds = 1
+
+    config = _parse_mutated_config(
+        "config/molecules/s3gfn_exact.yaml",
+        _reuse_for_one_round,
+    )
+
+    assert config.surrogate.state_path == Path(_STATE_PATH)
+    assert config.budget.max_rounds == 1
+
+
 def test_s3gfn_rejects_selfies_encoder() -> None:
     """S3-GFN must not feed generated SMILES to a SELFIES encoder."""
     with pytest.raises(

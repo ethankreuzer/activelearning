@@ -142,6 +142,7 @@ class ActiveLearningConfig(BaseModel):
             surrogate=self.surrogate,
             acquisition=self.acquisition,
             oracle=self.oracle,
+            budget=self.budget,
         )
         return self
 
@@ -434,6 +435,7 @@ def _validate_component_compatibility(
     surrogate: BaseModel,
     acquisition: BaseModel,
     oracle: BaseModel,
+    budget: BaseModel,
 ) -> None:
     """Reject parsed component combinations with incompatible contracts.
 
@@ -451,13 +453,25 @@ def _validate_component_compatibility(
         Parsed acquisition configuration.
     oracle : BaseModel
         Parsed oracle configuration.
+    budget : BaseModel
+        Parsed budget configuration, which fixes how many rounds may run.
 
     Raises
     ------
     ValueError
-        If a known sampler, surrogate, acquisition, or oracle contract is
+        If a known sampler, surrogate, acquisition, oracle or budget contract is
         incompatible with another configured component.
     """
+    if getattr(surrogate, "state_path", None) is not None:
+        max_rounds = getattr(budget, "max_rounds", None)
+        if max_rounds != 1:
+            raise ValueError(
+                "surrogate.state_path restores the saved parameters in place of "
+                "every fit, so past the first round the loop's own observations "
+                "would be silently discarded. Set budget.max_rounds=1 to reuse a "
+                f"fitted surrogate, or clear state_path to fit each round "
+                f"(max_rounds is currently {max_rounds!r})."
+            )
     encoder_component = getattr(surrogate, "encoder", None)
     encoder_representation = _encoder_molecule_representation(encoder_component)
     oracle_representation = _extract_molecule_representation(oracle)

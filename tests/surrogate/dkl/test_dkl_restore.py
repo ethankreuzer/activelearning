@@ -8,6 +8,8 @@ the parameters instead of training.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 import torch
 
@@ -131,3 +133,50 @@ def test_restore_requires_observations() -> None:
     fitted.fit(_observations())
     with pytest.raises(ValueError, match="without observations"):
         _surrogate().restore([], _saved_state(fitted))
+
+
+def _state_file(surrogate: ExactDKLSurrogate, tmp_path: Path) -> Path:
+    """Write a fitted surrogate's state where ``state_path`` can load it."""
+    path = tmp_path / "surrogate_state.pt"
+    torch.save(_saved_state(surrogate), path)
+    return path
+
+
+def test_state_path_makes_fit_restore_instead_of_training(tmp_path: Path) -> None:
+    """A study that varies something downstream reuses one fit, not many."""
+    fitted = _surrogate()
+    fitted.fit(_observations())
+    expected_mean, expected_std = _predict(fitted)
+
+    restored = _surrogate(state_path=_state_file(fitted, tmp_path))
+    epochs: list[int] = []
+    restored.set_epoch_callback(lambda epoch, loss: epochs.append(epoch))
+    restored.fit(_observations())
+
+    assert epochs == []
+    assert restored.is_fitted()
+    mean, std = _predict(restored)
+    assert torch.allclose(mean, expected_mean, atol=1e-5)
+    assert torch.allclose(std, expected_std, atol=1e-5)
+
+
+def test_state_path_still_leaves_an_empty_fit_alone(tmp_path: Path) -> None:
+    """``fit`` documents that no observations leaves the surrogate unchanged."""
+    fitted = _surrogate()
+    fitted.fit(_observations())
+
+    restored = _surrogate(state_path=_state_file(fitted, tmp_path))
+    restored.fit([])
+
+    assert not restored.is_fitted()
+
+
+def test_without_state_path_fit_still_trains() -> None:
+    """The restore path must not disturb the ordinary fit."""
+    surrogate = _surrogate()
+    epochs: list[int] = []
+    surrogate.set_epoch_callback(lambda epoch, loss: epochs.append(epoch))
+    surrogate.fit(_observations())
+
+    assert epochs
+    assert surrogate.is_fitted()

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field, PrivateAttr
@@ -148,10 +149,23 @@ class ExactDKLSurrogateConfig(DKLSurrogateConfigBase):
         Fixed GP prior mean on the original target scale, such as the mean
         target of the library the candidates come from. Use it when the training
         set is not a sample of that library. ``null`` learns the constant.
+    state_path : Path, optional
+        A ``surrogate_state.pt`` written by an earlier fit of **this same**
+        architecture and training set. When set, every fit restores those
+        parameters instead of training, which makes a study that varies
+        something downstream of the surrogate reuse one fit exactly rather than
+        refitting per arm.
+
+        The saved state carries parameters only, so the dataset and the encoder
+        must still produce the model this surrogate builds; a mismatch surfaces
+        as a ``RuntimeError`` from ``load_state_dict``. Because the restore
+        replaces training on *every* round, it is rejected for runs of more than
+        one round, where it would silently discard everything the loop observed.
     """
 
     type: Literal["ExactDKLSurrogate"] = "ExactDKLSurrogate"
     prior_mean: Optional[float] = None
+    state_path: Optional[Path] = None
 
     def _surrogate_class(self) -> type[Surrogate]:
         """Return the exact DKL surrogate class."""
@@ -161,7 +175,7 @@ class ExactDKLSurrogateConfig(DKLSurrogateConfigBase):
 
     def _additional_build_kwargs(self) -> dict[str, Any]:
         """Return the exact GP constructor arguments."""
-        return {"prior_mean": self.prior_mean}
+        return {"prior_mean": self.prior_mean, "state_path": self.state_path}
 
 
 class VariationalDKLSurrogateConfig(DKLSurrogateConfigBase):

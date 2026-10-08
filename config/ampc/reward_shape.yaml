@@ -1,0 +1,195 @@
+# Reward-shape study: one active-learning round per reward configuration, with
+# the surrogate held fixed.
+#
+# The question is not how well the surrogate predicts -- that is settled in
+# outputs/ampc/exact_dkl_top_n/balanced_25000_nolayer -- but whether the GIBBON
+# acquisition built on it can train an S3-GFN policy at all. Two earlier arms
+# bracket the failure modes: exponential at beta=100 was inert (the policy never
+# left its pretrained prior) and power at beta=1 destroyed it (validity fell to
+# 0.28%, and 2,000,000 generation attempts yielded nothing). So this study varies
+# only the reward transform and beta.
+#
+# The surrogate is RESTORED, not refitted: surrogate.state_path loads the fitted
+# no-layer arm's parameters in place of training, so every arm shares one
+# surrogate exactly and nothing but the reward differs between them. That is also
+# why budget.max_rounds is 1 -- restoring replaces every fit, so a second round
+# would silently discard what the first one observed, and the config validator
+# rejects that combination.
+#
+#   sbatch jobs/reward_shape.sh <exponential|power> <beta> [seed]
+#
+# Prerequisites:
+#   - uv sync --extra molecules
+#   - the collaborator package and checkpoint under minimol_ampc_encoder/
+#   - outputs/ampc/exact_dkl_top_n/balanced_25000_nolayer/surrogate_state.pt,
+#     from sbatch jobs/exact_dkl_balanced.sh 25000 none
+#   - cache/ampc/exact_dkl_top_n/balanced_25000.npy, from
+#     scripts/exact_dkl_balanced_prepare.py
+#   - the GP-MoLFormer weights in the HuggingFace cache, pre-fetched on a login
+#     node, since compute nodes have no internet
+#
+# Per-arm overrides, all from jobs/reward_shape.sh:
+#   sampler.reward_transform, sampler.beta, run_writer.output_dir,
+#   logger.loggers.0.run_name, logger.loggers.1.run_name, logger.loggers.1.tags
+
+runtime:
+  device: cuda
+  # 32, matching the arm the state was saved from. The restore would otherwise
+  # load float32 parameters into a float64 model.
+  precision: 32
+  seed: 42
+
+dataset:
+  # The exact GP conditions on its training data, which the saved state does not
+  # carry, so the restore has to be handed the same 25,000 molecules the fit saw:
+  # the library-proportional "balanced" set, top band floored at 5% of the budget.
+  type: ListDataset
+  initial_data:
+    path: data/ampc_balanced_25000.csv
+    x_columns: SMILE
+    y_column: y
+    fidelity_column: fidelity
+
+surrogate:
+  type: ExactDKLSurrogate
+  target_fidelity: 1
+  # Restore instead of fit. The architecture below must still build the model the
+  # state was saved from -- latent_dim null and activation none -- or
+  # load_state_dict raises.
+  state_path: outputs/ampc/exact_dkl_top_n/balanced_25000_nolayer/surrogate_state.pt
+  encoder:
+    type: MiniMolAmpcSmilesEncoder
+    checkpoint_path: minimol_ampc_encoder/model/final.pt
+    package_path: minimol_ampc_encoder
+    # cuda and a real batch size, unlike the scoring config: the policy generates
+    # molecules that are not in any cache, so MiniMol inference actually runs here.
+    device: cuda
+    batch_size: 64
+    cache_size: 4096
+    # false, unlike the fit and scoring runs. Generated SMILES are never in the
+    # training set's cache, and cache_only turns a miss into a RuntimeError, so
+    # leaving it true would abort the first time the policy produced a molecule.
+    cache_only: false
+    # No trainable layer: the kernel sees the 512-d fingerprints directly,
+    # divided by one fixed scalar. This is the arm whose uncertainty is not
+    # collapsed -- 88% of truths within 2 std on unseen ampc_331k, against 6%
+    # for the width-256 arm.
+    latent_dim: null
+    activation: none
+    # The training molecules are an exact ordered prefix of this cache, so the
+    # restore re-encodes them for free. Reading does not rewrite the file, and
+    # generated molecules simply fall through to live inference.
+    feature_cache_path: cache/ampc/exact_dkl_top_n/balanced_25000.npy
+  training_params:
+    # Unused while state_path is set; kept so the file still records how the
+    # restored parameters were obtained.
+    epochs: 1000
+    lr: 1.0e-3
+  standardize_outputs: true
+
+acquisition:
+  # GIBBON on the VALUE scale: log_space computes the information gain in log
+  # space so it never underflows to exactly zero, while log_output=false returns
+  # it as a value. The reward transform needs a value, because `power` takes the
+  # logarithm itself and would otherwise take it twice -- S3GFNSampler rejects
+  # that combination outright.
+  type: QLowerBoundMaxValueEntropy
+  candidate_set_spec:
+    # The max-value support is the 25,000-molecule training set, well under the
+    # fallback, so every arm sees exactly the same support.
+    type: TrainDataCandidateSetSpec
+    fallback_size: 100000
+    seed: 42
+  num_mv_samples: 10
+  score_chunk_size: 5000
+  maximize: true
+  log_space: true
+  log_output: false
+
+sampler:
+  type: S3GFNSampler
+  # Generate a 100k-candidate pool, from which the round budget selects 2,000.
+  n_samples: 100000
+  fidelities: [1]
+  model_name_or_path: ibm-research/GP-MoLFormer-Uniq
+  tokenizer_name_or_path: ibm-research/MoLFormer-XL-both-10pct
+  trust_remote_code: true
+  performance_mode: optimized
+  max_length: 80
+  batch_size: 64
+  replay_batch_size: 64
+  generation_batch_size: 128
+  # 10,000, matching the September reward arms rather than this study family's
+  # 2,500, so the per-step curves have room to show a trend and so the two
+  # earlier runs stay comparable.
+  n_train_steps: 10000
+  num_warmup_steps: 10
+  # Both overridden per arm. The default is the middle of the band
+  # scripts/reward_shape_preview.py measured on gp_molformer_set, the stand-in
+  # for what the policy generates: beta 0.05 leaves the reward spread over 63 of
+  # 64 molecules in a batch (the policy would not move), beta 0.25 concentrates
+  # it on 6.4, and beta=1 -- the September arm -- collapsed the policy outright.
+  # docs/tutorials/gflownet_sampler.md recommends 0.01-0.5 for a score spanning
+  # orders of magnitude, which information gain does.
+  reward_transform: power
+  beta: 0.2
+  aux_coefficient: 0.001
+  sa_threshold: 4.0
+
+selector:
+  type: CostAwareSelector
+
+oracle:
+  type: Dock3Oracle
+  mol_repr: smiles
+  indock_template: /home/ethankrz/dock_smiles/ampc_dockfiles/INDOCK
+  dockfiles_dir: /home/ethankrz/dock_smiles/ampc_dockfiles
+  fidelity_costs:
+    1: 1.0
+  fidelity_confidences:
+    1: 1.0
+  # null sizes the docking thread pool from the CPUs this job holds.
+  num_workers: null
+  ligbuild_timeout: 150
+  hitrate_params: ampc_hitrate_fits/fitted_params.json
+  score_pprop_table: ampc_hitrate_fits/data/full_scores.df
+  hitrate_target: ampc
+  pki_threshold: 6.5
+
+budget:
+  # 2,000 docking evaluations in the one round, not the 10,000 the other AmpC
+  # configs use: at ~32 core-seconds per molecule that is ~20 minutes on 48 CPUs
+  # rather than ~100, and 2,000 is ample to measure top-k enrichment against a
+  # random draw from the same pool.
+  available_budget: 2000.0
+  schedule:
+    type: constant
+    value: 2000.0
+  # Required with surrogate.state_path, and the point of the study: train the
+  # policy once against a fixed surrogate and look at what it generated.
+  max_rounds: 1
+
+logger:
+  # Run names and tags are overridden per arm by jobs/reward_shape.sh.
+  type: MultiLogger
+  loggers:
+    - type: ConsoleLogger
+      project_name: ampc-reward-shape
+      run_name: reward-shape
+    - type: WandbLogger
+      project_name: ampc-reward-shape
+      run_name: reward-shape
+      entity: models-mila5723
+      group: reward-shape
+      tags: [reward-shape]
+
+run_writer:
+  # Overridden per arm: starting a run truncates round_history.jsonl, so two arms
+  # must never share a directory.
+  type: JSONLinesRunWriter
+  output_dir: outputs/ampc/reward_shape/default
+  write_samples: true
+  # The per-round CSV of every generated molecule with its acquisition score is
+  # what the top-k enrichment is computed from after the round.
+  write_sample_scores: true
+  write_config: true
