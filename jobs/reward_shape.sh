@@ -158,6 +158,15 @@ Submitted with: sbatch jobs/reward_shape.sh $*   (Slurm job ${SLURM_JOB_ID:-unkn
 printf '%s\n' "${WANDB_NOTES}" > "${OUTPUT_DIR}/arm_description.txt"
 
 RUN_NAME="${ARM//_/-}-${SLURM_JOB_ID:-local}"
+TAGS="reward-shape,${TRANSFORM},beta${BETA},nolayer,restored-state,fp32,1-round${SEED_TAG}"
+
+# The whole logger is restated as one YAML value rather than overridden field by
+# field. OmegaConf.from_dotlist reads every path segment as a dict key, so
+# `logger.loggers.0.run_name=...` builds a dict under `loggers` and merging that
+# onto the config's list dies with "Cannot merge DictConfig with ListConfig".
+# Lists are replaced wholesale on merge, which is why job_10k_eager.sh and the
+# reward_* overlays restate the logger too.
+LOGGER="logger={type: MultiLogger, loggers: [{type: ConsoleLogger, project_name: ampc-reward-shape, run_name: ${RUN_NAME}}, {type: WandbLogger, project_name: ampc-reward-shape, run_name: ${RUN_NAME}, entity: models-mila5723, group: reward-shape, tags: [${TAGS}]}]}"
 
 # scripts/run_with_sigterm_flush.py wraps activelearning.main so the SIGTERM
 # Slurm sends at the wall clock becomes a clean shutdown, flushing buffered
@@ -170,9 +179,7 @@ uv run --no-sync python scripts/run_with_sigterm_flush.py \
   "sampler.beta=${BETA}" \
   "${SEED_OVERRIDE[@]}" \
   "run_writer.output_dir=${OUTPUT_DIR}" \
-  "logger.loggers.0.run_name=${RUN_NAME}" \
-  "logger.loggers.1.run_name=${RUN_NAME}" \
-  "logger.loggers.1.tags=[reward-shape,${TRANSFORM},beta${BETA},nolayer,restored-state,fp32,1-round${SEED_TAG}]" \
+  "${LOGGER}" \
   "${@:4}"
 
 echo
