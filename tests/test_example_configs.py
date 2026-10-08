@@ -501,7 +501,9 @@ def test_molecule_s3gfn_minimol_ampc_variational_single_fidelity_config_parses()
 @pytest.mark.parametrize(
     ("overlay_name", "reward_transform", "beta"),
     [
-        pytest.param("reward_power", "power", 0.5, id="power"),
+        # 1.0, as reward_power.yaml has set since 39f0d16 "run the power reward
+        # arm at beta=1"; the arm that ran (Slurm job 4177912) used that value.
+        pytest.param("reward_power", "power", 1.0, id="power"),
         pytest.param("reward_exponential", "exponential", 100.0, id="exponential"),
     ],
 )
