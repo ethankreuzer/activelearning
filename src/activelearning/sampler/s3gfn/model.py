@@ -31,6 +31,7 @@ from activelearning.sampler.s3gfn._optional import require_transformers
 from activelearning.sampler.s3gfn.fidelity import FidelityActionHead
 from activelearning.sampler.s3gfn.losses import (
     negative_replay_contrastive_loss,
+    relative_trajectory_balance_diagnostics,
     relative_trajectory_balance_loss,
     sequence_log_probabilities,
     sequence_log_probabilities_from_logits,
@@ -135,6 +136,7 @@ class S3GFNModel(nn.Module):
         self.eos_token_id = int(tokenizer.eos_token_id)
         self.log_z = nn.Parameter(torch.tensor(float(initial_log_z)))
         self._last_auxiliary_loss: Tensor | None = None
+        self._last_on_policy_diagnostics: Tensor | None = None
         self._policy_forward_compiled = False
         self._compiled_policy_forward: Any | None = None
         self._compiled_prior_scorer: Any | None = None
@@ -284,6 +286,26 @@ class S3GFNModel(nn.Module):
         if self._last_auxiliary_loss is None:
             return None
         return float(self._last_auxiliary_loss.item())
+
+    @property
+    def last_on_policy_diagnostics(self) -> tuple[float, float, float] | None:
+        """Return the latest on-policy batch's RTB residual summary.
+
+        Returns
+        -------
+        tuple[float, float, float] or None
+            The residual mean, the residual standard deviation and the mean of
+            ``log p_policy - log p_prior``, in nats and as they stood *before*
+            the update that batch drove; ``None`` until an on-policy loss has
+            been evaluated. See
+            :func:`~activelearning.sampler.s3gfn.losses.relative_trajectory_balance_diagnostics`.
+        """
+        if self._last_on_policy_diagnostics is None:
+            return None
+        residual_mean, residual_std, log_ratio_mean = (
+            self._last_on_policy_diagnostics.tolist()
+        )
+        return float(residual_mean), float(residual_std), float(log_ratio_mean)
 
     def train(self, mode: bool = True) -> "S3GFNModel":
         """Set the policy's training mode and keep the prior in evaluation.
@@ -801,6 +823,14 @@ class S3GFNModel(nn.Module):
             positive_input_ids,
             fidelity_indices=fidelity_indices,
         )
+        if policy_log_probabilities.numel() > 0:
+            self._last_on_policy_diagnostics = relative_trajectory_balance_diagnostics(
+                policy_log_probabilities=policy_log_probabilities,
+                prior_log_probabilities=prior_log_probabilities,
+                reward_scores=reward_scores,
+                log_z=self.log_z,
+                beta=beta,
+            )
         return relative_trajectory_balance_loss(
             policy_log_probabilities=policy_log_probabilities,
             prior_log_probabilities=prior_log_probabilities,

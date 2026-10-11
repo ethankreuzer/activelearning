@@ -755,4 +755,10 @@ def test_ampc_reward_shape_config_parses() -> None:
     assert config.acquisition.log_output is False
     assert config.sampler.type == "S3GFNSampler"
     assert config.sampler.reward_transform == "power"
+    # A fixed floor, so the reward is a function of the molecule alone, and a
+    # log_z that starts off zero and can move: left at 0 with the default 1e-3
+    # rate, the 2026-10-08 power arms collapsed.
+    assert config.sampler.log_score_floor == -100.0
+    assert config.sampler.initial_log_z < 0.0
+    assert config.sampler.log_z_learning_rate == 0.01
     assert config.oracle.type == "Dock3Oracle"

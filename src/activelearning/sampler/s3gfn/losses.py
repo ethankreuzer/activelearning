@@ -180,6 +180,68 @@ def relative_trajectory_balance_loss(
     return residual.square().mean()
 
 
+def relative_trajectory_balance_diagnostics(
+    policy_log_probabilities: Tensor,
+    prior_log_probabilities: Tensor,
+    reward_scores: Tensor,
+    log_z: Tensor,
+    beta: float = 1.0,
+) -> Tensor:
+    """Summarise one batch's RTB residual without building a graph.
+
+    The loss is the mean *squared* residual, which cannot tell a ``log_z`` that
+    sits at the wrong level from a policy that has not matched the reward's
+    shape. The signed mean isolates the first and the standard deviation the
+    second. The mean log ratio ``log p_policy - log p_prior`` is, on molecules
+    the policy itself sampled, a one-batch estimate of ``KL(policy || prior)``:
+    how far fine-tuning has moved the policy.
+
+    Parameters
+    ----------
+    policy_log_probabilities : Tensor
+        Policy sequence log probabilities, one per trajectory.
+    prior_log_probabilities : Tensor
+        Frozen prior sequence log probabilities, aligned with the policy's.
+    reward_scores : Tensor
+        Acquisition reward scores ``r(x)``, with ``log R(x) = beta * r(x)``.
+    log_z : Tensor
+        Scalar log normalizer.
+    beta : float
+        Reward inverse-temperature coefficient.
+
+    Returns
+    -------
+    Tensor
+        A detached float64 tensor ``[residual mean, residual standard deviation,
+        mean log ratio]``, in nats. The standard deviation is the population one,
+        so a single trajectory gives zero rather than NaN.
+
+    Raises
+    ------
+    ValueError
+        If the batch is empty.
+    """
+    if policy_log_probabilities.numel() == 0:
+        raise ValueError("RTB diagnostics need at least one trajectory.")
+    with torch.no_grad():
+        log_ratio = (
+            policy_log_probabilities.detach().double()
+            - prior_log_probabilities.detach().double()
+        )
+        residual = (
+            log_z.detach().double().reshape(())
+            + log_ratio
+            - beta * reward_scores.detach().double()
+        )
+        return torch.stack(
+            [
+                residual.mean(),
+                (residual - residual.mean()).square().mean().sqrt(),
+                log_ratio.mean(),
+            ]
+        )
+
+
 def negative_replay_contrastive_loss(
     positive_log_probabilities: Tensor,
     negative_log_probabilities: Tensor,

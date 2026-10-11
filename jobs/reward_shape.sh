@@ -3,7 +3,17 @@
 # surrogate is restored rather than refitted, so the only thing that differs
 # between arms is the reward the S3-GFN policy is trained against.
 #
-#   sbatch jobs/reward_shape.sh <exponential|power> <beta> [seed]
+#   sbatch jobs/reward_shape.sh <exponential|power> <beta> <initial_log_z> [seed]
+#
+# initial_log_z is where the RTB normalizer starts, and it is required because
+# there is no safe default: it is log E[R] under the pretrained prior, which
+# depends on beta and on the log-score floor, and is not proportional to either.
+# Read it per arm from the log_Z column of
+#   python -m scripts.reward_shape_preview <scored run> --log-score-floor -100
+# and pass 0 for exponential arms, where it measures 0.000. The four power arms
+# of 2026-10-08 (jobs 5024309, 5024311, 5024318, 5024345) started at 0, 9-23
+# nats from the truth, and collapsed to 0.4% validity within ~1000 updates; see
+# REWARD_SHAPE_LOGZ_FIX.md.
 #
 # beta means different things in the two transforms and the grids are NOT
 # interchangeable:
@@ -47,6 +57,11 @@
 # at 64 with a ratio of exactly 1 and never moved it. Nothing in between has been
 # run, which is what the arms below are for, so they span the interior widely
 # instead of clustering.
+#
+# That table and the paragraph below were measured under the old PER-BATCH floor
+# (20 nats below each batch's own best). The arms now run with a fixed floor of
+# LOG_SCORE_FLOOR on log(acq), so rerun the preview with --log-score-floor before
+# reading support numbers off it.
 #
 # Note what the floor fraction of 0.969 means, identically for every power arm:
 # about 62 of 64 molecules in a batch are tied, so the reward is effectively
@@ -94,17 +109,29 @@ set -euo pipefail
 
 TRANSFORM="${1:-}"
 BETA="${2:-}"
-SEED="${3:-}"
+INITIAL_LOG_Z="${3:-}"
+SEED="${4:-}"
 if [[ ! "${TRANSFORM}" =~ ^(exponential|power)$ \
       || ! "${BETA}" =~ ^[0-9]*\.?[0-9]+$ \
+      || ! "${INITIAL_LOG_Z}" =~ ^-?[0-9]*\.?[0-9]+$ \
       || ! "${SEED}" =~ ^[0-9]*$ ]]; then
-  echo "usage: sbatch jobs/reward_shape.sh <exponential|power> <beta> [seed]" >&2
+  echo "usage: sbatch jobs/reward_shape.sh <exponential|power> <beta> <initial_log_z> [seed]" >&2
   exit 2
 fi
 
+# Fixed for the whole study, and stated here rather than left to the YAML so the
+# notes and tags below cannot drift from what the run was given.
+#   LOG_SCORE_FLOOR  lower bound on log(acq) under power; a constant, so a
+#                    molecule's reward no longer depends on its batch.
+#   LOG_Z_LR         learning rate of the log_z scalar (the policy's is 1e-4).
+LOG_SCORE_FLOOR="-100"
+LOG_Z_LR="0.01"
+
 # The arm name carries only the non-defaults, as the exact-DKL arms do:
-#   reward_<transform>_beta<beta>[_s<seed>]
-ARM="reward_${TRANSFORM}_beta${BETA}"
+#   reward_<transform>_beta<beta>_logz<initial_log_z>[_s<seed>]
+# The logz part also keeps these arms out of the directories of the 2026-10-08
+# ones, which started log_z at 0 under the per-batch floor.
+ARM="reward_${TRANSFORM}_beta${BETA}_logz${INITIAL_LOG_Z}"
 SEED_OVERRIDE=()
 SEED_TAG=""
 if [[ -n "${SEED}" ]]; then
@@ -136,7 +163,7 @@ export WANDB_DIR="${OUTPUT_DIR}"
 mkdir -p "${WANDB_DIR}" slurm_logs
 
 if [[ "${TRANSFORM}" == power ]]; then
-  REWARD_TEXT="R = acq ** ${BETA}, so the reward RATIO between two molecules follows the ratio of their information gains. The transform takes the logarithm itself, which is why the acquisition stays on the value scale. Within a batch the spread is floored at 20 nats below that batch's own best molecule, so R spans at most exp(20 * ${BETA}) there"
+  REWARD_TEXT="R = acq ** ${BETA}, so the reward RATIO between two molecules follows the ratio of their information gains. The transform takes the logarithm itself, which is why the acquisition stays on the value scale. log(acq) is floored at the FIXED value ${LOG_SCORE_FLOOR} nats, the same for every batch, so a molecule's reward depends on that molecule alone; everything below the floor is tied. Earlier arms floored 20 nats below each batch's own best instead, which made the reward level swing from batch to batch"
 else
   REWARD_TEXT="R = exp(${BETA} * acq), so the reward ratio follows the DIFFERENCE of the information gains. Generated molecules score ~1e-14 at the 99.9th percentile against a best of ~4e-3, so the bulk of a batch is expected to stay tied at this or any beta; this arm exists to demonstrate that limit"
 fi
@@ -150,15 +177,16 @@ Surrogate: RESTORED, NOT REFITTED. The exact GP (no inducing points, no minibatc
 Why this surrogate: it is the first in the study whose uncertainty is not collapsed -- 88% of truths within 2 std on unseen ampc_331k against 6% for the width-256 arm, and a GIBBON effective support of ~21 molecules rather than 2.
 Acquisition: GIBBON (QLowerBoundMaxValueEntropy), log_space=true so the information gain never underflows, log_output=false so it is returned on the VALUE scale, which is what the reward transform needs. Max-value support is the 25,000 training molecules.
 Reward: transform=${TRANSFORM}, beta=${BETA}. ${REWARD_TEXT}. The loss uses beta * score as log R, so R = exp(beta * score) is always positive even where the logged post-transform score is negative.
-What to read: the per-training-step figures sampler/s3gfn/acq/trajectory (is the policy finding more informative molecules), reward/effective_support (how many of the 64 molecules in a batch the reward spreads over -- toward 1 means collapse, toward 64 means the policy will not move), reward/concentration, and train/batch_health (valid / synthesizable / unique). acq rising while validity or uniqueness falls is the policy fleeing the data the GP was fitted on.
+Normalizer: log_z STARTS AT ${INITIAL_LOG_Z}, not 0, with learning rate ${LOG_Z_LR} (default 1e-3) and no weight decay. log_z estimates log E[R] under the pretrained prior; ${INITIAL_LOG_Z} is that value as measured for this beta and floor by scripts/reward_shape_preview.py on gp_molformer_set. The 2026-10-08 power arms (jobs 5024309, 5024311, 5024318, 5024345) started it at 0, 9-23 nats too high, which told the policy every molecule it generated was far over-probable; validity fell to 0.4% and they took 60-429 of 10,000 updates. Watch sampler/s3gfn/log_z: it should stay near ${INITIAL_LOG_Z}, and a long drift means the measurement was off.
+What to read: the per-training-step figures sampler/s3gfn/acq/trajectory (is the policy finding more informative molecules), reward/effective_support (how many of the 64 molecules in a batch the reward spreads over -- toward 1 means collapse, toward 64 means the policy will not move), reward/concentration, and train/batch_health (valid / synthesizable / unique). acq rising while validity or uniqueness falls is the policy fleeing the data the GP was fitted on. Four more test the log_z diagnosis directly: train/residual splits the RTB residual into its signed mean (log_z at the wrong level -- should sit near 0 if ${INITIAL_LOG_Z} was right) and its standard deviation (the reward shape the policy has yet to match); train/prior_divergence estimates KL(policy || prior), 0 for an inert policy and unbounded for one being torn off its prior; reward/above_floor_fraction is the share of each batch scoring above the ${LOG_SCORE_FLOOR}-nat floor, about 0.03 under the prior and the thing that should climb; train/gradient_norm is the gradient norm before clipping against the threshold of 10.
 Then the round itself: 2,000 Dock3 evaluations selected by CostAwareSelector from a 100k generated pool, 10,000 S3-GFN training steps. The question the round answers is whether the true docking scores of those 2,000 beat a random draw from the same pool; expect low single digits, since GIBBON's top-1000 enrichment on generated-like molecules (gp_molformer_set) is 2.35x, not the 6.5x it reaches on the library.
 Prior art: exponential beta=100 (job 4012959) was inert, mean log-reward 0.02 nats, validity 0.93; power beta=1 (job 4177912) collapsed, validity 0.0028 and zero yield from 2,000,000 attempts. Both ran on a variational surrogate, not this one.
-Arm name: ${ARM}. Arms differ only in what the name carries: reward_<transform>_beta<beta>, plus _s<n> for a non-default seed.
+Arm name: ${ARM}. Arms differ only in what the name carries: reward_<transform>_beta<beta>_logz<initial log_z>, plus _s<n> for a non-default seed.
 Submitted with: sbatch jobs/reward_shape.sh $*   (Slurm job ${SLURM_JOB_ID:-unknown})"
 printf '%s\n' "${WANDB_NOTES}" > "${OUTPUT_DIR}/arm_description.txt"
 
 RUN_NAME="${ARM//_/-}-${SLURM_JOB_ID:-local}"
-TAGS="reward-shape,${TRANSFORM},beta${BETA},nolayer,restored-state,fp32,1-round${SEED_TAG}"
+TAGS="reward-shape,${TRANSFORM},beta${BETA},logz${INITIAL_LOG_Z},floor${LOG_SCORE_FLOOR},logz-lr${LOG_Z_LR},nolayer,restored-state,fp32,1-round${SEED_TAG}"
 
 # The whole logger is restated as one YAML value rather than overridden field by
 # field. OmegaConf.from_dotlist reads every path segment as a dict key, so
@@ -177,10 +205,13 @@ uv run --no-sync python scripts/run_with_sigterm_flush.py \
   config/ampc/reward_shape.yaml \
   "sampler.reward_transform=${TRANSFORM}" \
   "sampler.beta=${BETA}" \
+  "sampler.initial_log_z=${INITIAL_LOG_Z}" \
+  "sampler.log_score_floor=${LOG_SCORE_FLOOR}" \
+  "sampler.log_z_learning_rate=${LOG_Z_LR}" \
   "${SEED_OVERRIDE[@]}" \
   "run_writer.output_dir=${OUTPUT_DIR}" \
   "${LOGGER}" \
-  "${@:4}"
+  "${@:5}"
 
 echo
 echo "Done. Sync from a login node with:"

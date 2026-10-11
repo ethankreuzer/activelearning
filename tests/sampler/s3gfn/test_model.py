@@ -949,3 +949,19 @@ def test_terminal_hidden_states_reject_rows_without_real_tokens(make_model) -> N
 
     with pytest.raises(ValueError, match="at least one non-padding token"):
         model._terminal_hidden_states(torch.tensor([[1, 3, 2], [0, 0, 0]]))
+
+
+def test_on_policy_loss_exposes_its_residual_diagnostics(make_model) -> None:
+    """The loss's mean squared residual decomposes into the exposed mean and std."""
+    model = make_model()
+    assert model.last_on_policy_diagnostics is None
+
+    loss = model.on_policy_loss(
+        positive_input_ids=torch.tensor([[1, 2, 0], [1, 3, 2]]),
+        reward_scores=torch.tensor([0.1, 0.2]),
+        beta=2.0,
+        fidelity_indices=torch.tensor([0, 1]),
+    )
+
+    residual_mean, residual_std, _ = model.last_on_policy_diagnostics
+    assert residual_mean**2 + residual_std**2 == pytest.approx(loss.item(), rel=1e-5)

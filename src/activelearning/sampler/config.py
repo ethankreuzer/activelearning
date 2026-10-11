@@ -8,7 +8,14 @@ discriminated union below.
 from pathlib import Path
 from typing import Annotated, Any, ClassVar, Literal, Union, overload
 
-from pydantic import BaseModel, Field, PositiveFloat, StrictInt, model_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    FiniteFloat,
+    PositiveFloat,
+    StrictInt,
+    model_validator,
+)
 
 from activelearning.sampler.exact_grid_sampler import ExactGridSampler
 from activelearning.sampler.hypercube_sampler import HypercubeSampler
@@ -332,12 +339,19 @@ class S3GFNSamplerConfig(BaseModel):
     Policy learning rate.
     log_z_learning_rate : float, default=1e-3
     Learning rate for the log-partition estimate.
+    initial_log_z : float, default=0.0
+    Starting value of the log-partition estimate, ideally ``log E[R]`` under the
+    pretrained prior; ``scripts/reward_shape_preview.py`` measures it.
     beta : float, default=50.0
     GFlowNet loss temperature parameter.
     reward_transform : {"exponential", "power"}, default="exponential"
     Shape of the reward built from the acquisition score; see
     :mod:`activelearning.sampler.reward_transform`. ``beta`` is that transform's
     parameter, so its usable range differs between the two.
+    log_score_floor : float, optional
+    Fixed lower bound, in nats, on the logged score under ``power``, so a
+    molecule's reward does not depend on its batch. When omitted, each batch is
+    floored against its own maximum. Ignored by ``exponential``.
     aux_coefficient : float, default=1e-4
     Weight of the auxiliary loss.
     buffer_size : int, default=6400
@@ -389,8 +403,10 @@ class S3GFNSamplerConfig(BaseModel):
     num_warmup_steps: int = Field(default=100, ge=0)
     learning_rate: PositiveFloat = 1.0e-4
     log_z_learning_rate: PositiveFloat = 1.0e-3
+    initial_log_z: FiniteFloat = 0.0
     beta: PositiveFloat = 50.0
     reward_transform: RewardTransform = "exponential"
+    log_score_floor: FiniteFloat | None = None
     aux_coefficient: float = Field(default=1.0e-4, ge=0.0)
     buffer_size: int = Field(default=6400, gt=0)
     sa_threshold: float = Field(default=4.0, ge=0.0)
@@ -468,8 +484,10 @@ class S3GFNSamplerConfig(BaseModel):
             num_warmup_steps=self.num_warmup_steps,
             learning_rate=self.learning_rate,
             log_z_learning_rate=self.log_z_learning_rate,
+            initial_log_z=self.initial_log_z,
             beta=self.beta,
             reward_transform=self.reward_transform,
+            log_score_floor=self.log_score_floor,
             aux_coefficient=self.aux_coefficient,
             buffer_size=self.buffer_size,
             sa_threshold=self.sa_threshold,

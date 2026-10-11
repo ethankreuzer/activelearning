@@ -99,3 +99,32 @@ def test_s3gfn_config_rejects_unsupported_enum_values(field: str) -> None:
 def test_s3gfn_config_rejects_nonpositive_generation_batch_size() -> None:
     with pytest.raises(ValueError):
         S3GFNSamplerConfig(n_samples=4, generation_batch_size=0)
+
+
+def test_s3gfn_config_log_z_and_floor_defaults_change_no_existing_run() -> None:
+    config = S3GFNSamplerConfig(n_samples=4)
+
+    assert config.initial_log_z == 0.0
+    assert config.log_score_floor is None
+
+
+def test_s3gfn_config_passes_log_z_and_floor_to_the_sampler() -> None:
+    sampler = S3GFNSamplerConfig(
+        n_samples=4,
+        fidelities=[1],
+        reward_transform="power",
+        beta=0.1,
+        initial_log_z=-8.0,
+        log_score_floor=-100.0,
+        log_z_learning_rate=0.1,
+    ).build()
+
+    assert sampler.initial_log_z == -8.0
+    assert sampler.log_score_floor == -100.0
+    assert sampler.log_z_learning_rate == 0.1
+
+
+@pytest.mark.parametrize("field", ["initial_log_z", "log_score_floor"])
+def test_s3gfn_config_rejects_non_finite_log_z_and_floor(field: str) -> None:
+    with pytest.raises(ValueError):
+        S3GFNSamplerConfig(n_samples=4, **{field: float("-inf")})

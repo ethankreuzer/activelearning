@@ -635,11 +635,12 @@ def test_optimizer_clips_fidelity_head_gradients(monkeypatch, make_sampler) -> N
         lr=0.1,
     )
     captured_parameters = []
-    monkeypatch.setattr(
-        torch.nn.utils,
-        "clip_grad_norm_",
-        lambda parameters, max_norm: captured_parameters.extend(parameters),
-    )
+
+    def capture_clip(parameters, max_norm):
+        captured_parameters.extend(parameters)
+        return torch.tensor(0.0)
+
+    monkeypatch.setattr(torch.nn.utils, "clip_grad_norm_", capture_clip)
 
     sampler._optimize(
         optimizer,
@@ -815,3 +816,93 @@ def test_prepare_batch_retains_acquisition_reward_scores(
     )
 
     assert prepared.reward_scores.tolist() == [2.0, 1.0]
+
+
+def test_optimizer_does_not_decay_log_z(make_sampler) -> None:
+    """log_z is a normalizer estimate; decay would pull it back toward zero."""
+    model = SimpleNamespace(
+        policy=nn.Linear(1, 1),
+        fidelity_head=None,
+        log_z=nn.Parameter(torch.tensor(-8.0)),
+    )
+    sampler = make_sampler(log_z_learning_rate=0.1)
+
+    policy_group, log_z_group = sampler._build_training_optimizer(model).param_groups
+
+    assert log_z_group["params"][0] is model.log_z
+    assert log_z_group["weight_decay"] == 0.0
+    assert log_z_group["lr"] == 0.1
+    # The policy keeps AdamW's default decay; only the scalar is exempt.
+    assert policy_group["weight_decay"] > 0.0
+
+
+def test_round_model_starts_log_z_at_the_configured_value(make_sampler) -> None:
+    """Every round's fresh model opens at initial_log_z, not at zero."""
+    sampler = make_sampler(initial_log_z=-8.0)
+    sampler._pretrained_model = SimpleNamespace(
+        policy=nn.Linear(1, 1),
+        prior=nn.Linear(1, 1),
+        tokenizer=FakeTokenizer(),
+        fidelity_head=None,
+    )
+    sampler._keep_pretrained_template_on_cpu = lambda: None
+
+    round_model = sampler._new_round_model()
+
+    assert float(round_model.log_z.detach()) == pytest.approx(-8.0)
+    assert round_model.log_z.requires_grad
+
+
+@pytest.mark.parametrize("setting", ["initial_log_z", "log_score_floor"])
+def test_sampler_rejects_non_finite_log_z_and_floor(make_sampler, setting) -> None:
+    with pytest.raises(ValueError, match=setting):
+        make_sampler(**{setting: float("nan")})
+
+
+def test_optimizer_records_the_gradient_norm_before_clipping(make_sampler) -> None:
+    """The recorded norm is the unclipped one, so it can exceed the threshold."""
+    model = SimpleNamespace(
+        policy=nn.Linear(1, 1, bias=False),
+        fidelity_head=None,
+        log_z=nn.Parameter(torch.zeros(())),
+    )
+    sampler = make_sampler(n_samples=1, gradient_clip_norm=1.0)
+    optimizer = torch.optim.SGD([*model.policy.parameters(), model.log_z], lr=0.1)
+
+    # d/dw = 30 and d/dlog_z = 40, a global norm of 50 against a clip of 1.
+    sampler._optimize(
+        optimizer, 30.0 * model.policy.weight.sum() + 40.0 * model.log_z, model
+    )
+
+    assert sampler._last_gradient_norm == pytest.approx(50.0)
+
+
+def test_training_step_records_gradient_norms_for_the_updates_that_ran(
+    make_sampler,
+    make_replay_buffer,
+) -> None:
+    """One on-policy update and no replay: one norm, on the step it happened."""
+    sampler = make_sampler(
+        n_samples=1,
+        batch_size=1,
+        replay_batch_size=2,
+        num_warmup_steps=0,
+    )
+
+    sampler._train_round(
+        model=_GradientTrainingModel(),
+        synthesizability=FakeSynthesizability(),
+        positive_buffer=make_replay_buffer(),
+        negative_buffer=None,
+        molecule_chem=FakeChem,
+        acquisition=FakeAcquisition(),
+        cost_fn=None,
+    )
+
+    metrics = sampler.round_metrics
+    assert metrics.online_gradient_norm_steps == [1]
+    assert metrics.online_gradient_norms[0] > 0.0
+    assert metrics.replay_gradient_norms == []
+    assert metrics.gradient_clip_norm == sampler.gradient_clip_norm
+    # This stand-in model exposes no residual diagnostics, and none are invented.
+    assert metrics.residual_steps == []

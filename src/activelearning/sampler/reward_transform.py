@@ -35,22 +35,36 @@ from typing import Literal
 
 RewardTransform = Literal["exponential", "power"]
 
-#: How far below the batch maximum a logged score may fall, in nats. Scores that underflowed
-#: to zero would otherwise give ``-inf``, and the relative trajectory-balance loss squares its
-#: residual, so an unbounded tail would dominate training. ``log_z`` absorbs a constant
-#: offset, so only the spread above this floor reaches the target distribution.
+#: How far below the batch maximum a logged score may fall, in nats, when no fixed
+#: ``log_score_floor`` is given. Scores that underflowed to zero would otherwise give
+#: ``-inf``, and the relative trajectory-balance loss squares its residual, so an unbounded
+#: tail would dominate training. This floor moves with each batch's own maximum, so the
+#: reward of a molecule depends on which molecules share its batch; ``log_z`` is one scalar
+#: and can only absorb the mean of that drift. Pass ``log_score_floor`` to remove it.
 MAX_LOG_SCORE_SPREAD = 20.0
 
 
-def _exponential_scores(scores: list[float]) -> list[float]:
-    """Pass the scores through unchanged, giving ``R = exp(beta * s)``."""
+def _exponential_scores(
+    scores: list[float],
+    log_score_floor: float | None = None,
+) -> list[float]:
+    """Pass the scores through unchanged, giving ``R = exp(beta * s)``.
+
+    ``log_score_floor`` is ignored: nothing is logged, so there is no tail to floor.
+    """
     return scores
 
 
-def _power_scores(scores: list[float]) -> list[float]:
+def _power_scores(
+    scores: list[float],
+    log_score_floor: float | None = None,
+) -> list[float]:
     """Return ``log`` of each score, giving ``R = s ** beta``, flooring the vanishing tail.
 
-    A batch whose scores are all zero expresses no preference, so it maps to a flat zero.
+    With a fixed ``log_score_floor`` every score maps to ``max(log(s), log_score_floor)``, a
+    function of that score alone. Without one the floor sits ``MAX_LOG_SCORE_SPREAD`` below
+    the batch's own maximum, and a batch whose scores are all zero expresses no preference,
+    so it maps to a flat zero.
 
     Raises
     ------
@@ -62,6 +76,11 @@ def _power_scores(scores: list[float]) -> list[float]:
             "The 'power' reward transform requires non-negative acquisition scores, "
             "and the acquisition returned a negative one."
         )
+    if log_score_floor is not None:
+        return [
+            max(math.log(score), log_score_floor) if score > 0.0 else log_score_floor
+            for score in scores
+        ]
     largest = max(scores, default=0.0)
     if largest <= 0.0:
         return [0.0] * len(scores)
@@ -73,7 +92,7 @@ def _power_scores(scores: list[float]) -> list[float]:
     ]
 
 
-_REWARD_TRANSFORMS: dict[str, Callable[[list[float]], list[float]]] = {
+_REWARD_TRANSFORMS: dict[str, Callable[[list[float], float | None], list[float]]] = {
     "exponential": _exponential_scores,
     "power": _power_scores,
 }
@@ -112,10 +131,11 @@ def reward_concentration(
     batch size.
 
     Both are invariant to a constant offset in ``log R``. That matters twice over:
-    ``log_z`` is free and absorbs such an offset anyway, and under ``power`` the
-    floor is recomputed from each batch's own maximum, so the absolute reward
-    level drifts between steps for reasons unrelated to the policy. These
-    summaries describe what the step demands without that drift.
+    ``log_z`` is free and absorbs such an offset anyway, and under ``power``
+    without a fixed ``log_score_floor`` the floor is recomputed from each batch's
+    own maximum, so the absolute reward level drifts between steps for reasons
+    unrelated to the policy. These summaries describe what the step demands
+    without that drift.
 
     Parameters
     ----------
@@ -151,6 +171,7 @@ def reward_concentration(
 def apply_reward_transform(
     transform: RewardTransform,
     scores: list[float],
+    log_score_floor: float | None = None,
 ) -> list[float]:
     """Prepare acquisition scores for the ``log R = beta * r`` target.
 
@@ -160,6 +181,11 @@ def apply_reward_transform(
         Shape of the reward to build.
     scores : list of float
         Acquisition scores on the value scale.
+    log_score_floor : float or None, optional
+        Fixed lower bound on the logged score under ``power``, in nats. It makes the
+        reward a function of the molecule alone. ``None`` keeps the per-batch floor,
+        ``MAX_LOG_SCORE_SPREAD`` below each batch's own maximum. Ignored by
+        ``exponential``.
 
     Returns
     -------
@@ -179,4 +205,4 @@ def apply_reward_transform(
             f"Unknown reward transform {transform!r}. "
             f"Expected one of {list(_REWARD_TRANSFORMS)}."
         ) from None
-    return transform_fn(scores)
+    return transform_fn(scores, log_score_floor)

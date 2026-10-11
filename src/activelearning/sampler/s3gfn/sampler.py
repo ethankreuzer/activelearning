@@ -134,8 +134,10 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
         num_warmup_steps: int = 100,
         learning_rate: float = 1.0e-4,
         log_z_learning_rate: float = 1.0e-3,
+        initial_log_z: float = 0.0,
         beta: float = 50.0,
         reward_transform: RewardTransform = "exponential",
+        log_score_floor: float | None = None,
         aux_coefficient: float = 1.0e-4,
         buffer_size: int = 6400,
         sa_threshold: float = 4.0,
@@ -208,7 +210,13 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
         learning_rate : float, optional
             AdamW learning rate for policy parameters.
         log_z_learning_rate : float, optional
-            AdamW learning rate for the trainable RTB normalizer ``log Z``.
+            AdamW learning rate for the trainable RTB normalizer ``log Z``. It
+            is one scalar and carries no weight decay.
+        initial_log_z : float, optional
+            Starting value of ``log Z`` in each round. The true value is
+            ``log E[R]`` under the pretrained prior; starting far from it opens
+            training with a uniform residual that the policy, not the scalar,
+            ends up absorbing.
         beta : float, optional
             Reward inverse temperature used to convert acquisition scores into
             RTB log rewards.
@@ -216,6 +224,11 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
             Shape of the reward built from the acquisition score; see
             :mod:`activelearning.sampler.reward_transform`. ``beta`` is that
             transform's parameter, so its usable range differs between the two.
+        log_score_floor : float or None, optional
+            Fixed lower bound, in nats, on the logged score under the ``power``
+            transform, so a molecule's reward does not depend on its batch.
+            ``None`` floors each batch against its own maximum. Ignored by
+            ``exponential``.
         aux_coefficient : float, optional
             Weight of the negative replay contrastive loss. Zero disables the
             negative replay buffer and auxiliary loss.
@@ -260,8 +273,12 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
             raise ValueError("num_warmup_steps must be nonnegative.")
         if learning_rate <= 0.0 or log_z_learning_rate <= 0.0:
             raise ValueError("learning rates must be positive.")
+        if not math.isfinite(initial_log_z):
+            raise ValueError("initial_log_z must be finite.")
         if beta <= 0.0 or not math.isfinite(beta):
             raise ValueError("beta must be a finite positive value.")
+        if log_score_floor is not None and not math.isfinite(log_score_floor):
+            raise ValueError("log_score_floor must be finite when provided.")
         if aux_coefficient < 0.0 or not math.isfinite(aux_coefficient):
             raise ValueError("aux_coefficient must be finite and nonnegative.")
         if buffer_size <= 0:
@@ -313,8 +330,10 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
         self.num_warmup_steps = num_warmup_steps
         self.learning_rate = learning_rate
         self.log_z_learning_rate = log_z_learning_rate
+        self.initial_log_z = initial_log_z
         self.beta = beta
         self.reward_transform = reward_transform
+        self.log_score_floor = log_score_floor
         self.aux_coefficient = aux_coefficient
         self.buffer_size = buffer_size
         self.sa_threshold = sa_threshold
@@ -329,6 +348,9 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
         self._pretrained_model: S3GFNModel | None = None
         self._round_index = 0
         self._round_metrics = _RoundMetrics()
+        # Global gradient norm of the latest update, before clipping; None when
+        # no update has run since it was last cleared.
+        self._last_gradient_norm: float | None = None
 
     @property
     def effective_model_dtype(self) -> torch.dtype:
@@ -495,6 +517,7 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
             policy=policy,
             prior=self._pretrained_model.prior,
             tokenizer=self._pretrained_model.tokenizer,
+            initial_log_z=self.initial_log_z,
             fidelity_head=copy.deepcopy(self._pretrained_model.fidelity_head),
         ).to(self.device)
         if self.attention_mask_adapter:
@@ -585,7 +608,13 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
         return torch.optim.AdamW(
             [
                 {"params": policy_parameters, "lr": self.learning_rate},
-                {"params": [model.log_z], "lr": self.log_z_learning_rate},
+                # log_z estimates a normalizer, not a weight: AdamW's default
+                # decay would pull it back toward zero, short of its true value.
+                {
+                    "params": [model.log_z],
+                    "lr": self.log_z_learning_rate,
+                    "weight_decay": 0.0,
+                },
             ]
         )
 
@@ -671,6 +700,7 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
             acquisition=acquisition,
             cost_fn=cost_fn,
         )
+        self._last_gradient_norm = None
         online_loss = self._update_generated_batch(
             model=model,
             prepared=prepared,
@@ -678,6 +708,15 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
             negative_buffer=negative_buffer,
             optimizer=optimizer,
         )
+        online_gradient_norm = self._last_gradient_norm
+        # Read only when this step's on-policy loss ran, so a step that produced
+        # no synthesizable molecule does not repeat the previous step's reading.
+        on_policy_diagnostics = (
+            getattr(model, "last_on_policy_diagnostics", None)
+            if online_loss is not None
+            else None
+        )
+        self._last_gradient_norm = None
         replay_loss = None
         auxiliary_loss = None
         if prepared.smiles:
@@ -687,6 +726,7 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
                 negative_buffer=negative_buffer,
                 optimizer=optimizer,
             )
+        replay_gradient_norm = self._last_gradient_norm
         self.round_metrics.record_training_step(
             generated_count=self.batch_size,
             valid_count=len(prepared.smiles),
@@ -701,6 +741,15 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
             # per-step reading of mode collapse that keeps validity high.
             unique_count=len(set(prepared.smiles)),
             beta=self.beta,
+            on_policy_diagnostics=on_policy_diagnostics,
+            # Only `power` logs the score, so only there is the floor on the
+            # scale the post-transform scores are on.
+            log_score_floor=(
+                self.log_score_floor if self.reward_transform == "power" else None
+            ),
+            online_gradient_norm=online_gradient_norm,
+            replay_gradient_norm=replay_gradient_norm,
+            gradient_clip_norm=self.gradient_clip_norm,
         )
         return (
             self.batch_size,
@@ -879,6 +928,7 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
             candidates,
             cost_fn=cost_fn,
             transform=self.reward_transform,
+            log_score_floor=self.log_score_floor,
         )
 
         input_ids = model.encode_smiles(canonical_smiles)
@@ -1143,9 +1193,13 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
         if model.fidelity_head is not None:
             optimized_parameters.extend(model.fidelity_head.parameters())
         optimized_parameters.append(model.log_z)
-        torch.nn.utils.clip_grad_norm_(
-            optimized_parameters,
-            self.gradient_clip_norm,
+        # clip_grad_norm_ returns the norm as it was before clipping: above
+        # gradient_clip_norm, the clip rather than the learning rate set this step.
+        self._last_gradient_norm = float(
+            torch.nn.utils.clip_grad_norm_(
+                optimized_parameters,
+                self.gradient_clip_norm,
+            )
         )
         optimizer.step()
         return loss_value
@@ -1191,6 +1245,7 @@ def _score_candidates(
     *,
     cost_fn: Callable[[Sequence[Candidate]], list[float]] | None,
     transform: RewardTransform,
+    log_score_floor: float | None = None,
 ) -> tuple[list[float], list[float]]:
     """Score candidates, optionally inverse-cost weighted, and shape the reward.
 
@@ -1216,4 +1271,6 @@ def _score_candidates(
     score_values = [float(score) for score in scores]
     if not all(math.isfinite(score) for score in score_values):
         raise ValueError("Acquisition returned a non-finite score.")
-    return score_values, apply_reward_transform(transform, score_values)
+    return score_values, apply_reward_transform(
+        transform, score_values, log_score_floor
+    )

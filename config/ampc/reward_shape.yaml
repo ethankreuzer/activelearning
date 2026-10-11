@@ -29,7 +29,8 @@
 #     node, since compute nodes have no internet
 #
 # Per-arm overrides, all from jobs/reward_shape.sh:
-#   sampler.reward_transform, sampler.beta, run_writer.output_dir,
+#   sampler.reward_transform, sampler.beta, sampler.initial_log_z,
+#   sampler.log_score_floor, sampler.log_z_learning_rate, run_writer.output_dir,
 #   logger.loggers.0.run_name, logger.loggers.1.run_name, logger.loggers.1.tags
 
 runtime:
@@ -101,7 +102,13 @@ acquisition:
     fallback_size: 100000
     seed: 42
   num_mv_samples: 10
-  score_chunk_size: 5000
+  # An exact GP scores a chunk by concatenating the training inputs onto every
+  # candidate in it, so the peak allocation is
+  # chunk * len(train) * features * 4 bytes. At 5000 against this 25,000-molecule
+  # training set that is 5000*25000*512*4 = 238 GiB, which is what killed job
+  # 5024350 at the selection step; 256 brings it to 12.2 GiB, inside the 40 GiB
+  # card. Chunking only bounds memory -- the scores are identical either way.
+  score_chunk_size: 256
   maximize: true
   log_space: true
   log_output: false
@@ -133,6 +140,24 @@ sampler:
   # orders of magnitude, which information gain does.
   reward_transform: power
   beta: 0.2
+  # A fixed floor on log(acq), so a molecule's reward is a function of that
+  # molecule alone. The default floor sits 20 nats below each batch's own best,
+  # and on generated chemistry that best swings by ~100 nats from batch to batch,
+  # which put ~48x more variance into the reward than the within-batch signal
+  # (REWARD_SHAPE_LOGZ_FIX.md, section 6).
+  log_score_floor: -100.0
+  # log Z = log E[R] under the pretrained prior. Left at 0 it opened the four
+  # 2026-10-08 power arms with a uniform 9-23 nat residual that the policy
+  # absorbed by leaving the valid-SMILES manifold. It depends on beta AND on the
+  # floor, so jobs/reward_shape.sh takes it per arm; measure it with
+  #   python -m scripts.reward_shape_preview <scored run> --log-score-floor -100
+  initial_log_z: -8.0
+  # 10x the default and 100x the policy's 1e-4: log_z is one scalar and the thing
+  # that is supposed to absorb a level offset. Not higher, because it now starts
+  # within a nat or two of its target, and Adam moves a scalar by about the
+  # learning rate per step -- at 0.1 that jitter lands on every residual in the
+  # batch, and log_z slides to E[log R] before the policy has moved.
+  log_z_learning_rate: 0.01
   aux_coefficient: 0.001
   sa_threshold: 4.0
 

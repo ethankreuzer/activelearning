@@ -45,6 +45,19 @@ class _RoundMetrics:
     reward_ratio_medians: list[float] = field(default_factory=list)
     reward_ratio_mins: list[float] = field(default_factory=list)
     reward_effective_supports: list[float] = field(default_factory=list)
+    # Recorded only on steps whose on-policy update ran.
+    residual_steps: list[int] = field(default_factory=list)
+    residual_means: list[float] = field(default_factory=list)
+    residual_stds: list[float] = field(default_factory=list)
+    prior_log_ratio_means: list[float] = field(default_factory=list)
+    # Recorded only under a fixed log-score floor, on steps with valid molecules.
+    above_floor_steps: list[int] = field(default_factory=list)
+    above_floor_fractions: list[float] = field(default_factory=list)
+    online_gradient_norm_steps: list[int] = field(default_factory=list)
+    online_gradient_norms: list[float] = field(default_factory=list)
+    replay_gradient_norm_steps: list[int] = field(default_factory=list)
+    replay_gradient_norms: list[float] = field(default_factory=list)
+    gradient_clip_norm: float | None = None
     training_step_durations_s: list[float] = field(default_factory=list)
     online_updates: int = 0
     replay_updates: int = 0
@@ -71,6 +84,11 @@ class _RoundMetrics:
         acq_scores: Sequence[float] = (),
         unique_count: int | None = None,
         beta: float = 1.0,
+        on_policy_diagnostics: tuple[float, float, float] | None = None,
+        log_score_floor: float | None = None,
+        online_gradient_norm: float | None = None,
+        replay_gradient_norm: float | None = None,
+        gradient_clip_norm: float | None = None,
     ) -> None:
         """Record one training step and its generated-batch statistics.
 
@@ -97,6 +115,20 @@ class _RoundMetrics:
         beta : float, optional
             The reward's configured beta, needed because the concentration
             diagnostics describe ``beta * score`` rather than the score itself.
+        on_policy_diagnostics : tuple[float, float, float], optional
+            The on-policy batch's RTB residual mean, residual standard deviation
+            and mean ``log p_policy - log p_prior``, as they stood before the
+            step's update. ``None`` when no on-policy update ran.
+        log_score_floor : float, optional
+            The fixed floor the post-transform scores were clamped to. When
+            given, the fraction of the step's molecules strictly above it is
+            recorded; ``None`` (the per-batch floor, or a transform that does not
+            floor) records nothing.
+        online_gradient_norm, replay_gradient_norm : float, optional
+            Global gradient norm of each update before clipping, or ``None``
+            where that update did not run.
+        gradient_clip_norm : float, optional
+            The clipping threshold, drawn as a reference line.
         """
         self.generated_counts.append(generated_count)
         self.valid_counts.append(valid_count)
@@ -116,6 +148,26 @@ class _RoundMetrics:
             self.reward_ratio_medians.append(concentration.ratio_median)
             self.reward_ratio_mins.append(concentration.ratio_min)
             self.reward_effective_supports.append(concentration.effective_support)
+            if log_score_floor is not None:
+                self.above_floor_steps.append(step_number)
+                self.above_floor_fractions.append(
+                    sum(1 for value in reward_values if value > log_score_floor)
+                    / len(reward_values)
+                )
+        if on_policy_diagnostics is not None:
+            residual_mean, residual_std, log_ratio_mean = on_policy_diagnostics
+            self.residual_steps.append(step_number)
+            self.residual_means.append(float(residual_mean))
+            self.residual_stds.append(float(residual_std))
+            self.prior_log_ratio_means.append(float(log_ratio_mean))
+        if online_gradient_norm is not None:
+            self.online_gradient_norm_steps.append(step_number)
+            self.online_gradient_norms.append(float(online_gradient_norm))
+        if replay_gradient_norm is not None:
+            self.replay_gradient_norm_steps.append(step_number)
+            self.replay_gradient_norms.append(float(replay_gradient_norm))
+        if gradient_clip_norm is not None:
+            self.gradient_clip_norm = float(gradient_clip_norm)
         acq_values = [float(value) for value in acq_scores]
         if acq_values:
             self.acq_steps.append(step_number)
@@ -251,6 +303,12 @@ class S3GFNLoggingMixin:
                 metrics["sampler/s3gfn/train/log_z_final"] = round_metrics.log_z_values[
                     -1
                 ]
+            if round_metrics.prior_log_ratio_means:
+                # The one per-run reading of how far the policy ended from its
+                # prior, so arms can be sorted by it in the runs table.
+                metrics["sampler/s3gfn/train/prior_divergence_final"] = (
+                    round_metrics.prior_log_ratio_means[-1]
+                )
             if round_metrics.raw_reward_scores:
                 metrics["sampler/s3gfn/reward/raw_mean"] = _mean(
                     round_metrics.raw_reward_scores
@@ -297,6 +355,22 @@ class S3GFNLoggingMixin:
                     (
                         "sampler/s3gfn/train/batch_health",
                         _build_batch_health_figure(round_metrics, max_points),
+                    ),
+                    (
+                        "sampler/s3gfn/train/residual",
+                        _build_residual_figure(round_metrics, max_points),
+                    ),
+                    (
+                        "sampler/s3gfn/train/prior_divergence",
+                        _build_prior_divergence_figure(round_metrics, max_points),
+                    ),
+                    (
+                        "sampler/s3gfn/reward/above_floor_fraction",
+                        _build_above_floor_figure(round_metrics, max_points),
+                    ),
+                    (
+                        "sampler/s3gfn/train/gradient_norm",
+                        _build_gradient_norm_figure(round_metrics, max_points),
                     ),
                 ):
                     if figure is not None:
@@ -621,6 +695,141 @@ def _build_batch_health_figure(
         "S3-GFN per training step: generated-batch health "
         "(valid / synthesizable / unique)"
     )
+    return _finish_step_figure(figure, axis)
+
+
+def _build_residual_figure(
+    metrics: _RoundMetrics,
+    max_points: int,
+) -> Figure | None:
+    """Build the RTB residual figure for the on-policy training batches.
+
+    The loss is the mean squared residual, so it rises for two unrelated
+    reasons. The signed mean is the part a correct ``log_z`` removes; the
+    standard deviation is the part only the policy can remove, by matching the
+    shape of the reward.
+    """
+    if not metrics.residual_means:
+        return None
+
+    steps = metrics.residual_steps
+    series: tuple[tuple[str, Sequence[int], Sequence[float]], ...] = (
+        ("mean (log_z off its level)", steps, metrics.residual_means),
+        ("standard deviation (reward shape unmatched)", steps, metrics.residual_stds),
+    )
+    figure = Figure(figsize=(8.0, 4.5))
+    axis = figure.add_subplot(1, 1, 1)
+    _plot_step_series(axis, series, max_points, positive_only=False)
+    axis.axhline(0.0, color="grey", linewidth=0.8, linestyle="--", label="zero")
+    axis.set_ylabel("RTB residual (nats)")
+    axis.set_title(
+        "S3-GFN per training step: on-policy RTB residual (mean / standard deviation)"
+    )
+    return _finish_step_figure(figure, axis)
+
+
+def _build_prior_divergence_figure(
+    metrics: _RoundMetrics,
+    max_points: int,
+) -> Figure | None:
+    """Build the policy-versus-prior divergence figure for the training batches.
+
+    The mean of ``log p_policy - log p_prior`` over molecules the policy itself
+    sampled estimates ``KL(policy || prior)``. It is taken over the molecules
+    that reached the loss -- valid and synthesizable -- so it understates the
+    divergence of a policy that has started producing invalid strings.
+    """
+    if not metrics.prior_log_ratio_means:
+        return None
+
+    series: tuple[tuple[str, Sequence[int], Sequence[float]], ...] = (
+        (
+            "mean log p_policy - log p_prior",
+            metrics.residual_steps,
+            metrics.prior_log_ratio_means,
+        ),
+    )
+    figure = Figure(figsize=(8.0, 4.5))
+    axis = figure.add_subplot(1, 1, 1)
+    _plot_step_series(axis, series, max_points, positive_only=False)
+    axis.axhline(0.0, color="grey", linewidth=0.8, linestyle="--", label="at the prior")
+    axis.set_ylabel("estimated KL(policy || prior) (nats)")
+    axis.set_title(
+        "S3-GFN per training step: how far the policy has moved from its prior"
+    )
+    return _finish_step_figure(figure, axis)
+
+
+def _build_above_floor_figure(
+    metrics: _RoundMetrics,
+    max_points: int,
+) -> Figure | None:
+    """Build the above-floor fraction figure for the recorded training batches.
+
+    Under a fixed log-score floor every molecule below it earns the same reward,
+    so the reward is close to two-level and progress is the policy generating
+    more molecules above the floor. The batch median cannot show that while it
+    sits below the floor.
+    """
+    if not metrics.above_floor_fractions:
+        return None
+
+    series: tuple[tuple[str, Sequence[int], Sequence[float]], ...] = (
+        (
+            "above the log-score floor",
+            metrics.above_floor_steps,
+            metrics.above_floor_fractions,
+        ),
+    )
+    figure = Figure(figsize=(8.0, 4.5))
+    axis = figure.add_subplot(1, 1, 1)
+    _plot_step_series(axis, series, max_points, positive_only=False)
+    axis.set_ylim(0.0, 1.05)
+    axis.set_ylabel("fraction of valid molecules in batch")
+    axis.set_title(
+        "S3-GFN per training step: molecules scoring above the log-score floor"
+    )
+    return _finish_step_figure(figure, axis)
+
+
+def _build_gradient_norm_figure(
+    metrics: _RoundMetrics,
+    max_points: int,
+) -> Figure | None:
+    """Build the pre-clipping gradient-norm figure for the training updates.
+
+    Where a line sits above the clipping threshold, the clip and not the
+    learning rate set the size of that update.
+    """
+    series: tuple[tuple[str, Sequence[int], Sequence[float]], ...] = (
+        (
+            "on-policy update",
+            metrics.online_gradient_norm_steps,
+            metrics.online_gradient_norms,
+        ),
+        (
+            "replay update",
+            metrics.replay_gradient_norm_steps,
+            metrics.replay_gradient_norms,
+        ),
+    )
+    if not any(value > 0.0 for _, _, values in series for value in values):
+        return None
+
+    figure = Figure(figsize=(8.0, 4.5))
+    axis = figure.add_subplot(1, 1, 1)
+    _plot_step_series(axis, series, max_points, positive_only=True)
+    if metrics.gradient_clip_norm is not None:
+        axis.axhline(
+            metrics.gradient_clip_norm,
+            color="grey",
+            linewidth=0.8,
+            linestyle="--",
+            label="clipping threshold",
+        )
+    axis.set_yscale("log")
+    axis.set_ylabel("global gradient norm before clipping")
+    axis.set_title("S3-GFN per training step: gradient norm before clipping")
     return _finish_step_figure(figure, axis)
 
 

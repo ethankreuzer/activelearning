@@ -190,3 +190,97 @@ def test_uniqueness_line_is_omitted_when_not_recorded(
     health = figures["sampler/s3gfn/train/batch_health"]
     labels = {line.get_label() for line in health.axes[0].get_lines()}
     assert labels == {"valid", "synthesizable"}
+
+
+_NEW_STEP_FIGURES = (
+    "sampler/s3gfn/train/residual",
+    "sampler/s3gfn/train/prior_divergence",
+    "sampler/s3gfn/reward/above_floor_fraction",
+    "sampler/s3gfn/train/gradient_norm",
+)
+
+
+def _record(sampler, **overrides) -> None:
+    """Record one training step with three valid molecules."""
+    settings = dict(
+        generated_count=4,
+        valid_count=3,
+        synthesizable_count=2,
+        online_loss=1.0,
+        replay_loss=None,
+        auxiliary_loss=None,
+        log_z=-8.0,
+        raw_reward_scores=[-100.0, -100.0, -40.0],
+        acq_scores=[0.0, 0.0, 1e-18],
+        unique_count=3,
+        beta=0.1,
+    )
+    settings.update(overrides)
+    sampler.round_metrics.record_training_step(**settings)
+
+
+def test_residual_floor_and_gradient_figures_are_emitted_when_recorded(
+    make_sampler,
+) -> None:
+    """Each of the four gets its own figure and the divergence its final scalar."""
+    sampler = make_sampler(n_train_steps=1)
+    _record(
+        sampler,
+        on_policy_diagnostics=(1.5, 0.5, 0.25),
+        log_score_floor=-100.0,
+        online_gradient_norm=42.0,
+        replay_gradient_norm=None,
+        gradient_clip_norm=10.0,
+    )
+    assert sampler.round_metrics.above_floor_fractions == [pytest.approx(1 / 3)]
+
+    metrics, figures = sampler.drain_round_diagnostics(
+        include_figures=True,
+        max_points=1000,
+    )
+
+    for key in _NEW_STEP_FIGURES:
+        assert key in figures
+    titles = {key: figure.axes[0].get_title() for key, figure in figures.items()}
+    assert len(set(titles.values())) == len(titles)
+    assert metrics["sampler/s3gfn/train/prior_divergence_final"] == 0.25
+
+
+def test_residual_floor_and_gradient_figures_are_omitted_when_not_recorded(
+    make_sampler,
+) -> None:
+    """A run with the per-batch floor and no diagnostics gets no empty figures."""
+    sampler = make_sampler(n_train_steps=1)
+    _record(sampler)
+
+    metrics, figures = sampler.drain_round_diagnostics(
+        include_figures=True,
+        max_points=1000,
+    )
+
+    for key in _NEW_STEP_FIGURES:
+        assert key not in figures
+    assert "sampler/s3gfn/train/prior_divergence_final" not in metrics
+
+
+def test_steps_without_an_on_policy_update_do_not_shift_the_residual_curve(
+    make_sampler,
+) -> None:
+    """The residual is plotted against the step it was measured on."""
+    sampler = make_sampler(n_train_steps=3)
+    _record(sampler, on_policy_diagnostics=(2.0, 1.0, 0.0), log_score_floor=-100.0)
+    # No valid molecule: no on-policy update, no scores, nothing to record.
+    _record(
+        sampler,
+        valid_count=0,
+        synthesizable_count=0,
+        online_loss=None,
+        raw_reward_scores=[],
+        acq_scores=[],
+        unique_count=0,
+        log_score_floor=-100.0,
+    )
+    _record(sampler, on_policy_diagnostics=(1.0, 1.0, 0.5), log_score_floor=-100.0)
+
+    assert sampler.round_metrics.residual_steps == [1, 3]
+    assert sampler.round_metrics.above_floor_steps == [1, 3]

@@ -6,6 +6,7 @@ import pytest
 
 from activelearning.sampler.s3gfn.losses import (
     negative_replay_contrastive_loss,
+    relative_trajectory_balance_diagnostics,
     relative_trajectory_balance_loss,
     sequence_log_probabilities,
     sequence_log_probabilities_from_logits,
@@ -132,3 +133,42 @@ def test_sequence_log_probabilities_from_logits_rejects_misaligned_logits() -> N
             labels=torch.tensor([[2, 3, 1]]),
             pad_token_id=0,
         )
+
+
+def test_rtb_diagnostics_split_the_residual_into_level_and_spread() -> None:
+    """Mean, population std and log ratio match the loss's own residual."""
+    policy = torch.tensor([1.0, 2.0], requires_grad=True)
+    prior = torch.tensor([0.5, 1.0])
+    reward_scores = torch.tensor([0.1, 0.2])
+    log_z = torch.tensor(0.3, requires_grad=True)
+
+    diagnostics = relative_trajectory_balance_diagnostics(
+        policy, prior, reward_scores, log_z, beta=2.0
+    )
+    loss = relative_trajectory_balance_loss(
+        policy, prior, reward_scores, log_z, beta=2.0
+    )
+
+    residuals = [0.3 + 1.0 - 0.5 - 0.2, 0.3 + 2.0 - 1.0 - 0.4]
+    mean = sum(residuals) / 2
+    assert not diagnostics.requires_grad
+    assert diagnostics.tolist() == pytest.approx(
+        [mean, abs(residuals[0] - residuals[1]) / 2, (0.5 + 1.0) / 2]
+    )
+    # mean ** 2 + std ** 2 is the loss, which is why the loss alone is ambiguous.
+    assert diagnostics[0].item() ** 2 + diagnostics[1].item() ** 2 == pytest.approx(
+        loss.item()
+    )
+
+
+def test_rtb_diagnostics_of_one_trajectory_have_zero_spread() -> None:
+    """A single molecule gives a finite zero, not the NaN of a sample std."""
+    diagnostics = relative_trajectory_balance_diagnostics(
+        torch.tensor([1.0]),
+        torch.tensor([1.0]),
+        torch.tensor([-80.0]),
+        torch.tensor(-8.0),
+        0.1,
+    )
+
+    assert diagnostics.tolist() == pytest.approx([0.0, 0.0, 0.0])

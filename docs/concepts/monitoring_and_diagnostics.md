@@ -209,14 +209,18 @@ their query figures until the same round boundary.
 
 The policy trains for thousands of steps inside a single `sample()` call, so
 whether a round worked is a question about those steps rather than about the
-round. Four figures answer it, each plotted against the true training-step
+round. Eight figures answer it, each plotted against the true training-step
 number:
 
 ```text
 sampler/s3gfn/acq/trajectory
 sampler/s3gfn/reward/concentration
 sampler/s3gfn/reward/effective_support
+sampler/s3gfn/reward/above_floor_fraction
 sampler/s3gfn/train/batch_health
+sampler/s3gfn/train/residual
+sampler/s3gfn/train/prior_divergence
+sampler/s3gfn/train/gradient_norm
 ```
 
 - **`acq/trajectory`** plots the max, median and min of `acq` -- the acquisition
@@ -239,6 +243,27 @@ sampler/s3gfn/train/batch_health
 - **`train/batch_health`** plots the valid, synthesizable and unique fractions of
   each generated batch. Uniqueness is the only one of the three that reveals mode
   collapse while validity holds.
+- **`train/residual`** plots the signed mean and the standard deviation of the
+  on-policy RTB residual, as they stood before each update. The loss is the mean
+  *squared* residual and so mixes the two: a mean away from zero says `log_z` is
+  at the wrong level (check `initial_log_z`), while the standard deviation is the
+  part only the policy can remove, by matching the reward's shape.
+- **`train/prior_divergence`** plots the mean of `log p_policy - log p_prior`
+  over each on-policy batch, an estimate of `KL(policy || prior)`. Flat at zero
+  the policy never left its prior; climbing without bound it is being torn away
+  from it. It is taken over the valid, synthesizable molecules that reach the
+  loss, so it understates a policy that has begun emitting invalid strings --
+  read it with `train/batch_health`. Its last value is also logged as the scalar
+  `sampler/s3gfn/train/prior_divergence_final`.
+- **`reward/above_floor_fraction`** plots the fraction of each batch's valid
+  molecules scoring above the sampler's fixed `log_score_floor`. Everything
+  below the floor earns the same reward, so this fraction rising is what
+  progress looks like when the batch median still sits under the floor. Emitted
+  only for the `power` transform with a fixed floor.
+- **`train/gradient_norm`** plots the global gradient norm of the on-policy and
+  replay updates before clipping, on a logarithmic axis, against the clipping
+  threshold. A line that stays above the threshold means the clip, not the
+  learning rate, is setting the step size.
 
 They are read together. The acquisition rewards molecules the surrogate is
 *uncertain* about, so a policy can raise `acq` by moving away from the data the

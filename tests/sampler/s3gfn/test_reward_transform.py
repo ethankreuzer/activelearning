@@ -162,3 +162,49 @@ def test_power_warns_when_beta_is_read_as_a_large_exponent(
     messages = _validate(_sampler(transform, beta), _acquisition([1.0]))
 
     assert any("exponent" in message for message in messages) is warns
+
+
+# --------------------------------------------------------------------------------------
+# A fixed floor makes the reward a function of the molecule alone
+# --------------------------------------------------------------------------------------
+
+
+def test_fixed_floor_reward_does_not_depend_on_batch_composition() -> None:
+    """The same score maps to the same value whatever shares its batch."""
+    score = 1e-30
+    alone = apply_reward_transform("power", [score, 1e-35], -100.0)
+    beside_a_top_molecule = apply_reward_transform("power", [score, 0.05], -100.0)
+
+    assert alone[0] == beside_a_top_molecule[0] == pytest.approx(math.log(score))
+    # The per-batch floor, by contrast, clamps it once a far better molecule arrives.
+    assert apply_reward_transform("power", [score, 0.05])[0] > math.log(score)
+
+
+def test_fixed_floor_clamps_the_tail_and_zeros_to_the_floor() -> None:
+    """Underflowed and vanishing scores tie at the floor; the rest are logged."""
+    prepared = apply_reward_transform("power", [0.0, 1e-60, 1e-10], -100.0)
+
+    assert prepared == pytest.approx([-100.0, -100.0, math.log(1e-10)])
+
+
+def test_fixed_floor_keeps_an_all_zero_batch_at_the_floor() -> None:
+    """No flat-zero special case: it would be a batch-dependent reward level."""
+    assert apply_reward_transform("power", [0.0, 0.0], -100.0) == [-100.0, -100.0]
+
+
+def test_exponential_ignores_the_fixed_floor() -> None:
+    """Nothing is logged under `exponential`, so there is no tail to floor."""
+    scores = [-1.0, 0.0, 1e-60]
+    assert apply_reward_transform("exponential", scores, -100.0) == scores
+
+
+def test_score_candidates_applies_the_fixed_floor() -> None:
+    """The sampler's floor reaches the transform."""
+    _, transformed = _score_candidates(
+        _acquisition([0.0, 1.0]),
+        _candidates(2),
+        cost_fn=None,
+        transform="power",
+        log_score_floor=-100.0,
+    )
+    assert transformed == pytest.approx([-100.0, 0.0])
