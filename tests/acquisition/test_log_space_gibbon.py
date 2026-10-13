@@ -51,7 +51,11 @@ def _exact(gamma: np.ndarray, rho2: float) -> np.ndarray:
 
 def _ours(gamma: np.ndarray, rho2: float, dtype: torch.dtype) -> np.ndarray:
     g = torch.tensor(gamma, dtype=dtype)
-    return log_space_information_gain(g, torch.full_like(g, math.log(rho2))).double().numpy()
+    return (
+        log_space_information_gain(g, torch.full_like(g, math.log(rho2)))
+        .double()
+        .numpy()
+    )
 
 
 def _botorch(gamma: np.ndarray, rho2: float, dtype: torch.dtype) -> np.ndarray:
@@ -128,7 +132,9 @@ def test_nonzero_where_botorch_underflows() -> None:
 def test_gradients_are_finite_and_match_botorch() -> None:
     gamma = torch.linspace(-3.0, 4.0, 71, dtype=torch.float64, requires_grad=True)
     log_rho2 = torch.full_like(gamma, math.log(0.3))
-    (grad_ours,) = torch.autograd.grad(log_space_information_gain(gamma, log_rho2).sum(), gamma)
+    (grad_ours,) = torch.autograd.grad(
+        log_space_information_gain(gamma, log_rho2).sum(), gamma
+    )
 
     g = gamma.detach().clone().requires_grad_(True)
     normal = torch.distributions.Normal(0.0, 1.0)
@@ -167,14 +173,18 @@ def test_subclass_matches_exact_values_with_fixed_max_values(gp: SingleTaskGP) -
     with torch.no_grad():
         post = gp.posterior(X.squeeze(1))
         mu, var = post.mean.reshape(-1), post.variance.reshape(-1)
-        var_noisy = gp.posterior(X.squeeze(1), observation_noise=True).variance.reshape(-1)
+        var_noisy = gp.posterior(X.squeeze(1), observation_noise=True).variance.reshape(
+            -1
+        )
         mstar = (mu.max() + 12.0 * var.sqrt().max()).repeat(3).reshape(3, 1)
         for acqf in (reference, ours):
             acqf.posterior_max_values = mstar
         botorch_values = reference(X)
         ours_values = ours(X)
     assert (botorch_values == 0).all()
-    gamma = ((mstar.reshape(1, -1) - mu.reshape(-1, 1)) / var.sqrt().reshape(-1, 1)).numpy()
+    gamma = (
+        (mstar.reshape(1, -1) - mu.reshape(-1, 1)) / var.sqrt().reshape(-1, 1)
+    ).numpy()
     rho2 = (var / var_noisy).numpy()
     expected = np.array(
         [np.mean(_exact(gamma[i], float(rho2[i]))) for i in range(len(rho2))]
@@ -204,9 +214,13 @@ def test_float32_model_keeps_values_below_float32_range() -> None:
     values = values.numpy()
     # Same float32 inputs, combined in float64 as the implementation does.
     mstar64, mu64, var64 = mstar.double(), mu.double(), var.double()
-    gamma = ((mstar64.reshape(1, -1) - mu64.reshape(-1, 1)) / var64.sqrt().reshape(-1, 1)).numpy()
+    gamma = (
+        (mstar64.reshape(1, -1) - mu64.reshape(-1, 1)) / var64.sqrt().reshape(-1, 1)
+    ).numpy()
     rho2 = (var64 / var_noisy.double()).numpy()
-    expected = np.array([np.mean(_exact(gamma[i], float(rho2[i]))) for i in range(len(rho2))])
+    expected = np.array(
+        [np.mean(_exact(gamma[i], float(rho2[i]))) for i in range(len(rho2))]
+    )
     beyond_float32 = (gamma.min(axis=1) > 15) & (expected > 1e-300)
     assert beyond_float32.sum() >= 5
     assert (botorch_values[beyond_float32] == 0).all()
@@ -223,7 +237,9 @@ def test_subclass_equals_botorch_with_sampled_max_values(gp: SingleTaskGP) -> No
     reference = qLowerBoundMaxValueEntropy(gp, candidate_set, num_mv_samples=5)
     torch.manual_seed(2)
     ours = LogSpaceQLowerBoundMaxValueEntropy(gp, candidate_set, num_mv_samples=5)
-    torch.testing.assert_close(ours.posterior_max_values, reference.posterior_max_values)
+    torch.testing.assert_close(
+        ours.posterior_max_values, reference.posterior_max_values
+    )
     with torch.no_grad():
         torch.testing.assert_close(ours(X), reference(X), rtol=1e-6, atol=1e-12)
 
@@ -258,7 +274,10 @@ def mf_observations(sf_observations: list[Observation]) -> list[Observation]:
 @pytest.fixture()
 def candidates() -> list[Candidate]:
     torch.manual_seed(4)
-    return [Candidate(x=x.tolist(), fidelity=1) for x in torch.rand(16, 2, dtype=torch.float64)]
+    return [
+        Candidate(x=x.tolist(), fidelity=1)
+        for x in torch.rand(16, 2, dtype=torch.float64)
+    ]
 
 
 def _sf_surrogate(observations: list[Observation]) -> BoTorchGPSurrogate:
@@ -274,7 +293,12 @@ def _mf_surrogate(observations: list[Observation]) -> BoTorchGPSurrogate:
     return surrogate
 
 
-def _score(acq: Any, surrogate: BoTorchGPSurrogate, obs: list[Observation], cands: list[Candidate]) -> list[float]:
+def _score(
+    acq: Any,
+    surrogate: BoTorchGPSurrogate,
+    obs: list[Observation],
+    cands: list[Candidate],
+) -> list[float]:
     torch.manual_seed(5)  # same Gumbel max-value draws for every variant
     acq.update(surrogate, obs)
     return acq.score(cands)
@@ -313,7 +337,9 @@ def test_mf_wrapper_default_is_unchanged_and_log_space_matches(
     s_default = _score(default, surrogate, mf_observations, cands)
     s_log = _score(log_space, surrogate, mf_observations, cands)
     assert type(default._botorch_acqf) is qMultiFidelityLowerBoundMaxValueEntropy
-    assert type(log_space._botorch_acqf) is LogSpaceQMultiFidelityLowerBoundMaxValueEntropy
+    assert (
+        type(log_space._botorch_acqf) is LogSpaceQMultiFidelityLowerBoundMaxValueEntropy
+    )
     # The class-level default is not mutated by the opt-in instance.
     assert (
         QMultiFidelityLowerBoundMaxValueEntropy._botorch_acqf_class
@@ -351,7 +377,9 @@ def _exact_log(gamma: np.ndarray, rho2: float) -> np.ndarray:
     for g in gamma:
         g = mpmath.mpf(float(g))
         r = mpmath.npdf(g) / mpmath.ncdf(g)
-        out.append(float(mpmath.log(-mpmath.log1p(-mpmath.mpf(rho2) * r * (g + r)) / 2)))
+        out.append(
+            float(mpmath.log(-mpmath.log1p(-mpmath.mpf(rho2) * r * (g + r)) / 2))
+        )
     return np.array(out)
 
 
@@ -370,7 +398,9 @@ def test_log_output_matches_high_precision_reference(rho2: float) -> None:
 
 def test_log_output_gradients_are_finite() -> None:
     gamma = torch.linspace(-10.0, 60.0, 281, dtype=torch.float64, requires_grad=True)
-    (grad,) = torch.autograd.grad(log_information_gain(gamma, torch.zeros_like(gamma)).sum(), gamma)
+    (grad,) = torch.autograd.grad(
+        log_information_gain(gamma, torch.zeros_like(gamma)).sum(), gamma
+    )
     assert torch.isfinite(grad).all()
     # d log(IG) / d gamma -> -gamma for large gamma.
     assert grad[-1].item() == pytest.approx(-60.0, rel=0.05)
@@ -391,18 +421,24 @@ def test_log_output_is_finite_beyond_float64(gp: SingleTaskGP) -> None:
         log_out.posterior_max_values = mstar
         v = value(X).numpy()
         lo = log_out(X).numpy()
-    gamma = ((mstar.reshape(1, -1) - mu.reshape(-1, 1)) / var.sqrt().reshape(-1, 1)).numpy()
+    gamma = (
+        (mstar.reshape(1, -1) - mu.reshape(-1, 1)) / var.sqrt().reshape(-1, 1)
+    ).numpy()
     rho2 = (var / var_noisy).numpy()
     assert gamma.min() > 37 and (v == 0).all()
     # Both samples share m*, so logmeanexp over identical samples is just the sample.
-    expected = np.array([_exact_log(gamma[i, :1], float(rho2[i]))[0] for i in range(len(rho2))])
+    expected = np.array(
+        [_exact_log(gamma[i, :1], float(rho2[i]))[0] for i in range(len(rho2))]
+    )
     assert np.isfinite(lo).all()
     np.testing.assert_allclose(lo, expected, rtol=0, atol=1e-6)
 
 
 def test_log_output_rejects_pending_points(gp: SingleTaskGP) -> None:
     acqf = LogOutputQLowerBoundMaxValueEntropy(
-        gp, torch.rand(20, 2, dtype=torch.float64), X_pending=torch.rand(2, 2, dtype=torch.float64)
+        gp,
+        torch.rand(20, 2, dtype=torch.float64),
+        X_pending=torch.rand(2, 2, dtype=torch.float64),
     )
     with pytest.raises(NotImplementedError, match="q = 1"):
         acqf(torch.rand(3, 1, 2, dtype=torch.float64))
@@ -412,8 +448,12 @@ def test_sf_wrapper_log_output_is_log_of_log_space(
     sf_observations: list[Observation], candidates: list[Candidate]
 ) -> None:
     surrogate = _sf_surrogate(sf_observations)
-    value = QLowerBoundMaxValueEntropy(candidate_set_spec=TrainDataCandidateSetSpec(), log_space=True)
-    log_out = QLowerBoundMaxValueEntropy(candidate_set_spec=TrainDataCandidateSetSpec(), log_output=True)
+    value = QLowerBoundMaxValueEntropy(
+        candidate_set_spec=TrainDataCandidateSetSpec(), log_space=True
+    )
+    log_out = QLowerBoundMaxValueEntropy(
+        candidate_set_spec=TrainDataCandidateSetSpec(), log_output=True
+    )
     s_value = np.array(_score(value, surrogate, sf_observations, candidates))
     s_log = np.array(_score(log_out, surrogate, sf_observations, candidates))
     assert type(log_out._botorch_acqf) is LogOutputQLowerBoundMaxValueEntropy
@@ -427,12 +467,16 @@ def test_mf_wrapper_log_output_includes_log_cost(
 ) -> None:
     surrogate = _mf_surrogate(mf_observations)
     cands = candidates + [Candidate(x=c.x, fidelity=0) for c in candidates]
-    kwargs = dict(candidate_set_spec=TrainDataCandidateSetSpec(), num_fantasies=2, num_y_samples=8)
+    kwargs = dict(
+        candidate_set_spec=TrainDataCandidateSetSpec(), num_fantasies=2, num_y_samples=8
+    )
     value = QMultiFidelityLowerBoundMaxValueEntropy(**kwargs, log_space=True)
     log_out = QMultiFidelityLowerBoundMaxValueEntropy(**kwargs, log_output=True)
     s_value = np.array(_score(value, surrogate, mf_observations, cands))
     s_log = np.array(_score(log_out, surrogate, mf_observations, cands))
-    assert type(log_out._botorch_acqf) is LogOutputQMultiFidelityLowerBoundMaxValueEntropy
+    assert (
+        type(log_out._botorch_acqf) is LogOutputQMultiFidelityLowerBoundMaxValueEntropy
+    )
     assert log_out._botorch_acqf.cost_aware_utility._log
     # log(IG / cost) = log IG - log cost, with BoTorch's default affine cost.
     np.testing.assert_allclose(np.exp(s_log), s_value, rtol=1e-10)
@@ -440,7 +484,10 @@ def test_mf_wrapper_log_output_includes_log_cost(
 
 def test_log_output_config_option() -> None:
     base = {"candidate_set_spec": {"type": "TrainDataCandidateSetSpec"}}
-    for config_class in (QLowerBoundMaxValueEntropyConfig, QMultiFidelityLowerBoundMaxValueEntropyConfig):
+    for config_class in (
+        QLowerBoundMaxValueEntropyConfig,
+        QMultiFidelityLowerBoundMaxValueEntropyConfig,
+    ):
         assert config_class.model_validate(base).build().score_scale == "value"
         built = config_class.model_validate({**base, "log_output": True}).build()
         assert built.score_scale == "log" and built._log_space is True
@@ -449,7 +496,10 @@ def test_log_output_config_option() -> None:
 def test_default_acquisition_score_scale_is_value() -> None:
     from activelearning.acquisition.botorch.botorch_entropy import QMaxValueEntropy
 
-    assert QMaxValueEntropy(candidate_set_spec=TrainDataCandidateSetSpec()).score_scale == "value"
+    assert (
+        QMaxValueEntropy(candidate_set_spec=TrainDataCandidateSetSpec()).score_scale
+        == "value"
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -466,7 +516,11 @@ class _FixedScores:
 
     def score(self, candidates: Any, cost_weighting: Any = None) -> list[float]:
         scores = list(self._scores)
-        return scores if cost_weighting is None else cost_weighting(scores, list(candidates))
+        return (
+            scores
+            if cost_weighting is None
+            else cost_weighting(scores, list(candidates))
+        )
 
 
 def test_selectors_pick_the_same_candidates_from_log_scores_with_unit_cost() -> None:
@@ -477,12 +531,21 @@ def test_selectors_pick_the_same_candidates_from_log_scores_with_unit_cost() -> 
     values = np.exp(-rng.uniform(0, 200, size=50))  # spans ~1e-87 .. 1
     cands = [Candidate(x=[float(i)]) for i in range(50)]
     unit = lambda cs: [1.0] * len(cs)  # noqa: E731
-    value_acq, log_acq = _FixedScores(values.tolist(), "value"), _FixedScores(np.log(values).tolist(), "log")
-    by_value = CostAwareSelector()(cands, acquisition=value_acq, cost_fn=unit, round_budget=10)
-    by_log = CostAwareSelector()(cands, acquisition=log_acq, cost_fn=unit, round_budget=10)
+    value_acq, log_acq = (
+        _FixedScores(values.tolist(), "value"),
+        _FixedScores(np.log(values).tolist(), "log"),
+    )
+    by_value = CostAwareSelector()(
+        cands, acquisition=value_acq, cost_fn=unit, round_budget=10
+    )
+    by_log = CostAwareSelector()(
+        cands, acquisition=log_acq, cost_fn=unit, round_budget=10
+    )
     assert by_value == by_log
     top = TopKAcquisitionSelector(num_samples=10)
-    assert top(cands, acquisition=value_acq, cost_fn=unit) == top(cands, acquisition=log_acq, cost_fn=unit)
+    assert top(cands, acquisition=value_acq, cost_fn=unit) == top(
+        cands, acquisition=log_acq, cost_fn=unit
+    )
 
 
 def test_config_guard_rejects_value_scale_samplers() -> None:
@@ -494,12 +557,17 @@ def test_config_guard_rejects_value_scale_samplers() -> None:
     root = Path(__file__).resolve().parents[2] / "config"
 
     def parse(paths: list[str], overrides: list[str]) -> Any:
-        return parse_config(load_config([root / p for p in paths], overrides), ActiveLearningConfig)
+        return parse_config(
+            load_config([root / p for p in paths], overrides), ActiveLearningConfig
+        )
 
     with pytest.raises(ValueError, match="GFlowNetGridSampler"):
         parse(["branin/gflownet_single_fidelity.yaml"], ["acquisition.log_output=true"])
     with pytest.raises(ValueError, match="ExactGridSampler"):
-        parse(["branin_benchmark/base.yaml", "branin_benchmark/sf_high_fid.yaml"], ["acquisition.log_output=true"])
+        parse(
+            ["branin_benchmark/base.yaml", "branin_benchmark/sf_high_fid.yaml"],
+            ["acquisition.log_output=true"],
+        )
     parsed = parse(
         ["ampc/s3gfn_minimol_ampc_variational_single_fidelity.yaml"],
         ["acquisition.type=QLowerBoundMaxValueEntropy", "acquisition.log_output=true"],

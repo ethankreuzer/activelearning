@@ -18,7 +18,9 @@ def _acquisition(scale: str) -> SimpleNamespace:
     ("scale", "beta", "warns"),
     [("log", 100.0, True), ("log", 1.0, False), ("value", 100.0, False)],
 )
-def test_warns_only_for_log_scores_with_large_beta(scale: str, beta: float, warns: bool) -> None:
+def test_warns_only_for_log_scores_with_large_beta(
+    scale: str, beta: float, warns: bool
+) -> None:
     sampler = SimpleNamespace(beta=beta, reward_transform="exponential")
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")

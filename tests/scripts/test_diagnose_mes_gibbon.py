@@ -24,7 +24,9 @@ class _FakeModel:
     def __init__(self, mu: torch.Tensor, sigma: torch.Tensor) -> None:
         self._mu, self._var = mu.reshape(-1, 1), (sigma**2).reshape(-1, 1)
 
-    def posterior(self, X: torch.Tensor, posterior_transform: object = None) -> _FakePosterior:
+    def posterior(
+        self, X: torch.Tensor, posterior_transform: object = None
+    ) -> _FakePosterior:
         return _FakePosterior(self._mu, self._var)
 
 
@@ -58,7 +60,10 @@ def test_gumbel_bracket_failure_is_recorded_and_widened() -> None:
 def test_stable_information_gain_matches_mpmath(rho2: float) -> None:
     gammas = np.round(np.arange(-3.0, 12.0 + 1e-9, 0.25), 6)
     exact = diag._exact_ig(gammas, rho2)
-    for dtype, tol, floor in ((torch.float64, 1e-9, 1e-300), (torch.float32, 2e-4, 1e-30)):
+    for dtype, tol, floor in (
+        (torch.float64, 1e-9, 1e-300),
+        (torch.float32, 2e-4, 1e-30),
+    ):
         approx = diag._stable_ig_on_grid(gammas, rho2, dtype)
         ok = exact > floor
         assert np.max(np.abs(approx[ok] - exact[ok]) / exact[ok]) < tol
@@ -76,8 +81,12 @@ def test_botorch_underflows_where_stable_does_not() -> None:
 
 def test_rho2_min_nonzero_is_consistent_with_cutoff() -> None:
     # At rho2 = 1 the rule reproduces the fp32 / fp64 cutoffs to within ~0.15.
-    assert diag._cutoff_from_rule(1.0, 24) == pytest.approx(diag.GAMMA_FP32_CUTOFF, abs=0.15)
-    assert diag._cutoff_from_rule(1.0, 53) == pytest.approx(diag.GAMMA_FP64_CUTOFF, abs=0.15)
+    assert diag._cutoff_from_rule(1.0, 24) == pytest.approx(
+        diag.GAMMA_FP32_CUTOFF, abs=0.15
+    )
+    assert diag._cutoff_from_rule(1.0, 53) == pytest.approx(
+        diag.GAMMA_FP64_CUTOFF, abs=0.15
+    )
 
 
 def test_synthetic_pool_is_deterministic_and_nested() -> None:
@@ -98,7 +107,9 @@ def test_synthetic_pool_is_deterministic_and_nested() -> None:
 def test_end_to_end_tiny_model(tmp_path: Path, use_case: str) -> None:
     """Real repo surrogate + acquisition on a tiny synthetic fit; stable == BoTorch where BoTorch is nonzero."""
     uc = diag.USE_CASES[use_case]
-    ctx = diag.build_context(uc, tmp_path, n_fit=2000, fit_steps=4, signal_noise=1.0, quick=True)
+    ctx = diag.build_context(
+        uc, tmp_path, n_fit=2000, fit_steps=4, signal_noise=1.0, quick=True
+    )
     mu, var = diag.posterior_moments(
         ctx, ctx.add_fidelity(ctx.world.rows(0, 500)[0], ctx.target_fid_value)
     )
@@ -117,7 +128,9 @@ def test_end_to_end_tiny_model(tmp_path: Path, use_case: str) -> None:
     assert ((raw["rho2"] > 0) & (raw["rho2"] <= 1.0 + 1e-4)).all()
     # The wrapper's scoring path clamps negatives to zero, nothing else.
     scored = np.array(wrapper._score_encoded(X[:16].unsqueeze(1)))
-    np.testing.assert_allclose(scored, np.maximum(raw["acq"][:16], 0.0), rtol=1e-4, atol=1e-9)
+    np.testing.assert_allclose(
+        scored, np.maximum(raw["acq"][:16], 0.0), rtol=1e-4, atol=1e-9
+    )
     # Stable class refuses q > 1.
     stable_acqf = diag.to_stable(acqf)
     stable_acqf.X_pending = torch.zeros(1, X.shape[-1])
