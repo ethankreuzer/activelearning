@@ -31,6 +31,7 @@ class EncoderKernel(gpytorch.kernels.Kernel):
         encoder: nn.Module,
         base_kernel: gpytorch.kernels.Kernel,
         include_fidelity: bool = False,
+        max_chunk_bytes: int = 4 << 30,
     ) -> None:
         """Initialize an encoder-wrapping covariance kernel.
 
@@ -43,11 +44,27 @@ class EncoderKernel(gpytorch.kernels.Kernel):
         include_fidelity : bool, default=False
             Whether to treat the final input column as a fidelity value and
             append it to the encoded features.
+        max_chunk_bytes : int, default=4 GiB
+            Memory budget for one slice of a batched cross-covariance. BoTorch
+            scores candidates in q-batches, which makes the base kernel build a
+            ``(batch, train_size, latent_dim)`` intermediate; this caps how much
+            of that exists at once. It does not change the result, only peak
+            memory and the number of base-kernel calls. Ignored when the inputs
+            carry no batch dimension, as during a fit.
+
+            The default is sized for the 25,000-molecule AmpC arms on a 40 GB
+            A100: one candidate's slice costs about 154 MB there (25,000 x 512
+            floats, times three for the copies the Matern kernel holds), so
+            4 GiB slices about 27 candidates at a time. 1 GiB would slice only
+            ~6 and need roughly four times as many calls. Lower it for a
+            smaller GPU; the fix that matters for memory is the deduplication
+            in ``_encode_flat``, not this budget.
         """
         super().__init__()
         self.encoder = encoder
         self.base_kernel = base_kernel
         self.include_fidelity = include_fidelity
+        self.max_chunk_bytes = max_chunk_bytes
 
     def forward(
         self,
@@ -97,20 +114,107 @@ class EncoderKernel(gpytorch.kernels.Kernel):
         f1 = self._encode_flat(tok1)
         f2 = self._encode_flat(tok2)
 
+        chunk_size = self._batch_chunk_size(f1, f2)
+        if chunk_size is None:
+            if fid1 is not None:
+                f1 = torch.cat([f1, fid1.to(f1.dtype)], dim=-1)
+                f2 = torch.cat([f2, fid2.to(f2.dtype)], dim=-1)
+            return self.base_kernel(
+                f1.to(x1.dtype),
+                f2.to(x1.dtype),
+                diag=diag,
+                last_dim_is_batch=last_dim_is_batch,
+                **params,
+            )
+
+        # One slice of the batch at a time, so the base kernel's
+        # (batch, train_size, latent_dim) intermediate stays bounded. The
+        # blocks are independent, so concatenating them reproduces the
+        # unchunked result exactly.
+        blocks = [
+            self._base_kernel_block(
+                f1[start : start + chunk_size],
+                f2[start : start + chunk_size],
+                None if fid1 is None else fid1[start : start + chunk_size],
+                None if fid2 is None else fid2[start : start + chunk_size],
+                dtype=x1.dtype,
+                diag=diag,
+                last_dim_is_batch=last_dim_is_batch,
+                **params,
+            )
+            for start in range(0, f1.shape[0], chunk_size)
+        ]
+        return torch.cat(blocks, dim=0)
+
+    def _base_kernel_block(
+        self,
+        f1: Tensor,
+        f2: Tensor,
+        fid1: Tensor | None,
+        fid2: Tensor | None,
+        *,
+        dtype: torch.dtype,
+        diag: bool,
+        last_dim_is_batch: bool,
+        **params,
+    ) -> Tensor:
+        """Evaluate the base kernel on one slice of a batched input.
+
+        ``base_kernel.forward`` is called rather than ``base_kernel(...)`` so
+        the block comes back as a dense tensor that can be concatenated, as
+        GPyTorch's own composite kernels do with their children.
+        """
         if fid1 is not None:
             f1 = torch.cat([f1, fid1.to(f1.dtype)], dim=-1)
             f2 = torch.cat([f2, fid2.to(f2.dtype)], dim=-1)
-
-        return self.base_kernel(
-            f1.to(x1.dtype),
-            f2.to(x1.dtype),
+        return self.base_kernel.forward(
+            f1.to(dtype),
+            f2.to(dtype),
             diag=diag,
             last_dim_is_batch=last_dim_is_batch,
             **params,
         )
 
+    def _batch_chunk_size(self, f1: Tensor, f2: Tensor) -> int | None:
+        """Return the batch slice size to use, or None to evaluate at once.
+
+        Chunking only applies to a batched cross-covariance whose
+        ``(batch, train_size, latent_dim)`` intermediate would exceed
+        ``max_chunk_bytes``. A fit passes unbatched inputs and is untouched.
+
+        Parameters
+        ----------
+        f1, f2 : Tensor
+            Encoded inputs, shaped ``(*batch, n, latent_dim)``.
+
+        Returns
+        -------
+        int or None
+            Rows of the leading batch dimension to evaluate per block, or None
+            when the whole batch fits or the inputs are not batched alike.
+        """
+        if f1.dim() < 3 or f1.dim() != f2.dim() or f1.shape[0] != f2.shape[0]:
+            return None
+        batch_size = f1.shape[0]
+        if batch_size <= 1:
+            return None
+        # The base kernel centres and rescales x2, so it holds a couple of
+        # live copies of one batch slice at a time; budget for three.
+        per_batch_bytes = 3 * f2[0].numel() * f2.element_size()
+        if per_batch_bytes * batch_size <= self.max_chunk_bytes:
+            return None
+        return max(1, self.max_chunk_bytes // max(per_batch_bytes, 1))
+
     def _encode_flat(self, inputs: torch.Tensor) -> torch.Tensor:
         """Encode inputs with any leading batch dimensions.
+
+        A batched acquisition hands the kernel the same training inputs once
+        per candidate, as a broadcast view. Those repeats carry stride 0, so
+        flattening them outright would both re-encode identical rows and force
+        ``reshape`` to materialise every copy -- for 256 candidates against
+        25,000 training molecules in 512 dimensions, 12.2 GiB of duplicates.
+        The repeated dimensions are therefore dropped before encoding and
+        restored afterwards as a broadcast view, which costs nothing.
 
         Parameters
         ----------
@@ -124,7 +228,29 @@ class EncoderKernel(gpytorch.kernels.Kernel):
         """
         leading = inputs.shape[:-1]
         input_dim = inputs.shape[-1]
+        if not leading:
+            return self.encoder(inputs)
+
+        repeated = tuple(
+            dim
+            for dim, (stride, size) in enumerate(zip(inputs.stride()[:-1], leading))
+            if stride == 0 and size > 1
+        )
+        if repeated:
+            # Indexing with an integer drops the dimension entirely, leaving
+            # one copy of the rows that dimension was repeating.
+            unique = inputs[
+                tuple(
+                    0 if dim in repeated else slice(None) for dim in range(len(leading))
+                )
+            ]
+        else:
+            unique = inputs
+
         # Flatten to (N, input_dim), encode, then restore leading dimensions.
-        flat = inputs.reshape(-1, input_dim)
+        flat = unique.reshape(-1, input_dim)
         features = self.encoder(flat)  # (N, latent_dim)
-        return features.reshape(*leading, -1)  # (*leading, latent_dim)
+        features = features.reshape(*unique.shape[:-1], -1)
+        for dim in repeated:
+            features = features.unsqueeze(dim)
+        return features.expand(*leading, features.shape[-1])
