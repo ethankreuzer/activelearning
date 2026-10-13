@@ -12,6 +12,7 @@ import math
 
 import pytest
 
+import activelearning.sampler.s3gfn.logging as logging_module
 from activelearning.sampler.reward_transform import reward_concentration
 
 
@@ -284,3 +285,107 @@ def test_steps_without_an_on_policy_update_do_not_shift_the_residual_curve(
 
     assert sampler.round_metrics.residual_steps == [1, 3]
     assert sampler.round_metrics.above_floor_steps == [1, 3]
+
+
+class TestStepBinning:
+    """Per-step curves are reduced to a median per window, showing a trend."""
+
+    def test_bins_report_the_median_value_and_median_step(self) -> None:
+        points = [(step, float(step)) for step in range(1, 11)]
+
+        binned = logging_module._binned(points, 5)
+
+        # Steps 1-4 fall in bin 0 under floor division, 5-9 in bin 1, 10 in 2.
+        assert binned == [(2, 2.5), (7, 7.0), (10, 10.0)]
+
+    def test_a_rare_spike_does_not_move_the_level(self) -> None:
+        """Why the median: these series are heavy-tailed.
+
+        One batch holding a rare high-information molecule would drag a mean
+        well off the level the curve is meant to show.
+        """
+        # 1..99, not 1..100: step 100 would open a window holding only itself,
+        # whose median is then the spike. A window of one cannot be robust.
+        points = [(step, 1000.0 if step % 10 == 0 else 1.0) for step in range(1, 100)]
+
+        binned = logging_module._binned(points, 10)
+
+        assert all(value == pytest.approx(1.0) for _, value in binned)
+        # The mean over the same points sits far above the level.
+        assert sum(value for _, value in points) / len(points) > 50.0
+
+    def test_bin_size_of_one_or_less_is_a_no_op(self) -> None:
+        points = [(1, 1.0), (2, 2.0)]
+
+        assert logging_module._binned(points, 1) == points
+        assert logging_module._binned(points, 0) == points
+
+    def test_an_empty_series_stays_empty(self) -> None:
+        assert logging_module._binned([], 100) == []
+
+    def test_bins_are_taken_over_step_numbers_not_positions(self) -> None:
+        """A sparse series must stay aligned with a dense one."""
+        dense = [(step, 1.0) for step in range(1, 21)]
+        sparse = [(step, 1.0) for step in range(1, 21) if step % 5 == 0]
+
+        dense_steps = [step for step, _ in logging_module._binned(dense, 10)]
+        sparse_steps = [step for step, _ in logging_module._binned(sparse, 10)]
+
+        # The claim is alignment, not equal length: every point of the sparse
+        # series must land in a window the dense series also occupies. Binning
+        # by list position would have put its 4 points in different windows.
+        assert {step // 10 for step in sparse_steps} <= {
+            step // 10 for step in dense_steps
+        }
+
+    def test_a_window_with_no_finite_value_becomes_nan(self) -> None:
+        """A gap breaks the line rather than implying data."""
+        points = [(1, float("nan")), (2, float("nan")), (11, 5.0)]
+
+        binned = logging_module._binned(points, 10)
+
+        assert math.isnan(binned[0][1])
+        assert binned[1] == (11, 5.0)
+
+    def test_non_finite_values_do_not_poison_a_window(self) -> None:
+        points = [(1, 2.0), (2, float("nan")), (3, 4.0)]
+
+        ((_, value),) = logging_module._binned(points, 10)
+
+        assert value == pytest.approx(3.0)
+
+    def test_spikes_never_reach_the_plotted_points(self) -> None:
+        """Thinning only drops points; it cannot stop a spike being drawn."""
+        points = [(step, 1000.0 if step % 10 == 0 else 1.0) for step in range(1, 1000)]
+
+        plotted = logging_module._bounded(logging_module._binned(points, 100), 10)
+
+        assert max(value for _, value in points) == pytest.approx(1000.0)
+        assert max(value for _, value in plotted) == pytest.approx(1.0)
+        assert len(plotted) <= 10
+
+
+class TestEffectiveBinSize:
+    """The window shrinks rather than reducing a short round to a few points."""
+
+    def test_a_long_round_uses_the_full_window(self) -> None:
+        assert logging_module._effective_bin_size(10_000, 100) == 100
+
+    def test_a_short_round_is_not_binned_at_all(self) -> None:
+        """The regression this guards: a 3-step round became one point."""
+        assert logging_module._effective_bin_size(3, 100) == 1
+
+    def test_a_medium_round_keeps_at_least_the_minimum_points(self) -> None:
+        n_steps = 500
+
+        bin_size = logging_module._effective_bin_size(n_steps, 100)
+
+        assert bin_size == 10
+        assert n_steps // bin_size >= logging_module._MIN_BINNED_POINTS
+
+    def test_binning_disabled_stays_disabled(self) -> None:
+        assert logging_module._effective_bin_size(10_000, 1) == 1
+        assert logging_module._effective_bin_size(10_000, 0) == 1
+
+    def test_the_window_is_never_below_one(self) -> None:
+        assert logging_module._effective_bin_size(0, 100) == 1

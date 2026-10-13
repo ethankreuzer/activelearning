@@ -39,9 +39,10 @@ from activelearning.sampler.s3gfn._optional import (
 from activelearning.sampler.s3gfn.logging import (
     S3GFNLoggingMixin,
     _RoundMetrics,
+    write_pool_log,
     write_reject_log,
 )
-from activelearning.sampler.s3gfn.model import S3GFNModel
+from activelearning.sampler.s3gfn.model import S3GFNModel, TrajectoryLoss
 from activelearning.sampler.s3gfn.replay_buffer import ReplayBuffer
 from activelearning.sampler.s3gfn.synthesizability import SAScoreSynthesizability
 from activelearning.utils.types import Candidate, Observation
@@ -136,6 +137,7 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
         learning_rate: float = 1.0e-4,
         log_z_learning_rate: float = 1.0e-3,
         initial_log_z: float = 0.0,
+        loss: TrajectoryLoss = "rtb",
         beta: float = 50.0,
         reward_transform: RewardTransform = "exponential",
         log_score_floor: float | None = None,
@@ -147,6 +149,8 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
         max_generation_attempts: int | None = None,
         reject_sample_size: int = 2000,
         reject_log_path: str | None = None,
+        pool_log_path: str | None = None,
+        step_bin_size: int = 100,
         seed: int = 42,
     ) -> None:
         """Initialize an acquisition-guided S3-GFN sampler.
@@ -219,7 +223,15 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
             Starting value of ``log Z`` in each round. The true value is
             ``log E[R]`` under the pretrained prior; starting far from it opens
             training with a uniform residual that the policy, not the scalar,
-            ends up absorbing.
+            ends up absorbing. Unused under ``loss="vargrad"``.
+        loss : {"rtb", "vargrad"}, optional
+            Trajectory objective. ``"rtb"`` learns ``log_z`` as a parameter and
+            is sensitive to where ``initial_log_z`` starts. ``"vargrad"``
+            substitutes the batch's own optimal normalizer, leaving the
+            variance of the residual: no scalar to place, to tune a learning
+            rate for, or to starve of updates when few molecules survive. Its
+            gradient is purely within-batch, so a one-molecule batch carries no
+            signal and a near-constant reward carries little.
         beta : float, optional
             Reward inverse temperature used to convert acquisition scores into
             RTB log rewards.
@@ -252,6 +264,22 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
             CSV written at the end of each round's sampling with the retained
             rejects. ``{round}`` in the path is replaced by the round index.
             None disables the file, leaving the counts in the metrics.
+        pool_log_path : str or None, optional
+            CSV of the generated candidate pool, written as soon as generation
+            finishes. ``{round}`` is replaced by the round index. The run
+            writer's ``scored_samples.csv`` holds the same molecules but only
+            once the round *completes*, so a round that later times out in the
+            oracle loses a pool that cost hours to generate. This file is the
+            copy that survives, and the input for scoring the pool against the
+            prior's molecules afterwards. None disables it.
+        step_bin_size : int, optional
+            Training steps reduced to one median point on the per-step
+            figures. At one point per step a 10,000-step round plots the
+            batch-to-batch spread rather than the trend, and thinning the
+            line keeps every surviving point as noisy as it was. The median
+            rather than the mean, because one batch holding a rare
+            high-information molecule should not move the level. 1 disables
+            the binning.
         max_generation_attempts : int or None, optional
             Maximum number of final-generation samples attempted before
             failing. Defaults to
@@ -286,6 +314,8 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
             raise ValueError("learning rates must be positive.")
         if not math.isfinite(initial_log_z):
             raise ValueError("initial_log_z must be finite.")
+        if loss not in ("rtb", "vargrad"):
+            raise ValueError("loss must be 'rtb' or 'vargrad'.")
         if beta <= 0.0 or not math.isfinite(beta):
             raise ValueError("beta must be a finite positive value.")
         if log_score_floor is not None and not math.isfinite(log_score_floor):
@@ -304,6 +334,8 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
             raise ValueError("max_generation_attempts must be positive.")
         if reject_sample_size < 0:
             raise ValueError("reject_sample_size must be nonnegative.")
+        if step_bin_size < 1:
+            raise ValueError("step_bin_size must be at least 1.")
         if seed < 0:
             raise ValueError("seed must be nonnegative.")
         if compile_strategy not in {
@@ -344,6 +376,7 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
         self.learning_rate = learning_rate
         self.log_z_learning_rate = log_z_learning_rate
         self.initial_log_z = initial_log_z
+        self.loss = loss
         self.beta = beta
         self.reward_transform = reward_transform
         self.log_score_floor = log_score_floor
@@ -359,6 +392,8 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
         )
         self.reject_sample_size = reject_sample_size
         self.reject_log_path = reject_log_path
+        self.pool_log_path = pool_log_path
+        self.step_bin_size = step_bin_size
         self.seed = seed
         # Separate from the global seed so sampling rejects never consumes
         # draws the policy would otherwise have made.
@@ -501,6 +536,7 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
             # A round that cannot reach n_samples raises here, and that is
             # exactly the round whose rejects explain why. Write them first.
             self._write_reject_log(round_number)
+        self._write_pool_log(round_number, candidates)
         self.round_metrics.generation_duration_s = (
             time.perf_counter() - generation_started
         )
@@ -542,6 +578,7 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
             tokenizer=self._pretrained_model.tokenizer,
             initial_log_z=self.initial_log_z,
             fidelity_head=copy.deepcopy(self._pretrained_model.fidelity_head),
+            loss=self.loss,
         ).to(self.device)
         if self.attention_mask_adapter:
             model.enable_attention_mask_adapter()
@@ -628,18 +665,23 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
         policy_parameters = list(model.policy.parameters())
         if model.fidelity_head is not None:
             policy_parameters.extend(model.fidelity_head.parameters())
-        return torch.optim.AdamW(
-            [
-                {"params": policy_parameters, "lr": self.learning_rate},
-                # log_z estimates a normalizer, not a weight: AdamW's default
-                # decay would pull it back toward zero, short of its true value.
+        groups: list[dict[str, Any]] = [
+            {"params": policy_parameters, "lr": self.learning_rate}
+        ]
+        if self.loss != "vargrad":
+            # log_z estimates a normalizer, not a weight: AdamW's default
+            # decay would pull it back toward zero, short of its true value.
+            # VarGrad has no such parameter -- it takes the batch's own
+            # optimum -- so handing log_z to the optimizer would let weight
+            # decay and momentum drift a value nothing reads.
+            groups.append(
                 {
                     "params": [model.log_z],
                     "lr": self.log_z_learning_rate,
                     "weight_decay": 0.0,
-                },
-            ]
-        )
+                }
+            )
+        return torch.optim.AdamW(groups)
 
     def _train_round(
         self,
@@ -762,7 +804,15 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
             online_loss=online_loss,
             replay_loss=replay_loss,
             auxiliary_loss=auxiliary_loss,
-            log_z=float(model.log_z.detach().item()),
+            # Under VarGrad the parameter never moves; what the loss used is
+            # the normalizer the batch implied, which is the informative one
+            # and is also what initial_log_z should be set to under RTB.
+            # getattr keeps this working for any model exposing only log_z.
+            log_z=getattr(
+                model,
+                "effective_log_z",
+                float(model.log_z.detach().item()),
+            ),
             raw_reward_scores=prepared.reward_scores.detach().cpu().tolist(),
             acq_scores=prepared.acq_scores,
             # Canonical SMILES, so a repeat is the same molecule: this is the only
@@ -1235,7 +1285,10 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
         optimized_parameters = list(model.policy.parameters())
         if model.fidelity_head is not None:
             optimized_parameters.extend(model.fidelity_head.parameters())
-        optimized_parameters.append(model.log_z)
+        if self.loss != "vargrad":
+            # VarGrad never gives log_z a gradient; including it would only
+            # dilute the reported pre-clip norm with a constant zero.
+            optimized_parameters.append(model.log_z)
         # clip_grad_norm_ returns the norm as it was before clipping: above
         # gradient_clip_norm, the clip rather than the learning rate set this step.
         self._last_gradient_norm = float(
@@ -1259,6 +1312,23 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
             )
         except OSError as error:
             _logger.warning("Could not write the reject log: %s", error)
+
+    def _write_pool_log(
+        self,
+        round_number: int,
+        candidates: Sequence[Candidate],
+    ) -> None:
+        """Write the generated pool, never failing the round for it."""
+        if self.pool_log_path is None or not candidates:
+            return
+        try:
+            write_pool_log(
+                candidates,
+                self.pool_log_path,
+                round_index=round_number,
+            )
+        except OSError as error:
+            _logger.warning("Could not write the candidate pool: %s", error)
 
     def _record_rejects(
         self,

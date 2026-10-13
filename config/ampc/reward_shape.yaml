@@ -145,7 +145,11 @@ sampler:
   # and on generated chemistry that best swings by ~100 nats from batch to batch,
   # which put ~48x more variance into the reward than the within-batch signal
   # (REWARD_SHAPE_LOGZ_FIX.md, section 6).
-  log_score_floor: -100.0
+  # Lowered from -100 on 2026-10-13: at -100 only ~3% of a prior batch scored
+  # above the floor, so the reward was close to two-valued and most of the
+  # gradient went into a shared offset rather than into telling molecules
+  # apart. jobs/reward_shape.sh overrides this per arm.
+  log_score_floor: -150.0
   # log Z = log E[R] under the pretrained prior. Left at 0 it opened the four
   # 2026-10-08 power arms with a uniform 9-23 nat residual that the policy
   # absorbed by leaving the valid-SMILES manifold. It depends on beta AND on the

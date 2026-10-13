@@ -180,6 +180,117 @@ def relative_trajectory_balance_loss(
     return residual.square().mean()
 
 
+def vargrad_loss(
+    policy_log_probabilities: Tensor,
+    prior_log_probabilities: Tensor,
+    reward_scores: Tensor,
+    beta: float = 1.0,
+) -> Tensor:
+    """Compute the VarGrad objective: RTB with ``log_z`` solved for per batch.
+
+    The RTB residual is ``log_z + log p_policy - log p_prior - beta * r``. The
+    ``log_z`` minimising its mean square is just the negative batch mean of the
+    rest, so substituting it back leaves the *variance* of
+
+    ``d = log p_policy - log p_prior - beta * r``.
+
+    This is the same objective with the normalizer eliminated rather than
+    learned. Two consequences matter here. An offset shared by the whole batch
+    contributes no gradient, so there is no ``initial_log_z`` to place wrongly
+    and no feedback loop in which a badly placed one suppresses the very
+    molecules whose gradients would correct it. In exchange the signal is
+    purely *within* batch: a single trajectory has zero variance and therefore
+    no gradient, and a near-constant reward leaves little to learn from.
+
+    The population variance is used, matching
+    :func:`relative_trajectory_balance_loss`, which also averages rather than
+    applying Bessel's correction.
+
+    Parameters
+    ----------
+    policy_log_probabilities : Tensor
+        Policy sequence log probabilities, one per trajectory.
+    prior_log_probabilities : Tensor
+        Frozen prior sequence log probabilities, aligned with the policy's.
+    reward_scores : Tensor
+        Acquisition reward scores ``r(x)``, with ``log R(x) = beta * r(x)``.
+    beta : float, optional
+        Reward inverse-temperature coefficient.
+
+    Returns
+    -------
+    Tensor
+        Scalar variance of the residual, zero for an empty or single-trajectory
+        batch.
+
+    Raises
+    ------
+    ValueError
+        If tensor shapes do not align, ``beta`` is not finite, or a reward
+        score is non-finite.
+    """
+    if policy_log_probabilities.ndim != 1:
+        raise ValueError("policy_log_probabilities must be one-dimensional.")
+    if prior_log_probabilities.shape != policy_log_probabilities.shape:
+        raise ValueError("prior and policy log probabilities must have equal shape.")
+    if reward_scores.shape != policy_log_probabilities.shape:
+        raise ValueError("Reward scores must align with policy log probabilities.")
+    if not math.isfinite(beta):
+        raise ValueError("beta must be finite.")
+    if not torch.isfinite(reward_scores).all():
+        raise ValueError("Reward scores must be finite.")
+    if policy_log_probabilities.numel() == 0:
+        return policy_log_probabilities.sum() * 0.0
+
+    residual = (
+        policy_log_probabilities
+        - prior_log_probabilities.detach()
+        - beta * reward_scores
+    )
+    # Gradients flow through the mean as well; that is what makes the shared
+    # offset cancel instead of being pushed on.
+    return (residual - residual.mean()).square().mean()
+
+
+def implied_log_z(
+    policy_log_probabilities: Tensor,
+    prior_log_probabilities: Tensor,
+    reward_scores: Tensor,
+    beta: float = 1.0,
+) -> Tensor:
+    """Return the ``log_z`` this batch implies, as VarGrad effectively uses.
+
+    Under VarGrad the normalizer is never a parameter, but the value it would
+    have taken is still the most useful single number about the batch: it is
+    what ``initial_log_z`` should be set to if the run is switched back to RTB.
+
+    Parameters
+    ----------
+    policy_log_probabilities : Tensor
+        Policy sequence log probabilities, one per trajectory.
+    prior_log_probabilities : Tensor
+        Frozen prior sequence log probabilities, aligned with the policy's.
+    reward_scores : Tensor
+        Acquisition reward scores ``r(x)``.
+    beta : float, optional
+        Reward inverse-temperature coefficient.
+
+    Returns
+    -------
+    Tensor
+        Detached scalar, or a zero scalar for an empty batch.
+    """
+    if policy_log_probabilities.numel() == 0:
+        return torch.zeros((), dtype=torch.float64)
+    with torch.no_grad():
+        residual = (
+            policy_log_probabilities.detach().double()
+            - prior_log_probabilities.detach().double()
+            - beta * reward_scores.detach().double()
+        )
+        return -residual.mean()
+
+
 def relative_trajectory_balance_diagnostics(
     policy_log_probabilities: Tensor,
     prior_log_probabilities: Tensor,

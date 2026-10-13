@@ -341,7 +341,12 @@ class S3GFNSamplerConfig(BaseModel):
     Learning rate for the log-partition estimate.
     initial_log_z : float, default=0.0
     Starting value of the log-partition estimate, ideally ``log E[R]`` under the
-    pretrained prior; ``scripts/reward_shape_preview.py`` measures it.
+    pretrained prior; ``scripts/reward_shape_preview.py`` measures it. Unused
+    when ``loss`` is ``"vargrad"``.
+    loss : {"rtb", "vargrad"}, default="rtb"
+    Trajectory objective. ``"rtb"`` learns ``log_z``; ``"vargrad"`` solves for
+    it per batch, so ``initial_log_z`` and ``log_z_learning_rate`` stop
+    mattering and the gradient comes only from within-batch spread.
     beta : float, default=50.0
     GFlowNet loss temperature parameter.
     reward_transform : {"exponential", "power"}, default="exponential"
@@ -370,6 +375,13 @@ class S3GFNSamplerConfig(BaseModel):
     reject_log_path : str, optional
     CSV for the retained rejects, with ``{round}`` replaced by the round
     index. None disables the file and keeps the counts in the metrics.
+    pool_log_path : str, optional
+    CSV of the generated pool, written as soon as generation finishes so it
+    survives a round that later fails. None disables it.
+    step_bin_size : int, default=100
+    Training steps reduced to one median point on the per-step figures, so the
+    curves show a trend rather than batch-to-batch noise. The median resists
+    the heavy tails these series have. 1 plots every step.
     seed : int, default=42
     Random seed for policy training and sampling.
     """
@@ -410,6 +422,7 @@ class S3GFNSamplerConfig(BaseModel):
     learning_rate: PositiveFloat = 1.0e-4
     log_z_learning_rate: PositiveFloat = 1.0e-3
     initial_log_z: FiniteFloat = 0.0
+    loss: Literal["rtb", "vargrad"] = "rtb"
     beta: PositiveFloat = 50.0
     reward_transform: RewardTransform = "exponential"
     log_score_floor: FiniteFloat | None = None
@@ -421,6 +434,8 @@ class S3GFNSamplerConfig(BaseModel):
     max_generation_attempts: int | None = Field(default=None, gt=0)
     reject_sample_size: int = Field(default=2000, ge=0)
     reject_log_path: str | None = None
+    pool_log_path: str | None = None
+    step_bin_size: int = Field(default=100, ge=1)
     seed: int = Field(default=42, ge=0)
 
     @model_validator(mode="before")
@@ -493,6 +508,7 @@ class S3GFNSamplerConfig(BaseModel):
             learning_rate=self.learning_rate,
             log_z_learning_rate=self.log_z_learning_rate,
             initial_log_z=self.initial_log_z,
+            loss=self.loss,
             beta=self.beta,
             reward_transform=self.reward_transform,
             log_score_floor=self.log_score_floor,
@@ -504,6 +520,8 @@ class S3GFNSamplerConfig(BaseModel):
             max_generation_attempts=self.max_generation_attempts,
             reject_sample_size=self.reject_sample_size,
             reject_log_path=self.reject_log_path,
+            pool_log_path=self.pool_log_path,
+            step_bin_size=self.step_bin_size,
             seed=self.seed,
         )
 

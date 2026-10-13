@@ -755,10 +755,14 @@ def test_ampc_reward_shape_config_parses() -> None:
     assert config.acquisition.log_output is False
     assert config.sampler.type == "S3GFNSampler"
     assert config.sampler.reward_transform == "power"
-    # A fixed floor, so the reward is a function of the molecule alone, and a
-    # log_z that starts off zero and can move: left at 0 with the default 1e-3
-    # rate, the 2026-10-08 power arms collapsed.
-    assert config.sampler.log_score_floor == -100.0
+    # A fixed floor, so the reward is a function of the molecule alone. Lowered
+    # from -100 on 2026-10-13: only ~3% of a prior batch cleared -100, which
+    # left the reward close to two-valued and most of the gradient going into
+    # an offset shared by the batch rather than into telling molecules apart.
+    assert config.sampler.log_score_floor == -150.0
+    # The log_z settings below are still parsed and still used by `rtb`, but
+    # jobs/reward_shape.sh now overrides sampler.loss to vargrad, which solves
+    # for the normalizer per batch and reads neither of them.
     assert config.sampler.initial_log_z < 0.0
     assert config.sampler.log_z_learning_rate == 0.01
     assert config.oracle.type == "Dock3Oracle"

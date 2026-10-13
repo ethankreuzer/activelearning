@@ -22,7 +22,7 @@ import textwrap
 from collections.abc import Sequence
 from dataclasses import dataclass
 from types import MethodType
-from typing import Any
+from typing import Any, Literal
 
 import torch
 from torch import Tensor, nn
@@ -30,12 +30,16 @@ from torch import Tensor, nn
 from activelearning.sampler.s3gfn._optional import require_transformers
 from activelearning.sampler.s3gfn.fidelity import FidelityActionHead
 from activelearning.sampler.s3gfn.losses import (
+    implied_log_z,
     negative_replay_contrastive_loss,
     relative_trajectory_balance_diagnostics,
     relative_trajectory_balance_loss,
     sequence_log_probabilities,
     sequence_log_probabilities_from_logits,
+    vargrad_loss,
 )
+
+TrajectoryLoss = Literal["rtb", "vargrad"]
 
 
 DEFAULT_GP_MOLFORMER_MODEL = "ibm-research/GP-MoLFormer-Uniq"
@@ -84,6 +88,7 @@ class S3GFNModel(nn.Module):
         tokenizer: Any,
         initial_log_z: float = 0.0,
         fidelity_head: FidelityActionHead | None = None,
+        loss: TrajectoryLoss = "rtb",
     ) -> None:
         """Create an S3-GFN model from a policy, prior, and tokenizer.
 
@@ -96,20 +101,28 @@ class S3GFNModel(nn.Module):
         tokenizer : Any
             Hugging Face-compatible tokenizer with pad and EOS token ids.
         initial_log_z : float, optional
-            Initial value for the trainable RTB normalizer ``log Z``.
+            Initial value for the trainable RTB normalizer ``log Z``. Unused
+            under ``loss="vargrad"``, which solves for the normalizer instead.
         fidelity_head : FidelityActionHead or None, optional
             Optional head for a terminal fidelity action. Omit it for
             molecule-only trajectories.
+        loss : {"rtb", "vargrad"}, optional
+            Trajectory objective. ``"rtb"`` learns ``log_z`` as a parameter;
+            ``"vargrad"`` eliminates it by taking the batch's own optimum,
+            which removes the sensitivity to ``initial_log_z`` at the cost of
+            a signal that is purely within-batch.
 
         Raises
         ------
         ValueError
-            If ``initial_log_z`` is non-finite or the tokenizer lacks a pad
-            or EOS token id.
+            If ``initial_log_z`` is non-finite, ``loss`` is unknown, or the
+            tokenizer lacks a pad or EOS token id.
         """
         super().__init__()
         if not math.isfinite(initial_log_z):
             raise ValueError("initial_log_z must be finite.")
+        if loss not in ("rtb", "vargrad"):
+            raise ValueError("loss must be 'rtb' or 'vargrad'.")
         if tokenizer.pad_token_id is None:
             raise ValueError("The S3-GFN tokenizer must define pad_token_id.")
         if tokenizer.eos_token_id is None:
@@ -135,8 +148,12 @@ class S3GFNModel(nn.Module):
         self.pad_token_id = int(tokenizer.pad_token_id)
         self.eos_token_id = int(tokenizer.eos_token_id)
         self.log_z = nn.Parameter(torch.tensor(float(initial_log_z)))
+        self.loss = loss
         self._last_auxiliary_loss: Tensor | None = None
         self._last_on_policy_diagnostics: Tensor | None = None
+        # The normalizer the last loss actually used: the parameter under RTB,
+        # the batch's own optimum under VarGrad.
+        self._last_effective_log_z: float = float(initial_log_z)
         self._policy_forward_compiled = False
         self._compiled_policy_forward: Any | None = None
         self._compiled_prior_scorer: Any | None = None
@@ -306,6 +323,22 @@ class S3GFNModel(nn.Module):
             self._last_on_policy_diagnostics.tolist()
         )
         return float(residual_mean), float(residual_std), float(log_ratio_mean)
+
+    @property
+    def effective_log_z(self) -> float:
+        """Return the normalizer the most recent loss actually used.
+
+        Under ``loss="rtb"`` this tracks the ``log_z`` parameter. Under
+        ``loss="vargrad"`` the parameter is never read or updated, and this is
+        the normalizer the last batch implied -- the value to report, and the
+        one ``initial_log_z`` should take if the run switches back to RTB.
+
+        Returns
+        -------
+        float
+            The normalizer in nats, ``initial_log_z`` until a loss has run.
+        """
+        return self._last_effective_log_z
 
     def train(self, mode: bool = True) -> "S3GFNModel":
         """Set the policy's training mode and keep the prior in evaluation.
@@ -743,12 +776,11 @@ class S3GFNModel(nn.Module):
             positive_input_ids,
             fidelity_indices=positive_fidelity_indices,
         )
-        rtb_loss = relative_trajectory_balance_loss(
-            policy_log_probabilities=positive_log_probabilities,
-            prior_log_probabilities=prior_log_probabilities,
-            reward_scores=reward_scores,
-            log_z=self.log_z,
-            beta=beta,
+        rtb_loss = self._trajectory_loss(
+            positive_log_probabilities,
+            prior_log_probabilities,
+            reward_scores,
+            beta,
         )
 
         # ``_last_auxiliary_loss`` stays ``None`` unless the contrastive branch runs,
@@ -824,11 +856,41 @@ class S3GFNModel(nn.Module):
             fidelity_indices=fidelity_indices,
         )
         if policy_log_probabilities.numel() > 0:
+            # Under VarGrad the residual is measured against the normalizer the
+            # batch itself implies, so the diagnostics read on the same scale
+            # the loss is actually minimising.
             self._last_on_policy_diagnostics = relative_trajectory_balance_diagnostics(
                 policy_log_probabilities=policy_log_probabilities,
                 prior_log_probabilities=prior_log_probabilities,
                 reward_scores=reward_scores,
-                log_z=self.log_z,
+                log_z=self._effective_log_z(
+                    policy_log_probabilities,
+                    prior_log_probabilities,
+                    reward_scores,
+                    beta,
+                ),
+                beta=beta,
+            )
+        return self._trajectory_loss(
+            policy_log_probabilities,
+            prior_log_probabilities,
+            reward_scores,
+            beta,
+        )
+
+    def _trajectory_loss(
+        self,
+        policy_log_probabilities: Tensor,
+        prior_log_probabilities: Tensor,
+        reward_scores: Tensor,
+        beta: float,
+    ) -> Tensor:
+        """Apply the configured trajectory objective to one batch."""
+        if self.loss == "vargrad":
+            return vargrad_loss(
+                policy_log_probabilities=policy_log_probabilities,
+                prior_log_probabilities=prior_log_probabilities,
+                reward_scores=reward_scores,
                 beta=beta,
             )
         return relative_trajectory_balance_loss(
@@ -838,6 +900,30 @@ class S3GFNModel(nn.Module):
             log_z=self.log_z,
             beta=beta,
         )
+
+    def _effective_log_z(
+        self,
+        policy_log_probabilities: Tensor,
+        prior_log_probabilities: Tensor,
+        reward_scores: Tensor,
+        beta: float,
+    ) -> Tensor:
+        """Return the normalizer the configured objective is using.
+
+        Also records it, so the sampler can report the value VarGrad implied
+        rather than the ``log_z`` parameter, which never moves under VarGrad.
+        """
+        if self.loss == "vargrad":
+            effective = implied_log_z(
+                policy_log_probabilities=policy_log_probabilities,
+                prior_log_probabilities=prior_log_probabilities,
+                reward_scores=reward_scores,
+                beta=beta,
+            ).to(self.log_z.dtype)
+        else:
+            effective = self.log_z
+        self._last_effective_log_z = float(effective.detach().item())
+        return effective
 
     def _select_terminal_hidden_states(
         self,

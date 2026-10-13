@@ -1020,3 +1020,49 @@ def test_training_step_records_gradient_norms_for_the_updates_that_ran(
     assert metrics.gradient_clip_norm == sampler.gradient_clip_norm
     # This stand-in model exposes no residual diagnostics, and none are invented.
     assert metrics.residual_steps == []
+
+
+def test_write_pool_log_writes_smiles_and_fidelity(tmp_path) -> None:
+    candidates = [
+        Candidate(x="CCO", fidelity=1),
+        Candidate(x="c1ccccc1", fidelity=None),
+    ]
+    path = str(tmp_path / "pool_round_{round}.csv")
+
+    written = logging_module.write_pool_log(candidates, path, round_index=2)
+
+    assert written is not None
+    written_path = Path(written)
+    assert written_path.name == "pool_round_0002.csv"
+    rows = list(csv.DictReader(written_path.open(encoding="utf-8")))
+    # The column is SMILES so the file feeds the evaluation pipeline directly.
+    assert [row["SMILES"] for row in rows] == ["CCO", "c1ccccc1"]
+    assert [row["fidelity"] for row in rows] == ["1", ""]
+
+
+def test_write_pool_log_skips_an_empty_pool(tmp_path) -> None:
+    path = tmp_path / "pool.csv"
+
+    assert logging_module.write_pool_log([], str(path), round_index=0) is None
+    assert not path.exists()
+
+
+def test_pool_log_is_written_even_though_the_round_has_not_completed(
+    make_sampler, tmp_path
+) -> None:
+    """The pool must survive a round that dies later, in the oracle."""
+    sampler = make_sampler(n_samples=2)
+    sampler.pool_log_path = str(tmp_path / "pool_round_{round}.csv")
+
+    sampler._write_pool_log(1, [Candidate(x="CCO", fidelity=1)])
+
+    assert (tmp_path / "pool_round_0001.csv").exists()
+
+
+def test_pool_log_is_disabled_by_default(make_sampler, tmp_path) -> None:
+    sampler = make_sampler(n_samples=2)
+
+    assert sampler.pool_log_path is None
+    # No path configured: nothing is written and nothing raises.
+    sampler._write_pool_log(1, [Candidate(x="CCO", fidelity=1)])
+    assert list(tmp_path.iterdir()) == []

@@ -92,40 +92,41 @@
 # All memory on a 48-core A100 node (RealMemory=510000M). Narval rejects --mem=0
 # unless the whole node is requested, and this uses one GPU.
 #SBATCH --mem=510000M
-# 6h, down from 12h on 2026-10-11, to be backfillable. Measured from the collapsed
-# 2026-10-08 arms (5024309, 5024345): 10,000 training steps took 89 min there
-# (generated_total=640000 = 10000 x 64, so every step's generation ran), and the
-# remaining ~110 min of their 3h20 went into _generate_final_candidates grinding
-# 2,000,000 attempts before raising. A healthy arm trades that thrashing for real
-# generation but pays for ~9,500 gradient updates those runs skipped
-# (online_updates was 429), so budget 3-4.5h. 6h clears that, and if the log_z fix
-# does not hold the arm still dies at ~3h20 and the cap costs nothing. Fairshare
-# dominates Narval priority (weight 5e6 against 2500 for age), so a shorter job is
-# the only lever that moves a queued arm; the window it needs is what shrinks.
-#SBATCH --time=6:00:00
+# 10h, up from 6h on 2026-10-13. The 6h figure was budgeted for arms that die
+# early: training plus generation measured 2.9h on 5188073, and every arm until
+# now was killed by the DKL-kernel OOM immediately afterwards. With that fixed,
+# three things run to completion for the first time and NONE of them has ever
+# been timed -- scoring 100k candidates through the newly chunked kernel,
+# CostAwareSelector over that pool, and ~2,000 Dock3 evaluations. The config
+# puts the docking alone at ~20 min on 48 CPUs, but the scoring is the unknown:
+# it now runs in slices of ~27 candidates, so it trades memory for many more
+# kernel calls. 10h leaves room to measure all of it once rather than lose a
+# queue wait to a timeout. Shorten it again once a completed round gives a real
+# number: fairshare dominates Narval priority (weight 5e6 against 2500 for age),
+# so the window a job needs is the only lever that moves it up a full queue.
+#SBATCH --time=10:00:00
 #SBATCH --job-name=ampc_reward_shape
 # RE-CHECK THIS EVERY TIME; it is a snapshot, not a ranking. Measured
 # 2026-10-13 with `sshare -l -A def-bengioy_gpu,def-mailhoto_gpu,def-yvesbrun_gpu`:
 #
 #   account            acct RawShares   acct LevelFS   my FairShare
-#   def-yvesbrun_gpu          16287          2.205          0.369   <- this one
-#   def-bengioy_gpu           16287          0.936          0.343
-#   def-mailhoto_gpu          16287          0.730          0.329
+#   def-bengioy_gpu           14975          0.896          0.335   <- this one
+#   def-mailhoto_gpu          14975          0.699          0.322
+#   def-yvesbrun_gpu              1       0.000143          0.155
 #
-# Two numbers, and both matter. The ACCOUNT row's LevelFS says whether the account
-# is under its share (above 1) or over it; only yvesbrun is under today. The
-# USER row's FairShare is the real priority factor -- a job's FAIRSHARE term is
-# exactly 5e6 x that number -- so it is what to compare once two accounts both
-# hold real shares. Here yvesbrun wins on both.
+# Two numbers, and both matter. The ACCOUNT row's LevelFS says whether the
+# account is under its share (above 1) or over it; all three are over today, so
+# the choice is the least-over one. The USER row's FairShare is the real
+# priority factor -- a job's FAIRSHARE term is exactly 5e6 x that number -- and
+# bengioy leads on both.
 #
-# This has now flipped twice in five days, which is why it is re-measured rather
-# than remembered. def-yvesbrun_gpu held RawShares 14353 / LevelFS 1.57 on
-# 2026-10-08, collapsed to RawShares 1 by 2026-10-10 (arms queued on it sat behind
-# ~1079 of 1197 pending GPU jobs), and is restored to 16287 / LevelFS 2.205 as of
-# 2026-10-13 -- it has the lowest RawUsage of the three (3.59e9 against bengioy's
-# 8.46e9 and mailhoto's 1.08e10) on equal shares. Meanwhile bengioy slipped from
-# LevelFS 1.108 to 0.936, so the 2026-10-11 choice is now the wrong one. The three
-# arms submitted 2026-10-10 went to def-mailhoto_gpu and waited 35-38 h to start.
+# RE-MEASURE IMMEDIATELY BEFORE EVERY SUBMIT, not once a day. def-yvesbrun_gpu
+# held RawShares 14353 / LevelFS 1.57 on 2026-10-08, collapsed to 1 by
+# 2026-10-10 (arms queued on it sat behind ~1079 of 1197 pending GPU jobs), was
+# back at 16287 / LevelFS 2.205 earlier on 2026-10-13, and had collapsed to 1
+# again within hours of that same day. A snapshot taken this morning would have
+# sent this job to the worst of the three. The arms submitted 2026-10-10 went to
+# def-mailhoto_gpu and waited 35-38 h to start.
 #
 # def-alexhg_gpu and def-pr61079_gpu still carry RawShares=1 with NormShares
 # 0.000000. Their user-level FairShare looks excellent (0.985, 0.680) and their
@@ -133,7 +134,7 @@
 # for every member of the account. `sshare -U -u $USER` shows only the user's share
 # *within* each account and so hides this entirely; always check the account row
 # with `sshare -l -A <acct>`.
-#SBATCH --account=def-yvesbrun_gpu
+#SBATCH --account=def-bengioy_gpu
 #SBATCH --output=slurm_logs/ampc_reward_shape_%j.out
 #SBATCH --error=slurm_logs/ampc_reward_shape_%j.err
 
@@ -154,16 +155,32 @@ fi
 # Fixed for the whole study, and stated here rather than left to the YAML so the
 # notes and tags below cannot drift from what the run was given.
 #   LOG_SCORE_FLOOR  lower bound on log(acq) under power; a constant, so a
-#                    molecule's reward no longer depends on its batch.
+#                    molecule's reward no longer depends on its batch. Lowered
+#                    from -100 on 2026-10-13: only ~3% of a prior batch cleared
+#                    -100, which left the reward near two-valued.
+#   LOSS             vargrad drops log_z and minimises the variance of the RTB
+#                    residual, taking the batch's own optimal normalizer. That
+#                    removes the failure the 2026-10-12 arms hit, where a
+#                    badly placed log_z suppressed the valid molecules and so
+#                    starved itself of the updates that would have corrected
+#                    it. INITIAL_LOG_Z and LOG_Z_LR are then unused, and kept
+#                    only so switching back to rtb needs no edit here.
 #   LOG_Z_LR         learning rate of the log_z scalar (the policy's is 1e-4).
-LOG_SCORE_FLOOR="-100"
+LOG_SCORE_FLOOR="-150"
+LOSS="vargrad"
 LOG_Z_LR="0.01"
 
 # The arm name carries only the non-defaults, as the exact-DKL arms do:
-#   reward_<transform>_beta<beta>_logz<initial_log_z>[_s<seed>]
-# The logz part also keeps these arms out of the directories of the 2026-10-08
-# ones, which started log_z at 0 under the per-batch floor.
-ARM="reward_${TRANSFORM}_beta${BETA}_logz${INITIAL_LOG_Z}"
+#   reward_<transform>_beta<beta>_<vargrad|logz<initial_log_z>>_floor<floor>[_s<seed>]
+# Under vargrad the log_z value is not used, so naming the arm after it would
+# claim a setting the run ignored; the loss goes in its place. The floor is in
+# the name because it changed on 2026-10-13 and the -100 arms must stay in
+# their own directories.
+if [[ "${LOSS}" == "vargrad" ]]; then
+  ARM="reward_${TRANSFORM}_beta${BETA}_vargrad_floor${LOG_SCORE_FLOOR}"
+else
+  ARM="reward_${TRANSFORM}_beta${BETA}_logz${INITIAL_LOG_Z}_floor${LOG_SCORE_FLOOR}"
+fi
 SEED_OVERRIDE=()
 SEED_TAG=""
 if [[ -n "${SEED}" ]]; then
@@ -190,6 +207,10 @@ OUTPUT_DIR="outputs/ampc/reward_shape/${ARM}"
 # YAML loader, which would read a leading `{` as a flow mapping. Prefixed by
 # OUTPUT_DIR it parses as a plain string.
 REJECT_LOG_PATH="${OUTPUT_DIR}/rejects_round_{round}.csv"
+# The generated pool, written the moment generation finishes rather than when
+# the round completes, so an oracle timeout cannot destroy hours of sampling.
+# It is also the input to scoring this pool against the prior's molecules.
+POOL_LOG_PATH="${OUTPUT_DIR}/generated_pool_round_{round}.csv"
 if [[ ! -f "${STATE_PATH}" ]]; then
   echo "${STATE_PATH} not found: fit the no-layer arm first with" >&2
   echo "  sbatch jobs/exact_dkl_balanced.sh 25000 none" >&2
@@ -206,25 +227,42 @@ else
   REWARD_TEXT="R = exp(${BETA} * acq), so the reward ratio follows the DIFFERENCE of the information gains. Generated molecules score ~1e-14 at the 99.9th percentile against a best of ~4e-3, so the bulk of a batch is expected to stay tied at this or any beta; this arm exists to demonstrate that limit"
 fi
 
+if [[ "${LOSS}" == "vargrad" ]]; then
+  NORMALIZER_TEXT="Loss: VARGRAD, not RTB. There is no log_z parameter. The log_z minimising the mean squared RTB residual is just the negative batch mean of the rest, so substituting it back leaves the VARIANCE of (log p_policy - log p_prior - beta * r). An offset shared by the whole batch therefore contributes no gradient at all, which is the point: the 2026-10-08 and the logz0 arm of 2026-10-12 died because a log_z at the wrong level pushed down exactly the valid, synthesizable molecules -- the only ones the loss can see -- and the mass went to invalid strings, which in turn starved log_z of the updates that would have corrected it (348 of 10,000). VarGrad cannot enter that loop. What it gives up is that the signal is purely within-batch: a batch with one usable molecule has zero variance and no gradient, and a near-constant reward carries little. INITIAL_LOG_Z (${INITIAL_LOG_Z}) and LOG_Z_LR (${LOG_Z_LR}) are passed but UNUSED."
+  RESIDUAL_TEXT="train/residual is measured against the normalizer each batch implied, so its mean sits at 0 by construction and only the standard deviation -- the reward shape the policy has yet to match -- carries information; sampler/s3gfn/log_z is that implied normalizer per step, which is also the value INITIAL_LOG_Z should take if this is switched back to rtb"
+else
+  NORMALIZER_TEXT="Loss: RTB. Normalizer log_z STARTS AT ${INITIAL_LOG_Z}, not 0, with learning rate ${LOG_Z_LR} (default 1e-3) and no weight decay. log_z estimates log E[R] under the pretrained prior; ${INITIAL_LOG_Z} is that value as measured for this beta and floor by scripts/reward_shape_preview.py on gp_molformer_set. The 2026-10-08 power arms (jobs 5024309, 5024311, 5024318, 5024345) started it at 0, 9-23 nats too high, which told the policy every molecule it generated was far over-probable; validity fell to 0.4% and they took 60-429 of 10,000 updates. Watch sampler/s3gfn/log_z: it should stay near ${INITIAL_LOG_Z}, and a long drift means the measurement was off."
+  RESIDUAL_TEXT="train/residual splits the RTB residual into its signed mean (log_z at the wrong level -- should sit near 0 if ${INITIAL_LOG_Z} was right) and its standard deviation (the reward shape the policy has yet to match)"
+fi
+
 # A plain-language description, so the run can be understood on its own months
 # later. wandb reads WANDB_NOTES at init and shows it on the run's Overview page
 # and in the Notes column of the runs table; the same text is kept next to the
 # run's outputs.
-export WANDB_NOTES="REWARD-SHAPE arm ${ARM}: ONE active-learning round, varying only the reward the S3-GFN policy is trained against.
+export WANDB_NOTES="REWARD-SHAPE arm ${ARM}: ONE active-learning round, training the S3-GFN policy against a fixed GIBBON acquisition on a frozen surrogate.
+THE QUESTION THIS RUN ASKS: does the trained policy generate molecules the acquisition rates higher than the ones the untrained prior produces? Not validity, not docking -- those are read but are not what this arm is for. The answer comes from scoring BOTH pools afterwards with this same restored surrogate and ONE acquisition object, and comparing two distributions on each: the surrogate posterior MEAN, and log(acquisition). The generated pool is written to ${POOL_LOG_PATH} as soon as generation finishes, then prepared and scored alongside gp_molformer_set (83,811 docked prior samples) via exact_dkl_prepare.py --extra-set and exact_dkl_top_n.py --extra-set, which also reports pooled/acquisition/*/top{k}/<set>_share: which of the two pools the acquisition would actually pick from. Both sets must be scored in the SAME invocation, because GIBBON ranks against sampled posterior max-values and a separate run would draw different ones.
+WHAT IS NEW HERE, against the 2026-10-12 arms: the loss (vargrad, below), the log-score floor (-150, was -100), and a fixed OOM in the DKL kernel that killed every earlier arm during final scoring -- it re-encoded the 25,000 training molecules once per scored candidate and asked for 12.21 GiB. This is therefore the first arm of the study expected to complete a round at all.
 Surrogate: RESTORED, NOT REFITTED. The exact GP (no inducing points, no minibatching) is rebuilt on the 25000-molecule BALANCED training set data/ampc_balanced_25000.csv -- the library-proportional mix, top band floored at 5% of the budget -- and its fitted parameters are loaded from ${STATE_PATH} in place of training, so every arm of this study shares one surrogate exactly. See ${FITTED_DIR}/arm_description.txt for how that fit was obtained. Features: frozen MiniMol AmpC fingerprints with NO trainable layer, the kernel reading the 512-d fingerprints directly. GP prior mean: learned during that fit, not pinned. float32.
 Why this surrogate: it is the first in the study whose uncertainty is not collapsed -- 88% of truths within 2 std on unseen ampc_331k against 6% for the width-256 arm, and a GIBBON effective support of ~21 molecules rather than 2.
 Acquisition: GIBBON (QLowerBoundMaxValueEntropy), log_space=true so the information gain never underflows, log_output=false so it is returned on the VALUE scale, which is what the reward transform needs. Max-value support is the 25,000 training molecules.
 Reward: transform=${TRANSFORM}, beta=${BETA}. ${REWARD_TEXT}. The loss uses beta * score as log R, so R = exp(beta * score) is always positive even where the logged post-transform score is negative.
-Normalizer: log_z STARTS AT ${INITIAL_LOG_Z}, not 0, with learning rate ${LOG_Z_LR} (default 1e-3) and no weight decay. log_z estimates log E[R] under the pretrained prior; ${INITIAL_LOG_Z} is that value as measured for this beta and floor by scripts/reward_shape_preview.py on gp_molformer_set. The 2026-10-08 power arms (jobs 5024309, 5024311, 5024318, 5024345) started it at 0, 9-23 nats too high, which told the policy every molecule it generated was far over-probable; validity fell to 0.4% and they took 60-429 of 10,000 updates. Watch sampler/s3gfn/log_z: it should stay near ${INITIAL_LOG_Z}, and a long drift means the measurement was off.
-What to read: the per-training-step figures sampler/s3gfn/acq/trajectory (is the policy finding more informative molecules), reward/effective_support (how many of the 64 molecules in a batch the reward spreads over -- toward 1 means collapse, toward 64 means the policy will not move), reward/concentration, and train/batch_health (valid / synthesizable / unique). acq rising while validity or uniqueness falls is the policy fleeing the data the GP was fitted on. Four more test the log_z diagnosis directly: train/residual splits the RTB residual into its signed mean (log_z at the wrong level -- should sit near 0 if ${INITIAL_LOG_Z} was right) and its standard deviation (the reward shape the policy has yet to match); train/prior_divergence estimates KL(policy || prior), 0 for an inert policy and unbounded for one being torn off its prior; reward/above_floor_fraction is the share of each batch scoring above the ${LOG_SCORE_FLOOR}-nat floor, about 0.03 under the prior and the thing that should climb; train/gradient_norm is the gradient norm before clipping against the threshold of 10.
+${NORMALIZER_TEXT}
+What to read: the per-training-step figures sampler/s3gfn/acq/trajectory (is the policy finding more informative molecules), reward/effective_support (how many of the 64 molecules in a batch the reward spreads over -- toward 1 means collapse, toward 64 means the policy will not move), reward/concentration, and train/batch_health (valid / synthesizable / unique). acq rising while validity or uniqueness falls is the policy fleeing the data the GP was fitted on. Four more: ${RESIDUAL_TEXT}; train/prior_divergence estimates KL(policy || prior), 0 for an inert policy and unbounded for one being torn off its prior; reward/above_floor_fraction is the share of each batch scoring above the ${LOG_SCORE_FLOOR}-nat floor, about 0.03 under the prior and the thing that should climb; train/gradient_norm is the gradient norm before clipping against the threshold of 10.
 Then the round itself: 2,000 Dock3 evaluations selected by CostAwareSelector from a 100k generated pool, 10,000 S3-GFN training steps. The question the round answers is whether the true docking scores of those 2,000 beat a random draw from the same pool; expect low single digits, since GIBBON's top-1000 enrichment on generated-like molecules (gp_molformer_set) is 2.35x, not the 6.5x it reaches on the library.
 Prior art: exponential beta=100 (job 4012959) was inert, mean log-reward 0.02 nats, validity 0.93; power beta=1 (job 4177912) collapsed, validity 0.0028 and zero yield from 2,000,000 attempts. Both ran on a variational surrogate, not this one.
-Arm name: ${ARM}. Arms differ only in what the name carries: reward_<transform>_beta<beta>_logz<initial log_z>, plus _s<n> for a non-default seed.
+Arm name: ${ARM}. Arms differ only in what the name carries: reward_<transform>_beta<beta>_<vargrad|logz<initial log_z>>_floor<floor>, plus _s<n> for a non-default seed.
 Submitted with: sbatch jobs/reward_shape.sh $*   (Slurm job ${SLURM_JOB_ID:-unknown})"
 printf '%s\n' "${WANDB_NOTES}" > "${OUTPUT_DIR}/arm_description.txt"
 
 RUN_NAME="${ARM//_/-}-${SLURM_JOB_ID:-local}"
-TAGS="reward-shape,${TRANSFORM},beta${BETA},logz${INITIAL_LOG_Z},floor${LOG_SCORE_FLOOR},logz-lr${LOG_Z_LR},nolayer,restored-state,fp32,1-round${SEED_TAG}"
+# Only tag log_z settings when the loss actually reads them, so a tag search
+# never turns up an arm that ignored the value it is tagged with.
+if [[ "${LOSS}" == "vargrad" ]]; then
+  LOSS_TAGS="vargrad,oom-fixed,acq-vs-prior"
+else
+  LOSS_TAGS="rtb,logz${INITIAL_LOG_Z},logz-lr${LOG_Z_LR}"
+fi
+TAGS="reward-shape,${TRANSFORM},beta${BETA},${LOSS_TAGS},floor${LOG_SCORE_FLOOR},nolayer,restored-state,fp32,1-round${SEED_TAG}"
 
 # The whole logger is restated as one YAML value rather than overridden field by
 # field. OmegaConf.from_dotlist reads every path segment as a dict key, so
@@ -244,11 +282,13 @@ uv run --no-sync python scripts/run_with_sigterm_flush.py \
   "sampler.reward_transform=${TRANSFORM}" \
   "sampler.beta=${BETA}" \
   "sampler.initial_log_z=${INITIAL_LOG_Z}" \
+  "sampler.loss=${LOSS}" \
   "sampler.log_score_floor=${LOG_SCORE_FLOOR}" \
   "sampler.log_z_learning_rate=${LOG_Z_LR}" \
   "${SEED_OVERRIDE[@]}" \
   "run_writer.output_dir=${OUTPUT_DIR}" \
   "sampler.reject_log_path=${REJECT_LOG_PATH}" \
+  "sampler.pool_log_path=${POOL_LOG_PATH}" \
   "${LOGGER}" \
   "${@:5}"
 

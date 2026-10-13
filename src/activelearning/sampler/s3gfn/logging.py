@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import logging
+import math
 import random
 import statistics
 from dataclasses import dataclass, field
@@ -317,6 +318,12 @@ class S3GFNLoggingMixin:
     ) -> tuple[dict[str, float | int], dict[str, Figure]]:
         """Return and clear the S3-GFN diagnostics for the current AL round."""
         round_metrics = self.round_metrics
+        # The sampler owns this; getattr keeps the mixin usable on its own.
+        # Resolved once here so every figure shares one window.
+        bin_size = _effective_bin_size(
+            len(round_metrics.generated_counts),
+            getattr(self, "step_bin_size", 1),
+        )
         try:
             if not _has_round_data(round_metrics):
                 return {}, {}
@@ -411,47 +418,57 @@ class S3GFNLoggingMixin:
                 for key, figure in (
                     (
                         "sampler/s3gfn/training_losses",
-                        _build_training_losses_figure(round_metrics, max_points),
+                        _build_training_losses_figure(
+                            round_metrics, max_points, bin_size
+                        ),
                     ),
                     (
                         "sampler/s3gfn/log_z",
-                        _build_log_z_figure(round_metrics, max_points),
+                        _build_log_z_figure(round_metrics, max_points, bin_size),
                     ),
                     (
                         "sampler/s3gfn/reward/trajectory",
-                        _build_reward_figure(round_metrics, max_points),
+                        _build_reward_figure(round_metrics, max_points, bin_size),
                     ),
                     (
                         "sampler/s3gfn/acq/trajectory",
-                        _build_acq_figure(round_metrics, max_points),
+                        _build_acq_figure(round_metrics, max_points, bin_size),
                     ),
                     (
                         "sampler/s3gfn/reward/concentration",
-                        _build_reward_concentration_figure(round_metrics, max_points),
+                        _build_reward_concentration_figure(
+                            round_metrics, max_points, bin_size
+                        ),
                     ),
                     (
                         "sampler/s3gfn/reward/effective_support",
-                        _build_effective_support_figure(round_metrics, max_points),
+                        _build_effective_support_figure(
+                            round_metrics, max_points, bin_size
+                        ),
                     ),
                     (
                         "sampler/s3gfn/train/batch_health",
-                        _build_batch_health_figure(round_metrics, max_points),
+                        _build_batch_health_figure(round_metrics, max_points, bin_size),
                     ),
                     (
                         "sampler/s3gfn/train/residual",
-                        _build_residual_figure(round_metrics, max_points),
+                        _build_residual_figure(round_metrics, max_points, bin_size),
                     ),
                     (
                         "sampler/s3gfn/train/prior_divergence",
-                        _build_prior_divergence_figure(round_metrics, max_points),
+                        _build_prior_divergence_figure(
+                            round_metrics, max_points, bin_size
+                        ),
                     ),
                     (
                         "sampler/s3gfn/reward/above_floor_fraction",
-                        _build_above_floor_figure(round_metrics, max_points),
+                        _build_above_floor_figure(round_metrics, max_points, bin_size),
                     ),
                     (
                         "sampler/s3gfn/train/gradient_norm",
-                        _build_gradient_norm_figure(round_metrics, max_points),
+                        _build_gradient_norm_figure(
+                            round_metrics, max_points, bin_size
+                        ),
                     ),
                 ):
                     if figure is not None:
@@ -499,6 +516,7 @@ def _safe_ratio(numerator: int, denominator: int) -> float:
 def _build_training_losses_figure(
     metrics: _RoundMetrics,
     max_points: int,
+    bin_size: int = 1,
 ) -> Figure | None:
     """Build a loss trajectory figure for the recorded training steps."""
     series = (
@@ -517,7 +535,7 @@ def _build_training_losses_figure(
             for step, value in enumerate(values, start=1)
             if value is not None
         ]
-        points = _bounded(points, max_points)
+        points = _bounded(_binned(points, bin_size), max_points)
         if points:
             axis.plot(
                 [step for step, _ in points],
@@ -534,7 +552,9 @@ def _build_training_losses_figure(
     return figure
 
 
-def _build_log_z_figure(metrics: _RoundMetrics, max_points: int) -> Figure | None:
+def _build_log_z_figure(
+    metrics: _RoundMetrics, max_points: int, bin_size: int = 1
+) -> Figure | None:
     """Build a log-normalizer trajectory figure for the recorded steps."""
     if not metrics.log_z_values:
         return None
@@ -542,7 +562,7 @@ def _build_log_z_figure(metrics: _RoundMetrics, max_points: int) -> Figure | Non
     figure = Figure(figsize=(8.0, 4.5))
     axis = figure.add_subplot(1, 1, 1)
     points = _bounded(
-        list(enumerate(metrics.log_z_values, start=1)),
+        _binned(list(enumerate(metrics.log_z_values, start=1)), bin_size),
         max_points,
     )
     axis.plot([step for step, _ in points], [value for _, value in points])
@@ -555,7 +575,9 @@ def _build_log_z_figure(metrics: _RoundMetrics, max_points: int) -> Figure | Non
     return figure
 
 
-def _build_reward_figure(metrics: _RoundMetrics, max_points: int) -> Figure | None:
+def _build_reward_figure(
+    metrics: _RoundMetrics, max_points: int, bin_size: int = 1
+) -> Figure | None:
     """Build the post-transform score trajectory for recorded training batches.
 
     This plots the score the loss multiplies by ``beta``, which under the
@@ -574,18 +596,19 @@ def _build_reward_figure(metrics: _RoundMetrics, max_points: int) -> Figure | No
     )
     figure = Figure(figsize=(8.0, 4.5))
     axis = figure.add_subplot(1, 1, 1)
-    _plot_step_series(axis, series, max_points, positive_only=False)
+    _plot_step_series(axis, series, max_points, bin_size, positive_only=False)
     axis.set_ylabel("post-transform score (log(acq) under power)")
     axis.set_title(
         "S3-GFN per training step: post-transform score before beta (mean / max)"
     )
-    return _finish_step_figure(figure, axis)
+    return _finish_step_figure(figure, axis, bin_size)
 
 
 def _plot_step_series(
     axis: Axes,
     series: Sequence[tuple[str, Sequence[int], Sequence[float]]],
     max_points: int,
+    bin_size: int = 1,
     *,
     positive_only: bool,
 ) -> None:
@@ -606,7 +629,7 @@ def _plot_step_series(
         gap for them instead of dropping the whole line.
     """
     for label, steps, values in series:
-        points = _bounded(list(zip(steps, values)), max_points)
+        points = _bounded(_binned(list(zip(steps, values)), bin_size), max_points)
         if not points:
             continue
         axis.plot(
@@ -619,9 +642,13 @@ def _plot_step_series(
         )
 
 
-def _finish_step_figure(figure: Figure, axis: Axes) -> Figure:
+def _finish_step_figure(figure: Figure, axis: Axes, bin_size: int = 1) -> Figure:
     """Apply the shared legend, spine and layout treatment to a step figure."""
-    axis.set_xlabel("Training step")
+    axis.set_xlabel(
+        "Training step"
+        if bin_size <= 1
+        else f"Training step (median over {bin_size}-step bins)"
+    )
     axis.legend()
     axis.spines["top"].set_visible(False)
     axis.spines["right"].set_visible(False)
@@ -629,7 +656,9 @@ def _finish_step_figure(figure: Figure, axis: Axes) -> Figure:
     return figure
 
 
-def _build_acq_figure(metrics: _RoundMetrics, max_points: int) -> Figure | None:
+def _build_acq_figure(
+    metrics: _RoundMetrics, max_points: int, bin_size: int = 1
+) -> Figure | None:
     """Build the acq trajectory figure for the recorded training batches.
 
     ``acq`` is a fixed function of the molecule while the surrogate is frozen for
@@ -647,18 +676,19 @@ def _build_acq_figure(metrics: _RoundMetrics, max_points: int) -> Figure | None:
 
     figure = Figure(figsize=(8.0, 4.5))
     axis = figure.add_subplot(1, 1, 1)
-    _plot_step_series(axis, series, max_points, positive_only=True)
+    _plot_step_series(axis, series, max_points, bin_size, positive_only=True)
     axis.set_yscale("log")
     axis.set_ylabel("acq = GIBBON information gain (log scale)")
     axis.set_title(
         "S3-GFN per training step: acq of generated molecules (max / median / min)"
     )
-    return _finish_step_figure(figure, axis)
+    return _finish_step_figure(figure, axis, bin_size)
 
 
 def _build_reward_concentration_figure(
     metrics: _RoundMetrics,
     max_points: int,
+    bin_size: int = 1,
 ) -> Figure | None:
     """Build the reward-concentration figure for the recorded training batches.
 
@@ -676,19 +706,20 @@ def _build_reward_concentration_figure(
 
     figure = Figure(figsize=(8.0, 4.5))
     axis = figure.add_subplot(1, 1, 1)
-    _plot_step_series(axis, series, max_points, positive_only=True)
+    _plot_step_series(axis, series, max_points, bin_size, positive_only=True)
     axis.axhline(1.0, color="grey", linewidth=0.8, linestyle="--", label="batch mean")
     axis.set_yscale("log")
     axis.set_ylabel("R / mean(R)")
     axis.set_title(
         "S3-GFN per training step: reward concentration, R divided by batch mean R"
     )
-    return _finish_step_figure(figure, axis)
+    return _finish_step_figure(figure, axis, bin_size)
 
 
 def _build_effective_support_figure(
     metrics: _RoundMetrics,
     max_points: int,
+    bin_size: int = 1,
 ) -> Figure | None:
     """Build the reward effective-support figure for the training batches.
 
@@ -712,19 +743,20 @@ def _build_effective_support_figure(
     )
     figure = Figure(figsize=(8.0, 4.5))
     axis = figure.add_subplot(1, 1, 1)
-    _plot_step_series(axis, series, max_points, positive_only=False)
+    _plot_step_series(axis, series, max_points, bin_size, positive_only=False)
     axis.set_ylim(bottom=0.0)
     axis.set_ylabel("effective support (molecules)")
     axis.set_title(
         "S3-GFN per training step: effective support of the reward "
         "(molecules out of batch)"
     )
-    return _finish_step_figure(figure, axis)
+    return _finish_step_figure(figure, axis, bin_size)
 
 
 def _build_batch_health_figure(
     metrics: _RoundMetrics,
     max_points: int,
+    bin_size: int = 1,
 ) -> Figure | None:
     """Build the generated-batch health figure for the recorded training steps.
 
@@ -769,19 +801,20 @@ def _build_batch_health_figure(
 
     figure = Figure(figsize=(8.0, 4.5))
     axis = figure.add_subplot(1, 1, 1)
-    _plot_step_series(axis, series, max_points, positive_only=False)
+    _plot_step_series(axis, series, max_points, bin_size, positive_only=False)
     axis.set_ylim(0.0, 1.05)
     axis.set_ylabel("fraction of generated batch")
     axis.set_title(
         "S3-GFN per training step: generated-batch health "
         "(valid / synthesizable / unique)"
     )
-    return _finish_step_figure(figure, axis)
+    return _finish_step_figure(figure, axis, bin_size)
 
 
 def _build_residual_figure(
     metrics: _RoundMetrics,
     max_points: int,
+    bin_size: int = 1,
 ) -> Figure | None:
     """Build the RTB residual figure for the on-policy training batches.
 
@@ -800,13 +833,13 @@ def _build_residual_figure(
     )
     figure = Figure(figsize=(8.0, 4.5))
     axis = figure.add_subplot(1, 1, 1)
-    _plot_step_series(axis, series, max_points, positive_only=False)
+    _plot_step_series(axis, series, max_points, bin_size, positive_only=False)
     axis.axhline(0.0, color="grey", linewidth=0.8, linestyle="--", label="zero")
     axis.set_ylabel("RTB residual (nats)")
     axis.set_title(
         "S3-GFN per training step: on-policy RTB residual (mean / standard deviation)"
     )
-    return _finish_step_figure(figure, axis)
+    return _finish_step_figure(figure, axis, bin_size)
 
 
 def write_reject_log(
@@ -849,9 +882,59 @@ def write_reject_log(
     return str(resolved)
 
 
+def write_pool_log(
+    candidates: Sequence[Candidate],
+    path: str,
+    *,
+    round_index: int,
+) -> str | None:
+    """Write the generated candidate pool to a CSV.
+
+    The column is named ``SMILES`` so the file drops straight into the
+    evaluation pipeline that scores the prior's molecules, letting the same
+    restored surrogate and the same acquisition rank both pools.
+
+    Parameters
+    ----------
+    candidates : Sequence of Candidate
+        The pool the round generated.
+    path : str
+        Destination path, with ``{round}`` replaced by the zero-padded round
+        index.
+    round_index : int
+        Round the pool came from.
+
+    Returns
+    -------
+    str or None
+        The path written, or None when the pool was empty.
+    """
+    if not candidates:
+        return None
+    resolved = Path(path.replace("{round}", f"{round_index:04d}"))
+    resolved.parent.mkdir(parents=True, exist_ok=True)
+    with resolved.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(("SMILES", "fidelity"))
+        for candidate in candidates:
+            writer.writerow(
+                (
+                    candidate.x,
+                    "" if candidate.fidelity is None else candidate.fidelity,
+                )
+            )
+    _logger.info(
+        "Wrote the %d-molecule generated pool to %s.",
+        len(candidates),
+        resolved,
+    )
+    return str(resolved)
+
+
 def _build_prior_divergence_figure(
     metrics: _RoundMetrics,
     max_points: int,
+    bin_size: int = 1,
 ) -> Figure | None:
     """Build the policy-versus-prior divergence figure for the training batches.
 
@@ -872,18 +955,19 @@ def _build_prior_divergence_figure(
     )
     figure = Figure(figsize=(8.0, 4.5))
     axis = figure.add_subplot(1, 1, 1)
-    _plot_step_series(axis, series, max_points, positive_only=False)
+    _plot_step_series(axis, series, max_points, bin_size, positive_only=False)
     axis.axhline(0.0, color="grey", linewidth=0.8, linestyle="--", label="at the prior")
     axis.set_ylabel("estimated KL(policy || prior) (nats)")
     axis.set_title(
         "S3-GFN per training step: how far the policy has moved from its prior"
     )
-    return _finish_step_figure(figure, axis)
+    return _finish_step_figure(figure, axis, bin_size)
 
 
 def _build_above_floor_figure(
     metrics: _RoundMetrics,
     max_points: int,
+    bin_size: int = 1,
 ) -> Figure | None:
     """Build the above-floor fraction figure for the recorded training batches.
 
@@ -904,18 +988,19 @@ def _build_above_floor_figure(
     )
     figure = Figure(figsize=(8.0, 4.5))
     axis = figure.add_subplot(1, 1, 1)
-    _plot_step_series(axis, series, max_points, positive_only=False)
+    _plot_step_series(axis, series, max_points, bin_size, positive_only=False)
     axis.set_ylim(0.0, 1.05)
     axis.set_ylabel("fraction of valid molecules in batch")
     axis.set_title(
         "S3-GFN per training step: molecules scoring above the log-score floor"
     )
-    return _finish_step_figure(figure, axis)
+    return _finish_step_figure(figure, axis, bin_size)
 
 
 def _build_gradient_norm_figure(
     metrics: _RoundMetrics,
     max_points: int,
+    bin_size: int = 1,
 ) -> Figure | None:
     """Build the pre-clipping gradient-norm figure for the training updates.
 
@@ -939,7 +1024,7 @@ def _build_gradient_norm_figure(
 
     figure = Figure(figsize=(8.0, 4.5))
     axis = figure.add_subplot(1, 1, 1)
-    _plot_step_series(axis, series, max_points, positive_only=True)
+    _plot_step_series(axis, series, max_points, bin_size, positive_only=True)
     if metrics.gradient_clip_norm is not None:
         axis.axhline(
             metrics.gradient_clip_norm,
@@ -951,7 +1036,95 @@ def _build_gradient_norm_figure(
     axis.set_yscale("log")
     axis.set_ylabel("global gradient norm before clipping")
     axis.set_title("S3-GFN per training step: gradient norm before clipping")
-    return _finish_step_figure(figure, axis)
+    return _finish_step_figure(figure, axis, bin_size)
+
+
+#: Fewest points a binned curve should keep.
+_MIN_BINNED_POINTS = 50
+
+
+def _effective_bin_size(n_steps: int, bin_size: int) -> int:
+    """Shrink the binning window so a short round still draws a curve.
+
+    A 300-step round binned at 100 would be three points. The window is
+    capped at what keeps ``_MIN_BINNED_POINTS`` of them, so only a round of
+    at least ``_MIN_BINNED_POINTS * bin_size`` steps uses the full window.
+
+    It is resolved once per round, from the step count, so every series on
+    every figure shares one window. Deriving it per series from that series
+    own extent would leave one figure holding lines binned differently.
+
+    Parameters
+    ----------
+    n_steps : int
+        Training steps the round ran.
+    bin_size : int
+        Requested window.
+
+    Returns
+    -------
+    int
+        The window to use, at least 1.
+    """
+    if bin_size <= 1:
+        return 1
+    return min(bin_size, max(1, n_steps // _MIN_BINNED_POINTS))
+
+
+def _binned(
+    values: Sequence[tuple[int, float]], bin_size: int
+) -> list[tuple[int, float]]:
+    """Reduce a per-step series to one median per window of training steps.
+
+    One point per training step is unreadable over thousands of steps: the
+    batch-to-batch spread swamps the trend. Thinning the line instead, as
+    :func:`_bounded` does alone, drops points but keeps every surviving one as
+    noisy as it was.
+
+    The window median rather than its mean, because these series are
+    heavy-tailed -- one batch that happens to contain a high-information
+    molecule moves a mean far more than it moves the level the curve is meant
+    to show. The median reports the typical batch and ignores the spike. Where
+    the spikes themselves matter, the figures already carry a separate max
+    line, which is reduced the same way and so becomes the typical max.
+
+    Windows are taken over the *step number*, not over position in the list, so
+    series recorded only on steps that produced valid molecules stay aligned
+    with the ones recorded every step.
+
+    Parameters
+    ----------
+    values : Sequence[tuple[int, float]]
+        ``(step, value)`` pairs, in step order.
+    bin_size : int
+        Steps per window. One or less returns the input unchanged.
+
+    Returns
+    -------
+    list[tuple[int, float]]
+        One pair per non-empty window: its median step and the median of its
+        finite values, or NaN where a window holds none, so the line breaks
+        instead of implying data that was never recorded.
+    """
+    if bin_size <= 1 or not values:
+        return list(values)
+    totals: dict[int, list[float]] = {}
+    steps: dict[int, list[int]] = {}
+    for step, value in values:
+        key = step // bin_size
+        steps.setdefault(key, []).append(step)
+        if math.isfinite(value):
+            totals.setdefault(key, []).append(value)
+    binned: list[tuple[int, float]] = []
+    for key in sorted(steps):
+        window = totals.get(key, ())
+        binned.append(
+            (
+                round(statistics.median(steps[key])),
+                statistics.median(window) if window else float("nan"),
+            )
+        )
+    return binned
 
 
 def _bounded(
