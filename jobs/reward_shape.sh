@@ -92,15 +92,47 @@
 # All memory on a 48-core A100 node (RealMemory=510000M). Narval rejects --mem=0
 # unless the whole node is requested, and this uses one GPU.
 #SBATCH --mem=510000M
-#SBATCH --time=12:00:00
+# 6h, down from 12h on 2026-10-11, to be backfillable. Measured from the collapsed
+# 2026-10-08 arms (5024309, 5024345): 10,000 training steps took 89 min there
+# (generated_total=640000 = 10000 x 64, so every step's generation ran), and the
+# remaining ~110 min of their 3h20 went into _generate_final_candidates grinding
+# 2,000,000 attempts before raising. A healthy arm trades that thrashing for real
+# generation but pays for ~9,500 gradient updates those runs skipped
+# (online_updates was 429), so budget 3-4.5h. 6h clears that, and if the log_z fix
+# does not hold the arm still dies at ~3h20 and the cap costs nothing. Fairshare
+# dominates Narval priority (weight 5e6 against 2500 for age), so a shorter job is
+# the only lever that moves a queued arm; the window it needs is what shrinks.
+#SBATCH --time=6:00:00
 #SBATCH --job-name=ampc_reward_shape
-# def-yvesbrun_gpu, despite its lower user-level FairShare. It is the only one of
-# these accounts with a real allocation: account RawShares 14353 and LevelFS 1.57
-# (above 1, so under-served). def-alexhg_gpu and def-pr61079_gpu carry
-# RawShares=1 and NormShares 0.000000, and their LevelFS of inf is an artifact of
-# zero usage against zero shares -- it collapses on first use. `sshare -U -u
-# $USER` hides this, because it prints only the user's share *within* an account;
-# check the account with `sshare -l -A <acct>`.
+# RE-CHECK THIS EVERY TIME; it is a snapshot, not a ranking. Measured
+# 2026-10-13 with `sshare -l -A def-bengioy_gpu,def-mailhoto_gpu,def-yvesbrun_gpu`:
+#
+#   account            acct RawShares   acct LevelFS   my FairShare
+#   def-yvesbrun_gpu          16287          2.205          0.369   <- this one
+#   def-bengioy_gpu           16287          0.936          0.343
+#   def-mailhoto_gpu          16287          0.730          0.329
+#
+# Two numbers, and both matter. The ACCOUNT row's LevelFS says whether the account
+# is under its share (above 1) or over it; only yvesbrun is under today. The
+# USER row's FairShare is the real priority factor -- a job's FAIRSHARE term is
+# exactly 5e6 x that number -- so it is what to compare once two accounts both
+# hold real shares. Here yvesbrun wins on both.
+#
+# This has now flipped twice in five days, which is why it is re-measured rather
+# than remembered. def-yvesbrun_gpu held RawShares 14353 / LevelFS 1.57 on
+# 2026-10-08, collapsed to RawShares 1 by 2026-10-10 (arms queued on it sat behind
+# ~1079 of 1197 pending GPU jobs), and is restored to 16287 / LevelFS 2.205 as of
+# 2026-10-13 -- it has the lowest RawUsage of the three (3.59e9 against bengioy's
+# 8.46e9 and mailhoto's 1.08e10) on equal shares. Meanwhile bengioy slipped from
+# LevelFS 1.108 to 0.936, so the 2026-10-11 choice is now the wrong one. The three
+# arms submitted 2026-10-10 went to def-mailhoto_gpu and waited 35-38 h to start.
+#
+# def-alexhg_gpu and def-pr61079_gpu still carry RawShares=1 with NormShares
+# 0.000000. Their user-level FairShare looks excellent (0.985, 0.680) and their
+# LevelFS of inf is zero usage against zero shares, which collapses on first use
+# for every member of the account. `sshare -U -u $USER` shows only the user's share
+# *within* each account and so hides this entirely; always check the account row
+# with `sshare -l -A <acct>`.
 #SBATCH --account=def-yvesbrun_gpu
 #SBATCH --output=slurm_logs/ampc_reward_shape_%j.out
 #SBATCH --error=slurm_logs/ampc_reward_shape_%j.err
@@ -152,6 +184,12 @@ export WANDB_MODE=offline
 FITTED_DIR="outputs/ampc/exact_dkl_top_n/balanced_25000_nolayer"
 STATE_PATH="${FITTED_DIR}/surrogate_state.pt"
 OUTPUT_DIR="outputs/ampc/reward_shape/${ARM}"
+# Why validity is lost, not just how much: every discarded generation is counted
+# by reason, and a reservoir sample of them is written here. The `{round}`
+# placeholder must not start the value -- OmegaConf runs the dotlist through a
+# YAML loader, which would read a leading `{` as a flow mapping. Prefixed by
+# OUTPUT_DIR it parses as a plain string.
+REJECT_LOG_PATH="${OUTPUT_DIR}/rejects_round_{round}.csv"
 if [[ ! -f "${STATE_PATH}" ]]; then
   echo "${STATE_PATH} not found: fit the no-layer arm first with" >&2
   echo "  sbatch jobs/exact_dkl_balanced.sh 25000 none" >&2
@@ -210,6 +248,7 @@ uv run --no-sync python scripts/run_with_sigterm_flush.py \
   "sampler.log_z_learning_rate=${LOG_Z_LR}" \
   "${SEED_OVERRIDE[@]}" \
   "run_writer.output_dir=${OUTPUT_DIR}" \
+  "sampler.reject_log_path=${REJECT_LOG_PATH}" \
   "${LOGGER}" \
   "${@:5}"
 
