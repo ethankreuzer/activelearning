@@ -681,3 +681,42 @@ def test_git_provenance_outside_a_repository_is_unknown(tmp_path: Path) -> None:
     """A missing repository must not stop a run; the fields are just unknown."""
     provenance = arm.git_provenance(tmp_path / "absent")
     assert provenance == {"git_commit": None, "git_dirty": None}
+
+
+class TestResolveStudySets:
+    """``--extra-set`` adds a prepared pool to the evaluated and pooled sets."""
+
+    def test_no_extras_leaves_the_study_unchanged(self) -> None:
+        study_sets, pool = arm.resolve_study_sets([])
+
+        assert study_sets == arm.STUDY_SETS
+        assert pool == arm.CROSS_SET_POOL
+
+    def test_an_extra_set_is_predicted_and_scored(self) -> None:
+        study_sets, _ = arm.resolve_study_sets(["generated_pool"])
+
+        assert len(study_sets) == len(arm.STUDY_SETS) + 1
+        extra = study_sets[-1]
+        assert extra.name == "generated_pool"
+        assert extra.predict is True
+        assert extra.score is True
+
+    def test_an_extra_set_joins_the_cross_set_pool(self) -> None:
+        """Pooling is what compares it against the prior's molecules."""
+        _, pool = arm.resolve_study_sets(["generated_pool"])
+
+        assert "generated_pool" in pool
+        assert arm.CROSS_SET_POOL <= pool
+
+    def test_extras_keep_their_order_after_the_built_ins(self) -> None:
+        study_sets, _ = arm.resolve_study_sets(["first", "second"])
+
+        assert [s.name for s in study_sets[-2:]] == ["first", "second"]
+
+    def test_rejects_a_name_that_is_already_a_study_set(self) -> None:
+        with pytest.raises(SystemExit, match="already a study set"):
+            arm.resolve_study_sets(["gp_molformer_set"])
+
+    def test_rejects_a_repeated_extra_name(self) -> None:
+        with pytest.raises(SystemExit, match="already a study set"):
+            arm.resolve_study_sets(["pool", "pool"])

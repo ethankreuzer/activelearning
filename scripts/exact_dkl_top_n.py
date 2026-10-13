@@ -129,6 +129,44 @@ STUDY_SETS = (
 CROSS_SET_POOL = frozenset({"ampc_331k", "gp_molformer_set"})
 
 
+def resolve_study_sets(
+    extra_names: Sequence[str],
+) -> tuple[tuple[StudySet, ...], frozenset[str]]:
+    """Return the sets to evaluate and the ones to pool, including extras.
+
+    An extra set is predicted and scored exactly as ``gp_molformer_set`` is,
+    and joins the cross-set pool, so the pooled top-k shares answer whether the
+    acquisition prefers it to the prior's molecules. Scoring every set in one
+    process is what makes that comparison meaningful: the acquisition samples
+    its posterior max-values once, so all sets are ranked against the same
+    draw, which two separate runs would not guarantee.
+
+    Parameters
+    ----------
+    extra_names : Sequence of str
+        Names given to ``--extra-set``, each already prepared into the cache.
+
+    Returns
+    -------
+    tuple[tuple[StudySet, ...], frozenset[str]]
+        The study sets in evaluation order, and the names to pool.
+
+    Raises
+    ------
+    SystemExit
+        If a name is already a study set, or is repeated.
+    """
+    known = {study_set.name for study_set in STUDY_SETS}
+    for name in extra_names:
+        if name in known:
+            raise SystemExit(f"--extra-set {name!r} is already a study set.")
+        known.add(name)
+    study_sets = STUDY_SETS + tuple(
+        StudySet(name, predict=True, score=True) for name in extra_names
+    )
+    return study_sets, CROSS_SET_POOL | frozenset(extra_names)
+
+
 @dataclass(frozen=True)
 class Scoring:
     """One acquisition scoring pass.
@@ -767,6 +805,21 @@ def _parse_args(argv: Sequence[str] | None) -> tuple[argparse.Namespace, list[st
     parser.add_argument("--wandb-group", type=str, default=None)
     parser.add_argument("--wandb-tags", type=str, default=None)
     parser.add_argument("--run-name", type=str, default=None)
+    parser.add_argument(
+        "--extra-set",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help=(
+            "An additional prepared set to predict and score, by the name "
+            "given to exact_dkl_prepare.py --extra-set. Repeatable. It is "
+            "pooled with the built-in cross-set sets, so the top-k shares "
+            "say whether the acquisition prefers it to the prior's "
+            "molecules. Scoring every set in one process means one "
+            "acquisition object, so all sets are ranked against the same "
+            "sampled max-values; scoring them in separate runs would not."
+        ),
+    )
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument(
         "--score-limit",
@@ -966,7 +1019,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         )
     plan = scoring_plan(acquisition_type)
     training_cache = Path(str(encoder_cfg.get("feature_cache_path")))
-    check_required_paths(args.cache_dir, STUDY_SETS, training_cache)
+    study_sets, cross_set_pool = resolve_study_sets(args.extra_set)
+    check_required_paths(args.cache_dir, study_sets, training_cache)
 
     profiler = StageProfiler(
         cuda_reader=CudaReader() if torch.cuda.is_available() else None
@@ -1022,7 +1076,7 @@ def main(argv: Sequence[str] | None = None) -> None:
 
             eval_sets: dict[str, EvalSet] = {}
             with profiler.timing_only("features_total"):
-                for study_set in STUDY_SETS:
+                for study_set in study_sets:
                     with profiler.stage(f"features_{study_set.name}"):
                         encoder = build_cache_only_encoder(
                             encoder_cfg, args.cache_dir / f"{study_set.name}.npy"
@@ -1150,7 +1204,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             # Only the scores, never the features: a float per molecule over
             # every scored set is a few megabytes, so the peak is unaffected.
             pooled_scores: dict[str, dict[str, np.ndarray]] = {}
-            for study_set in STUDY_SETS:
+            for study_set in study_sets:
                 eval_set = eval_sets[study_set.name]
                 if args.skip_scoring and not study_set.predict:
                     # Nothing left to do for a scored-only set: free its features
@@ -1190,7 +1244,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                             )
                         flush_stage_profile()
                         columns[f"score_{scoring.name}"] = scores
-                        if study_set.name in CROSS_SET_POOL:
+                        if study_set.name in cross_set_pool:
                             pooled_scores.setdefault(scoring.name, {})[
                                 study_set.name
                             ] = scores

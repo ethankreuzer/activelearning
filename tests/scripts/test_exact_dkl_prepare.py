@@ -310,3 +310,67 @@ def test_sets_flag_restricts_the_work() -> None:
     """A timed-out prep job must be resumable set by set."""
     args = prep._parse_args(["--sets", "ampc_331k, gp_molformer_set"])
     assert args.selected_sets == {"ampc_331k", "gp_molformer_set"}
+
+
+class TestParseExtraSets:
+    """``--extra-set name=path.csv`` brings an arbitrary pool into the study."""
+
+    def _csv(self, tmp_path: Path, name: str = "pool.csv") -> Path:
+        path = tmp_path / name
+        path.write_text("SMILES,fidelity\nCCO,1\n", encoding="utf-8")
+        return path
+
+    def test_parses_a_pair_into_an_unlabelled_spec(self, tmp_path: Path) -> None:
+        source = self._csv(tmp_path)
+
+        (spec,) = prep.parse_extra_sets([f"generated_pool={source}"])
+
+        assert spec.name == "generated_pool"
+        assert spec.source == source
+        assert spec.smiles_column == "SMILES"
+        # No target: the point is predictions and acquisition scores.
+        assert spec.label_column is None
+        assert spec.docked_sa_filter is False
+
+    def test_parses_several_in_order(self, tmp_path: Path) -> None:
+        first = self._csv(tmp_path, "a.csv")
+        second = self._csv(tmp_path, "b.csv")
+
+        specs = prep.parse_extra_sets([f"a={first}", f"b={second}"])
+
+        assert [spec.name for spec in specs] == ["a", "b"]
+
+    def test_no_arguments_gives_no_specs(self) -> None:
+        assert prep.parse_extra_sets([]) == ()
+
+    @pytest.mark.parametrize("value", ("noequals", "=/tmp/x.csv", "name=", " = "))
+    def test_rejects_a_malformed_pair(self, value: str) -> None:
+        with pytest.raises(SystemExit, match="name=path.csv"):
+            prep.parse_extra_sets([value])
+
+    @pytest.mark.parametrize(
+        "name",
+        (
+            "train_random",
+            "train_top",
+            "val_set",
+            "ampc_331k",
+            "gp_molformer_set",
+            "olivier_invitro",
+        ),
+    )
+    def test_rejects_a_built_in_name(self, tmp_path: Path, name: str) -> None:
+        source = self._csv(tmp_path)
+
+        with pytest.raises(SystemExit, match="collides with a built-in set"):
+            prep.parse_extra_sets([f"{name}={source}"])
+
+    def test_rejects_a_repeated_name(self, tmp_path: Path) -> None:
+        source = self._csv(tmp_path)
+
+        with pytest.raises(SystemExit, match="was given twice"):
+            prep.parse_extra_sets([f"pool={source}", f"pool={source}"])
+
+    def test_rejects_a_missing_file(self, tmp_path: Path) -> None:
+        with pytest.raises(SystemExit, match="does not exist"):
+            prep.parse_extra_sets([f"pool={tmp_path / 'absent.csv'}"])
