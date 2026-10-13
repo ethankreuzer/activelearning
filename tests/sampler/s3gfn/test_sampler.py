@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import csv
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -10,6 +12,7 @@ from matplotlib import pyplot as plt
 from matplotlib.figure import Figure
 
 from activelearning.runtime import RuntimeContext
+import activelearning.sampler.s3gfn.logging as logging_module
 import activelearning.sampler.s3gfn.sampler as sampler_module
 from activelearning.utils.types import Candidate
 
@@ -506,6 +509,117 @@ def test_canonicalization_rejects_disconnected_molecules():
         )
         is None
     )
+
+
+@pytest.mark.parametrize(
+    ("smiles", "expected_reason"),
+    (
+        ("CCO", None),
+        ("", "empty"),
+        ("   ", "empty"),
+        ("invalid", "parse_error"),
+        ("C.C", "disconnected"),
+    ),
+)
+def test_canonicalize_with_reason_labels_each_rejection_path(
+    smiles: str,
+    expected_reason: str | None,
+) -> None:
+    canonical, reason = sampler_module._canonicalize_with_reason(
+        smiles,
+        molecule_chem=FakeChem,
+    )
+    assert reason == expected_reason
+    # Exactly one of the two is set, whichever path was taken.
+    assert (canonical is None) is (reason is not None)
+
+
+def test_reject_counts_separate_phases_and_reasons(make_sampler) -> None:
+    sampler = make_sampler(n_samples=2)
+    sampler._record_rejects(
+        [("parse_error", "C1CC"), ("disconnected", "C.C")],
+        phase="generation",
+    )
+    sampler._record_rejects([("parse_error", "c1cc")], phase="train")
+    sampler.round_metrics.record_reject_count(
+        "unterminated",
+        3,
+        phase="generation",
+    )
+
+    assert sampler.round_metrics.reject_counts == {
+        "generation/parse_error": 1,
+        "generation/disconnected": 1,
+        "generation/unterminated": 3,
+        "train/parse_error": 1,
+    }
+    # Unterminated generations carry no string, so only the three with one are
+    # eligible for the reservoir.
+    assert len(sampler.round_metrics.reject_examples) == 3
+
+
+def test_reject_reservoir_is_bounded_but_counts_stay_exact(make_sampler) -> None:
+    sampler = make_sampler(n_samples=2)
+    sampler.reject_sample_size = 5
+    sampler._record_rejects(
+        [("parse_error", f"C{index}") for index in range(500)],
+        phase="generation",
+    )
+
+    assert sampler.round_metrics.reject_counts["generation/parse_error"] == 500
+    assert len(sampler.round_metrics.reject_examples) == 5
+    assert all(
+        phase == "generation" and reason == "parse_error"
+        for phase, reason, _ in sampler.round_metrics.reject_examples
+    )
+
+
+def test_zero_reject_sample_size_keeps_counts_only(make_sampler) -> None:
+    sampler = make_sampler(n_samples=2)
+    sampler.reject_sample_size = 0
+    sampler._record_rejects([("parse_error", "C1CC")], phase="generation")
+
+    assert sampler.round_metrics.reject_counts == {"generation/parse_error": 1}
+    assert sampler.round_metrics.reject_examples == []
+
+
+def test_write_reject_log_writes_sampled_rows(make_sampler, tmp_path) -> None:
+    sampler = make_sampler(n_samples=2)
+    sampler._record_rejects(
+        [("parse_error", "C1CC"), ("disconnected", "C.C")],
+        phase="generation",
+    )
+    path = str(tmp_path / "rejects_round_{round}.csv")
+
+    written = logging_module.write_reject_log(
+        sampler.round_metrics,
+        path,
+        round_index=3,
+    )
+
+    assert written is not None
+    written_path = Path(written)
+    # `{round}` is substituted so successive rounds do not overwrite.
+    assert written_path.name == "rejects_round_0003.csv"
+    rows = list(csv.DictReader(written_path.open(encoding="utf-8")))
+    assert [row["reason"] for row in rows] == ["parse_error", "disconnected"]
+    assert [row["smiles"] for row in rows] == ["C1CC", "C.C"]
+    assert [row["length"] for row in rows] == ["4", "3"]
+
+
+def test_write_reject_log_skips_an_empty_reservoir(make_sampler, tmp_path) -> None:
+    sampler = make_sampler(n_samples=2)
+    path = tmp_path / "rejects.csv"
+
+    assert (
+        logging_module.write_reject_log(
+            sampler.round_metrics,
+            str(path),
+            round_index=0,
+        )
+        is None
+    )
+    assert not path.exists()
 
 
 def test_training_updates_policy_and_fidelity_parameters(

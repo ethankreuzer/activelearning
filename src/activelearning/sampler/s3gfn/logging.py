@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import csv
 import logging
+import random
 import statistics
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Sequence
 
 from matplotlib.axes import Axes
@@ -64,6 +67,13 @@ class _RoundMetrics:
     generation_attempts: int = 0
     generation_invalid: int = 0
     generation_duplicates: int = 0
+    # Why generations were thrown away, by phase. `generation_invalid` counts
+    # these together, which cannot say whether validity is lost to truncation,
+    # to broken SMILES syntax, or to multi-fragment spam -- three problems with
+    # three different fixes.
+    reject_counts: dict[str, int] = field(default_factory=dict)
+    reject_examples: list[tuple[str, str, str]] = field(default_factory=list)
+    _reject_seen: int = 0
     final_candidates: tuple[Candidate, ...] = ()
     positive_buffer_size: int = 0
     negative_buffer_size: int = 0
@@ -196,6 +206,64 @@ class _RoundMetrics:
         self.generation_invalid += invalid_count
         self.generation_duplicates += duplicate_count
 
+    def record_rejects(
+        self,
+        rejects: Sequence[tuple[str, str]],
+        *,
+        phase: str,
+        reservoir_size: int,
+        rng: random.Random,
+    ) -> None:
+        """Count rejected generations and keep a uniform sample of them.
+
+        Counting is exact. The retained strings are a reservoir sample over
+        every reject in the round, so the examples stay representative as the
+        reject rate changes rather than over-representing the first batches.
+
+        Parameters
+        ----------
+        rejects : Sequence of (str, str)
+            ``(reason, smiles)`` pairs for one batch. The SMILES is the raw
+            decoded string, before canonicalization.
+        phase : str
+            Where the reject came from, ``"train"`` or ``"generation"``.
+        reservoir_size : int
+            Maximum examples retained across the whole round. Zero keeps counts
+            only.
+        rng : random.Random
+            Seeded generator, so a rerun samples the same examples.
+        """
+        for reason, smiles in rejects:
+            key = f"{phase}/{reason}"
+            self.reject_counts[key] = self.reject_counts.get(key, 0) + 1
+            if reservoir_size <= 0:
+                continue
+            self._reject_seen += 1
+            record = (phase, reason, smiles)
+            if len(self.reject_examples) < reservoir_size:
+                self.reject_examples.append(record)
+                continue
+            index = rng.randrange(self._reject_seen)
+            if index < reservoir_size:
+                self.reject_examples[index] = record
+
+    def record_reject_count(self, reason: str, count: int, *, phase: str) -> None:
+        """Count rejects that carry no string, such as unterminated samples.
+
+        Parameters
+        ----------
+        reason : str
+            Rejection category.
+        count : int
+            Number of rejects to add. Non-positive counts are ignored.
+        phase : str
+            Where the reject came from, ``"train"`` or ``"generation"``.
+        """
+        if count <= 0:
+            return
+        key = f"{phase}/{reason}"
+        self.reject_counts[key] = self.reject_counts.get(key, 0) + count
+
     def record_final_candidates(self, candidates: Sequence[Candidate]) -> None:
         """Store the candidates returned by the completed round."""
         self.final_candidates = tuple(candidates)
@@ -282,6 +350,19 @@ class S3GFNLoggingMixin:
                     round_metrics.generation_duplicates, generation_attempts
                 ),
             }
+            # Split the single invalid_rate into the reasons behind it. Each
+            # phase is normalised by its own denominator: training generates
+            # `generated_total` strings, final sampling makes
+            # `generation_attempts`.
+            for key, count in sorted(round_metrics.reject_counts.items()):
+                phase, _, reason = key.partition("/")
+                denominator = (
+                    generated_total if phase == "train" else generation_attempts
+                )
+                metrics[f"sampler/s3gfn/{phase}/reject/{reason}"] = count
+                metrics[f"sampler/s3gfn/{phase}/reject_rate/{reason}"] = _safe_ratio(
+                    count, denominator
+                )
             online_losses = _present_values(round_metrics.online_rtb_losses)
             replay_losses = _present_values(round_metrics.replay_losses)
             contrastive_losses = _present_values(round_metrics.auxiliary_losses)
@@ -726,6 +807,46 @@ def _build_residual_figure(
         "S3-GFN per training step: on-policy RTB residual (mean / standard deviation)"
     )
     return _finish_step_figure(figure, axis)
+
+
+def write_reject_log(
+    metrics: _RoundMetrics,
+    path: str,
+    *,
+    round_index: int,
+) -> str | None:
+    """Write the round's retained rejects to a CSV.
+
+    Parameters
+    ----------
+    metrics : _RoundMetrics
+        Accumulator holding the reservoir sample.
+    path : str
+        Destination path. ``{round}`` is replaced by the zero-padded round
+        index, so successive rounds do not overwrite one another.
+    round_index : int
+        Round the rejects came from.
+
+    Returns
+    -------
+    str or None
+        The path written, or None when there was nothing to write.
+    """
+    if not metrics.reject_examples:
+        return None
+    resolved = Path(path.replace("{round}", f"{round_index:04d}"))
+    resolved.parent.mkdir(parents=True, exist_ok=True)
+    with resolved.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(("phase", "reason", "smiles", "length"))
+        for phase, reason, smiles in metrics.reject_examples:
+            writer.writerow((phase, reason, smiles, len(smiles)))
+    _logger.info(
+        "Wrote %d sampled reject(s) to %s.",
+        len(metrics.reject_examples),
+        resolved,
+    )
+    return str(resolved)
 
 
 def _build_prior_divergence_figure(

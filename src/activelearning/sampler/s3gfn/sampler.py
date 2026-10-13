@@ -39,6 +39,7 @@ from activelearning.sampler.s3gfn._optional import (
 from activelearning.sampler.s3gfn.logging import (
     S3GFNLoggingMixin,
     _RoundMetrics,
+    write_reject_log,
 )
 from activelearning.sampler.s3gfn.model import S3GFNModel
 from activelearning.sampler.s3gfn.replay_buffer import ReplayBuffer
@@ -144,6 +145,8 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
         sampling_temperature: float = 1.0,
         gradient_clip_norm: float = 10.0,
         max_generation_attempts: int | None = None,
+        reject_sample_size: int = 2000,
+        reject_log_path: str | None = None,
         seed: int = 42,
     ) -> None:
         """Initialize an acquisition-guided S3-GFN sampler.
@@ -241,6 +244,14 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
         gradient_clip_norm : float, optional
             Maximum global norm for all optimized policy, fidelity-head, and
             ``log Z`` gradients.
+        reject_sample_size : int, optional
+            Rejected generations retained per round as a reservoir sample, for
+            inspecting *why* validity is being lost. Counts are always exact
+            and unaffected by this; zero keeps counts only.
+        reject_log_path : str or None, optional
+            CSV written at the end of each round's sampling with the retained
+            rejects. ``{round}`` in the path is replaced by the round index.
+            None disables the file, leaving the counts in the metrics.
         max_generation_attempts : int or None, optional
             Maximum number of final-generation samples attempted before
             failing. Defaults to
@@ -291,6 +302,8 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
             raise ValueError("gradient_clip_norm must be finite and positive.")
         if max_generation_attempts is not None and max_generation_attempts <= 0:
             raise ValueError("max_generation_attempts must be positive.")
+        if reject_sample_size < 0:
+            raise ValueError("reject_sample_size must be nonnegative.")
         if seed < 0:
             raise ValueError("seed must be nonnegative.")
         if compile_strategy not in {
@@ -344,7 +357,12 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
             if max_generation_attempts is not None
             else max(n_samples * 20, self.effective_generation_batch_size * 2)
         )
+        self.reject_sample_size = reject_sample_size
+        self.reject_log_path = reject_log_path
         self.seed = seed
+        # Separate from the global seed so sampling rejects never consumes
+        # draws the policy would otherwise have made.
+        self._reject_rng = random.Random(seed)
         self._pretrained_model: S3GFNModel | None = None
         self._round_index = 0
         self._round_metrics = _RoundMetrics()
@@ -474,10 +492,15 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
             )
 
         generation_started = time.perf_counter()
-        candidates = self._generate_final_candidates(
-            model=model,
-            molecule_chem=molecule_chem,
-        )
+        try:
+            candidates = self._generate_final_candidates(
+                model=model,
+                molecule_chem=molecule_chem,
+            )
+        finally:
+            # A round that cannot reach n_samples raises here, and that is
+            # exactly the round whose rejects explain why. Write them first.
+            self._write_reject_log(round_number)
         self.round_metrics.generation_duration_s = (
             time.perf_counter() - generation_started
         )
@@ -690,6 +713,11 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
             count=self.batch_size,
             max_length=self.max_length,
             temperature=self.sampling_temperature,
+        )
+        self.round_metrics.record_reject_count(
+            "unterminated",
+            self.batch_size - len(generated.smiles),
+            phase="train",
         )
         prepared = self._prepare_batch(
             model=model,
@@ -959,17 +987,21 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
         self._resolve_fidelity_values(fidelity_indices, count=len(smiles))
         canonical_smiles: list[str] = []
         retained_fidelity_indices: list[int] = []
+        rejects: list[tuple[str, str]] = []
         for index, generated_smiles in enumerate(smiles):
-            canonical = _canonicalize_to_smiles(
+            canonical, reason = _canonicalize_with_reason(
                 generated_smiles,
                 molecule_chem=molecule_chem,
             )
-            if canonical is not None:
+            if canonical is None:
+                rejects.append((reason or "parse_error", generated_smiles))
+            else:
                 canonical_smiles.append(canonical)
                 if fidelity_indices is not None:
                     retained_fidelity_indices.append(
                         int(fidelity_indices[index].item())
                     )
+        self._record_rejects(rejects, phase="train")
         return (
             tuple(canonical_smiles),
             (
@@ -1059,6 +1091,13 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
                 molecule_chem=molecule_chem,
             )
             invalid_count += unterminated_count
+            # No string to keep: `generate` drops these before decoding, so
+            # they are counted here and never reach the reservoir.
+            self.round_metrics.record_reject_count(
+                "unterminated",
+                unterminated_count,
+                phase="generation",
+            )
             self.round_metrics.record_generation_batch(
                 attempts=batch_attempts,
                 invalid_count=invalid_count,
@@ -1109,20 +1148,23 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
         invalid_count = 0
         duplicate_count = 0
         valid_count = 0
+        rejects: list[tuple[str, str]] = []
         fidelity_values = self._resolve_fidelity_values(
             fidelity_indices,
             count=len(smiles),
         )
         for index, generated_smiles in enumerate(smiles):
-            canonical = _canonicalize_to_smiles(
+            canonical, reason = _canonicalize_with_reason(
                 generated_smiles,
                 molecule_chem=molecule_chem,
             )
             if canonical is None:
                 invalid_count += 1
+                rejects.append((reason or "parse_error", generated_smiles))
                 continue
             if canonical in seen_smiles:
                 duplicate_count += 1
+                rejects.append(("duplicate", generated_smiles))
                 continue
 
             valid_count += 1
@@ -1131,6 +1173,7 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
             if len(candidates) == self.n_samples:
                 break
 
+        self._record_rejects(rejects, phase="generation")
         return valid_count, invalid_count, duplicate_count
 
     def _log_final_batch_progress(
@@ -1204,6 +1247,35 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
         optimizer.step()
         return loss_value
 
+    def _write_reject_log(self, round_number: int) -> None:
+        """Write the round's sampled rejects, never failing the round for it."""
+        if self.reject_log_path is None:
+            return
+        try:
+            write_reject_log(
+                self.round_metrics,
+                self.reject_log_path,
+                round_index=round_number,
+            )
+        except OSError as error:
+            _logger.warning("Could not write the reject log: %s", error)
+
+    def _record_rejects(
+        self,
+        rejects: Sequence[tuple[str, str]],
+        *,
+        phase: str,
+    ) -> None:
+        """Forward one batch's rejects to the round's accumulator."""
+        if not rejects:
+            return
+        self.round_metrics.record_rejects(
+            rejects,
+            phase=phase,
+            reservoir_size=self.reject_sample_size,
+            rng=self._reject_rng,
+        )
+
     def _set_round_seed(self) -> None:
         """Seed Python, PyTorch, and CUDA for the current round."""
         seed = self.seed + self._round_index
@@ -1213,29 +1285,65 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
             torch.cuda.manual_seed_all(seed)
 
 
-def _canonicalize_to_smiles(
+def _canonicalize_with_reason(
     smiles: str,
     *,
     molecule_chem: Any,
-) -> str | None:
-    """Return a canonical connected SMILES, or ``None`` if invalid."""
+) -> tuple[str | None, str | None]:
+    """Return a canonical connected SMILES and why it was rejected.
+
+    Exactly one element is ``None``: a string with no reason on success, or a
+    reason with no string on rejection.
+
+    The reasons distinguish the three rejection paths that
+    :func:`_canonicalize_to_smiles` collapses into a single ``None``. Two of
+    them are silent in the RDKit log -- ``empty`` never reaches the parser, and
+    ``disconnected`` parses successfully -- so counting them is the only way to
+    see them at all.
+
+    Parameters
+    ----------
+    smiles : str
+        Raw decoded SMILES from the policy.
+    molecule_chem : Any
+        RDKit ``Chem`` module.
+
+    Returns
+    -------
+    tuple of (str or None, str or None)
+        ``(canonical, None)`` when the molecule is usable, otherwise
+        ``(None, reason)`` with reason one of ``"empty"``, ``"parse_error"``,
+        or ``"disconnected"``.
+    """
     if not isinstance(smiles, str) or not smiles.strip():
-        return None
+        return None, "empty"
     molecule = molecule_chem.MolFromSmiles(smiles.strip())
     if molecule is None:
-        return None
+        return None, "parse_error"
     try:
         canonical = molecule_chem.MolToSmiles(
             molecule,
             canonical=True,
             isomericSmiles=False,
         )
-        if "." in canonical:
-            return None
     except (TypeError, ValueError, RuntimeError):
-        return None
+        return None, "parse_error"
     if not canonical:
-        return None
+        return None, "parse_error"
+    # Parses cleanly, so RDKit logs nothing: salts and multi-fragment spam land
+    # here and are invisible in the run's stderr.
+    if "." in canonical:
+        return None, "disconnected"
+    return canonical, None
+
+
+def _canonicalize_to_smiles(
+    smiles: str,
+    *,
+    molecule_chem: Any,
+) -> str | None:
+    """Return a canonical connected SMILES, or ``None`` if invalid."""
+    canonical, _ = _canonicalize_with_reason(smiles, molecule_chem=molecule_chem)
     return canonical
 
 
