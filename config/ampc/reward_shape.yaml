@@ -16,7 +16,7 @@
 # would silently discard what the first one observed, and the config validator
 # rejects that combination.
 #
-#   sbatch jobs/reward_shape.sh <exponential|power> <beta> [seed]
+#   sbatch jobs/reward_shape.sh <exponential|power> <beta> <initial_log_z> <n_train_steps> [seed]
 #
 # Prerequisites:
 #   - uv sync --extra molecules
