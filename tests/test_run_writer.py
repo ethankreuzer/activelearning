@@ -502,6 +502,60 @@ def test_run_writer_writes_scored_samples_beside_score_figure(tmp_path) -> None:
     )
 
 
+def test_run_writer_writes_raw_oracle_measurements_from_metadata(tmp_path) -> None:
+    """A transformed ``y`` keeps the raw measurement its metadata carried.
+
+    Dock3Oracle's ``y`` is a probability of binding that is not monotone in the
+    docking score, so the raw score is unrecoverable from ``y`` and has to be
+    carried through from the observation's metadata.
+    """
+    run_writer = JSONLinesRunWriter(output_dir=tmp_path)
+    run_writer.start_run({})
+    record = replace(
+        _scored_round_record(_SCORES),
+        queried_observations=[
+            Observation(
+                x="c1ccccc1",
+                y=0.5,
+                fidelity=1,
+                metadata={"dock3_raw_score": -62.5, "dock3_failure_reason": None},
+            ),
+            Observation(
+                x="CCO",
+                y=float("nan"),
+                fidelity=1,
+                metadata={"dock3_raw_score": None, "dock3_failure_reason": "ligbuild"},
+            ),
+        ],
+    )
+
+    run_writer.record_round(record)
+
+    with (tmp_path / _SCORED_SAMPLES_PATH).open(newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    # Index 2 was selected first and index 0 second; the unselected rows stay
+    # blank rather than borrowing a neighbour's measurement.
+    assert rows[2]["dock3_raw_score"] == "-62.5"
+    # A None metadata value is a blank cell, not the string "null": a failed
+    # molecule must be distinguishable from one whose reason happens to be text.
+    assert rows[2]["dock3_failure_reason"] == ""
+    assert rows[0]["dock3_raw_score"] == ""
+    assert rows[0]["dock3_failure_reason"] == "ligbuild"
+    assert rows[1]["dock3_raw_score"] == rows[3]["dock3_raw_score"] == ""
+
+
+def test_run_writer_omits_metadata_columns_no_oracle_supplied(tmp_path) -> None:
+    """An oracle without raw measurements gains no empty columns."""
+    run_writer = JSONLinesRunWriter(output_dir=tmp_path)
+    run_writer.start_run({})
+
+    run_writer.record_round(_scored_round_record(_SCORES))
+
+    with (tmp_path / _SCORED_SAMPLES_PATH).open(newline="") as handle:
+        fieldnames = csv.DictReader(handle).fieldnames or []
+    assert not [name for name in fieldnames if name.startswith(("dock3_", "cxcalc_"))]
+
+
 @pytest.mark.parametrize(
     ("write_sample_scores", "selection_scores"),
     [(False, _SCORES), (True, None)],

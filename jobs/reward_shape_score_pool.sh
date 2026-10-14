@@ -34,6 +34,13 @@
 #                              pooled/acquisition/*/top{k}/<set>_share
 #   figures/surrogate_mean.png, figures/log_acquisition.png
 #                              both pools overlaid, from scripts/plot_pool_vs_prior.py
+#   selected_molecules.csv     one row per DOCKED molecule: SMILES, raw DOCK3
+#                              score, probability of binding, surrogate mean and
+#                              acquisition, joined from the arm's own
+#                              scored_samples.csv by scripts/reward_shape_pool_report.py
+#   figures/pool_surrogate_mean.png, figures/pool_acquisition.png,
+#   figures/selected_dock_score.png
+#                              the three distributions, over every finite value
 #
 # usage: sbatch jobs/reward_shape_score_pool.sh <arm> [round]
 #   arm    directory name under outputs/ampc/reward_shape/, e.g.
@@ -140,6 +147,14 @@ if [[ "${ARM}" =~ _floor(-?[0-9]+(\.[0-9]+)?) ]]; then
   FLOOR_ARGS=(--log-score-floor "${BASH_REMATCH[1]}")
 fi
 uv run --no-sync python -m scripts.plot_pool_vs_prior "${OUTPUT_DIR}" "${FLOOR_ARGS[@]}"
+
+# Stage 4: the per-molecule join. Stage 2 gives the surrogate mean and the
+# acquisition for all 100k; only the ARM knows which molecules were selected and
+# what DOCK3 returned for them, so the two have to be joined on SMILES to relate
+# the three quantities on one row. Writes selected_molecules.csv and the three
+# whole-pool / selected distributions. It only reads, so it is safe to rerun.
+uv run --no-sync python -m scripts.reward_shape_pool_report \
+  "${RUN_DIR}" "${OUTPUT_DIR}" --round "${ROUND}"
 
 echo
 echo "Done. Sync from a login node with:"

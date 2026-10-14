@@ -21,6 +21,23 @@ _logger = logging.getLogger(__name__)
 # Written next to the acquisition score-distribution figure of the same round.
 _SCORED_SAMPLES_KEY = "acquisition/general/scored_samples"
 
+#: Observation metadata keys carried into ``scored_samples.csv`` when an oracle
+#: supplies them. Kept to an explicit list rather than writing whatever metadata
+#: happens to be present: a candidate's metadata is arbitrary and may hold
+#: structures that do not belong in a column. These are the raw measurements
+#: behind a transformed ``y``, which cannot be recovered from ``y`` itself --
+#: the Dock3 and cxcalc oracles both observe a probability of binding that is
+#: not monotone in the quantity actually measured.
+_OBSERVATION_METADATA_COLUMNS = frozenset(
+    {
+        "dock3_raw_score",
+        "dock3_pprop",
+        "dock3_failure_reason",
+        "cxcalc_anion_percent",
+        "cxcalc_failure_reason",
+    }
+)
+
 
 @dataclass(frozen=True)
 class RoundRecord:
@@ -251,6 +268,12 @@ class JSONLinesRunWriter(RunWriter):
             index: rank for rank, index in enumerate(scores.selected_indices)
         }
         observed_targets: dict[int, Any] = {}
+        # Oracles that observe a transformed target keep the underlying
+        # measurement in metadata. Dock3Oracle's y is an estimated probability
+        # of binding, which is NOT monotone in the raw docking score, so the
+        # raw score cannot be recovered from y afterwards and is written here.
+        # Read from metadata rather than recomputed: no oracle is re-queried.
+        observed_metadata: dict[int, Mapping[str, Any]] = {}
         if len(record.queried_observations) == len(scores.selected_indices):
             observed_targets = {
                 index: observation.y
@@ -258,6 +281,22 @@ class JSONLinesRunWriter(RunWriter):
                     scores.selected_indices, record.queried_observations
                 )
             }
+            observed_metadata = {
+                index: observation.metadata or {}
+                for index, observation in zip(
+                    scores.selected_indices, record.queried_observations
+                )
+            }
+        # Only columns some observation actually carries, so an oracle without
+        # them does not gain empty columns.
+        metadata_columns = sorted(
+            {
+                key
+                for metadata in observed_metadata.values()
+                for key in metadata
+                if key in _OBSERVATION_METADATA_COLUMNS
+            }
+        )
 
         relative_path = _artifact_relative_path(
             _SCORED_SAMPLES_KEY, record.round_index, suffix=".csv"
@@ -276,11 +315,13 @@ class JSONLinesRunWriter(RunWriter):
                     "selected",
                     "selection_rank",
                     "y",
+                    *metadata_columns,
                 ]
             )
             for index, candidate in enumerate(candidates):
                 rank = selection_ranks.get(index)
                 target = observed_targets.get(index)
+                metadata = observed_metadata.get(index, {})
                 writer.writerow(
                     [
                         index,
@@ -291,6 +332,17 @@ class JSONLinesRunWriter(RunWriter):
                         rank is not None,
                         "" if rank is None else rank,
                         "" if target is None else _csv_value(target),
+                        *(
+                            # A missing key and an explicit None both mean "no
+                            # measurement" and must read as an empty cell. Left
+                            # to _csv_value, None would be written as the string
+                            # "null", which a reader cannot tell from a real
+                            # value and which pandas would not read as missing.
+                            ""
+                            if metadata.get(column) is None
+                            else _csv_value(metadata[column])
+                            for column in metadata_columns
+                        ),
                     ]
                 )
         return relative_path.as_posix()

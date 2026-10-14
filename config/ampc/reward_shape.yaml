@@ -119,7 +119,7 @@ acquisition:
 
 sampler:
   type: S3GFNSampler
-  # Generate a 100k-candidate pool, from which the round budget selects 2,000.
+  # Generate a 100k-candidate pool, from which the round budget selects 10,000.
   n_samples: 100000
   fidelities: [1]
   model_name_or_path: ibm-research/GP-MoLFormer-Uniq
@@ -130,9 +130,14 @@ sampler:
   batch_size: 64
   replay_batch_size: 64
   generation_batch_size: 128
-  # 10,000, matching the September reward arms rather than this study family's
-  # 2,500, so the per-step curves have room to show a trend and so the two
-  # earlier runs stay comparable.
+  # Overridden per arm by jobs/reward_shape.sh, which puts the value in the arm
+  # name. 10,000 matches the September reward arms and the two 2026-10-12 runs.
+  # Most of what the vargrad floor -150 arm (job 5493805) learned had arrived by
+  # ~5,000: the above-floor fraction was flat by ~1,500, KL from the prior by
+  # ~1,000, and the implied log Z gained ~0.2 nats after 4,000. Only the
+  # residual standard deviation was still falling at 10,000. A shorter arm is
+  # NOT that run truncated: the warmup/decay schedule spans n_train_steps, so
+  # 5,000 steps decays the learning rate twice as fast.
   n_train_steps: 10000
   num_warmup_steps: 10
   # Both overridden per arm. The default is the middle of the band
@@ -190,14 +195,17 @@ oracle:
   pki_threshold: 6.5
 
 budget:
-  # 2,000 docking evaluations in the one round, not the 10,000 the other AmpC
-  # configs use: at ~32 core-seconds per molecule that is ~20 minutes on 48 CPUs
-  # rather than ~100, and 2,000 is ample to measure top-k enrichment against a
-  # random draw from the same pool.
-  available_budget: 2000.0
+  # 10,000 docking evaluations in the one round, raised from 2,000 on
+  # 2026-10-14: the arms now exist to relate the docking score to the surrogate
+  # mean and the acquisition on the SAME molecules, and 2,000 is a thin tail to
+  # read that relationship off. At ~32 core-seconds per molecule this is ~1.9 h
+  # on 48 CPUs rather than ~20 min, which the 10 h limit still covers. That rate
+  # is the config's own estimate and has never been measured: no arm of this
+  # study has reached docking.
+  available_budget: 10000.0
   schedule:
     type: constant
-    value: 2000.0
+    value: 10000.0
   # Required with surrogate.state_path, and the point of the study: train the
   # policy once against a fixed surrogate and look at what it generated.
   max_rounds: 1

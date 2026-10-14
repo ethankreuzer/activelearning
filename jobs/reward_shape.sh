@@ -3,7 +3,7 @@
 # surrogate is restored rather than refitted, so the only thing that differs
 # between arms is the reward the S3-GFN policy is trained against.
 #
-#   sbatch jobs/reward_shape.sh <exponential|power> <beta> <initial_log_z> [seed]
+#   sbatch jobs/reward_shape.sh <exponential|power> <beta> <initial_log_z> <n_train_steps> [seed]
 #
 # initial_log_z is where the RTB normalizer starts, and it is required because
 # there is no safe default: it is log E[R] under the pretrained prior, which
@@ -141,12 +141,21 @@ set -euo pipefail
 TRANSFORM="${1:-}"
 BETA="${2:-}"
 INITIAL_LOG_Z="${3:-}"
-SEED="${4:-}"
+# Training steps became an experimental variable on 2026-10-14, so it is a
+# positional argument and goes in the arm name beside the transform and beta.
+# It sits BEFORE the seed, which was argument 4 until that date; the minimum of
+# 100 below is what stops an old `... <initial_log_z> <seed>` call from silently
+# training for `seed` steps.
+N_TRAIN_STEPS="${4:-}"
+SEED="${5:-}"
 if [[ ! "${TRANSFORM}" =~ ^(exponential|power)$ \
       || ! "${BETA}" =~ ^[0-9]*\.?[0-9]+$ \
       || ! "${INITIAL_LOG_Z}" =~ ^-?[0-9]*\.?[0-9]+$ \
+      || ! "${N_TRAIN_STEPS}" =~ ^[0-9]+$ \
+      || "${N_TRAIN_STEPS}" -lt 100 \
       || ! "${SEED}" =~ ^[0-9]*$ ]]; then
-  echo "usage: sbatch jobs/reward_shape.sh <exponential|power> <beta> <initial_log_z> [seed]" >&2
+  echo "usage: sbatch jobs/reward_shape.sh <exponential|power> <beta> <initial_log_z> <n_train_steps> [seed]" >&2
+  echo "n_train_steps is an integer of at least 100; the seed moved to argument 5 on 2026-10-14." >&2
   exit 2
 fi
 
@@ -169,16 +178,19 @@ LOSS="vargrad"
 LOG_Z_LR="0.01"
 
 # The arm name carries only the non-defaults, as the exact-DKL arms do:
-#   reward_<transform>_beta<beta>_<vargrad|logz<initial_log_z>>_floor<floor>[_s<seed>]
+#   reward_<transform>_beta<beta>_<vargrad|logz<initial_log_z>>_floor<floor>_steps<n>[_s<seed>]
 # Under vargrad the log_z value is not used, so naming the arm after it would
 # claim a setting the run ignored; the loss goes in its place. The floor is in
 # the name because it changed on 2026-10-13 and the -100 arms must stay in
-# their own directories.
+# their own directories. The step count is in the name because the 2026-10-14
+# grid varies it against beta, so two arms otherwise identical must not share a
+# directory -- and so an arm can be identified from its name alone.
 if [[ "${LOSS}" == "vargrad" ]]; then
   ARM="reward_${TRANSFORM}_beta${BETA}_vargrad_floor${LOG_SCORE_FLOOR}"
 else
   ARM="reward_${TRANSFORM}_beta${BETA}_logz${INITIAL_LOG_Z}_floor${LOG_SCORE_FLOOR}"
 fi
+ARM="${ARM}_steps${N_TRAIN_STEPS}"
 SEED_OVERRIDE=()
 SEED_TAG=""
 if [[ -n "${SEED}" ]]; then
@@ -188,7 +200,7 @@ if [[ -n "${SEED}" ]]; then
 fi
 # Optional suffix for rerunning an arm whose settings are unchanged, so the
 # rerun gets its own directory instead of overwriting the earlier run's pool:
-#   ARM_SUFFIX=_chunk64 sbatch jobs/reward_shape.sh power 0.1 1000
+#   ARM_SUFFIX=_chunk64 sbatch jobs/reward_shape.sh power 0.1 1000 10000
 # sbatch exports the submitting shell's environment, so this reaches the job.
 ARM_SUFFIX="${ARM_SUFFIX:-}"
 if [[ -n "${ARM_SUFFIX}" && ! "${ARM_SUFFIX}" =~ ^_[A-Za-z0-9.-]+$ ]]; then
@@ -196,6 +208,13 @@ if [[ -n "${ARM_SUFFIX}" && ! "${ARM_SUFFIX}" =~ ^_[A-Za-z0-9.-]+$ ]]; then
   exit 2
 fi
 ARM="${ARM}${ARM_SUFFIX}"
+# Built here rather than inline in the notes below: an apostrophe inside a
+# ${VAR:+...} expansion makes bash look for a matching quote and the script
+# fails to parse.
+SUFFIX_TEXT=""
+if [[ -n "${ARM_SUFFIX}" ]]; then
+  SUFFIX_TEXT=" Arm suffix ${ARM_SUFFIX}: a rerun under unchanged settings, kept in its own directory so the earlier outputs survive."
+fi
 
 cd /home/ethankrz/activelearning
 source .venv/bin/activate
@@ -256,14 +275,16 @@ fi
 # run's outputs.
 export WANDB_NOTES="REWARD-SHAPE arm ${ARM}: ONE active-learning round, training the S3-GFN policy against a fixed GIBBON acquisition on a frozen surrogate.
 THE QUESTION THIS RUN ASKS: does the trained policy generate molecules the acquisition rates higher than the ones the untrained prior produces? Not validity, not docking -- those are read but are not what this arm is for. The answer comes from scoring BOTH pools afterwards with this same restored surrogate and ONE acquisition object, and comparing two distributions on each: the surrogate posterior MEAN, and log(acquisition). The generated pool is written to ${POOL_LOG_PATH} as soon as generation finishes, then prepared and scored alongside gp_molformer_set (83,811 docked prior samples) via exact_dkl_prepare.py --extra-set and exact_dkl_top_n.py --extra-set, which also reports pooled/acquisition/*/top{k}/<set>_share: which of the two pools the acquisition would actually pick from. Both sets must be scored in the SAME invocation, because GIBBON ranks against sampled posterior max-values and a separate run would draw different ones.
-WHAT IS NEW HERE, against the 2026-10-12 arms: the loss (vargrad, below) and the log-score floor (-150, was -100). Selection scoring now runs in chunks of 64 (acquisition.score_chunk_size, was 256). Every earlier arm, including the first vargrad floor -150 run (job 5493805), died at selection with 'Tried to allocate 12.21 GiB': gpytorch's exact-GP posterior concatenates the 25,000 training molecules onto every candidate in a chunk, so memory scales with the chunk size, and the earlier kernel-side fix never applied to that path. At 64 the same path already ran every S3-GFN training step, and job 5515579 scored a 100k pool with it at ~17 GiB peak. This is therefore the first arm expected to reach docking.${ARM_SUFFIX:+ Arm suffix ${ARM_SUFFIX}: a rerun under unchanged settings, kept in its own directory so the earlier run's outputs survive.}
+WHAT IS NEW HERE, against the 2026-10-12 arms: the loss (vargrad, below) and the log-score floor (-150, was -100). Selection scoring now runs in chunks of 64 (acquisition.score_chunk_size, was 256). Every earlier arm, including the first vargrad floor -150 run (job 5493805), died at selection with 'Tried to allocate 12.21 GiB': gpytorch's exact-GP posterior concatenates the 25,000 training molecules onto every candidate in a chunk, so memory scales with the chunk size, and the earlier kernel-side fix never applied to that path. At 64 the same path already ran every S3-GFN training step, and job 5515579 scored a 100k pool with it at ~17 GiB peak. This is therefore the first arm expected to reach docking.${SUFFIX_TEXT}
 Surrogate: RESTORED, NOT REFITTED. The exact GP (no inducing points, no minibatching) is rebuilt on the 25000-molecule BALANCED training set data/ampc_balanced_25000.csv -- the library-proportional mix, top band floored at 5% of the budget -- and its fitted parameters are loaded from ${STATE_PATH} in place of training, so every arm of this study shares one surrogate exactly. See ${FITTED_DIR}/arm_description.txt for how that fit was obtained. Features: frozen MiniMol AmpC fingerprints with NO trainable layer, the kernel reading the 512-d fingerprints directly. GP prior mean: learned during that fit, not pinned. float32.
 Why this surrogate: it is the first in the study whose uncertainty is not collapsed -- 88% of truths within 2 std on unseen ampc_331k against 6% for the width-256 arm, and a GIBBON effective support of ~21 molecules rather than 2.
 Acquisition: GIBBON (QLowerBoundMaxValueEntropy), log_space=true so the information gain never underflows, log_output=false so it is returned on the VALUE scale, which is what the reward transform needs. Max-value support is the 25,000 training molecules.
 Reward: transform=${TRANSFORM}, beta=${BETA}. ${REWARD_TEXT}. The loss uses beta * score as log R, so R = exp(beta * score) is always positive even where the logged post-transform score is negative.
 ${NORMALIZER_TEXT}
 What to read: the per-training-step figures sampler/s3gfn/acq/trajectory (is the policy finding more informative molecules), reward/effective_support (how many of the 64 molecules in a batch the reward spreads over -- toward 1 means collapse, toward 64 means the policy will not move), reward/concentration, and train/batch_health (valid / synthesizable / unique). acq rising while validity or uniqueness falls is the policy fleeing the data the GP was fitted on. Four more: ${RESIDUAL_TEXT}; train/prior_divergence estimates KL(policy || prior), 0 for an inert policy and unbounded for one being torn off its prior; reward/above_floor_fraction is the share of each batch scoring above the ${LOG_SCORE_FLOOR}-nat floor, about 0.03 under the prior and the thing that should climb; train/gradient_norm is the gradient norm before clipping against the threshold of 10.
-Then the round itself: 2,000 Dock3 evaluations selected by CostAwareSelector from a 100k generated pool, 10,000 S3-GFN training steps. The question the round answers is whether the true docking scores of those 2,000 beat a random draw from the same pool; expect low single digits, since GIBBON's top-1000 enrichment on generated-like molecules (gp_molformer_set) is 2.35x, not the 6.5x it reaches on the library.
+Then the round itself: ${N_TRAIN_STEPS} S3-GFN training steps, then 10,000 Dock3 evaluations -- the top 10,000 by acquisition, since CostAwareSelector ranks the 100k pool by acquisition over a flat cost of 1.0. Raised from 2,000 on 2026-10-14 so the docking score, the surrogate mean and the acquisition can be related on the same molecules rather than on a thin tail; at ~32 core-seconds each that is ~1.9 h on 48 CPUs, an estimate no arm has yet confirmed. The question the round answers is whether the true docking scores of those 10,000 beat a random draw from the same pool; expect low single digits, since GIBBON's top-1000 enrichment on generated-like molecules (gp_molformer_set) is 2.35x, not the 6.5x it reaches on the library.
+TRAINING LENGTH: this arm runs ${N_TRAIN_STEPS} steps. A shorter arm is not a longer one stopped early -- the warmup/decay schedule spans n_train_steps, so 5,000 steps decays the learning rate twice as fast as 10,000. On job 5493805 (10,000 steps) the above-floor fraction was flat by ~1,500 steps, KL from the prior by ~1,000, and the implied log Z gained ~0.2 nats after 4,000; only the residual standard deviation was still falling at 10,000. The 2026-10-14 grid crosses this against beta to find out whether the shorter schedule reaches the same place.
+Per-run outputs for comparing the three quantities on the SAME molecules: artifacts/acquisition/general/round_NNNN/scored_samples.csv carries every pooled molecule with its acquisition score, whether it was selected, and -- for the selected -- the observed probability of binding and the raw DOCK3 score from the observation's metadata (the probability is not monotone in it, so it cannot be recovered afterwards). jobs/reward_shape_score_pool.sh then joins that against the surrogate mean it computes for the whole pool.
 Prior art: exponential beta=100 (job 4012959) was inert, mean log-reward 0.02 nats, validity 0.93; power beta=1 (job 4177912) collapsed, validity 0.0028 and zero yield from 2,000,000 attempts. Both ran on a variational surrogate, not this one.
 Arm name: ${ARM}. Arms differ only in what the name carries: reward_<transform>_beta<beta>_<vargrad|logz<initial log_z>>_floor<floor>, plus _s<n> for a non-default seed.
 Submitted with: sbatch jobs/reward_shape.sh $*   (Slurm job ${SLURM_JOB_ID:-unknown})"
@@ -277,7 +298,7 @@ if [[ "${LOSS}" == "vargrad" ]]; then
 else
   LOSS_TAGS="rtb,logz${INITIAL_LOG_Z},logz-lr${LOG_Z_LR}"
 fi
-TAGS="reward-shape,${TRANSFORM},beta${BETA},${LOSS_TAGS},floor${LOG_SCORE_FLOOR},nolayer,restored-state,fp32,1-round${SEED_TAG}${ARM_SUFFIX:+,suffix${ARM_SUFFIX}}"
+TAGS="reward-shape,${TRANSFORM},beta${BETA},${LOSS_TAGS},floor${LOG_SCORE_FLOOR},steps${N_TRAIN_STEPS},nolayer,restored-state,fp32,1-round${SEED_TAG}${ARM_SUFFIX:+,suffix${ARM_SUFFIX}}"
 
 # The whole logger is restated as one YAML value rather than overridden field by
 # field. OmegaConf.from_dotlist reads every path segment as a dict key, so
@@ -296,6 +317,7 @@ uv run --no-sync python scripts/run_with_sigterm_flush.py \
   config/ampc/reward_shape.yaml \
   "sampler.reward_transform=${TRANSFORM}" \
   "sampler.beta=${BETA}" \
+  "sampler.n_train_steps=${N_TRAIN_STEPS}" \
   "sampler.initial_log_z=${INITIAL_LOG_Z}" \
   "sampler.loss=${LOSS}" \
   "sampler.log_score_floor=${LOG_SCORE_FLOOR}" \
