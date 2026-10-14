@@ -67,7 +67,8 @@ def _batched_inputs(include_fidelity: bool) -> tuple[Tensor, Tensor]:
     dim = INPUT_DIM + (1 if include_fidelity else 0)
     x1 = torch.randn(BATCH_SIZE, 1, dim, dtype=torch.float64)
     train = torch.randn(TRAIN_SIZE, dim, dtype=torch.float64)
-    # expand, not repeat: this is the stride-0 view the GP actually builds.
+    # expand, not repeat: a stride-0 broadcast view. Note that gpytorch's
+    # ExactGP posterior does NOT pass this; it torch.cat's train and test first.
     x2 = train.expand(BATCH_SIZE, TRAIN_SIZE, dim)
     assert x2.stride()[0] == 0
     return x1, x2

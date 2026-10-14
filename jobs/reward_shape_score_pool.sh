@@ -32,6 +32,8 @@
 #                              rescored here so both share one acquisition
 #   eval_summary.json          per-set metrics and
 #                              pooled/acquisition/*/top{k}/<set>_share
+#   figures/surrogate_mean.png, figures/log_acquisition.png
+#                              both pools overlaid, from scripts/plot_pool_vs_prior.py
 #
 # usage: sbatch jobs/reward_shape_score_pool.sh <arm> [round]
 #   arm    directory name under outputs/ampc/reward_shape/, e.g.
@@ -128,6 +130,16 @@ uv run --no-sync python -m scripts.exact_dkl_top_n \
   --wandb-tags "reward-shape,scored,acq-vs-prior,generated-pool,n25000,nolayer,fp32,restored-state" \
   --run-name "${ARM//_/-}-pool-scored-${SLURM_JOB_ID:-local}" \
   "${@:3}"
+
+# Stage 3: the two overlay figures, read straight from the CSVs stage 2 wrote,
+# so both distributions on each come from the one acquisition above. The arm
+# name carries its reward floor (..._floor-150 is -150 nats), which the
+# acquisition figure marks.
+FLOOR_ARGS=()
+if [[ "${ARM}" =~ _floor(-?[0-9]+(\.[0-9]+)?) ]]; then
+  FLOOR_ARGS=(--log-score-floor "${BASH_REMATCH[1]}")
+fi
+uv run --no-sync python -m scripts.plot_pool_vs_prior "${OUTPUT_DIR}" "${FLOOR_ARGS[@]}"
 
 echo
 echo "Done. Sync from a login node with:"

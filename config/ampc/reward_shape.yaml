@@ -103,12 +103,16 @@ acquisition:
     seed: 42
   num_mv_samples: 10
   # An exact GP scores a chunk by concatenating the training inputs onto every
-  # candidate in it, so the peak allocation is
-  # chunk * len(train) * features * 4 bytes. At 5000 against this 25,000-molecule
-  # training set that is 5000*25000*512*4 = 238 GiB, which is what killed job
-  # 5024350 at the selection step; 256 brings it to 12.2 GiB, inside the 40 GiB
-  # card. Chunking only bounds memory -- the scores are identical either way.
-  score_chunk_size: 256
+  # candidate in it (gpytorch's ExactGP torch.cat), which materialises
+  # chunk * len(train) * features * 4 bytes, and EncoderKernel then copies the
+  # training slice of that once more. At 5000 that is 238 GiB per copy, which
+  # killed job 5024350. 256 is 12.2 GiB per copy, ~25 GiB together, and with the
+  # S3-GFN models resident it killed 5188073 and 5493805 at selection. 64 is
+  # ~3 GiB per copy: the S3-GFN training batches of 64 run the same path 10,000
+  # times in this process, and jobs/reward_shape_score_pool.sh scores at 64
+  # (job 5515579, peak ~17 GiB, 100k molecules in ~150 s). Chunking only bounds
+  # memory -- the scores are identical either way.
+  score_chunk_size: 64
   maximize: true
   log_space: true
   log_output: false

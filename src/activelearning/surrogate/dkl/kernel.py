@@ -216,6 +216,13 @@ class EncoderKernel(gpytorch.kernels.Kernel):
         The repeated dimensions are therefore dropped before encoding and
         restored afterwards as a broadcast view, which costs nothing.
 
+        This only helps a caller that keeps the view. gpytorch's
+        ``ExactGP`` posterior (1.15) does not: it concatenates the training
+        inputs onto the test inputs with ``torch.cat`` first, so an exact GP hands this method a
+        contiguous slice with no stride-0 dimension, and the full copy is made
+        anyway. For exact GPs the acquisition's ``score_chunk_size`` is what
+        bounds that memory.
+
         Parameters
         ----------
         inputs : Tensor

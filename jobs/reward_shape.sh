@@ -94,14 +94,12 @@
 #SBATCH --mem=510000M
 # 10h, up from 6h on 2026-10-13. The 6h figure was budgeted for arms that die
 # early: training plus generation measured 2.9h on 5188073, and every arm until
-# now was killed by the DKL-kernel OOM immediately afterwards. With that fixed,
-# three things run to completion for the first time and NONE of them has ever
-# been timed -- scoring 100k candidates through the newly chunked kernel,
-# CostAwareSelector over that pool, and ~2,000 Dock3 evaluations. The config
-# puts the docking alone at ~20 min on 48 CPUs, but the scoring is the unknown:
-# it now runs in slices of ~27 candidates, so it trades memory for many more
-# kernel calls. 10h leaves room to measure all of it once rather than lose a
-# queue wait to a timeout. Shorten it again once a completed round gives a real
+# now was killed by the DKL-kernel OOM at selection (5493805 at 3.0h). Selection
+# scoring is now bounded by score_chunk_size 64 in config/ampc/reward_shape.yaml;
+# job 5515579 encoded and scored a 100k pool at that chunk in ~6 min. Docking the
+# ~2,000 selected molecules has never run in this study: the config puts it at
+# ~20 min on 48 CPUs, unmeasured. 10h leaves room to measure it once rather than
+# lose a queue wait to a timeout. Shorten it again once a completed round gives a real
 # number: fairshare dominates Narval priority (weight 5e6 against 2500 for age),
 # so the window a job needs is the only lever that moves it up a full queue.
 #SBATCH --time=10:00:00
@@ -188,6 +186,16 @@ if [[ -n "${SEED}" ]]; then
   SEED_OVERRIDE=("runtime.seed=${SEED}")
   SEED_TAG=",seed${SEED}"
 fi
+# Optional suffix for rerunning an arm whose settings are unchanged, so the
+# rerun gets its own directory instead of overwriting the earlier run's pool:
+#   ARM_SUFFIX=_chunk64 sbatch jobs/reward_shape.sh power 0.1 1000
+# sbatch exports the submitting shell's environment, so this reaches the job.
+ARM_SUFFIX="${ARM_SUFFIX:-}"
+if [[ -n "${ARM_SUFFIX}" && ! "${ARM_SUFFIX}" =~ ^_[A-Za-z0-9.-]+$ ]]; then
+  echo "ARM_SUFFIX must look like _name (letters, digits, '.', '-')." >&2
+  exit 2
+fi
+ARM="${ARM}${ARM_SUFFIX}"
 
 cd /home/ethankrz/activelearning
 source .venv/bin/activate
@@ -216,6 +224,13 @@ if [[ ! -f "${STATE_PATH}" ]]; then
   echo "  sbatch jobs/exact_dkl_balanced.sh 25000 none" >&2
   exit 2
 fi
+# Never overwrite an earlier run's generated pool: it is hours of sampling, and
+# the input any _scored/ results were computed from. Rerun under ARM_SUFFIX.
+if compgen -G "${OUTPUT_DIR}/generated_pool_round_*.csv" > /dev/null; then
+  echo "${OUTPUT_DIR} already holds a generated pool from an earlier run." >&2
+  echo "Rerun with a suffix, e.g. ARM_SUFFIX=_rerun2 sbatch jobs/reward_shape.sh $*" >&2
+  exit 2
+fi
 
 # Per-arm, so concurrent arms never race on a shared ./wandb/latest-run symlink.
 export WANDB_DIR="${OUTPUT_DIR}"
@@ -241,7 +256,7 @@ fi
 # run's outputs.
 export WANDB_NOTES="REWARD-SHAPE arm ${ARM}: ONE active-learning round, training the S3-GFN policy against a fixed GIBBON acquisition on a frozen surrogate.
 THE QUESTION THIS RUN ASKS: does the trained policy generate molecules the acquisition rates higher than the ones the untrained prior produces? Not validity, not docking -- those are read but are not what this arm is for. The answer comes from scoring BOTH pools afterwards with this same restored surrogate and ONE acquisition object, and comparing two distributions on each: the surrogate posterior MEAN, and log(acquisition). The generated pool is written to ${POOL_LOG_PATH} as soon as generation finishes, then prepared and scored alongside gp_molformer_set (83,811 docked prior samples) via exact_dkl_prepare.py --extra-set and exact_dkl_top_n.py --extra-set, which also reports pooled/acquisition/*/top{k}/<set>_share: which of the two pools the acquisition would actually pick from. Both sets must be scored in the SAME invocation, because GIBBON ranks against sampled posterior max-values and a separate run would draw different ones.
-WHAT IS NEW HERE, against the 2026-10-12 arms: the loss (vargrad, below), the log-score floor (-150, was -100), and a fixed OOM in the DKL kernel that killed every earlier arm during final scoring -- it re-encoded the 25,000 training molecules once per scored candidate and asked for 12.21 GiB. This is therefore the first arm of the study expected to complete a round at all.
+WHAT IS NEW HERE, against the 2026-10-12 arms: the loss (vargrad, below) and the log-score floor (-150, was -100). Selection scoring now runs in chunks of 64 (acquisition.score_chunk_size, was 256). Every earlier arm, including the first vargrad floor -150 run (job 5493805), died at selection with 'Tried to allocate 12.21 GiB': gpytorch's exact-GP posterior concatenates the 25,000 training molecules onto every candidate in a chunk, so memory scales with the chunk size, and the earlier kernel-side fix never applied to that path. At 64 the same path already ran every S3-GFN training step, and job 5515579 scored a 100k pool with it at ~17 GiB peak. This is therefore the first arm expected to reach docking.${ARM_SUFFIX:+ Arm suffix ${ARM_SUFFIX}: a rerun under unchanged settings, kept in its own directory so the earlier run's outputs survive.}
 Surrogate: RESTORED, NOT REFITTED. The exact GP (no inducing points, no minibatching) is rebuilt on the 25000-molecule BALANCED training set data/ampc_balanced_25000.csv -- the library-proportional mix, top band floored at 5% of the budget -- and its fitted parameters are loaded from ${STATE_PATH} in place of training, so every arm of this study shares one surrogate exactly. See ${FITTED_DIR}/arm_description.txt for how that fit was obtained. Features: frozen MiniMol AmpC fingerprints with NO trainable layer, the kernel reading the 512-d fingerprints directly. GP prior mean: learned during that fit, not pinned. float32.
 Why this surrogate: it is the first in the study whose uncertainty is not collapsed -- 88% of truths within 2 std on unseen ampc_331k against 6% for the width-256 arm, and a GIBBON effective support of ~21 molecules rather than 2.
 Acquisition: GIBBON (QLowerBoundMaxValueEntropy), log_space=true so the information gain never underflows, log_output=false so it is returned on the VALUE scale, which is what the reward transform needs. Max-value support is the 25,000 training molecules.
@@ -258,11 +273,11 @@ RUN_NAME="${ARM//_/-}-${SLURM_JOB_ID:-local}"
 # Only tag log_z settings when the loss actually reads them, so a tag search
 # never turns up an arm that ignored the value it is tagged with.
 if [[ "${LOSS}" == "vargrad" ]]; then
-  LOSS_TAGS="vargrad,oom-fixed,acq-vs-prior"
+  LOSS_TAGS="vargrad,chunk64,acq-vs-prior"
 else
   LOSS_TAGS="rtb,logz${INITIAL_LOG_Z},logz-lr${LOG_Z_LR}"
 fi
-TAGS="reward-shape,${TRANSFORM},beta${BETA},${LOSS_TAGS},floor${LOG_SCORE_FLOOR},nolayer,restored-state,fp32,1-round${SEED_TAG}"
+TAGS="reward-shape,${TRANSFORM},beta${BETA},${LOSS_TAGS},floor${LOG_SCORE_FLOOR},nolayer,restored-state,fp32,1-round${SEED_TAG}${ARM_SUFFIX:+,suffix${ARM_SUFFIX}}"
 
 # The whole logger is restated as one YAML value rather than overridden field by
 # field. OmegaConf.from_dotlist reads every path segment as a dict key, so
