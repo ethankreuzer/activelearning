@@ -83,8 +83,6 @@ REGRESSION_TESTS=(
 #     The test expects sampler.beta == 0.5, but
 #     config/ampc/overrides/reward_power.yaml deliberately sets 1.0 and says so
 #     in a comment. The test is stale, not the config.
-#   test_molecule_s3gfn_minimol_slurm_dock3_config_parses
-#     config/molecules/s3gfn_minimol_slurm_dock3.yaml does not exist.
 #   test_convert_al_d0 / test_diagnose_ampc_acquisition / test_diagnose_mes_gibbon
 #     Orphaned test modules: scripts/convert_al_d0.py,
 #     scripts/diagnose_ampc_acquisition.py and scripts/diagnose_mes_gibbon.py
@@ -92,8 +90,6 @@ REGRESSION_TESTS=(
 PREEXISTING_DESELECT=(
   --deselect
   "tests/test_example_configs.py::test_ampc_single_fidelity_reward_transform_overlays_parse[power]"
-  --deselect
-  "tests/test_example_configs.py::test_molecule_s3gfn_minimol_slurm_dock3_config_parses"
 )
 PREEXISTING_IGNORE=(
   --ignore tests/scripts/test_convert_al_d0.py

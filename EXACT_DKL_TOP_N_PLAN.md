@@ -373,7 +373,7 @@ by it (`git diff b6afcfa..HEAD` lists none of the files):
 | failure | cause | not ours because |
 |---|---|---|
 | `test_ampc_single_fidelity_reward_transform_overlays_parse[power]` | test expects `sampler.beta == 0.5`; `config/ampc/overrides/reward_power.yaml` deliberately sets `1.0` and documents why | neither file changed |
-| `test_molecule_s3gfn_minimol_slurm_dock3_config_parses` | `config/molecules/s3gfn_minimol_slurm_dock3.yaml` does not exist | no config added or removed |
+| `test_molecule_s3gfn_minimol_slurm_dock3_config_parses` | `config/molecules/s3gfn_minimol_slurm_dock3.yaml` does not exist (`cc16474` added the test without it; the config was committed on 2026-10-15 and the test is no longer deselected) | no config added or removed |
 | `test_convert_al_d0`, `test_diagnose_ampc_acquisition`, `test_diagnose_mes_gibbon` | orphaned test modules; `scripts/convert_al_d0.py`, `scripts/diagnose_ampc_acquisition.py`, `scripts/diagnose_mes_gibbon.py` are absent | those scripts were never in this branch |
 | `test_num_workers_auto_resolves_from_slurm` | environment-dependent: `resolve_num_workers` takes `min(cpu_affinity, SLURM_CPUS_PER_TASK)` by design, and the test monkeypatches only the env var, so it needs a host with >= 64 available CPUs | `dock3_oracle.py` and `_parallel.py` unchanged since `0104988` |
 | `test_select_stratified_draws_from_each_stratum`, `test_select_stratified_is_seeded`, `test_select_kmeans_respects_strata_and_subsampling` | the default strata allot `0.1875 * 64 = 12` inducing points to the top 0.1%, but the test's 10,000 rows put only 10 there, so `_allocation` raises | `inducing_init.py` and its test both arrived in `0104988` and are unchanged |

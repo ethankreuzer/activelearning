@@ -1,0 +1,118 @@
+# S3-GFN molecule experiment: MiniMol fingerprints + exact SMILES DKL, scored by
+# DOCK3 docking against the AmpC beta-lactamase receptor, sharded across a Slurm
+# job array.
+#
+# This is config/molecules/s3gfn_minimol_dock3.yaml with the single-node oracle
+# swapped for SlurmDock3Oracle. Everything above the oracle block is identical,
+# so a diff between the two files shows only what distributing the docking costs.
+#
+# The objective is the estimated probability of binding at pKi >= 6.5, converted
+# from the raw docking score by the fitted AmpC hit-rate model. Note it is not
+# monotone in the score: it peaks at an interior score and falls off beyond it,
+# because scores that good are more likely artifacts than real binders.
+#
+# Prerequisites:
+#   - uv sync --extra molecules
+#   - the DOCK3 toolchain on the cluster: dockenv.sh, ligbuild, dock64
+#   - a prepared receptor dockfiles directory and its INDOCK template
+#   - sbatch submission rights from wherever the loop runs, since the oracle
+#     submits the array itself rather than docking in-process
+#
+# Why distribute at all: docking is ~32 core-seconds per molecule and one
+# molecule occupies one core, so a 128-molecule round is about 68 core-minutes.
+# Budget is denominated in those same core-seconds, so an array buys wall time,
+# not more evaluations -- the round costs the same whether it runs on 32 cores
+# or 128.
+
+runtime:
+  device: cpu
+  precision: 64
+  seed: 42
+
+dataset:
+  type: ListDataset
+
+surrogate:
+  type: ExactDKLSurrogate
+  encoder:
+    type: MiniMolSmilesEncoder
+    batch_size: 16
+    latent_dim: 32
+    cache_size: 4096
+  training_params:
+    epochs: 10
+    lr: 1.0e-3
+  standardize_outputs: true
+
+acquisition:
+  type: UpperConfidenceBound
+  beta: 2.0
+
+sampler:
+  type: S3GFNSampler
+  n_samples: 256
+  fidelities: [1]
+  model_name_or_path: ibm-research/GP-MoLFormer-Uniq
+  tokenizer_name_or_path: ibm-research/MoLFormer-XL-both-10pct
+  trust_remote_code: true
+  max_length: 140
+  batch_size: 16
+  replay_batch_size: 16
+  n_train_steps: 25
+  num_warmup_steps: 5
+  beta: 25.0
+  aux_coefficient: 0.001
+  sa_threshold: 4.0
+
+selector:
+  # 128 molecules per round, which divides evenly by num_array_tasks below so
+  # every task gets a full shard of 32 and none sits idle.
+  type: TopKAcquisitionSelector
+  num_samples: 128
+
+oracle:
+  type: SlurmDock3Oracle
+  indock_template: /home/ethankrz/dock_smiles/ampc_dockfiles/INDOCK
+  dockfiles_dir: /home/ethankrz/dock_smiles/ampc_dockfiles
+  mol_repr: smiles
+  fidelity_costs:
+    1: 32.0          # measured mean core-seconds per molecule
+  # Every array task writes its shard's results here and the loop polls for
+  # them, so this must be on a filesystem all of them share. It cannot be
+  # $SLURM_TMPDIR, which the single-node oracle is happy with: that is
+  # node-local, and each task lands on a different node.
+  shared_work_dir: /home/ethankrz/scratch/dock3_shared
+  # 4 tasks of 32 workers = 128 cores, one per molecule in the round.
+  num_array_tasks: 4
+  # Explicit, unlike the null the single-node oracle accepts. Each task gets its
+  # own allocation, so the submitting job's CPU count says nothing about what a
+  # task will hold; it has to match the --cpus-per-task in sbatch_args below.
+  num_workers: 32
+  # Run all four at once. Lower it to trade wall time for a lighter footprint in
+  # the queue when the partition is busy.
+  max_parallel_tasks: 4
+  poll_interval: 5.0
+  sbatch_args:
+    - --account=def-yvesbrun_cpu
+    - --time=0:30:00
+    - --cpus-per-task=32
+    - --mem=32G
+  ligbuild_timeout: 150
+  # The observed value is P(binding), not the docking score. Paths are relative
+  # to the repository root, like config/data/molecules.txt elsewhere.
+  hitrate_params: ampc_hitrate_fits/fitted_params.json
+  score_pprop_table: ampc_hitrate_fits/data/full_scores.df
+  hitrate_target: ampc
+  pki_threshold: 6.5
+
+budget:
+  # 128 molecules at 32 core-seconds each is 4096 per round, so three rounds.
+  available_budget: 12288.0
+  schedule:
+    type: constant
+    value: 4096.0
+
+logger:
+  type: ConsoleLogger
+  project_name: activelearning_tutorials
+  run_name: molecules-s3gfn-minimol-slurm-dock3
