@@ -5,6 +5,12 @@ minibatching) over one trainable layer on the frozen MiniMol AmpC features,
 fitted to the n highest-scoring molecules of the 10M set, then evaluated and
 used to score three candidate sets.
 
+The same runner also fits ``FixedFeatureGPSurrogate`` -- BoTorch's default
+exact GP on the same fingerprints, fitted by L-BFGS-B -- so the two are
+evaluated by identical code. For it the ``train/epoch/*`` series are indexed by
+objective evaluation rather than epoch, and ``run/fit/converged`` records
+whether the last L-BFGS-B attempt reached scipy's convergence criterion.
+
 Two things about this script are deliberate and easy to "simplify" wrongly:
 
 **It never calls ``acquisition.score()`` or ``surrogate.predict()``.**
@@ -81,6 +87,16 @@ QMFMES_TYPE = "QMultiFidelityMaxValueEntropy"
 
 #: The only charted series. Everything else is a one-off summary scalar.
 PER_EPOCH_HYPERPARAMETERS = ("noise", "outputscale", "lengthscale_median")
+
+#: BoTorch's default exact GP on the fixed fingerprints, fitted by L-BFGS-B.
+FIXED_FEATURE_GP_TYPE = "FixedFeatureGPSurrogate"
+
+#: The surrogates this study runs, each with the encoder type it is run with.
+#: The DKL encoder can carry a trainable layer; the fixed one never does.
+SURROGATE_ENCODERS = {
+    "ExactDKLSurrogate": "MiniMolAmpcSmilesEncoder",
+    FIXED_FEATURE_GP_TYPE: "MiniMolAmpcSmilesFixedEncoder",
+}
 
 #: Appended to a set's name for the metrics computed on only the molecules the
 #: surrogate was not trained on.
@@ -246,16 +262,20 @@ def scoring_plan(acquisition_type: str) -> tuple[Scoring, ...]:
 
 
 def exact_dkl_hyperparameters(surrogate: Any) -> dict[str, float]:
-    """Read the learned hyperparameters of an exact DKL GP.
+    """Read the learned hyperparameters of an exact GP.
 
     The variational study's reader looks for ``_gp_model`` and a variational
-    strategy and returns nothing here. The structure in this study is
-    ``model.covar_module = EncoderKernel(base_kernel=ScaleKernel(MaternKernel))``.
+    strategy and returns nothing here. Two kernel structures occur in this
+    study: ``EncoderKernel(base_kernel=ScaleKernel(MaternKernel))`` for
+    ``ExactDKLSurrogate``, and BoTorch's bare ``RBFKernel`` for
+    ``FixedFeatureGPSurrogate``. The reader walks ``base_kernel`` down to the
+    kernel with lengthscales; a kernel with no ``ScaleKernel`` has an output
+    scale of exactly 1.
 
     Parameters
     ----------
     surrogate : Any
-        A fitted ``ExactDKLSurrogate``.
+        A fitted ``ExactDKLSurrogate`` or ``FixedFeatureGPSurrogate``.
 
     Returns
     -------
@@ -268,11 +288,14 @@ def exact_dkl_hyperparameters(surrogate: Any) -> dict[str, float]:
     if not surrogate.is_fitted():
         return {}
     model = surrogate.get_model()
-    scale_kernel = model.covar_module.base_kernel
-    matern = scale_kernel.base_kernel
-    lengthscale = matern.lengthscale.detach().reshape(-1)
+    kernel = model.covar_module
+    outputscale = 1.0
+    while not kernel.has_lengthscale:
+        if hasattr(kernel, "outputscale"):
+            outputscale = float(kernel.outputscale.detach())
+        kernel = kernel.base_kernel
+    lengthscale = kernel.lengthscale.detach().reshape(-1)
     noise = float(model.likelihood.noise.detach().mean())
-    outputscale = float(scale_kernel.outputscale.detach())
     transform = getattr(model, "outcome_transform", None)
     y_mean = 0.0 if transform is None else float(transform.means.reshape(-1)[0])
     y_std = 1.0 if transform is None else float(transform.stdvs.reshape(-1)[0])
@@ -364,6 +387,89 @@ def make_epoch_callback(
         logger.log_step(epoch)
 
     return callback
+
+
+def trace_lbfgs_fit(
+    surrogate: Any, callback: Any, attempts: list[dict[str, Any]]
+) -> None:
+    """Route a ``FixedFeatureGPSurrogate`` fit through a recording optimizer.
+
+    L-BFGS-B has no epochs, so ``callback`` -- the same per-epoch callback the
+    DKL fit uses, which keeps the ``train/epoch/*`` charts comparable -- is
+    called once per objective evaluation instead, line searches included, with
+    one running index across BoTorch's retry attempts. The trace is taken inside
+    the loss closure rather than through scipy's step callback, which BoTorch
+    implements by evaluating the objective a second time at every step.
+
+    Each attempt's scipy outcome is appended to ``attempts``. BoTorch treats an
+    attempt that ran out of iterations as a success, so whether the fit
+    converged has to be read from the last one's ``status``.
+
+    Parameters
+    ----------
+    surrogate : Any
+        The ``FixedFeatureGPSurrogate`` about to be fitted. Its ``fit_kwargs``
+        gain an ``optimizer``.
+    callback : Any
+        Called as ``callback(evaluation, loss)``.
+    attempts : list[dict[str, Any]]
+        Appended to, one entry per L-BFGS-B attempt.
+    """
+    from botorch.optim.closures import get_loss_closure_with_grads
+    from botorch.optim.fit import fit_gpytorch_mll_scipy
+    from botorch.optim.utils import get_parameters_and_bounds
+
+    evaluations = [0]
+
+    def recording_optimizer(mll: Any, closure: Any = None, **kwargs: Any) -> Any:
+        attempt = len(attempts) + 1
+        attempts.append({"attempt": attempt, "first_evaluation": evaluations[0]})
+        _logger.info("L-BFGS-B attempt %d started.", attempt)
+        if closure is None:
+            # What fit_gpytorch_mll_scipy builds itself for a single-output model.
+            parameters, _ = get_parameters_and_bounds(mll)
+            closure = get_loss_closure_with_grads(
+                mll,
+                parameters={
+                    name: parameter
+                    for name, parameter in parameters.items()
+                    if parameter.requires_grad
+                },
+            )
+        inner_closure = closure
+
+        def traced_closure(**closure_kwargs: Any) -> Any:
+            loss, grads = inner_closure(**closure_kwargs)
+            callback(evaluations[0], float(loss))
+            if evaluations[0] % 10 == 0:
+                _logger.info(
+                    "L-BFGS-B evaluation %d: loss %.6f", evaluations[0], float(loss)
+                )
+            evaluations[0] += 1
+            return loss, grads
+
+        result = fit_gpytorch_mll_scipy(mll, closure=traced_closure, **kwargs)
+        attempts[-1].update(
+            {
+                "steps": int(result.step),
+                "evaluations": evaluations[0] - attempts[-1]["first_evaluation"],
+                "final_loss": float(result.fval),
+                "status": result.status.name,
+                "message": result.message,
+                "runtime_s": result.runtime,
+            }
+        )
+        _logger.info(
+            "L-BFGS-B attempt %d ended after %d steps: %s (%s), loss %.6f.",
+            attempt,
+            result.step,
+            result.status.name,
+            result.message,
+            result.fval,
+        )
+        return result
+
+    surrogate.fit_kwargs = {**surrogate.fit_kwargs, "optimizer": recording_optimizer}
 
 
 def git_provenance(repo_dir: Path | None = None) -> dict[str, Any]:
@@ -910,6 +1016,8 @@ def run_configuration(
         "feature_cache_path": encoder.get("feature_cache_path"),
         "standardize_outputs": surrogate.get("standardize_outputs"),
         "prior_mean": surrogate.get("prior_mean"),
+        "scale_inputs": surrogate.get("scale_inputs"),
+        "max_cholesky_size": surrogate.get("max_cholesky_size"),
         "epochs": training.get("epochs"),
         "lr": training.get("lr"),
         "num_mv_samples": acquisition.get("num_mv_samples"),
@@ -984,34 +1092,45 @@ def main(argv: Sequence[str] | None = None) -> None:
     acquisition_cfg = dict(resolved.get("acquisition", {}))
     acquisition_type = str(acquisition_cfg.get("type"))
 
-    if surrogate_cfg.get("type") != "ExactDKLSurrogate":
+    surrogate_type = surrogate_cfg.get("type")
+    if surrogate_type not in SURROGATE_ENCODERS:
         raise SystemExit(
-            f"This study fits ExactDKLSurrogate; the config has "
-            f"{surrogate_cfg.get('type')!r}."
+            f"This study fits {' or '.join(SURROGATE_ENCODERS)}; the config has "
+            f"{surrogate_type!r}."
         )
-    if encoder_cfg.get("type") != "MiniMolAmpcSmilesEncoder":
+    if encoder_cfg.get("type") != SURROGATE_ENCODERS[surrogate_type]:
         raise SystemExit(
-            "This study uses the MiniMolAmpcSmilesEncoder latent encoder; the config "
-            f"has {encoder_cfg.get('type')!r}."
+            f"{surrogate_type} is run with the {SURROGATE_ENCODERS[surrogate_type]} "
+            f"encoder in this study; the config has {encoder_cfg.get('type')!r}."
         )
-    # Stated, not compared against a fixed expectation: the arms sweep the width
-    # deliberately, and an earlier version of this warning named a default no arm
-    # used, which was later read back as a description of what had run.
-    latent_dim = encoder_cfg.get("latent_dim")
-    activation = encoder_cfg.get("activation")
-    _logger.info(
-        "Encoder: %s, activation=%r.",
-        "no trainable layer (the kernel sees the fingerprints directly)"
-        if latent_dim is None
-        else f"one trainable layer of width {latent_dim}",
-        activation,
-    )
-    if activation not in (None, "none"):
-        _logger.warning(
-            "activation=%r makes the layer non-linear. Every arm of this study so "
-            "far used activation='none', so results are not comparable to them.",
+    if surrogate_type == FIXED_FEATURE_GP_TYPE:
+        _logger.info(
+            "Surrogate: BoTorch's default exact GP on the fingerprints, "
+            "scale_inputs=%s, max_cholesky_size=%s.",
+            surrogate_cfg.get("scale_inputs"),
+            surrogate_cfg.get("max_cholesky_size"),
+        )
+    else:
+        # Stated, not compared against a fixed expectation: the arms sweep the
+        # width deliberately, and an earlier version of this warning named a
+        # default no arm used, which was later read back as a description of
+        # what had run.
+        latent_dim = encoder_cfg.get("latent_dim")
+        activation = encoder_cfg.get("activation")
+        _logger.info(
+            "Encoder: %s, activation=%r.",
+            "no trainable layer (the kernel sees the fingerprints directly)"
+            if latent_dim is None
+            else f"one trainable layer of width {latent_dim}",
             activation,
         )
+        if activation not in (None, "none"):
+            _logger.warning(
+                "activation=%r makes the layer non-linear. Every arm of this study "
+                "so far used activation='none', so results are not comparable to "
+                "them.",
+                activation,
+            )
     if surrogate_cfg.get("prior_mean") is not None:
         _logger.info(
             "The GP prior mean is fixed at %s on the original target scale.",
@@ -1115,17 +1234,21 @@ def main(argv: Sequence[str] | None = None) -> None:
             )
 
             loss_rows: list[dict[str, float]] = []
+            lbfgs_attempts: list[dict[str, Any]] = []
             fit_seconds: float | None = None
             set_global_seed(cfg.runtime.seed)
             if args.load_state is None:
-                surrogate.set_epoch_callback(
-                    make_epoch_callback(logger, surrogate, loss_rows)
-                )
+                epoch_callback = make_epoch_callback(logger, surrogate, loss_rows)
+                if surrogate_type == FIXED_FEATURE_GP_TYPE:
+                    trace_lbfgs_fit(surrogate, epoch_callback, lbfgs_attempts)
+                else:
+                    surrogate.set_epoch_callback(epoch_callback)
                 fit_started = time.perf_counter()
                 with profiler.stage("gp_fit"):
                     surrogate.fit(observations)
                 fit_seconds = time.perf_counter() - fit_started
-                surrogate.set_epoch_callback(None)
+                if surrogate_type != FIXED_FEATURE_GP_TYPE:
+                    surrogate.set_epoch_callback(None)
                 flush_stage_profile()
 
                 torch.save(surrogate.get_state_dict(), out_dir / STATE_FILE)
@@ -1148,10 +1271,28 @@ def main(argv: Sequence[str] | None = None) -> None:
             if fit_seconds is not None:
                 final_metrics["run/fit/seconds"] = fit_seconds
             final_metrics["run/fit/n_train"] = float(n_train)
-            final_metrics["run/fit/epochs"] = float(
-                cfg.surrogate.training_params.epochs
-            )
-            if loss_rows:
+            training_params = getattr(cfg.surrogate, "training_params", None)
+            if training_params is not None:
+                final_metrics["run/fit/epochs"] = float(training_params.epochs)
+            if lbfgs_attempts:
+                last_attempt = lbfgs_attempts[-1]
+                # The last evaluation can be a rejected line-search trial, so the
+                # final loss is the one scipy reports for the accepted point.
+                final_metrics["run/fit/final_loss"] = last_attempt["final_loss"]
+                final_metrics["run/fit/converged"] = float(
+                    last_attempt["status"] == "SUCCESS"
+                )
+                final_metrics["run/fit/lbfgs_attempts"] = float(len(lbfgs_attempts))
+                final_metrics["run/fit/lbfgs_steps"] = float(last_attempt["steps"])
+                final_metrics["run/fit/lbfgs_evaluations"] = float(len(loss_rows))
+                if last_attempt["status"] != "SUCCESS":
+                    _logger.warning(
+                        "The last L-BFGS-B attempt ended with %s (%s): the fit did "
+                        "not converge.",
+                        last_attempt["status"],
+                        last_attempt["message"],
+                    )
+            elif loss_rows:
                 final_metrics["run/fit/final_loss"] = loss_rows[-1]["train/epoch/loss"]
             for key, value in hyperparameters.items():
                 if key in ("y_mean", "y_std"):
@@ -1171,8 +1312,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                         None if args.load_state is None else str(args.load_state)
                     ),
                     "n_train": n_train,
-                    "epochs": cfg.surrogate.training_params.epochs,
-                    "lr": cfg.surrogate.training_params.lr,
+                    "epochs": getattr(training_params, "epochs", None),
+                    "lr": getattr(training_params, "lr", None),
+                    "lbfgs_attempts": lbfgs_attempts or None,
                     "acquisition_type": acquisition_type,
                     "hyperparameters": hyperparameters,
                     "profiling": surrogate.get_fit_profiling(),
@@ -1281,7 +1423,13 @@ def main(argv: Sequence[str] | None = None) -> None:
         if logger is not None:
             log_final_scalars(logger, final_metrics)
             log_figures(logger, final_figures)
-            logger.log_step(int(cfg.surrogate.training_params.epochs))
+            # One past the last charted step: the epoch count for DKL, the
+            # number of objective evaluations for an L-BFGS-B fit.
+            logger.log_step(
+                int(training_params.epochs)
+                if training_params is not None
+                else len(loss_rows)
+            )
     finally:
         for figure in final_figures.values():
             import matplotlib.pyplot as plt

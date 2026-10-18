@@ -5,6 +5,7 @@ configuration. New built-in surrogates should be added to the explicit
 discriminated union below.
 """
 
+from pathlib import Path
 from typing import (
     Annotated,
     Any,
@@ -270,6 +271,75 @@ class BoTorchGPSurrogateConfig(BaseModel):
         )
 
 
+class FixedFeatureGPSurrogateConfig(BaseModel):
+    """Configuration for BoTorch's default exact GP on fixed encoder features.
+
+    Parameters
+    ----------
+    encoder : FixedEncoderConfig
+        Fixed encoder mapping raw domain values, such as SMILES, to features.
+    scale_inputs : bool, default=True
+        Whether BoTorch min-max normalizes each feature to [0, 1].
+    standardize_outputs : bool, default=True
+        Whether BoTorch standardizes regression targets.
+    fit_kwargs : dict[str, Any], optional
+        Keyword arguments passed to ``fit_gpytorch_mll``.
+    max_cholesky_size : int, optional
+        GPyTorch's ``max_cholesky_size`` while fitting; at or above the
+        training-set size the fit objective is exact rather than a stochastic
+        estimate. ``null`` keeps GPyTorch's default.
+    state_path : Path, optional
+        A ``surrogate_state.pt`` from an earlier fit of this same configuration
+        and training set, restored in place of every fit. Like
+        ``ExactDKLSurrogate.state_path``, it is rejected for runs of more than
+        one round.
+    """
+
+    type: Literal["FixedFeatureGPSurrogate"] = "FixedFeatureGPSurrogate"
+    encoder: FixedEncoderConfig
+    scale_inputs: bool = True
+    standardize_outputs: bool = True
+    fit_kwargs: dict[str, Any] = Field(default_factory=dict)
+    max_cholesky_size: int | None = Field(default=None, ge=0)
+    state_path: Path | None = None
+    # Derived from the oracle's fidelity set by the top-level config validator.
+    is_multi_fidelity: bool = False
+
+    def resolve_fidelity_confidences(
+        self,
+        confidences: dict[int, float],
+    ) -> "FixedFeatureGPSurrogateConfig":
+        """Derive multi-fidelity mode from oracle confidence metadata.
+
+        Parameters
+        ----------
+        confidences : dict[int, float]
+            Oracle fidelity confidence mapping.
+
+        Returns
+        -------
+        FixedFeatureGPSurrogateConfig
+            Revalidated config with the derived ``is_multi_fidelity`` value.
+        """
+        data = self.model_dump()
+        data["is_multi_fidelity"] = len(confidences) > 1
+        return type(self).model_validate(data)
+
+    def build(self) -> Surrogate:
+        """Build the fixed-feature exact GP surrogate."""
+        from activelearning.surrogate.fixed_feature_gp import FixedFeatureGPSurrogate
+
+        return FixedFeatureGPSurrogate(
+            encoder=self.encoder.build(),
+            scale_inputs=self.scale_inputs,
+            standardize_outputs=self.standardize_outputs,
+            fit_kwargs=self.fit_kwargs,
+            max_cholesky_size=self.max_cholesky_size,
+            is_multi_fidelity=self.is_multi_fidelity,
+            state_path=self.state_path,
+        )
+
+
 class VariationalGPTrainingConfig(BaseModel):
     """Adam training settings for a fixed-feature variational GP.
 
@@ -366,6 +436,7 @@ SurrogateConfig = Annotated[
     Union[
         DummyMeanSurrogateConfig,
         BoTorchGPSurrogateConfig,
+        FixedFeatureGPSurrogateConfig,
         ExactDKLSurrogateConfig,
         VariationalDKLSurrogateConfig,
         VariationalGPSurrogateConfig,

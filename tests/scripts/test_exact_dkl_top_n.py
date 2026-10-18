@@ -720,3 +720,156 @@ class TestResolveStudySets:
     def test_rejects_a_repeated_extra_name(self) -> None:
         with pytest.raises(SystemExit, match="already a study set"):
             arm.resolve_study_sets(["pool", "pool"])
+
+
+# FixedFeatureGPSurrogate: BoTorch's default exact GP, fitted by L-BFGS-B.
+
+_TOY_SMILES = ("C", "CC", "CCO", "CCN", "CCCO", "OCCO", "NCCN", "CCCCC")
+
+
+def _toy_fixed_gp(**kwargs: Any) -> Any:
+    """Return an unfitted FixedFeatureGPSurrogate over character counts."""
+    from activelearning.surrogate.encoder import FixedEncoder
+    from activelearning.surrogate.fixed_feature_gp import FixedFeatureGPSurrogate
+
+    class _CountEncoder(FixedEncoder):
+        feature_dim = 4
+
+        def encode(self, values: Any, *, device: torch.device) -> torch.Tensor:
+            return torch.tensor(
+                [[len(v), v.count("C"), v.count("O"), v.count("N")] for v in values],
+                dtype=torch.float32,
+                device=device,
+            )
+
+    return FixedFeatureGPSurrogate(_CountEncoder(), **kwargs)
+
+
+def _toy_observations() -> list[Any]:
+    from activelearning.utils.types import Observation
+
+    return [
+        Observation(x=smiles, y=0.3 * smiles.count("C") - 0.5 * smiles.count("O"))
+        for smiles in _TOY_SMILES
+    ]
+
+
+def test_hyperparameters_read_botorch_default_kernel() -> None:
+    """A bare RBF kernel reports its lengthscales and an output scale of 1."""
+    surrogate = _toy_fixed_gp()
+    surrogate.fit(_toy_observations())
+
+    hyperparameters = arm.exact_dkl_hyperparameters(surrogate)
+
+    assert hyperparameters["outputscale"] == 1.0
+    assert hyperparameters["lengthscale_dims"] == 4.0
+    expected = surrogate.get_model().covar_module.lengthscale.median()
+    assert hyperparameters["lengthscale_median"] == pytest.approx(float(expected))
+    assert hyperparameters["noise"] > 0.0
+
+
+def test_hyperparameters_still_read_the_dkl_kernel() -> None:
+    """The DKL layout -- EncoderKernel over ScaleKernel(Matern) -- reads as before."""
+    from botorch.models import SingleTaskGP
+    from botorch.models.transforms.outcome import Standardize
+    from gpytorch.kernels import MaternKernel, ScaleKernel
+
+    from activelearning.surrogate.dkl.kernel import EncoderKernel
+
+    train_X = torch.rand(6, 2, dtype=torch.float64)
+    model = SingleTaskGP(
+        train_X,
+        train_X.sum(-1, keepdim=True),
+        covar_module=EncoderKernel(
+            encoder=torch.nn.Identity(),
+            base_kernel=ScaleKernel(MaternKernel(ard_num_dims=2)),
+        ),
+        outcome_transform=Standardize(m=1),
+    )
+    model.covar_module.base_kernel.outputscale = 0.7
+
+    class _Fitted:
+        def is_fitted(self) -> bool:
+            return True
+
+        def get_model(self) -> Any:
+            return model
+
+    hyperparameters = arm.exact_dkl_hyperparameters(_Fitted())
+
+    assert hyperparameters["outputscale"] == pytest.approx(0.7)
+    assert hyperparameters["lengthscale_dims"] == 2.0
+
+
+def test_lbfgs_trace_charts_every_evaluation_and_records_the_attempt() -> None:
+    """Each objective evaluation reaches the epoch callback, in order."""
+    surrogate = _toy_fixed_gp()
+    logger = _Recorder()
+    rows: list[dict[str, float]] = []
+    attempts: list[dict[str, Any]] = []
+    arm.trace_lbfgs_fit(surrogate, arm.make_epoch_callback(logger, surrogate, rows), attempts)
+
+    surrogate.fit(_toy_observations())
+
+    assert rows, "the callback never ran"
+    assert logger.steps == list(range(len(rows)))
+    assert set(logger.metrics) == {
+        "train/epoch/loss",
+        "train/epoch/noise",
+        "train/epoch/outputscale",
+        "train/epoch/lengthscale_median",
+    }
+    assert attempts and attempts[-1]["status"] in {"SUCCESS", "STOPPED", "FAILURE"}
+    assert sum(attempt["evaluations"] for attempt in attempts) == len(rows)
+    # The record goes into fit_summary.json.
+    json.dumps(attempts)
+
+
+def test_lbfgs_trace_reports_a_fit_stopped_by_maxiter() -> None:
+    """BoTorch accepts a fit that ran out of iterations; the record does not."""
+    surrogate = _toy_fixed_gp(fit_kwargs={"optimizer_kwargs": {"options": {"maxiter": 1}}})
+    attempts: list[dict[str, Any]] = []
+    arm.trace_lbfgs_fit(surrogate, lambda evaluation, loss: None, attempts)
+
+    surrogate.fit(_toy_observations())
+
+    assert len(attempts) == 1
+    assert attempts[0]["status"] == "STOPPED"
+    assert attempts[0]["steps"] == 1
+
+
+def test_lbfgs_trace_does_not_change_the_fit() -> None:
+    """Tracing observes the fit; the fitted model is the same without it."""
+    traced = _toy_fixed_gp()
+    arm.trace_lbfgs_fit(traced, lambda evaluation, loss: None, [])
+    traced.fit(_toy_observations())
+    plain = _toy_fixed_gp()
+    plain.fit(_toy_observations())
+
+    assert torch.allclose(
+        traced.get_model().covar_module.lengthscale,
+        plain.get_model().covar_module.lengthscale,
+    )
+
+
+def test_fixed_feature_gp_balanced_config_parses() -> None:
+    """The arm's config passes full validation with the encoder the runner expects."""
+    from activelearning.config import ActiveLearningConfig
+    from activelearning.utils.config_loader import load_and_parse
+
+    config_path = (
+        Path(__file__).resolve().parents[2]
+        / "config"
+        / "ampc"
+        / "fixed_feature_gp_balanced.yaml"
+    )
+
+    config = load_and_parse(config_path, ActiveLearningConfig)
+
+    assert config.surrogate.type == arm.FIXED_FEATURE_GP_TYPE
+    assert config.surrogate.encoder.type == arm.SURROGATE_ENCODERS[config.surrogate.type]
+    assert config.surrogate.encoder.cache_only is True
+    assert config.surrogate.is_multi_fidelity is False
+    assert config.surrogate.scale_inputs is True
+    assert config.surrogate.state_path is None
+    assert config.runtime.precision == 64

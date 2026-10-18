@@ -9,6 +9,7 @@ from botorch.models.transforms.outcome import Standardize
 from gpytorch.mlls import ExactMarginalLogLikelihood
 from gpytorch.module import Module
 
+from activelearning.runtime import RuntimeContext
 from activelearning.surrogate.surrogate import MultiFidelitySurrogate
 from activelearning.utils.types import (
     Candidate,
@@ -100,6 +101,24 @@ class BoTorchGPSurrogate(MultiFidelitySurrogate):
         self._train_Y: Optional[torch.Tensor] = None
         self._fidelity_confidences: dict[int, float] = {}
         self._pending_state_dict: Optional[dict[str, torch.Tensor]] = None
+
+    def bind_runtime_context(self, runtime_context: RuntimeContext) -> None:
+        """Bind runtime settings and move an already-built model onto them.
+
+        Training and candidate tensors are created on the bound device and dtype
+        (see :meth:`_parse_observations` and :meth:`encode_candidates`), and
+        ``SingleTaskGP`` follows its training inputs, so a model built after this
+        call needs nothing more. One built before it is moved here.
+
+        Parameters
+        ----------
+        runtime_context : RuntimeContext
+            Runtime device and floating-point dtype used by the active-learning
+            loop.
+        """
+        super().bind_runtime_context(runtime_context)
+        if self.model is not None:
+            self.model.to(device=self.device, dtype=self.dtype)
 
     def set_fidelity_confidences(self, confidences: dict[int, float]) -> None:
         """Stores fidelity confidences and passes them to the custom kernel if supported.
@@ -201,8 +220,10 @@ class BoTorchGPSurrogate(MultiFidelitySurrogate):
 
         new_X, new_Y = self._parse_observations(obs_list)
 
-        self._train_X = torch.cat([self._train_X, new_X], dim=0)
-        self._train_Y = torch.cat([self._train_Y, new_Y], dim=0)
+        # The stored rows follow the new ones, in case the runtime context was
+        # rebound since the last fit.
+        self._train_X = torch.cat([self._train_X.to(new_X), new_X], dim=0)
+        self._train_Y = torch.cat([self._train_Y.to(new_Y), new_Y], dim=0)
 
         if not self.use_partial_updates:
             self._build_model(self._train_X, self._train_Y)
@@ -385,7 +406,8 @@ class BoTorchGPSurrogate(MultiFidelitySurrogate):
         Returns
         -------
         test_X : torch.Tensor
-            Encoded candidate tensor of shape ``(N, d)``.
+            Encoded candidate tensor of shape ``(N, d)``, on the runtime device
+            and dtype.
 
         Raises
         ------
@@ -419,7 +441,7 @@ class BoTorchGPSurrogate(MultiFidelitySurrogate):
             fid_tensor = torch.tensor(fidelities, dtype=torch.float64).view(-1, 1)
             test_X = torch.cat([test_X, fid_tensor], dim=-1)
 
-        return test_X
+        return test_X.to(device=self.device, dtype=self.dtype)
 
     def encode_candidate_batches(
         self,
@@ -576,6 +598,8 @@ class BoTorchGPSurrogate(MultiFidelitySurrogate):
         train_Y : torch.Tensor
             A tensor of observed labels reshaped for BoTorch.
 
+            Both are on the runtime device and dtype.
+
         Raises
         ------
         ValueError
@@ -605,7 +629,12 @@ class BoTorchGPSurrogate(MultiFidelitySurrogate):
             fid_tensor = torch.tensor(fidelities, dtype=torch.float64).view(-1, 1)
             train_X = torch.cat([train_X, fid_tensor], dim=-1)
 
-        return train_X, train_Y
+        # SingleTaskGP is built where its training inputs live, so this is what
+        # puts the model on the runtime device.
+        return (
+            train_X.to(device=self.device, dtype=self.dtype),
+            train_Y.to(device=self.device, dtype=self.dtype),
+        )
 
     def _build_model(self, train_X: torch.Tensor, train_Y: torch.Tensor) -> None:
         """Construct the BoTorch Gaussian Process model and marginal log likelihood.
