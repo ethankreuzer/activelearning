@@ -1,0 +1,79 @@
+# Nibi overlay for s3gfn_minimol_ampc_variational_multi_fidelity_narval.yaml.
+# Pass it after the base config.
+#
+# The oracle is a CompositeOracle whose sub_oracles is a list, and lists are
+# replaced wholesale on merge, so the whole oracle block is restated here.
+# Only the cluster-specific fields differ from the Narval config.
+#
+# Nibi regular CPU nodes have 192 cores (766000M). Narval targeted ~980 cores
+# with 16 x 64; on Nibi 5 nodes give 960 (< 980), so 6 whole-node array tasks
+# (1,152 cores) is the smallest allocation meeting that target.
+oracle:
+  type: CompositeOracle
+  sub_oracles:
+    - type: CxcalcOracle
+      mol_repr: smiles
+      # Patched freechem 19.15.r4 (-XX:ActiveProcessorCount=1, db_home=/tmp).
+      # env_setup keeps its default "module load java" (java/17.0.6 exists on Nibi).
+      cxcalc_exe: /project/def-mailhoto/share/soft/software/freechem-19.15.r4/bin/cxcalc
+      fidelity_costs:
+        0: 0.2
+      # Must stay explicit; see the comment in the base config.
+      fidelity_confidences:
+        0: 0.3
+      ph: 7.4
+      anion_percent_threshold: 0.0
+      zero_probability: 0.0
+      nonzero_probability: 0.01
+      num_workers: 1
+    - type: SlurmDock3Oracle
+      mol_repr: smiles
+      indock_template: /project/def-mailhoto/share/ampc_chemstep_dockfiles/dockfiles/INDOCK
+      dockfiles_dir: /project/def-mailhoto/share/ampc_chemstep_dockfiles/dockfiles/
+      dockenv_sh: /home/ethankrz/dock/dockenv_nibi.sh
+      # 2022 build (md5 11c439078b58f861385412a82a28ddb8). Do not switch to the 2025 build.
+      dock64_exe: /project/def-mailhoto/soft/software/dock-3.8.0-2022/bin/dock64
+      fidelity_costs:
+        1: 32.0
+      fidelity_confidences:
+        1: 1.0
+      # Each array task owns one whole 192-core Nibi CPU node.
+      num_workers: 192
+      num_array_tasks: 6
+      max_parallel_tasks: 6
+      shared_work_dir: /scratch/ethankrz/activelearning/dock3_queries
+      # Alliance policy: at least 60 s between Slurm queries (Narval config uses 5.0).
+      poll_interval: 60.0
+      sbatch_args:
+        - --account=def-mailhoto_cpu
+        - --nodes=1
+        - --ntasks=1
+        - --exclusive
+        - --mem=0
+        - --time=03:00:00
+      ligbuild_timeout: 150
+      hitrate_params: ampc_hitrate_fits/fitted_params.json
+      score_pprop_table: ampc_hitrate_fits/data/full_scores.df
+      hitrate_target: ampc
+      pki_threshold: 6.5
+
+logger:
+  type: MultiLogger
+  loggers:
+    - type: ConsoleLogger
+      project_name: ampc_sanity_check
+      run_name: molecules-s3gfn-minimol-ampc-fixed-feature-variational-gp-nibi
+    - type: WandbLogger
+      project_name: ampc_sanity_check
+      run_name: molecules-s3gfn-minimol-ampc-fixed-feature-variational-gp-nibi
+    - type: CometLogger
+      project_name: ampc_sanity_check
+      run_name: molecules-s3gfn-minimol-ampc-fixed-feature-variational-gp-nibi
+      workspace: null
+      api_key: null
+
+run_writer:
+  type: JSONLinesRunWriter
+  output_dir: outputs/ampc/s3gfn_minimol_ampc_variational_multi_fidelity_nibi/seed_${runtime.seed}
+  write_samples: false
+  write_config: true

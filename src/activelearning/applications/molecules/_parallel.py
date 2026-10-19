@@ -21,10 +21,21 @@ logger = logging.getLogger(__name__)
 # worker, so a threaded BLAS or OpenMP component inside them would multiply the
 # worker count instead of adding throughput -- and would invalidate the
 # core-second cost constants, which were measured at one core per molecule.
+#
+# JAVA_TOOL_OPTIONS covers the JVM ligbuild starts internally for its cxcalc
+# step: an unpinned JVM sizes its thread pools off the node's full core count
+# (sched_getaffinity on an exclusive-node allocation reports all of them, not
+# this call's share), so one ligbuild call alone spawns ~12 extra OS threads.
+# At num_workers concurrent calls on a num_workers-core node that is a 10x+
+# oversubscription that stalls every call past its timeout. The standalone
+# CxcalcOracle sub-oracle avoids this with a separately patched freechem
+# build; ligbuild's internal cxcalc call goes through the unpatched
+# module-loaded freechem, so it needs pinning here instead.
 SINGLE_THREAD_ENV = {
     "OMP_NUM_THREADS": "1",
     "MKL_NUM_THREADS": "1",
     "OPENBLAS_NUM_THREADS": "1",
+    "JAVA_TOOL_OPTIONS": "-XX:ActiveProcessorCount=1",
 }
 
 

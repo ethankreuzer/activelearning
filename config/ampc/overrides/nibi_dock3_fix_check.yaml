@@ -1,0 +1,62 @@
+# Small-footprint overlay for validating the JAVA_TOOL_OPTIONS fix
+# (_parallel.SINGLE_THREAD_ENV) before trusting it on a full 1000-molecule,
+# whole-node run. Pass after nibi_multi_fidelity.yaml: it restates the same
+# oracle block with num_workers and sbatch_args cut down so each array task
+# asks for 20 cores instead of an exclusive 192-core node.
+oracle:
+  type: CompositeOracle
+  sub_oracles:
+    - type: CxcalcOracle
+      mol_repr: smiles
+      cxcalc_exe: /project/def-mailhoto/share/soft/software/freechem-19.15.r4/bin/cxcalc
+      fidelity_costs:
+        0: 0.2
+      fidelity_confidences:
+        0: 0.3
+      ph: 7.4
+      anion_percent_threshold: 0.0
+      zero_probability: 0.0
+      nonzero_probability: 0.01
+      num_workers: 1
+    - type: SlurmDock3Oracle
+      mol_repr: smiles
+      indock_template: /project/def-mailhoto/share/ampc_chemstep_dockfiles/dockfiles/INDOCK
+      dockfiles_dir: /project/def-mailhoto/share/ampc_chemstep_dockfiles/dockfiles/
+      dockenv_sh: /home/ethankrz/dock/dockenv_nibi.sh
+      dock64_exe: /project/def-mailhoto/soft/software/dock-3.8.0-2022/bin/dock64
+      fidelity_costs:
+        1: 32.0
+      fidelity_confidences:
+        1: 1.0
+      # Cut from 192 to 20 workers per shard so this validation run asks for
+      # 20 cores instead of a whole exclusive node.
+      num_workers: 20
+      num_array_tasks: 6
+      max_parallel_tasks: 6
+      shared_work_dir: /scratch/ethankrz/activelearning/dock3_queries
+      poll_interval: 60.0
+      # --cpus-per-task is reserved: SlurmDock3Oracle sets it itself from
+      # num_workers (20), so each shard still requests 20 cores without
+      # saying so here.
+      sbatch_args:
+        - --account=def-mailhoto_cpu
+        - --mem=32G
+        - --time=00:20:00
+      ligbuild_timeout: 150
+      hitrate_params: ampc_hitrate_fits/fitted_params.json
+      score_pprop_table: ampc_hitrate_fits/data/full_scores.df
+      hitrate_target: ampc
+      pki_threshold: 6.5
+
+logger:
+  type: MultiLogger
+  loggers:
+    - type: ConsoleLogger
+      project_name: ampc_sanity_check
+      run_name: molecules-s3gfn-minimol-ampc-fixed-feature-variational-gp-nibi-dock3-fix-check
+
+run_writer:
+  type: JSONLinesRunWriter
+  output_dir: outputs/ampc/s3gfn_minimol_ampc_variational_multi_fidelity_nibi_dock3_fix_check/seed_${runtime.seed}
+  write_samples: false
+  write_config: true

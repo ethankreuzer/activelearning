@@ -1,0 +1,47 @@
+# Tiny single-fidelity AmpC run for a first end-to-end check on Nibi.
+# Pass it after the base config and the Nibi overlay:
+#   scripts/run_with_sigterm_flush.py \
+#     config/ampc/s3gfn_minimol_ampc_variational_single_fidelity.yaml \
+#     config/ampc/overrides/nibi_single_fidelity.yaml \
+#     config/ampc/overrides/nibi_tiny_single_fidelity.yaml
+#
+# Two rounds of ~50 real Dock3 evaluations on a 10k initial set. The 20 GB
+# fingerprint cache is tied to the 10M CSV's row order, so it is disabled here
+# and the 10k set is encoded on the fly.
+dataset:
+  initial_data:
+    path: data/10k_unif_random_subset.csv
+
+surrogate:
+  encoder:
+    feature_cache_path: null
+  training_params:
+    epochs: 5
+
+acquisition:
+  candidate_set_spec:
+    fallback_size: 2000
+
+sampler:
+  n_samples: 500
+  n_train_steps: 50
+
+budget:
+  available_budget: 100.0
+  schedule:
+    type: constant
+    value: 50.0
+
+# Lists are replaced on merge, so the loggers are restated in full.
+logger:
+  type: MultiLogger
+  loggers:
+    - type: ConsoleLogger
+      project_name: ampc_sanity_check
+      run_name: molecules-s3gfn-minimol-ampc-single-fidelity-nibi-tiny
+    - type: WandbLogger
+      project_name: ampc_sanity_check
+      run_name: molecules-s3gfn-minimol-ampc-single-fidelity-nibi-tiny
+
+run_writer:
+  output_dir: outputs/ampc/nibi_tiny/seed_${runtime.seed}

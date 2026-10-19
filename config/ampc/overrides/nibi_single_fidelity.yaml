@@ -1,0 +1,17 @@
+# Nibi overlay for s3gfn_minimol_ampc_variational_single_fidelity.yaml.
+# Pass it after the base config:
+#   scripts/run_with_sigterm_flush.py <base.yaml> config/ampc/overrides/nibi_single_fidelity.yaml
+#
+# The base oracle is a plain Dock3Oracle mapping, so these keys merge into it.
+# Everything else (num_workers: null -> sized from the job's CPUs, hit-rate
+# fits, etc.) is inherited unchanged.
+oracle:
+  indock_template: /project/def-mailhoto/share/ampc_chemstep_dockfiles/dockfiles/INDOCK
+  dockfiles_dir: /project/def-mailhoto/share/ampc_chemstep_dockfiles/dockfiles/
+  dockenv_sh: /home/ethankrz/dock/dockenv_nibi.sh
+  # 2022 build (md5 11c439078b58f861385412a82a28ddb8), the one the AmpC grids
+  # were validated against. Do not switch to dock-3.8.0 (the 2025 build).
+  dock64_exe: /project/def-mailhoto/soft/software/dock-3.8.0-2022/bin/dock64
+
+run_writer:
+  output_dir: outputs/ampc/s3gfn_minimol_ampc_variational_single_fidelity_nibi/seed_${runtime.seed}
