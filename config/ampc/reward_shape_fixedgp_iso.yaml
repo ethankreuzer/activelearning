@@ -1,0 +1,210 @@
+# Reward-shape arm on the ISOTROPIC fixed-feature GP instead of the DKL
+# no-layer surrogate. Everything outside `surrogate` is copied verbatim from
+# reward_shape.yaml, precision 32 included, so the arm differs from its DKL
+# counterpart in the surrogate alone; tests/test_example_configs.py fails if
+# the two files drift apart anywhere else. See reward_shape.yaml for the
+# rationale of every shared setting.
+#
+# A copy rather than an overlay because OmegaConf merges dicts key by key: an
+# overlay would leave the DKL encoder's latent_dim and activation behind, which
+# the fixed encoder's schema forbids.
+#
+#   SURROGATE=fixedgp_iso sbatch jobs/reward_shape_nibi.sh power 0.1 1000 5000
+#
+# Prerequisites, beyond reward_shape.yaml's:
+#   - outputs/ampc/exact_dkl_top_n/balanced_25000_fixedgp_iso_fp32/surrogate_state.pt,
+#     from KERNEL=iso PRECISION=32 sbatch jobs/fixed_feature_gp_balanced_nibi.sh
+
+runtime:
+  device: cuda
+  # 32, matching the fit the state was saved from. The float32 and float64
+  # isotropic fits agree to four decimals in every hyperparameter and held-out
+  # metric, and float32 halves the GP's memory.
+  precision: 32
+  seed: 42
+
+dataset:
+  # The exact GP conditions on its training data, which the saved state does not
+  # carry, so the restore has to be handed the same 25,000 molecules the fit saw:
+  # the library-proportional "balanced" set, top band floored at 5% of the budget.
+  type: ListDataset
+  initial_data:
+    path: data/ampc_balanced_25000.csv
+    x_columns: SMILE
+    y_column: y
+    fidelity_column: fidelity
+
+surrogate:
+  # BoTorch's SingleTaskGP on the frozen 512-d MiniMol AmpC fingerprints, with
+  # ONE lengthscale shared by all features (ard: false) under BoTorch's
+  # dimension-scaled LogNormal lengthscale prior and LogNormal(-4, 1) noise
+  # prior, fitted to convergence by L-BFGS-B. Fitted lengthscale 2.67 and noise
+  # 0.27 (standardized), on inputs min-max scaled to [0, 1], in float32.
+  type: FixedFeatureGPSurrogate
+  # Restore instead of fit. ard and the transforms must match the fit, or
+  # load_state_dict raises.
+  state_path: outputs/ampc/exact_dkl_top_n/balanced_25000_fixedgp_iso_fp32/surrogate_state.pt
+  ard: false
+  scale_inputs: true
+  standardize_outputs: true
+  encoder:
+    # The encoder the fit's training cache was written by, as in
+    # fixed_feature_gp_balanced.yaml, but able to run inference: cuda, a real
+    # batch size and cache_only false, since generated SMILES are in no cache.
+    type: MiniMolAmpcSmilesFixedEncoder
+    checkpoint_path: minimol_ampc_encoder/model/final.pt
+    package_path: minimol_ampc_encoder
+    device: cuda
+    batch_size: 64
+    cache_size: 4096
+    cache_only: false
+    # The training molecules are an exact ordered prefix of this cache, so the
+    # restore re-encodes them for free.
+    feature_cache_path: cache/ampc/exact_dkl_top_n/balanced_25000.npy
+
+acquisition:
+  # GIBBON on the VALUE scale: log_space computes the information gain in log
+  # space so it never underflows to exactly zero, while log_output=false returns
+  # it as a value. The reward transform needs a value, because `power` takes the
+  # logarithm itself and would otherwise take it twice -- S3GFNSampler rejects
+  # that combination outright.
+  type: QLowerBoundMaxValueEntropy
+  candidate_set_spec:
+    # The max-value support is the 25,000-molecule training set, well under the
+    # fallback, so every arm sees exactly the same support.
+    type: TrainDataCandidateSetSpec
+    fallback_size: 100000
+    seed: 42
+  num_mv_samples: 10
+  # An exact GP scores a chunk by concatenating the training inputs onto every
+  # candidate in it (gpytorch's ExactGP torch.cat), which materialises
+  # chunk * len(train) * features * 4 bytes, and EncoderKernel then copies the
+  # training slice of that once more. At 5000 that is 238 GiB per copy, which
+  # killed job 5024350. 256 is 12.2 GiB per copy, ~25 GiB together, and with the
+  # S3-GFN models resident it killed 5188073 and 5493805 at selection. 64 is
+  # ~3 GiB per copy: the S3-GFN training batches of 64 run the same path 10,000
+  # times in this process, and jobs/reward_shape_score_pool.sh scores at 64
+  # (job 5515579, peak ~17 GiB, 100k molecules in ~150 s). Chunking only bounds
+  # memory -- the scores are identical either way.
+  score_chunk_size: 64
+  maximize: true
+  log_space: true
+  log_output: false
+
+sampler:
+  type: S3GFNSampler
+  # Generate a 100k-candidate pool, from which the round budget selects 10,000.
+  n_samples: 100000
+  fidelities: [1]
+  model_name_or_path: ibm-research/GP-MoLFormer-Uniq
+  tokenizer_name_or_path: ibm-research/MoLFormer-XL-both-10pct
+  trust_remote_code: true
+  performance_mode: optimized
+  max_length: 80
+  batch_size: 64
+  replay_batch_size: 64
+  generation_batch_size: 128
+  # Overridden per arm by jobs/reward_shape.sh, which puts the value in the arm
+  # name. 10,000 matches the September reward arms and the two 2026-10-12 runs.
+  # Most of what the vargrad floor -150 arm (job 5493805) learned had arrived by
+  # ~5,000: the above-floor fraction was flat by ~1,500, KL from the prior by
+  # ~1,000, and the implied log Z gained ~0.2 nats after 4,000. Only the
+  # residual standard deviation was still falling at 10,000. A shorter arm is
+  # NOT that run truncated: the warmup/decay schedule spans n_train_steps, so
+  # 5,000 steps decays the learning rate twice as fast.
+  n_train_steps: 10000
+  num_warmup_steps: 10
+  # Both overridden per arm. The default is the middle of the band
+  # scripts/reward_shape_preview.py measured on gp_molformer_set, the stand-in
+  # for what the policy generates: beta 0.05 leaves the reward spread over 63 of
+  # 64 molecules in a batch (the policy would not move), beta 0.25 concentrates
+  # it on 6.4, and beta=1 -- the September arm -- collapsed the policy outright.
+  # docs/tutorials/gflownet_sampler.md recommends 0.01-0.5 for a score spanning
+  # orders of magnitude, which information gain does.
+  reward_transform: power
+  beta: 0.2
+  # A fixed floor on log(acq), so a molecule's reward is a function of that
+  # molecule alone. The default floor sits 20 nats below each batch's own best,
+  # and on generated chemistry that best swings by ~100 nats from batch to batch,
+  # which put ~48x more variance into the reward than the within-batch signal
+  # (REWARD_SHAPE_LOGZ_FIX.md, section 6).
+  # Lowered from -100 on 2026-10-13: at -100 only ~3% of a prior batch scored
+  # above the floor, so the reward was close to two-valued and most of the
+  # gradient went into a shared offset rather than into telling molecules
+  # apart. jobs/reward_shape.sh overrides this per arm.
+  log_score_floor: -150.0
+  # log Z = log E[R] under the pretrained prior. Left at 0 it opened the four
+  # 2026-10-08 power arms with a uniform 9-23 nat residual that the policy
+  # absorbed by leaving the valid-SMILES manifold. It depends on beta AND on the
+  # floor, so jobs/reward_shape.sh takes it per arm; measure it with
+  #   python -m scripts.reward_shape_preview <scored run> --log-score-floor -100
+  initial_log_z: -8.0
+  # 10x the default and 100x the policy's 1e-4: log_z is one scalar and the thing
+  # that is supposed to absorb a level offset. Not higher, because it now starts
+  # within a nat or two of its target, and Adam moves a scalar by about the
+  # learning rate per step -- at 0.1 that jitter lands on every residual in the
+  # batch, and log_z slides to E[log R] before the policy has moved.
+  log_z_learning_rate: 0.01
+  aux_coefficient: 0.001
+  sa_threshold: 4.0
+
+selector:
+  type: CostAwareSelector
+
+oracle:
+  type: Dock3Oracle
+  mol_repr: smiles
+  indock_template: /home/ethankrz/dock_smiles/ampc_dockfiles/INDOCK
+  dockfiles_dir: /home/ethankrz/dock_smiles/ampc_dockfiles
+  fidelity_costs:
+    1: 1.0
+  fidelity_confidences:
+    1: 1.0
+  # null sizes the docking thread pool from the CPUs this job holds.
+  num_workers: null
+  ligbuild_timeout: 150
+  hitrate_params: ampc_hitrate_fits/fitted_params.json
+  score_pprop_table: ampc_hitrate_fits/data/full_scores.df
+  hitrate_target: ampc
+  pki_threshold: 6.5
+
+budget:
+  # 10,000 docking evaluations in the one round, raised from 2,000 on
+  # 2026-10-14: the arms now exist to relate the docking score to the surrogate
+  # mean and the acquisition on the SAME molecules, and 2,000 is a thin tail to
+  # read that relationship off. At ~32 core-seconds per molecule this is ~1.9 h
+  # on 48 CPUs rather than ~20 min, which the 10 h limit still covers. That rate
+  # is the config's own estimate and has never been measured: no arm of this
+  # study has reached docking.
+  available_budget: 10000.0
+  schedule:
+    type: constant
+    value: 10000.0
+  # Required with surrogate.state_path, and the point of the study: train the
+  # policy once against a fixed surrogate and look at what it generated.
+  max_rounds: 1
+
+logger:
+  # Run names and tags are overridden per arm by jobs/reward_shape.sh.
+  type: MultiLogger
+  loggers:
+    - type: ConsoleLogger
+      project_name: ampc-reward-shape
+      run_name: reward-shape
+    - type: WandbLogger
+      project_name: ampc-reward-shape
+      run_name: reward-shape
+      entity: models-mila5723
+      group: reward-shape
+      tags: [reward-shape]
+
+run_writer:
+  # Overridden per arm: starting a run truncates round_history.jsonl, so two arms
+  # must never share a directory.
+  type: JSONLinesRunWriter
+  output_dir: outputs/ampc/reward_shape/default
+  write_samples: true
+  # The per-round CSV of every generated molecule with its acquisition score is
+  # what the top-k enrichment is computed from after the round.
+  write_sample_scores: true
+  write_config: true

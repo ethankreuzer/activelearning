@@ -28,7 +28,8 @@
 # per objective evaluation, ~70 s of setup, ~70 s to predict all six sets, and
 # a 38.8 GB GPU peak. 3,000 evaluations is ~75 min, and BoTorch's worst case of
 # five such attempts ~6 h, so submit with --time=6:00:00; the 12 h here is the
-# ceiling.
+# ceiling. KERNEL=iso has three hyperparameters instead of 514 and is expected
+# to converge in far fewer evaluations; its first run measures how many.
 #SBATCH --time=12:00:00
 #SBATCH --job-name=ampc_fixed_gp_bal
 # Re-check the fair share before every submit:
@@ -51,13 +52,93 @@ if [[ "${PRECISION}" != 64 && "${PRECISION}" != 32 ]]; then
   echo "PRECISION must be 64 or 32." >&2
   exit 2
 fi
+# Kernel, ard (BoTorch's default, one lengthscale per feature) or iso (one
+# lengthscale shared by all 512, same prior). Like PRECISION it sets the
+# override, the directory, the tags and the notes together:
+#   KERNEL=iso sbatch --time=2:00:00 jobs/fixed_feature_gp_balanced_nibi.sh
+KERNEL="${KERNEL:-ard}"
+if [[ "${KERNEL}" != ard && "${KERNEL}" != iso ]]; then
+  echo "KERNEL must be ard or iso." >&2
+  exit 2
+fi
+# Kernel family, rbf (BoTorch's default) or matern (Matern-5/2 under the same
+# lengthscale prior and constraint):
+#   FAMILY=matern KERNEL=iso sbatch --time=2:00:00 jobs/fixed_feature_gp_balanced_nibi.sh
+FAMILY="${FAMILY:-rbf}"
+if [[ "${FAMILY}" != rbf && "${FAMILY}" != matern ]]; then
+  echo "FAMILY must be rbf or matern." >&2
+  exit 2
+fi
+# Output scale, 0 (BoTorch's default: none, so the signal variance is fixed at
+# the training targets' variance) or 1 (a learned, prior-free ScaleKernel):
+#   OUTPUTSCALE=1 KERNEL=iso sbatch --time=2:00:00 jobs/fixed_feature_gp_balanced_nibi.sh
+OUTPUTSCALE="${OUTPUTSCALE:-0}"
+if [[ "${OUTPUTSCALE}" != 0 && "${OUTPUTSCALE}" != 1 ]]; then
+  echo "OUTPUTSCALE must be 0 or 1." >&2
+  exit 2
+fi
+# Prior mean on the original target scale, pinned through the fit; empty learns
+# it. The AmpC library value is the mean y of data/10M_unif_random_subset.csv
+# (n = 10,000,000, mean 0.03956042999405787, std 0.021780709138335935):
+#   PRIOR_MEAN=0.03956042999405787 KERNEL=iso sbatch ...
+PRIOR_MEAN="${PRIOR_MEAN:-}"
+if [[ -n "${PRIOR_MEAN}" && ! "${PRIOR_MEAN}" =~ ^-?[0-9]*\.?[0-9]+([eE][-+]?[0-9]+)?$ ]]; then
+  echo "PRIOR_MEAN must be a number." >&2
+  exit 2
+fi
 for argument in "$@"; do
+  if [[ "${argument}" == surrogate.outputscale=* || "${argument}" == surrogate.prior_mean=* || "${argument}" == surrogate.kernel=* ]]; then
+    echo "Set ${argument%%=*} with FAMILY=rbf|matern, OUTPUTSCALE=0|1 or PRIOR_MEAN=<value>, not" \
+      "${argument}, so the directory, tags and notes follow it." >&2
+    exit 2
+  fi
   if [[ "${argument}" == runtime.precision=* ]]; then
     echo "Set the precision with PRECISION=${argument#runtime.precision=}, not" \
       "${argument}, so the directory, tags and notes follow it." >&2
     exit 2
   fi
+  if [[ "${argument}" == surrogate.ard=* ]]; then
+    echo "Set the kernel with KERNEL=ard|iso, not ${argument}, so the" \
+      "directory, tags and notes follow it." >&2
+    exit 2
+  fi
 done
+if [[ "${FAMILY}" == matern ]]; then
+  FAMILY_NAME="Matern-5/2"
+else
+  FAMILY_NAME="RBF"
+fi
+if [[ "${KERNEL}" == iso ]]; then
+  ARM="${ARM}_iso"
+  ARD_OVERRIDE="surrogate.ard=false"
+  KERNEL_NOTE="ISOTROPIC ${FAMILY_NAME}: one lengthscale shared by all 512 features, under BoTorch's dimension-scaled LogNormal lengthscale prior (the same prior, still scaled by d=512)"
+  KERNEL_TAG="isotropic"
+else
+  ARD_OVERRIDE="surrogate.ard=true"
+  KERNEL_NOTE="ARD ${FAMILY_NAME} (one lengthscale per feature) with BoTorch's dimension-scaled LogNormal lengthscale prior"
+  KERNEL_TAG="ard"
+fi
+EXTRA_OVERRIDES=()
+if [[ "${FAMILY}" == matern ]]; then
+  ARM="${ARM}_matern"
+  EXTRA_OVERRIDES+=("surrogate.kernel=matern")
+fi
+if [[ "${OUTPUTSCALE}" == 1 ]]; then
+  ARM="${ARM}_scaled"
+  EXTRA_OVERRIDES+=("surrogate.outputscale=true")
+  SCALE_NOTE="a learned, prior-free output scale (ScaleKernel, initialized at 1)"
+  KERNEL_TAG="${KERNEL_TAG},outputscale"
+else
+  SCALE_NOTE="no output scale"
+fi
+if [[ -n "${PRIOR_MEAN}" ]]; then
+  ARM="${ARM}_pm${PRIOR_MEAN:0:7}"
+  EXTRA_OVERRIDES+=("surrogate.prior_mean=${PRIOR_MEAN}")
+  MEAN_NOTE="constant, PINNED at ${PRIOR_MEAN} on the original target scale (converted with each fit's standardization) and not fitted"
+  KERNEL_TAG="${KERNEL_TAG},pinned-mean"
+else
+  MEAN_NOTE="constant, learned"
+fi
 if [[ "${PRECISION}" == 32 ]]; then
   ARM="${ARM}_fp32"
 fi
@@ -89,7 +170,7 @@ mkdir -p "${WANDB_DIR}" slurm_logs
 
 # Shown on the W&B run's Overview page and kept next to the outputs.
 export WANDB_NOTES="Exact GP (no inducing points, no minibatching) fitted to the 25000-molecule BALANCED training set data/ampc_balanced_25000.csv -- the same set, fingerprints and evaluation as balanced-25000-nolayer, the exact-DKL arm the reward-shape study restores.
-Surrogate: FixedFeatureGPSurrogate, i.e. BoTorch's default SingleTaskGP on the frozen 512-d MiniMol AmpC fingerprints. Kernel: ARD RBF with BoTorch's dimension-scaled LogNormal lengthscale prior and no output scale. Likelihood: Gaussian with the LogNormal(-4, 1) noise prior. Mean: constant, learned. Inputs min-max scaled per dimension to [0, 1] (scale_inputs=true); targets standardized.
+Surrogate: FixedFeatureGPSurrogate, i.e. BoTorch's default SingleTaskGP on the frozen 512-d MiniMol AmpC fingerprints. Kernel: ${KERNEL_NOTE}, and ${SCALE_NOTE}. Likelihood: Gaussian with the LogNormal(-4, 1) noise prior. Mean: ${MEAN_NOTE}. Inputs min-max scaled per dimension to [0, 1] (scale_inputs=true); targets standardized.
 Fit: BoTorch fit_gpytorch_mll (scipy L-BFGS-B) run to convergence, on an exact Cholesky marginal likelihood (max_cholesky_size=30000), float${PRECISION} on one H100. The balanced-25000-nolayer arm instead used a prior-free Matern-5/2 kernel with an output scale on fingerprints divided by one fixed scalar, fitted by 1000 Adam steps in float32 that had not converged.
 train/epoch/* here is indexed by L-BFGS-B objective evaluation, line searches included, not by epoch. The loss includes the hyperparameter priors, so its level is not comparable with the DKL arm's.
 Acquisition scoring skipped, as for the DKL arms.
@@ -99,6 +180,8 @@ printf '%s\n' "${WANDB_NOTES}" > "${OUTPUT_DIR}/arm_description.txt"
 uv run --no-sync python -m scripts.exact_dkl_top_n \
   config/ampc/fixed_feature_gp_balanced.yaml \
   "runtime.precision=${PRECISION}" \
+  "${ARD_OVERRIDE}" \
+  ${EXTRA_OVERRIDES[@]+"${EXTRA_OVERRIDES[@]}"} \
   --output-dir "${OUTPUT_DIR}" \
   --cache-dir cache/ampc/exact_dkl_top_n \
   --eval-chunk-size 2000 \
@@ -106,7 +189,7 @@ uv run --no-sync python -m scripts.exact_dkl_top_n \
   --wandb-project ampc-exact-dkl-balanced \
   --wandb-entity models-mila5723 \
   --wandb-group fixed-feature-gp-balanced \
-  --wandb-tags "fixed-feature-gp,botorch-default,rbf,lbfgs,exact-cholesky,fp${PRECISION},n25000,proportional,top5pct${ARM_SUFFIX:+,${ARM_SUFFIX#_}}" \
+  --wandb-tags "fixed-feature-gp,botorch-default,${FAMILY},${KERNEL_TAG},lbfgs,exact-cholesky,fp${PRECISION},n25000,proportional,top5pct${ARM_SUFFIX:+,${ARM_SUFFIX#_}}" \
   --run-name "${ARM//_/-}-${SLURM_JOB_ID}" \
   "$@"
 

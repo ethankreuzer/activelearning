@@ -11,7 +11,7 @@ import pytest
 import torch
 from botorch.models import SingleTaskGP
 from botorch.models.transforms.input import Normalize
-from gpytorch.kernels import RBFKernel
+from gpytorch.kernels import MaternKernel, RBFKernel, ScaleKernel
 from pydantic import TypeAdapter
 from torch import Tensor
 
@@ -83,6 +83,159 @@ def test_fits_botorch_default_model_on_encoded_smiles() -> None:
     assert model.covar_module.lengthscale.shape[-1] == 4
     train_X, _ = surrogate.get_train_data()
     assert train_X.shape == (len(SMILES), 4)
+
+
+def test_ard_false_fits_one_lengthscale_under_the_default_prior() -> None:
+    """The isotropic kernel shares one lengthscale and keeps the default prior."""
+    default = _fitted().get_model().covar_module
+    isotropic = _fitted(ard=False).get_model().covar_module
+
+    assert isinstance(isotropic, RBFKernel)
+    assert isotropic.lengthscale.numel() == 1
+    # Scaled by the 4 input features, as the ARD prior is.
+    assert torch.equal(
+        isotropic.lengthscale_prior.loc, default.lengthscale_prior.loc
+    )
+    assert torch.equal(
+        isotropic.lengthscale_prior.scale, default.lengthscale_prior.scale
+    )
+    assert isotropic.raw_lengthscale_constraint.lower_bound == pytest.approx(0.025)
+
+
+def test_ard_false_restores_its_fitted_lengthscale() -> None:
+    """An isotropic state restores into an isotropic surrogate, not an ARD one."""
+    fitted = _fitted(ard=False)
+    state = fitted.get_state_dict()
+    restored = FixedFeatureGPSurrogate(_SmilesFeatureEncoder(), ard=False)
+    restored.restore(_observations(), state)
+
+    assert torch.equal(
+        restored.get_model().covar_module.lengthscale,
+        fitted.get_model().covar_module.lengthscale,
+    )
+    with pytest.raises(RuntimeError):
+        FixedFeatureGPSurrogate(_SmilesFeatureEncoder()).restore(
+            _observations(), state
+        )
+
+
+def test_ard_false_rejects_multi_fidelity() -> None:
+    """The isotropic kernel would treat the fidelity column as a feature."""
+    with pytest.raises(ValueError, match="single-fidelity"):
+        FixedFeatureGPSurrogate(
+            _SmilesFeatureEncoder(), ard=False, is_multi_fidelity=True
+        )
+
+
+@pytest.mark.parametrize("ard", [True, False])
+def test_outputscale_wraps_the_kernel_in_a_learned_scale(ard: bool) -> None:
+    """The output scale is fitted, around the kernel ard would build anyway."""
+    plain = _fitted(ard=ard).get_model().covar_module
+    kernel = _fitted(ard=ard, outputscale=True).get_model().covar_module
+
+    assert isinstance(kernel, ScaleKernel)
+    assert isinstance(kernel.base_kernel, RBFKernel)
+    assert kernel.raw_outputscale.requires_grad
+    assert kernel.outputscale.item() != pytest.approx(1.0)
+    assert kernel.base_kernel.lengthscale.numel() == plain.lengthscale.numel()
+    assert torch.equal(
+        kernel.base_kernel.lengthscale_prior.loc, plain.lengthscale_prior.loc
+    )
+
+
+def test_outputscale_state_restores_only_into_an_outputscale_surrogate() -> None:
+    """A state with an output scale does not load into a kernel without one."""
+    fitted = _fitted(ard=False, outputscale=True)
+    state = fitted.get_state_dict()
+    restored = FixedFeatureGPSurrogate(
+        _SmilesFeatureEncoder(), ard=False, outputscale=True
+    )
+    restored.restore(_observations(), state)
+
+    assert torch.equal(
+        restored.get_model().covar_module.outputscale,
+        fitted.get_model().covar_module.outputscale,
+    )
+    with pytest.raises(RuntimeError):
+        FixedFeatureGPSurrogate(_SmilesFeatureEncoder(), ard=False).restore(
+            _observations(), state
+        )
+
+
+def test_outputscale_rejects_multi_fidelity() -> None:
+    """A custom kernel would replace SingleTaskMultiFidelityGP."""
+    with pytest.raises(ValueError, match="single-fidelity"):
+        FixedFeatureGPSurrogate(
+            _SmilesFeatureEncoder(), outputscale=True, is_multi_fidelity=True
+        )
+
+
+@pytest.mark.parametrize("ard", [True, False])
+def test_matern_kernel_keeps_the_default_lengthscale_prior(ard: bool) -> None:
+    """kernel='matern' swaps in a Matern-5/2 under the RBF's prior."""
+    rbf = _fitted(ard=ard).get_model().covar_module
+    scaled = _fitted(ard=ard, kernel="matern", outputscale=True)
+    matern = scaled.get_model().covar_module.base_kernel
+
+    assert isinstance(matern, MaternKernel)
+    assert matern.nu == 2.5
+    assert matern.lengthscale.numel() == rbf.lengthscale.numel()
+    assert torch.equal(matern.lengthscale_prior.loc, rbf.lengthscale_prior.loc)
+    assert torch.equal(matern.lengthscale_prior.scale, rbf.lengthscale_prior.scale)
+    assert matern.raw_lengthscale_constraint.lower_bound == pytest.approx(0.025)
+
+
+def test_matern_kernel_rejects_multi_fidelity_and_unknown_kernels() -> None:
+    """Only rbf and matern exist, and matern is single-fidelity only."""
+    with pytest.raises(ValueError, match="single-fidelity"):
+        FixedFeatureGPSurrogate(
+            _SmilesFeatureEncoder(), kernel="matern", is_multi_fidelity=True
+        )
+    with pytest.raises(ValueError, match="kernel must be"):
+        FixedFeatureGPSurrogate(_SmilesFeatureEncoder(), kernel="linear")
+
+
+def _prior_mean_original_scale(surrogate: FixedFeatureGPSurrogate) -> float:
+    """Return the fitted constant mean in original target units."""
+    model = surrogate.get_model()
+    transform = model.outcome_transform
+    constant = model.mean_module.constant.reshape(-1)[0]
+    y_mean = transform.means.reshape(-1)[0]
+    y_std = transform.stdvs.reshape(-1)[0]
+    return float(y_mean + constant * y_std)
+
+
+def test_mean_is_learned_by_default() -> None:
+    """Without prior_mean the constant is a fitted hyperparameter."""
+    assert _fitted().get_model().mean_module.raw_constant.requires_grad
+
+
+@pytest.mark.parametrize("outputscale", [False, True])
+def test_prior_mean_is_pinned_in_original_units_through_every_fit(
+    outputscale: bool,
+) -> None:
+    """The pinned value survives the fit and a refit on a shifted training set."""
+    surrogate = _fitted(ard=False, outputscale=outputscale, prior_mean=-0.4)
+
+    assert not surrogate.get_model().mean_module.raw_constant.requires_grad
+    assert _prior_mean_original_scale(surrogate) == pytest.approx(-0.4)
+
+    # A training set with a different mean and spread, as later rounds have.
+    surrogate.update(
+        [Observation(x="CCCCCC", y=2.0), Observation(x="CCCCCCC", y=2.5)]
+    )
+    assert _prior_mean_original_scale(surrogate) == pytest.approx(-0.4)
+
+
+def test_prior_mean_survives_a_restore() -> None:
+    """A pinned surrogate restores to the same pinned constant."""
+    fitted = _fitted(ard=False, outputscale=True, prior_mean=-0.4)
+    restored = FixedFeatureGPSurrogate(
+        _SmilesFeatureEncoder(), ard=False, outputscale=True, prior_mean=-0.4
+    )
+    restored.restore(_observations(), fitted.get_state_dict())
+
+    assert _prior_mean_original_scale(restored) == pytest.approx(-0.4)
 
 
 def test_scale_inputs_adds_normalize_by_default_and_can_be_disabled() -> None:
@@ -282,6 +435,10 @@ def test_config_builds_the_surrogate(tmp_path: Path) -> None:
         {
             "type": "FixedFeatureGPSurrogate",
             "encoder": {"type": "MiniMolSmilesFixedEncoder"},
+            "ard": False,
+            "kernel": "matern",
+            "outputscale": True,
+            "prior_mean": 0.04,
             "scale_inputs": False,
             "max_cholesky_size": 100,
             "state_path": str(state_path),
@@ -291,6 +448,10 @@ def test_config_builds_the_surrogate(tmp_path: Path) -> None:
     assert isinstance(parsed, FixedFeatureGPSurrogateConfig)
     surrogate = parsed.build()
     assert isinstance(surrogate, FixedFeatureGPSurrogate)
+    assert surrogate._ard is False
+    assert surrogate._kernel == "matern"
+    assert surrogate._outputscale is True
+    assert surrogate._prior_mean == 0.04
     assert surrogate.scale_inputs is False
     assert surrogate._max_cholesky_size == 100
     assert surrogate._state_path == state_path
@@ -302,5 +463,9 @@ def test_config_defaults_scale_inputs_to_true() -> None:
         encoder={"type": "MiniMolSmilesFixedEncoder"}
     )
 
+    assert parsed.ard is True
+    assert parsed.kernel == "rbf"
+    assert parsed.outputscale is False
+    assert parsed.prior_mean is None
     assert parsed.scale_inputs is True
     assert parsed.max_cholesky_size is None

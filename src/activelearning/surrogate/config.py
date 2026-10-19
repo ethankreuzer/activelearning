@@ -278,6 +278,22 @@ class FixedFeatureGPSurrogateConfig(BaseModel):
     ----------
     encoder : FixedEncoderConfig
         Fixed encoder mapping raw domain values, such as SMILES, to features.
+    ard : bool, default=True
+        Whether each feature gets its own lengthscale (BoTorch's default).
+        ``false`` fits one shared lengthscale under the same prior;
+        single-fidelity only.
+    kernel : {"rbf", "matern"}, default="rbf"
+        BoTorch's default RBF, or a Matern-5/2 under the same lengthscale prior;
+        ``matern`` is single-fidelity only.
+    outputscale : bool, default=False
+        Whether the kernel gets a learned, prior-free output scale (a
+        ``ScaleKernel``). ``false`` keeps BoTorch's default, which fixes the
+        signal variance at the training targets' variance; single-fidelity
+        only.
+    prior_mean : float, optional
+        Fixed GP prior mean on the original target scale, such as the mean of
+        the library the training set was drawn from, held constant through
+        every fit. ``null`` learns it.
     scale_inputs : bool, default=True
         Whether BoTorch min-max normalizes each feature to [0, 1].
     standardize_outputs : bool, default=True
@@ -297,6 +313,10 @@ class FixedFeatureGPSurrogateConfig(BaseModel):
 
     type: Literal["FixedFeatureGPSurrogate"] = "FixedFeatureGPSurrogate"
     encoder: FixedEncoderConfig
+    ard: bool = True
+    kernel: Literal["rbf", "matern"] = "rbf"
+    outputscale: bool = False
+    prior_mean: float | None = None
     scale_inputs: bool = True
     standardize_outputs: bool = True
     fit_kwargs: dict[str, Any] = Field(default_factory=dict)
@@ -331,6 +351,10 @@ class FixedFeatureGPSurrogateConfig(BaseModel):
 
         return FixedFeatureGPSurrogate(
             encoder=self.encoder.build(),
+            ard=self.ard,
+            kernel=self.kernel,
+            outputscale=self.outputscale,
+            prior_mean=self.prior_mean,
             scale_inputs=self.scale_inputs,
             standardize_outputs=self.standardize_outputs,
             fit_kwargs=self.fit_kwargs,

@@ -766,3 +766,33 @@ def test_ampc_reward_shape_config_parses() -> None:
     assert config.sampler.initial_log_z < 0.0
     assert config.sampler.log_z_learning_rate == 0.01
     assert config.oracle.type == "Dock3Oracle"
+
+
+def test_ampc_reward_shape_fixedgp_iso_config_parses() -> None:
+    """Ensure the isotropic fixed-feature GP reward-shape arm matches the schema.
+
+    It restores the float32 isotropic fit and must otherwise stay identical to
+    reward_shape.yaml, precision included, so the two arms differ in the
+    surrogate alone.
+    """
+    config_dir = REPOSITORY_ROOT / "config" / "ampc"
+    config_path = config_dir / "reward_shape_fixedgp_iso.yaml"
+
+    config = load_and_parse(config_path, ActiveLearningConfig)
+
+    assert config.surrogate.type == "FixedFeatureGPSurrogate"
+    assert config.surrogate.ard is False
+    assert config.surrogate.state_path == Path(
+        "outputs/ampc/exact_dkl_top_n/balanced_25000_fixedgp_iso_fp32/surrogate_state.pt"
+    )
+    assert config.surrogate.encoder.type == "MiniMolAmpcSmilesFixedEncoder"
+    # Generated molecules are in no cache, so inference has to be allowed.
+    assert config.surrogate.encoder.cache_only is False
+    assert config.runtime.precision == 32
+    assert config.budget.max_rounds == 1
+
+    iso = OmegaConf.to_container(OmegaConf.load(config_path))
+    dkl = OmegaConf.to_container(OmegaConf.load(config_dir / "reward_shape.yaml"))
+    for raw in (iso, dkl):
+        del raw["surrogate"]
+    assert iso == dkl

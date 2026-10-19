@@ -48,6 +48,10 @@ surrogate:
     # A cache miss is a loud error rather than silent MiniMol inference.
     cache_only: true
     feature_cache_path: cache/ampc/exact_dkl_top_n/balanced_25000.npy
+  # One lengthscale per feature, BoTorch's default. false shares one
+  # lengthscale across all 512 under the same prior; the job sets it from
+  # KERNEL=ard|iso.
+  ard: true
   # Per-dimension min-max to [0, 1], which the dimension-scaled lengthscale
   # prior assumes.
   scale_inputs: true
