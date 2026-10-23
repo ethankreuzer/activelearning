@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import random
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -801,6 +802,14 @@ def test_round_metrics_aggregate_scalars_and_figures(
         invalid_count=1,
         duplicate_count=1,
     )
+    # The real generation path counts a duplicate in both places at once, so the
+    # reject counter is what carries the duplicate rate.
+    metrics.record_rejects(
+        [("duplicate", "CC")],
+        phase="generation",
+        reservoir_size=0,
+        rng=random.Random(0),
+    )
     metrics.record_final_candidates(
         [
             Candidate(x="CC", fidelity=1),
@@ -826,6 +835,7 @@ def test_round_metrics_aggregate_scalars_and_figures(
     assert logged["sampler/s3gfn/train/online_rtb_loss_mean"] == pytest.approx(3.0)
     assert logged["sampler/s3gfn/train/online_rtb_loss_final"] == pytest.approx(4.0)
     assert logged["sampler/s3gfn/train/replay_loss_mean"] == pytest.approx(3.0)
+    assert logged["sampler/s3gfn/train/replay_loss_final"] == pytest.approx(3.0)
     assert logged["sampler/s3gfn/train/contrastive_loss_mean"] == pytest.approx(0.5)
     assert logged["sampler/s3gfn/train/contrastive_loss_final"] == pytest.approx(0.5)
     assert logged["sampler/s3gfn/train/log_z_final"] == pytest.approx(0.2)
@@ -833,7 +843,10 @@ def test_round_metrics_aggregate_scalars_and_figures(
     assert logged["sampler/s3gfn/reward/raw_max"] == pytest.approx(10.0)
     assert logged["sampler/s3gfn/generation/yield"] == pytest.approx(0.4)
     assert logged["sampler/s3gfn/generation/invalid_rate"] == pytest.approx(0.2)
-    assert logged["sampler/s3gfn/generation/duplicate_rate"] == pytest.approx(0.2)
+    assert logged["sampler/s3gfn/generation/reject_rate/duplicate"] == pytest.approx(
+        0.2
+    )
+    assert "sampler/s3gfn/generation/duplicate_rate" not in logged
     assert all(
         isinstance(value, (int, float)) and not isinstance(value, bool)
         for value in logged.values()

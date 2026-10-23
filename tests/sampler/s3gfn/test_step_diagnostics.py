@@ -264,6 +264,118 @@ def test_residual_floor_and_gradient_figures_are_omitted_when_not_recorded(
     assert "sampler/s3gfn/train/prior_divergence_final" not in metrics
 
 
+#: Round scalars summarising the series that are otherwise figures only, so a
+#: multi-round run can read them as a trend instead of an image per round.
+_FIGURE_SERIES_SCALARS = (
+    "sampler/s3gfn/train/unique_total",
+    "sampler/s3gfn/train/unique_rate",
+    "sampler/s3gfn/acq/median",
+    "sampler/s3gfn/reward/concentration_median",
+    "sampler/s3gfn/reward/effective_support_median",
+    "sampler/s3gfn/reward/above_floor_fraction_median",
+    "sampler/s3gfn/train/residual_mean_median",
+    "sampler/s3gfn/train/residual_std_median",
+    "sampler/s3gfn/train/online_gradient_norm_median",
+    "sampler/s3gfn/train/replay_gradient_norm_median",
+)
+
+
+def test_figure_only_series_also_report_a_round_scalar(make_sampler) -> None:
+    """Every per-step figure gets a scalar companion for cross-round trends."""
+    sampler = make_sampler(n_train_steps=1)
+    _record(
+        sampler,
+        on_policy_diagnostics=(1.5, 0.5, 0.25),
+        log_score_floor=-100.0,
+        online_gradient_norm=42.0,
+        replay_gradient_norm=7.0,
+        gradient_clip_norm=10.0,
+    )
+
+    metrics, _ = sampler.drain_round_diagnostics(
+        include_figures=False,
+        max_points=1000,
+    )
+
+    for key in _FIGURE_SERIES_SCALARS:
+        assert key in metrics
+    # Three distinct SMILES out of four the policy was asked for, matching the
+    # batch-health figure's denominator rather than the valid count.
+    assert metrics["sampler/s3gfn/train/unique_total"] == 3
+    assert metrics["sampler/s3gfn/train/unique_rate"] == pytest.approx(3 / 4)
+    assert metrics["sampler/s3gfn/reward/above_floor_fraction_median"] == pytest.approx(
+        1 / 3
+    )
+    assert metrics["sampler/s3gfn/train/residual_mean_median"] == pytest.approx(1.5)
+    assert metrics["sampler/s3gfn/train/residual_std_median"] == pytest.approx(0.5)
+    assert metrics["sampler/s3gfn/train/online_gradient_norm_median"] == pytest.approx(
+        42.0
+    )
+    assert metrics["sampler/s3gfn/train/replay_gradient_norm_median"] == pytest.approx(
+        7.0
+    )
+
+
+def test_round_scalars_are_omitted_when_their_series_was_not_recorded(
+    make_sampler,
+) -> None:
+    """A series with no data gets no scalar, as it gets no figure.
+
+    The reward scalars are the exception: a step that scored any molecule
+    recorded them, whatever the caller left out.
+    """
+    sampler = make_sampler(n_train_steps=1)
+    _record(sampler, acq_scores=[], unique_count=None)
+
+    metrics, _ = sampler.drain_round_diagnostics(
+        include_figures=False,
+        max_points=1000,
+    )
+
+    for key in (
+        "sampler/s3gfn/train/unique_total",
+        "sampler/s3gfn/train/unique_rate",
+        "sampler/s3gfn/acq/median",
+        "sampler/s3gfn/reward/above_floor_fraction_median",
+        "sampler/s3gfn/train/residual_mean_median",
+        "sampler/s3gfn/train/residual_std_median",
+        "sampler/s3gfn/train/online_gradient_norm_median",
+        "sampler/s3gfn/train/replay_gradient_norm_median",
+    ):
+        assert key not in metrics
+    # Both follow from the raw reward scores, which this step did record.
+    assert "sampler/s3gfn/reward/concentration_median" in metrics
+    assert "sampler/s3gfn/reward/effective_support_median" in metrics
+
+
+def test_a_single_collapsed_batch_does_not_move_the_round_scalar(
+    make_sampler,
+) -> None:
+    """The round scalar is a median, so one outlier step cannot set the level."""
+    sampler = make_sampler(n_train_steps=3)
+    for _ in range(2):
+        _record(sampler, log_score_floor=-100.0, online_gradient_norm=1.0)
+    # One step where the floor ties every molecule and the gradient spikes.
+    _record(
+        sampler,
+        raw_reward_scores=[-100.0, -100.0, -100.0],
+        log_score_floor=-100.0,
+        online_gradient_norm=1000.0,
+    )
+
+    metrics, _ = sampler.drain_round_diagnostics(
+        include_figures=False,
+        max_points=1000,
+    )
+
+    assert metrics["sampler/s3gfn/reward/above_floor_fraction_median"] == pytest.approx(
+        1 / 3
+    )
+    assert metrics["sampler/s3gfn/train/online_gradient_norm_median"] == pytest.approx(
+        1.0
+    )
+
+
 def test_steps_without_an_on_policy_update_do_not_shift_the_residual_curve(
     make_sampler,
 ) -> None:

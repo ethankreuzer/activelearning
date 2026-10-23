@@ -353,10 +353,13 @@ class S3GFNLoggingMixin:
                 "sampler/s3gfn/generation/invalid_rate": _safe_ratio(
                     round_metrics.generation_invalid, generation_attempts
                 ),
-                "sampler/s3gfn/generation/duplicate_rate": _safe_ratio(
-                    round_metrics.generation_duplicates, generation_attempts
-                ),
             }
+            # No `generation/duplicate_rate`: it was the same quantity as
+            # `generation/reject_rate/duplicate` below, over the same
+            # denominator, and the two counters are incremented on adjacent
+            # lines of one branch. Unlike that key, this one was emitted even at
+            # zero, so a round that drops no duplicate now leaves a gap in the
+            # series rather than a zero.
             # Split the single invalid_rate into the reasons behind it. Each
             # phase is normalised by its own denominator: training generates
             # `generated_total` strings, final sampling makes
@@ -380,6 +383,7 @@ class S3GFNLoggingMixin:
                 metrics["sampler/s3gfn/train/online_rtb_loss_final"] = online_losses[-1]
             if replay_losses:
                 metrics["sampler/s3gfn/train/replay_loss_mean"] = _mean(replay_losses)
+                metrics["sampler/s3gfn/train/replay_loss_final"] = replay_losses[-1]
             if contrastive_losses:
                 metrics["sampler/s3gfn/train/contrastive_loss_mean"] = _mean(
                     contrastive_losses
@@ -411,6 +415,56 @@ class S3GFNLoggingMixin:
             if round_metrics.generation_duration_s is not None:
                 metrics["sampler/s3gfn/generation/duration_s"] = float(
                     round_metrics.generation_duration_s
+                )
+            # One scalar per series that otherwise exists only as a per-round
+            # figure. Across a multi-round run a figure is an image per round,
+            # which cannot be read as a trend; these make the same series
+            # sortable and plottable round over round. The median over the
+            # round's steps, matching the binning the figures already use: these
+            # series have heavy tails, and one collapsed batch should not move
+            # the round's reading.
+            if round_metrics.unique_counts:
+                unique_total = sum(round_metrics.unique_counts)
+                metrics["sampler/s3gfn/train/unique_total"] = unique_total
+                # Over the generated count, not the valid one, so this matches
+                # the batch-health figure's third line and stays comparable with
+                # validity_rate and synthesizable_rate. Uniqueness is the only
+                # one of the three that reveals mode collapse while validity
+                # stays high.
+                metrics["sampler/s3gfn/train/unique_rate"] = _safe_ratio(
+                    unique_total, generated_total
+                )
+            if round_metrics.acq_medians:
+                metrics["sampler/s3gfn/acq/median"] = _median(round_metrics.acq_medians)
+            if round_metrics.reward_ratio_medians:
+                metrics["sampler/s3gfn/reward/concentration_median"] = _median(
+                    round_metrics.reward_ratio_medians
+                )
+            if round_metrics.reward_effective_supports:
+                metrics["sampler/s3gfn/reward/effective_support_median"] = _median(
+                    round_metrics.reward_effective_supports
+                )
+            if round_metrics.above_floor_fractions:
+                metrics["sampler/s3gfn/reward/above_floor_fraction_median"] = _median(
+                    round_metrics.above_floor_fractions
+                )
+            if round_metrics.residual_means:
+                # Both lines, because they rise for unrelated reasons: the
+                # signed mean is what a correct log_z removes, the standard
+                # deviation is what only the policy can.
+                metrics["sampler/s3gfn/train/residual_mean_median"] = _median(
+                    round_metrics.residual_means
+                )
+                metrics["sampler/s3gfn/train/residual_std_median"] = _median(
+                    round_metrics.residual_stds
+                )
+            if round_metrics.online_gradient_norms:
+                metrics["sampler/s3gfn/train/online_gradient_norm_median"] = _median(
+                    round_metrics.online_gradient_norms
+                )
+            if round_metrics.replay_gradient_norms:
+                metrics["sampler/s3gfn/train/replay_gradient_norm_median"] = _median(
+                    round_metrics.replay_gradient_norms
                 )
 
             figures: dict[str, Figure] = {}
