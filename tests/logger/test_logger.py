@@ -220,6 +220,46 @@ class TestWandbLogger:
         mock.Image.assert_called_once_with(mock_fig)
         assert "surrogate/general/plot" in wandb_logger._buffer
 
+    def test_log_file_uploads_an_artifact_named_after_the_key(self, logger, tmp_path):
+        wandb_logger, mock, mock_run = logger
+        path = tmp_path / "selected_samples.csv"
+        path.write_text("x,y\nCCO,0.5\n", encoding="utf-8")
+
+        wandb_logger.log_file("acquisition/general/selected_samples", path)
+
+        mock.Artifact.assert_called_once_with(
+            name="acquisition-general-selected_samples",
+            type="round-samples",
+        )
+        mock.Artifact.return_value.add_file.assert_called_once_with(str(path))
+        mock_run.log_artifact.assert_called_once_with(mock.Artifact.return_value)
+
+    def test_log_file_skips_a_missing_file(self, logger, tmp_path):
+        wandb_logger, mock, mock_run = logger
+
+        wandb_logger.log_file(
+            "acquisition/general/selected_samples", tmp_path / "absent.csv"
+        )
+
+        mock_run.log_artifact.assert_not_called()
+
+    def test_log_file_survives_an_upload_failure(self, logger, tmp_path):
+        """A round must finish even when the backend refuses the file."""
+        wandb_logger, mock, mock_run = logger
+        path = tmp_path / "selected_samples.csv"
+        path.write_text("x\nCCO\n", encoding="utf-8")
+        mock_run.log_artifact.side_effect = RuntimeError("offline store full")
+
+        wandb_logger.log_file("acquisition/general/selected_samples", path)
+
+    def test_log_file_rejects_an_unqualified_key(self, logger, tmp_path):
+        wandb_logger, mock, mock_run = logger
+        path = tmp_path / "selected_samples.csv"
+        path.write_text("x\nCCO\n", encoding="utf-8")
+
+        with pytest.raises(ValueError, match="component-qualified namespace"):
+            wandb_logger.log_file("selected_samples", path)
+
     def test_end_calls_run_finish(self, logger):
         wandb_logger, mock, mock_run = logger
         wandb_logger.end()

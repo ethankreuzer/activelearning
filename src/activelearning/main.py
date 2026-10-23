@@ -124,6 +124,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 config_paths=config_paths,
                 overrides=overrides,
                 raw_cfg=raw_cfg,
+                cfg=cfg,
             )
         )
         if cfg.run_writer is not None
@@ -138,6 +139,13 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     if logger is not None:
         logger.log_config(OmegaConf.to_container(raw_cfg, resolve=True))
+        # The VALIDATED config as well, under `effective`. The raw config above
+        # is the YAML plus overrides, so anything left to a schema default is
+        # absent from it -- with `sampler.loss` unset a run cannot be told from
+        # a vargrad one, and the GP's kernel, output scale and pinned mean are
+        # invisible unless written out. This dump carries every field, default
+        # or not, so a run in the table always says exactly what it ran.
+        logger.log_config({"effective": cfg.model_dump(mode="json")})
 
     # Run active learning campaign
     dataset, total_cost, num_rounds = active_learning(
@@ -161,11 +169,17 @@ def _build_run_metadata(
     config_paths: Sequence[Path],
     overrides: Sequence[str],
     raw_cfg: Any,
+    cfg: Any = None,
 ) -> dict[str, Any]:
     """Build compact reproducibility metadata from the CLI inputs."""
     resolved_config = OmegaConf.to_container(raw_cfg, resolve=True)
     return {
         "config": resolved_config,
+        # Every field including the defaults the raw config leaves out, so the
+        # on-disk record identifies the run as completely as the W&B one.
+        "effective_config": (
+            None if cfg is None else cfg.model_dump(mode="json")
+        ),
         "cli": {
             "command": _format_activelearning_command(config_paths, overrides),
             "config_files": [_display_path(path) for path in config_paths],

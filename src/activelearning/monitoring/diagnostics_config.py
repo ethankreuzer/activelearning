@@ -1,6 +1,9 @@
 """Configuration values for active-learning diagnostics."""
 
-from dataclasses import dataclass
+from collections.abc import Sequence
+from dataclasses import dataclass, field
+
+from activelearning.monitoring.held_out import HeldOutSetConfig
 
 
 @dataclass(frozen=True)
@@ -24,11 +27,18 @@ class DiagnosticsConfig:
     max_points : int, default=1000
         Bound diagnostic prediction batches, retained rolling history, and
         rendered or histogram points. Scalar summaries use all finite values.
+    held_out_sets : Sequence[HeldOutSetConfig], default=()
+        Fixed evaluation sets the surrogate is scored on every round. Specs,
+        not loaded sets: the loop reads each one once before the first round.
+        These are the constant scale on which the surrogate's own health can be
+        read across rounds, unlike the per-round panels, which score whatever
+        that round proposed. Each costs one encode-and-predict pass per round.
     """
 
     enabled: bool = True
     figure_interval: int = 1
     max_points: int = 1000
+    held_out_sets: Sequence[HeldOutSetConfig] = field(default_factory=tuple)
 
     def __post_init__(self) -> None:
         """Validate diagnostic rendering limits."""

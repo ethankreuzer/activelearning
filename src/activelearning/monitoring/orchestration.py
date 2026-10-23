@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
 
 from matplotlib import pyplot as plt
 from matplotlib.figure import Figure
@@ -15,14 +16,17 @@ from activelearning.monitoring.diagnostics import (
     append_prequential_panel,
     budget_diagnostics,
     dataset_diagnostics,
+    evaluate_held_out_set,
     oracle_diagnostics,
     sampler_diagnostics,
     selection_score_diagnostics,
     surrogate_diagnostics,
 )
 from activelearning.logger.logger import Logger
+from activelearning.monitoring.held_out import HeldOutSet
 from activelearning.monitoring.keys import validate_log_key
 from activelearning.monitoring.run_writer import RoundRecord, RunWriter
+from activelearning.utils.types import Observation
 from activelearning.oracle.oracle import Oracle
 from activelearning.sampler.sampler import Sampler
 from activelearning.selector.selector import Selector
@@ -30,6 +34,136 @@ from activelearning.surrogate.plotting import PredictionPanel
 from activelearning.surrogate.surrogate import Surrogate
 
 _logger = logging.getLogger(__name__)
+
+#: Namespace the selected-rows CSV is attached to the run under.
+_SELECTED_SAMPLES_LOG_KEY = "acquisition/general/selected_samples"
+
+
+@dataclass
+class StageStash:
+    """Diagnostics drained as stages finished, awaiting the round's record.
+
+    Draining a component clears it, so a stage recorded mid-round would
+    otherwise be missing from the completed round. Everything drained early is
+    kept here and merged back in by :func:`collect_round_diagnostics`.
+
+    Attributes
+    ----------
+    metrics : dict[str, int | float]
+        Scalars drained so far this round.
+    figures : dict[str, Figure]
+        Figures drained so far this round. Owned until the round record closes
+        them.
+    """
+
+    metrics: dict[str, int | float] = field(default_factory=dict)
+    figures: dict[str, Figure] = field(default_factory=dict)
+    #: Components already drained this round. They must NOT be drained again:
+    #: a drain is not required to clear what it reports, and two of the GP's do
+    #: not -- the hyperparameters are recomputed from the model and the
+    #: composition is re-returned -- so a second drain would duplicate keys and
+    #: `_merge_unique` would end the round.
+    drained: set[str] = field(default_factory=set)
+
+    def clear(self) -> None:
+        """Drop everything, without closing figures the record now owns."""
+        self.metrics = {}
+        self.figures = {}
+        self.drained = set()
+
+
+def record_finished_stage(
+    *,
+    stage: str,
+    component_name: str,
+    component: object,
+    round_index: int,
+    run_writer: RunWriter | None,
+    stash: StageStash,
+    enabled: bool,
+    include_figures: bool,
+    max_points: int,
+    metrics: Mapping[str, int | float] | None = None,
+    observations: Sequence[Observation] | None = None,
+) -> None:
+    """Drain one component as its stage finishes and persist it immediately.
+
+    Called from the loop at a stage boundary, so the hours a stage cost survive
+    a later failure in the same round -- including one that kills the process
+    outright, which the loop's crash handler cannot catch.
+
+    Draining here means the round-end drain finds the component empty, so what
+    is drained is also kept in ``stash`` and merged into the round's
+    diagnostics by :func:`collect_round_diagnostics`.
+
+    Nothing raised here may reach the loop: a stage that finished must not be
+    undone by a failure to record it.
+
+    Parameters
+    ----------
+    stage : str
+        Short name of the finished stage, for the artifact path.
+    component_name : str
+        Namespace the component's keys must start with.
+    component : object
+        The component to drain, if it implements ``drain_round_diagnostics``.
+    round_index : int
+        The round this stage belongs to.
+    run_writer : RunWriter or None
+        Sink for the durable copy.
+    stash : StageStash
+        Accumulator the round's record is completed from.
+    enabled : bool
+        Whether diagnostics are collected at all. A disabled run still drains,
+        so values cannot surface in a later round, but keeps nothing.
+    include_figures : bool
+        Whether this round renders figures.
+    max_points : int
+        Bound passed to the component's drain.
+    metrics : Mapping[str, int | float], optional
+        Extra scalars to persist with the stage, such as its timings.
+    observations : Sequence[Observation], optional
+        Oracle results to persist as rows alongside the stage.
+    """
+    try:
+        drained_metrics: dict[str, int | float] = dict(metrics or {})
+        drained_figures: dict[str, Figure] = {}
+        drain = getattr(component, "drain_round_diagnostics", None)
+        if callable(drain):
+            component_metrics, component_figures = drain(
+                include_figures=enabled and include_figures,
+                max_points=max_points,
+            )
+            if enabled:
+                _validate_component_namespace(component_name, component_metrics)
+                _validate_component_namespace(component_name, component_figures)
+                drained_metrics.update(component_metrics)
+                drained_figures.update(component_figures)
+            else:
+                _close_figures(component_figures.values())
+        if not enabled:
+            return
+        for key, figure in drained_figures.items():
+            figure.set_label(key)
+        if run_writer is not None:
+            run_writer.record_stage(
+                round_index=round_index,
+                stage=stage,
+                metrics=drained_metrics,
+                figures=drained_figures,
+                observations=observations,
+            )
+        _merge_unique(stash.metrics, drained_metrics)
+        _merge_unique(stash.figures, drained_figures)
+        if callable(drain):
+            stash.drained.add(component_name)
+    except Exception:
+        _logger.warning(
+            "Could not record the finished stage %s of round %d.",
+            stage,
+            round_index,
+            exc_info=True,
+        )
 
 
 def collect_round_diagnostics(
@@ -46,16 +180,28 @@ def collect_round_diagnostics(
     include_figures: bool,
     max_points: int,
     prequential_history: Sequence[PredictionPanel],
+    held_out_sets: Sequence[HeldOutSet] = (),
+    stage_stash: StageStash | None = None,
 ) -> tuple[dict[str, int | float], dict[str, Figure], tuple[PredictionPanel, ...]]:
     """Collect optional reusable and component diagnostics for one completed round.
 
     This function reads without modifying the completed round data. It does not
-    fit models, query oracles, or rescore candidates for monitoring. Even when
+    fit models or query oracles for monitoring, though it does predict the
+    configured ``held_out_sets`` with the round's surrogate. Even when
     diagnostics are disabled, it clears temporary selector and component data
     so values cannot appear in a later round.
     """
     metrics: dict[str, int | float] = {}
     figures: dict[str, Figure] = {}
+    # Stages recorded mid-round drained their components already, so the
+    # round-end drain below finds them empty; what they produced comes back
+    # here, and the stash releases its figures to the round's record.
+    drained_at_stages: set[str] = set()
+    if stage_stash is not None:
+        metrics.update(stage_stash.metrics)
+        figures.update(stage_stash.figures)
+        drained_at_stages = set(stage_stash.drained)
+        stage_stash.clear()
     updated_prequential_history = tuple(prequential_history)
     if enabled:
         try:
@@ -145,6 +291,32 @@ def collect_round_diagnostics(
             else:
                 _close_figures(score_figures.values())
 
+    # Fixed evaluation sets: the same molecules every round, so the surrogate's
+    # own health is readable across rounds rather than against a moving target.
+    # One failure must not cost the round its other diagnostics.
+    for held_out in held_out_sets or ():
+        if not enabled:
+            break
+        try:
+            held_out_metrics, held_out_figures = evaluate_held_out_set(
+                surrogate,
+                held_out,
+                include_figure=include_figures,
+            )
+        except Exception:
+            _logger.warning(
+                "Could not score the held-out set %s for round %d.",
+                held_out.name,
+                record.round_index,
+                exc_info=True,
+            )
+            metrics[f"diagnostics/failures/held_out_{held_out.name}"] = 1
+            continue
+        _validate_component_namespace("surrogate", held_out_metrics)
+        _validate_component_namespace("surrogate", held_out_figures)
+        _merge_unique(metrics, held_out_metrics)
+        _merge_unique(figures, held_out_figures)
+
     _drain_component_diagnostics(
         _component_diagnostic_sources(
             dataset=dataset,
@@ -161,6 +333,7 @@ def collect_round_diagnostics(
         enabled=enabled,
         include_figures=include_figures,
         max_points=max_points,
+        skip=drained_at_stages,
     )
     return metrics, figures, updated_prequential_history
 
@@ -189,6 +362,17 @@ def record_completed_round(
         if run_writer is not None:
             run_writer.record_round(record, figures)
 
+        # The selected rows of this round, uploaded beside the run so the
+        # molecules that were actually docked travel with it. The full pool is
+        # ~100k rows and stays on disk. getattr because only a writer that
+        # writes sample scores exposes one, and a writer may be any
+        # implementation.
+        if logger is not None and run_writer is not None:
+            selected_path = getattr(run_writer, "selected_samples_path", None)
+            path = selected_path() if callable(selected_path) else None
+            if path is not None:
+                logger.log_file(_SELECTED_SAMPLES_LOG_KEY, path)
+
         if logger is not None:
             for key, value in record.metrics.items():
                 logger.log_metric(key, value)
@@ -210,6 +394,7 @@ def record_partial_round(
     profiling: Mapping[str, float],
     enabled: bool,
     max_points: int,
+    stage_stash: "StageStash | None" = None,
     dataset: Dataset,
     surrogate: Surrogate,
     acquisition: Acquisition,
@@ -237,6 +422,16 @@ def record_partial_round(
     figures: dict[str, Figure] = {}
     try:
         metrics: dict[str, int | float] = {}
+        # Whatever the finished stages of this round drained. They are already
+        # on disk, but a drain does not necessarily clear, so they cannot be
+        # re-drained below; without this a crash during docking would leave the
+        # policy training out of the logger even though it completed.
+        drained_at_stages: set[str] = set()
+        if stage_stash is not None:
+            metrics.update(stage_stash.metrics)
+            figures.update(stage_stash.figures)
+            drained_at_stages = set(stage_stash.drained)
+            stage_stash.clear()
         _drain_component_diagnostics(
             _component_diagnostic_sources(
                 dataset=dataset,
@@ -253,6 +448,7 @@ def record_partial_round(
             enabled=enabled,
             include_figures=True,
             max_points=max_points,
+            skip=drained_at_stages,
         )
         if not metrics and not figures and not profiling:
             return
@@ -313,13 +509,20 @@ def _drain_component_diagnostics(
     enabled: bool,
     include_figures: bool,
     max_points: int,
+    skip: Sequence[str] | set[str] = (),
 ) -> None:
     """Drain implementation-specific diagnostics into the given payloads.
 
     Every component is drained even when diagnostics are disabled, so pending
-    values cannot appear in a later round.
+    values cannot appear in a later round. The exception is ``skip``: a
+    component already drained at a stage boundary this round, whose values the
+    caller holds. Draining it again is not harmless -- a drain need not clear
+    what it reports, so a second call can return the same keys and duplicate
+    them.
     """
     for component_name, component in components:
+        if component_name in skip:
+            continue
         drain = getattr(component, "drain_round_diagnostics", None)
         if not callable(drain):
             continue

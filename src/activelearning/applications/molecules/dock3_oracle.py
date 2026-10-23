@@ -29,11 +29,12 @@ import sys
 import tarfile
 import tempfile
 import threading
+import time
 import weakref
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any, Optional, Sequence
+from typing import Any, Iterable, Optional, Sequence
 
 from activelearning.applications.molecules._parallel import (
     SINGLE_THREAD_ENV,
@@ -45,6 +46,11 @@ from activelearning.oracle.multi_fidelity_oracle import MultiFidelityOracle
 from activelearning.utils.types import Candidate, Observation
 
 logger = logging.getLogger(__name__)
+
+#: Molecules between docking-progress lines. Docking is the long pole of a
+#: round, so the job's output needs a throughput and a remaining-time estimate
+#: while it runs rather than only a summary once it is over.
+_PROGRESS_EVERY = 500
 
 DEFAULT_DOCKENV_SH = "/project/rrg-mailhoto/share/dockingpackages/dockenv.sh"
 DEFAULT_DOCK64_EXE = "/project/rrg-mailhoto/share/dock64"
@@ -838,11 +844,19 @@ class Dock3Oracle(MultiFidelityOracle):
                 self._num_workers,
             )
         if workers_used == 1:
-            results = [self._safe_dock3_score(smiles) for smiles in smiles_list]
+            results = self._collect_with_progress(
+                (self._safe_dock3_score(smiles) for smiles in smiles_list),
+                total=len(smiles_list),
+                workers_used=workers_used,
+            )
         else:
             with ThreadPoolExecutor(max_workers=workers_used) as executor:
                 # executor.map preserves input order.
-                results = list(executor.map(self._safe_dock3_score, smiles_list))
+                results = self._collect_with_progress(
+                    executor.map(self._safe_dock3_score, smiles_list),
+                    total=len(smiles_list),
+                    workers_used=workers_used,
+                )
 
         observations: list[Observation] = []
         for candidate, (fidelity, _), (raw, reason) in zip(
@@ -863,6 +877,64 @@ class Dock3Oracle(MultiFidelityOracle):
             )
         self._log_query_failure_summary(results, workers_used)
         return observations
+
+    def _collect_with_progress(
+        self,
+        results: Iterable[tuple[float, str | None]],
+        *,
+        total: int,
+        workers_used: int,
+    ) -> list[tuple[float, str | None]]:
+        """Drain docking results, logging progress and a remaining-time estimate.
+
+        Docking is the long pole of a round -- thousands of molecules at tens of
+        core-seconds each -- and without this the job's output says nothing
+        between the batch starting and finishing, so there is no way to tell a
+        slow round from a stuck one.
+
+        The source preserves input order, so the count is results collected in
+        order rather than tasks finished. One slow early molecule can hold the
+        count back briefly while later ones are already done, which makes the
+        first estimate pessimistic; over a batch of this size it settles.
+
+        Parameters
+        ----------
+        results : Iterable[tuple[float, str | None]]
+            The per-molecule ``(raw score, failure reason)`` results.
+        total : int
+            How many molecules the batch holds.
+        workers_used : int
+            Workers the batch is spread over, for the throughput line.
+
+        Returns
+        -------
+        list[tuple[float, str | None]]
+            Every result, in input order.
+        """
+        collected: list[tuple[float, str | None]] = []
+        started = time.monotonic()
+        for result in results:
+            collected.append(result)
+            done = len(collected)
+            if done % _PROGRESS_EVERY and done != total:
+                continue
+            elapsed = time.monotonic() - started
+            if elapsed <= 0.0 or done == 0:
+                continue
+            per_molecule = elapsed / done
+            remaining = (total - done) * per_molecule
+            logger.info(
+                "Docking progress: %d/%d in %.1f min (%.1f s/molecule wall, "
+                "%.1f core-s/molecule across %d workers); ~%.1f min remaining.",
+                done,
+                total,
+                elapsed / 60.0,
+                per_molecule,
+                per_molecule * workers_used,
+                workers_used,
+                remaining / 60.0,
+            )
+        return collected
 
     # ------------------------------------------------------------------
     # Internal helpers

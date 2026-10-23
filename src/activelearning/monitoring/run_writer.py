@@ -4,7 +4,9 @@ import csv
 import json
 import logging
 import math
+import os
 from abc import ABC, abstractmethod
+from datetime import datetime
 from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
 from typing import Any, Literal, Mapping, Sequence
@@ -20,6 +22,9 @@ _logger = logging.getLogger(__name__)
 
 # Written next to the acquisition score-distribution figure of the same round.
 _SCORED_SAMPLES_KEY = "acquisition/general/scored_samples"
+
+#: The selected rows of the same round, written beside the full pool.
+_SELECTED_SAMPLES_KEY = "acquisition/general/selected_samples"
 
 #: Observation metadata keys carried into ``scored_samples.csv`` when an oracle
 #: supplies them. Kept to an explicit list rather than writing whatever metadata
@@ -68,6 +73,13 @@ class RoundRecord:
     profiling: Mapping[str, float]
     diagnostics: Mapping[str, int | float]
     selection_scores: SelectionScores | None = None
+    #: The surrogate's posterior mean and standard deviation for every molecule
+    #: in ``sampled_candidates``, in that order, on the scale of ``y``. Written
+    #: as the ``gp_mean`` and ``gp_std`` columns of ``scored_samples.csv``, which
+    #: otherwise records what the acquisition and the oracle said about a
+    #: molecule but not what the surrogate predicted for it.
+    sampled_means: Sequence[float] | None = None
+    sampled_stds: Sequence[float] | None = None
 
 
 class RunWriter(ABC):
@@ -99,9 +111,43 @@ class RunWriter(ABC):
             Diagnostic figures keyed by their stable metric namespace.
         """
 
-    @abstractmethod
-    def end_run(self, summary: dict[str, Any]) -> None:
-        """Write the final run summary."""
+    def record_stage(
+        self,
+        *,
+        round_index: int,
+        stage: str,
+        metrics: Mapping[str, int | float] | None = None,
+        figures: Mapping[str, Figure] | None = None,
+        observations: Sequence[Observation] | None = None,
+    ) -> None:
+        """Persist what one finished stage of a round produced, immediately.
+
+        Concrete and a no-op by default, unlike the methods above: a writer
+        that only keeps completed rounds should ignore stages rather than fail,
+        and an existing writer outside this module must keep working without
+        implementing it.
+
+        The point is durability inside a round. A round's record is written
+        only once the round completes, and the loop's crash handler cannot run
+        at all if the process is killed outright, so without this a round that
+        dies during docking loses the hours of policy training that preceded
+        it. Anything written here survives regardless of how the round ends.
+
+        Parameters
+        ----------
+        round_index : int
+            The round the stage belongs to.
+        stage : str
+            Short name of the finished stage, used in the artifact path.
+        metrics : Mapping[str, int | float], optional
+            Scalars the stage produced, under their monitoring namespaces.
+        figures : Mapping[str, Figure], optional
+            Figures the stage produced, under their monitoring namespaces. The
+            caller keeps ownership and closes them.
+        observations : Sequence[Observation], optional
+            Oracle results to persist as rows, for a stage whose cost is the
+            measurements themselves rather than its metrics.
+        """
 
 
 class JSONLinesRunWriter(RunWriter):
@@ -135,13 +181,16 @@ class JSONLinesRunWriter(RunWriter):
         self._best_objective_value: float | None = None
         self._experiment_rows: list[dict[str, int | float | str | None]] = []
         self._next_experiment_row_index = 0
+        self._last_selected_samples_path: str | None = None
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self._rounds_path = self.output_dir / "round_history.jsonl"
+        self._stages_path = self.output_dir / "stage_history.jsonl"
         self._started = False
 
     def start_run(self, metadata: dict[str, Any]) -> None:
         """Write run metadata to disk."""
         self._rounds_path.write_text("", encoding="utf-8")
+        self._stages_path.write_text("", encoding="utf-8")
         self._manifest = _deep_merge(self.metadata, metadata)
         self._method = _resolve_method(self._manifest, self.output_dir)
         self._seed = _resolve_seed(self._manifest)
@@ -171,9 +220,14 @@ class JSONLinesRunWriter(RunWriter):
             figures=figures or {},
         )
         if self.write_sample_scores:
+            self._last_selected_samples_path = None
             scored_samples_path = self._write_scored_samples(record)
             if scored_samples_path is not None:
                 artifact_paths[_SCORED_SAMPLES_KEY] = scored_samples_path
+            if self._last_selected_samples_path is not None:
+                artifact_paths[_SELECTED_SAMPLES_KEY] = (
+                    self._last_selected_samples_path
+                )
         payload: dict[str, Any] = {
             "round_index": record.round_index,
             "selected_candidates": _jsonable(record.selected_candidates),
@@ -200,6 +254,98 @@ class JSONLinesRunWriter(RunWriter):
             observations=record.valid_observations,
             cumulative_cost=record.cumulative_cost,
         )
+
+    def record_stage(
+        self,
+        *,
+        round_index: int,
+        stage: str,
+        metrics: Mapping[str, int | float] | None = None,
+        figures: Mapping[str, Figure] | None = None,
+        observations: Sequence[Observation] | None = None,
+    ) -> None:
+        """Append one finished stage to ``stage_history.jsonl`` and write its files.
+
+        Figures go to the same component-round paths a completed round uses, so
+        a round that later completes simply overwrites them with identical
+        content. Observations go to one CSV per stage. The JSONL line is
+        appended and flushed per stage, so a process killed mid-round leaves a
+        readable history of the stages that did finish.
+        """
+        if not self._started:
+            raise RuntimeError("Call start_run() before recording stages.")
+        if not _is_safe_path_segment(stage):
+            raise ValueError(f"Invalid stage name: {stage!r}")
+        for values in (metrics or {},):
+            for key in values:
+                validate_log_key(key)
+        for key in figures or {}:
+            validate_log_key(key)
+
+        artifact_paths = self._write_figures(
+            round_index=round_index, figures=figures or {}
+        )
+        if observations is not None:
+            artifact_paths["stage/observations"] = self._write_stage_observations(
+                round_index=round_index, stage=stage, observations=observations
+            )
+        payload = {
+            "round_index": round_index,
+            "stage": stage,
+            "recorded_at": datetime.now().astimezone().isoformat(),
+            "metrics": _jsonable(dict(metrics or {})),
+            "artifacts": artifact_paths,
+        }
+        with self._stages_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+
+    def _write_stage_observations(
+        self,
+        *,
+        round_index: int,
+        stage: str,
+        observations: Sequence[Observation],
+    ) -> str:
+        """Write one stage's oracle results as a CSV and return its path.
+
+        The measurements themselves, not a summary: these cost the round most
+        of its wall time, and a crash after the oracle returned but before the
+        round completed would otherwise discard them.
+        """
+        relative_path = Path(
+            "artifacts", "oracle", "general", f"round_{round_index:04d}"
+        ) / f"{stage}_observations.csv"
+        path = self.output_dir / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        metadata_columns = sorted(
+            {
+                key
+                for observation in observations
+                for key in (observation.metadata or {})
+                if key in _OBSERVATION_METADATA_COLUMNS
+            }
+        )
+        with path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(["x", "fidelity", "y", *metadata_columns])
+            for observation in observations:
+                metadata = observation.metadata or {}
+                writer.writerow(
+                    [
+                        _csv_value(observation.x),
+                        "" if observation.fidelity is None else observation.fidelity,
+                        _csv_value(observation.y),
+                        *(
+                            ""
+                            if metadata.get(column) is None
+                            else _csv_value(metadata[column])
+                            for column in metadata_columns
+                        ),
+                    ]
+                )
+        return relative_path.as_posix()
 
     def end_run(self, summary: dict[str, Any]) -> None:
         """Write the final summary."""
@@ -229,6 +375,16 @@ class JSONLinesRunWriter(RunWriter):
             figure.savefig(path, dpi=150, bbox_inches="tight")
             artifact_paths[key] = relative_path.as_posix()
         return artifact_paths
+
+    def selected_samples_path(self) -> Path | None:
+        """Return the selected-rows CSV of the round written most recently.
+
+        Absolute, because the caller uploads the file rather than referring to
+        it from inside the run directory. ``None`` before any round wrote one.
+        """
+        if self._last_selected_samples_path is None:
+            return None
+        return self.output_dir / self._last_selected_samples_path
 
     def _write_scored_samples(self, record: RoundRecord) -> str | None:
         """Write the sampled pool with its selector scores as one CSV per round.
@@ -298,53 +454,92 @@ class JSONLinesRunWriter(RunWriter):
             }
         )
 
+        # Only when they cover the pool exactly: these columns sit beside the
+        # acquisition score of the same molecule, so a partially filled pair
+        # would read as covering every row.
+        surrogate_means = _aligned_predictions(
+            record.sampled_means, len(candidates), "sampled_means", record.round_index
+        )
+        surrogate_stds = _aligned_predictions(
+            record.sampled_stds, len(candidates), "sampled_stds", record.round_index
+        )
+        prediction_columns = [
+            name
+            for name, values in (
+                ("gp_mean", surrogate_means),
+                ("gp_std", surrogate_stds),
+            )
+            if values is not None
+        ]
+
         relative_path = _artifact_relative_path(
             _SCORED_SAMPLES_KEY, record.round_index, suffix=".csv"
         )
+        selected_relative_path = _artifact_relative_path(
+            _SELECTED_SAMPLES_KEY, record.round_index, suffix=".csv"
+        )
         path = self.output_dir / relative_path
+        selected_path = self.output_dir / selected_relative_path
         path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("w", encoding="utf-8", newline="") as handle:
+        selected_path.parent.mkdir(parents=True, exist_ok=True)
+        header = [
+            "sample_index",
+            "x",
+            "fidelity",
+            "acquisition_score",
+            "ranking_score",
+            "selected",
+            "selection_rank",
+            "y",
+            *prediction_columns,
+            *metadata_columns,
+        ]
+        with (
+            path.open("w", encoding="utf-8", newline="") as handle,
+            # The selected rows again on their own. The pool is ~100k rows per
+            # round and the selected ones are the only rows carrying a ``y``, so
+            # this is the small file worth uploading beside the run while the
+            # full pool stays on disk.
+            selected_path.open("w", encoding="utf-8", newline="") as selected_handle,
+        ):
             writer = csv.writer(handle)
-            writer.writerow(
-                [
-                    "sample_index",
-                    "x",
-                    "fidelity",
-                    "acquisition_score",
-                    "ranking_score",
-                    "selected",
-                    "selection_rank",
-                    "y",
-                    *metadata_columns,
-                ]
-            )
+            selected_writer = csv.writer(selected_handle)
+            writer.writerow(header)
+            selected_writer.writerow(header)
             for index, candidate in enumerate(candidates):
                 rank = selection_ranks.get(index)
                 target = observed_targets.get(index)
                 metadata = observed_metadata.get(index, {})
-                writer.writerow(
-                    [
-                        index,
-                        _csv_value(candidate.x),
-                        "" if candidate.fidelity is None else candidate.fidelity,
-                        scores.acquisition_scores[index],
-                        scores.ranking_scores[index],
-                        rank is not None,
-                        "" if rank is None else rank,
-                        "" if target is None else _csv_value(target),
-                        *(
-                            # A missing key and an explicit None both mean "no
-                            # measurement" and must read as an empty cell. Left
-                            # to _csv_value, None would be written as the string
-                            # "null", which a reader cannot tell from a real
-                            # value and which pandas would not read as missing.
-                            ""
-                            if metadata.get(column) is None
-                            else _csv_value(metadata[column])
-                            for column in metadata_columns
-                        ),
-                    ]
-                )
+                row = [
+                    index,
+                    _csv_value(candidate.x),
+                    "" if candidate.fidelity is None else candidate.fidelity,
+                    scores.acquisition_scores[index],
+                    scores.ranking_scores[index],
+                    rank is not None,
+                    "" if rank is None else rank,
+                    "" if target is None else _csv_value(target),
+                    *(
+                        values[index]
+                        for values in (surrogate_means, surrogate_stds)
+                        if values is not None
+                    ),
+                    *(
+                        # A missing key and an explicit None both mean "no
+                        # measurement" and must read as an empty cell. Left
+                        # to _csv_value, None would be written as the string
+                        # "null", which a reader cannot tell from a real
+                        # value and which pandas would not read as missing.
+                        ""
+                        if metadata.get(column) is None
+                        else _csv_value(metadata[column])
+                        for column in metadata_columns
+                    ),
+                ]
+                writer.writerow(row)
+                if rank is not None:
+                    selected_writer.writerow(row)
+        self._last_selected_samples_path = selected_relative_path.as_posix()
         return relative_path.as_posix()
 
     def _append_experiment_row(
@@ -448,6 +643,33 @@ def _artifact_relative_path(key: str, round_index: int, *, suffix: str) -> Path:
     return Path("artifacts", *segments[:-1], f"round_{round_index:04d}") / (
         f"{segments[-1]}{suffix}"
     )
+
+
+def _aligned_predictions(
+    values: Sequence[float] | None,
+    expected_length: int,
+    name: str,
+    round_index: int,
+) -> list[float] | None:
+    """Return per-candidate predictions, or ``None`` when they do not align.
+
+    A length mismatch is a caller bug rather than missing data, so it is warned
+    about and the column dropped: writing it would silently pair each molecule
+    with another molecule's prediction.
+    """
+    if values is None:
+        return None
+    aligned = list(values)
+    if len(aligned) != expected_length:
+        _logger.warning(
+            "Not writing %s for round %d: %d values for %d sampled candidates.",
+            name,
+            round_index,
+            len(aligned),
+            expected_length,
+        )
+        return None
+    return aligned
 
 
 def _csv_value(value: Any) -> Any:

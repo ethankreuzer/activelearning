@@ -7,10 +7,13 @@ from activelearning.acquisition.acquisition import Acquisition
 from activelearning.budget.budget import Budget
 from activelearning.dataset.dataset import Dataset
 from activelearning.logger.logger import Logger
+from activelearning.monitoring.diagnostics import predict_pool
 from activelearning.monitoring.diagnostics_config import DiagnosticsConfig
 from activelearning.monitoring.orchestration import (
+    StageStash,
     collect_round_diagnostics,
     record_completed_round,
+    record_finished_stage,
     record_partial_round,
 )
 from activelearning.oracle.oracle import Oracle
@@ -138,6 +141,10 @@ def active_learning(
     # Held outside the loop so a failed round's completed stage timings are
     # still available to the monitoring sinks while the exception unwinds.
     profiling: dict[str, float] = {}
+    # Replaced per round. Declared here so the crash handler below can flush
+    # the stages of a round that died, including one that died before the
+    # first round began.
+    stage_stash: StageStash | None = None
     surrogate_prequential_history: tuple[PredictionPanel, ...] = ()
     diagnostics_enabled = diagnostics_config.enabled and (
         logger is not None or run_writer is not None
@@ -157,12 +164,32 @@ def active_learning(
             dataset=dataset,
             initial_budget=initial_budget,
         )
+        # Read once, before the first round, so a missing or malformed file
+        # fails now rather than after the first round's hours of docking.
+        held_out_sets = tuple(
+            spec.load() for spec in diagnostics_config.held_out_sets
+        )
 
         while budget.available_budget > 0 and (
             budget.max_rounds is None or num_rounds < budget.max_rounds
         ):
             round_started = time.perf_counter()
             profiling = {}
+            # Diagnostics drained as stages finish, merged into this round's
+            # record at the end. The durable copy is written per stage, so a
+            # later failure -- including a kill the handler cannot catch --
+            # cannot undo a stage that completed.
+            stage_stash = StageStash()
+            stage_kwargs = {
+                "round_index": num_rounds + 1,
+                "run_writer": run_writer,
+                "stash": stage_stash,
+                "enabled": diagnostics_enabled,
+                "include_figures": (
+                    (num_rounds + 1) % diagnostics_config.figure_interval == 0
+                ),
+                "max_points": diagnostics_config.max_points,
+            }
 
             # Call once per round so all consumers share the same consistent epoch view.
             # Implementations must guarantee the returned iterable supports multiple
@@ -181,6 +208,15 @@ def active_learning(
                 with profile_operation(profiling, "surrogate/fit"):
                     surrogate.fit(observations)
             profiling.update(surrogate.get_fit_profiling())
+            # The fit is done: its hyperparameters, the training set it chose
+            # and how long it took are safe from here on.
+            record_finished_stage(
+                stage="surrogate_fit",
+                component_name="surrogate",
+                component=surrogate,
+                metrics=dict(surrogate.get_fit_profiling()),
+                **stage_kwargs,
+            )
 
             # Only couple the acquisition to the surrogate once it has been fitted.
             # Before fitting, acquisition falls back to its unfitted behaviour (e.g.
@@ -197,6 +233,14 @@ def active_learning(
                     observations=observations,
                     cost_fn=oracle.get_costs,
                 )
+            # Policy training and generation are done: the longest stage of the
+            # round before docking, and every per-step figure it produced.
+            record_finished_stage(
+                stage="sampler",
+                component_name="sampler",
+                component=sampler,
+                **stage_kwargs,
+            )
 
             # Get the current round budget and pass the same oracle cost model to
             # the selector for ranking/filtering.
@@ -244,6 +288,17 @@ def active_learning(
                 new_observations = list(oracle.query(selected_samples))
             _validate_oracle_results(selected_samples, new_observations)
 
+            # The measurements themselves, written before anything else can
+            # fail: docking is most of a round's wall time and cannot be redone
+            # cheaply.
+            record_finished_stage(
+                stage="oracle_query",
+                component_name="oracle",
+                component=oracle,
+                observations=new_observations,
+                **stage_kwargs,
+            )
+
             with profile_operation(profiling, "oracle/filter_observations"):
                 valid_observations = filter_finite_target_observations(new_observations)
             num_dropped = len(new_observations) - len(valid_observations)
@@ -275,6 +330,26 @@ def active_learning(
                 "active_learning/budget/remaining": budget.available_budget,
             }
 
+            # What the surrogate predicted for every molecule in the pool, for
+            # the round's scored_samples.csv: the acquisition score and the
+            # docking result are recorded there, but not the posterior the
+            # acquisition was computed from. Only when a writer will persist
+            # them, because this is a second pass over the pool and nothing else
+            # reads it.
+            sampled_means: list[float] | None = None
+            sampled_stds: list[float] | None = None
+            if getattr(run_writer, "write_sample_scores", False):
+                with profile_operation(profiling, "surrogate/predict_pool"):
+                    pool_predictions = predict_pool(surrogate, samples)
+                if pool_predictions is None:
+                    _logger.warning(
+                        "Round %d: the surrogate could not predict the sampled "
+                        "pool, so scored_samples.csv has no gp_mean column.",
+                        num_rounds,
+                    )
+                else:
+                    sampled_means, sampled_stds = pool_predictions
+
             preliminary_record = RoundRecord(
                 round_index=num_rounds,
                 observations_before=observations,
@@ -292,6 +367,8 @@ def active_learning(
                 profiling=profiling,
                 diagnostics={},
                 selection_scores=selection_scores,
+                sampled_means=sampled_means,
+                sampled_stds=sampled_stds,
             )
             with profile_operation(profiling, "diagnostics/total"):
                 (
@@ -313,6 +390,8 @@ def active_learning(
                     ),
                     max_points=diagnostics_config.max_points,
                     prequential_history=surrogate_prequential_history,
+                    held_out_sets=held_out_sets,
+                    stage_stash=stage_stash,
                 )
             profiling["profiling/round/total_s"] = time.perf_counter() - round_started
             record = replace(
@@ -334,6 +413,7 @@ def active_learning(
             logger=logger,
             round_index=num_rounds + 1,
             profiling=profiling,
+            stage_stash=stage_stash,
             enabled=diagnostics_enabled,
             max_points=diagnostics_config.max_points,
             dataset=dataset,

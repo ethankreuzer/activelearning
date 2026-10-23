@@ -1,13 +1,17 @@
 import json
+import logging
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from datetime import datetime
 from numbers import Real
+from pathlib import Path
 from typing import Any
 
 from matplotlib.figure import Figure as MatplotlibFigure
 
 from activelearning.monitoring.keys import validate_log_key
+
+_logger = logging.getLogger(__name__)
 
 
 class Logger(ABC):
@@ -95,6 +99,23 @@ class Logger(ABC):
         ----------
         step : int
             The current step or iteration number.
+        """
+
+    def log_file(self, key: str, path: "Path") -> None:
+        """Attach a file to the run, where the backend stores files.
+
+        Concrete and a no-op by default, unlike the methods above: a backend
+        without file storage should drop the file rather than fail the round
+        that produced it, and an existing logger outside this module must keep
+        working without implementing it. Only :class:`WandbLogger` stores files
+        today.
+
+        Parameters
+        ----------
+        key : str
+            Component-qualified namespace identifying what the file holds.
+        path : Path
+            The local file to attach. A missing file is ignored.
         """
 
     @abstractmethod
@@ -294,6 +315,37 @@ class WandbLogger(Logger):
         """
         self.run.log(self._buffer, step=step, commit=True)
         self._buffer = {}
+
+    def log_file(self, key: str, path: Path) -> None:
+        """Upload a file to the run as a wandb artifact.
+
+        Offline runs stage the artifact locally and upload it on ``wandb sync``,
+        so this duplicates the file on disk until then.
+
+        Parameters
+        ----------
+        key : str
+            Component-qualified namespace, which names the artifact with its
+            separators replaced: wandb artifact names allow only letters,
+            digits, dashes, underscores and dots. Re-using a name across rounds
+            therefore adds a version rather than overwriting.
+        path : Path
+            The local file to upload. A missing file is warned about and
+            skipped, because a round that produced no file must still finish.
+        """
+        validate_log_key(key)
+        if not path.is_file():
+            _logger.warning("Not uploading %s: %s is not a file.", key, path)
+            return
+        name = key.replace("/", "-")
+        try:
+            artifact = self._wandb.Artifact(name=name, type="round-samples")
+            artifact.add_file(str(path))
+            self.run.log_artifact(artifact)
+        except Exception:
+            # Telemetry must never end a run that is otherwise fine; the file
+            # stays on disk either way.
+            _logger.warning("Could not upload %s from %s.", key, path, exc_info=True)
 
     def end(self) -> None:
         """Finish the wandb run."""
@@ -584,6 +636,20 @@ class MultiLogger(Logger):
         """
         for logger in self._loggers:
             logger.log_step(step)
+
+    def log_file(self, key: str, path: Path) -> None:
+        """Forward log_file to all child loggers.
+
+        Parameters
+        ----------
+        key : str
+            Component-qualified namespace identifying what the file holds.
+        path : Path
+            The local file to attach.
+        """
+        validate_log_key(key)
+        for logger in self._loggers:
+            logger.log_file(key, path)
 
     def end(self) -> None:
         """Forward end to all child loggers."""

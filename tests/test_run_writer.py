@@ -502,6 +502,98 @@ def test_run_writer_writes_scored_samples_beside_score_figure(tmp_path) -> None:
     )
 
 
+_SELECTED_SAMPLES_PATH = "artifacts/acquisition/general/round_0003/selected_samples.csv"
+
+
+def test_run_writer_writes_surrogate_predictions_for_the_pool(tmp_path) -> None:
+    """The posterior the acquisition was computed from is written beside it."""
+    run_writer = JSONLinesRunWriter(output_dir=tmp_path)
+    run_writer.start_run({})
+    record = replace(
+        _scored_round_record(_SCORES),
+        sampled_means=[0.10, 0.20, 0.30, 0.40],
+        sampled_stds=[0.01, 0.02, 0.03, 0.04],
+    )
+
+    run_writer.record_round(record)
+
+    with (tmp_path / _SCORED_SAMPLES_PATH).open(newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    assert [float(row["gp_mean"]) for row in rows] == [0.10, 0.20, 0.30, 0.40]
+    assert [float(row["gp_std"]) for row in rows] == [0.01, 0.02, 0.03, 0.04]
+
+
+def test_run_writer_omits_prediction_columns_without_predictions(tmp_path) -> None:
+    """A round that predicted nothing gains no empty columns."""
+    run_writer = JSONLinesRunWriter(output_dir=tmp_path)
+    run_writer.start_run({})
+
+    run_writer.record_round(_scored_round_record(_SCORES))
+
+    with (tmp_path / _SCORED_SAMPLES_PATH).open(newline="") as handle:
+        fieldnames = csv.DictReader(handle).fieldnames or []
+    assert "gp_mean" not in fieldnames
+    assert "gp_std" not in fieldnames
+
+
+def test_run_writer_drops_predictions_that_do_not_cover_the_pool(tmp_path) -> None:
+    """Short predictions are dropped, not written against the wrong molecules."""
+    run_writer = JSONLinesRunWriter(output_dir=tmp_path)
+    run_writer.start_run({})
+    record = replace(
+        _scored_round_record(_SCORES),
+        sampled_means=[0.1, 0.2],
+        sampled_stds=[0.01, 0.02, 0.03, 0.04],
+    )
+
+    run_writer.record_round(record)
+
+    with (tmp_path / _SCORED_SAMPLES_PATH).open(newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    assert "gp_mean" not in (rows[0].keys())
+    # The aligned column of the same round still lands.
+    assert [float(row["gp_std"]) for row in rows] == [0.01, 0.02, 0.03, 0.04]
+
+
+def test_run_writer_writes_the_selected_rows_on_their_own(tmp_path) -> None:
+    """The selected rows are written again as the small per-round file."""
+    run_writer = JSONLinesRunWriter(output_dir=tmp_path)
+    run_writer.start_run({})
+
+    run_writer.record_round(_scored_round_record(_SCORES))
+
+    with (tmp_path / _SCORED_SAMPLES_PATH).open(newline="") as handle:
+        pool = csv.DictReader(handle)
+        pool_fieldnames = pool.fieldnames
+        pool_rows = list(pool)
+    with (tmp_path / _SELECTED_SAMPLES_PATH).open(newline="") as handle:
+        selected = csv.DictReader(handle)
+        assert selected.fieldnames == pool_fieldnames
+        selected_rows = list(selected)
+    # Pool order, not selection order: the same rows as the pool file marks.
+    assert [row["x"] for row in selected_rows] == ["CCO", "c1ccccc1"]
+    assert selected_rows == [row for row in pool_rows if row["selected"] == "True"]
+    assert run_writer.selected_samples_path() == tmp_path / _SELECTED_SAMPLES_PATH
+
+    round_payload = json.loads(
+        (tmp_path / "round_history.jsonl").read_text(encoding="utf-8")
+    )
+    assert (
+        round_payload["artifacts"]["acquisition/general/selected_samples"]
+        == _SELECTED_SAMPLES_PATH
+    )
+
+
+def test_run_writer_reports_no_selected_samples_without_scores(tmp_path) -> None:
+    """A round that wrote no scored samples offers no file to upload."""
+    run_writer = JSONLinesRunWriter(output_dir=tmp_path)
+    run_writer.start_run({})
+
+    run_writer.record_round(_scored_round_record(None))
+
+    assert run_writer.selected_samples_path() is None
+
+
 def test_run_writer_writes_raw_oracle_measurements_from_metadata(tmp_path) -> None:
     """A transformed ``y`` keeps the raw measurement its metadata carried.
 

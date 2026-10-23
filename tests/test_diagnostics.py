@@ -10,6 +10,7 @@ from activelearning.monitoring.diagnostics import (
     budget_diagnostics,
     dataset_diagnostics,
     oracle_diagnostics,
+    predict_pool,
     sampler_diagnostics,
     selection_score_diagnostics,
     surrogate_diagnostics,
@@ -50,6 +51,86 @@ def _record() -> RoundRecord:
         profiling={},
         diagnostics={},
     )
+
+
+def test_docked_distribution_describes_only_this_round() -> None:
+    """The round's own targets, so enrichment is not diluted by the archive."""
+    observations_before = [Observation(x=(0.0,), y=0.9, fidelity=1)]
+    valid = [
+        Observation(x=(1.0,), y=0.1, fidelity=1),
+        Observation(x=(2.0,), y=0.25, fidelity=1),
+        Observation(x=(3.0,), y=0.55, fidelity=1),
+        Observation(x=(4.0,), y=0.65, fidelity=1),
+    ]
+    record = replace(
+        _record(),
+        observations_before=observations_before,
+        observations_after=[*observations_before, *valid],
+        queried_observations=valid,
+        valid_observations=valid,
+    )
+
+    metrics, _ = dataset_diagnostics(record)
+
+    assert metrics["dataset/general/docked/count"] == 4
+    # 0.9 belongs to an earlier round and must not appear in this round's max.
+    assert metrics["dataset/general/docked/y_max"] == 0.65
+    # Nearest-rank over four molecules: the rank falls between the middle two
+    # and takes the upper.
+    assert metrics["dataset/general/docked/y_median"] == 0.55
+    assert metrics["dataset/general/docked/count_above_0.5"] == 2
+    assert metrics["dataset/general/docked/frac_above_0.5"] == 0.5
+    assert metrics["dataset/general/docked/count_above_0.2"] == 3
+    # Fewer than 100 molecules: the top-100 mean is the mean of them all.
+    assert metrics["dataset/general/docked/y_top100_mean"] == pytest.approx(0.3875)
+
+
+def test_docked_distribution_is_absent_without_finite_targets() -> None:
+    """A round whose docking all failed reports no distribution."""
+    record = replace(
+        _record(),
+        queried_observations=[Observation(x=(1.0,), y=float("nan"), fidelity=1)],
+        valid_observations=[],
+    )
+
+    metrics, _ = dataset_diagnostics(record)
+
+    assert not any(key.startswith("dataset/general/docked/") for key in metrics)
+
+
+def test_predict_pool_covers_every_candidate_across_chunks() -> None:
+    """A pool larger than one chunk is predicted whole and stays aligned."""
+    observations = [
+        Observation(x=(0.0,), y=1.0, fidelity=0),
+        Observation(x=(1.0,), y=3.0, fidelity=0),
+    ]
+    surrogate = DummyMeanSurrogate()
+    surrogate.fit(observations)
+    candidates = [Candidate(x=(float(index),), fidelity=0) for index in range(7)]
+
+    predicted = predict_pool(surrogate, candidates, chunk_size=3)
+
+    assert predicted is not None
+    means, _ = predicted
+    assert len(means) == len(candidates)
+    assert means == predict_pool(surrogate, candidates, chunk_size=100)[0]
+
+
+def test_predict_pool_rejects_a_chunk_size_below_one() -> None:
+    """A non-positive chunk size would silently predict nothing."""
+    surrogate = DummyMeanSurrogate()
+    surrogate.fit([Observation(x=(0.0,), y=1.0, fidelity=0)])
+
+    with pytest.raises(ValueError, match="chunk_size must be at least 1"):
+        predict_pool(surrogate, [Candidate(x=(0.0,), fidelity=0)], chunk_size=0)
+
+
+def test_predict_pool_returns_nothing_for_an_empty_pool() -> None:
+    """No pool means no columns, rather than an empty pair of lists."""
+    surrogate = DummyMeanSurrogate()
+    surrogate.fit([Observation(x=(0.0,), y=1.0, fidelity=0)])
+
+    assert predict_pool(surrogate, []) is None
 
 
 @pytest.mark.parametrize(

@@ -3,12 +3,18 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+import logging
 import math
 from typing import TYPE_CHECKING, Any
 
+import numpy as np
 import torch
 from matplotlib.figure import Figure
 
+from activelearning.surrogate.eval_metrics import (
+    predicted_vs_observed_figure,
+    prediction_metrics,
+)
 from activelearning.surrogate.plotting import (
     PredictionPanel,
     build_predicted_vs_observed_figure,
@@ -22,7 +28,167 @@ from activelearning.utils.types import (
 )
 
 if TYPE_CHECKING:
+    from activelearning.monitoring.held_out import HeldOutSet
     from activelearning.monitoring.run_writer import RoundRecord
+
+_logger = logging.getLogger(__name__)
+
+
+#: Candidates per ``surrogate.predict`` call in :func:`predict_pool`. The
+#: surrogate predicts a whole input in one posterior call, which for an exact GP
+#: builds a kernel of the chunk against every training row, so a 100k pool has
+#: to be split. 5,000 matches the ``--eval-chunk-size`` the offline evaluation
+#: script uses against the same surrogate.
+_POOL_PREDICT_CHUNK = 5_000
+
+#: Target thresholds whose exceedance is reported per round. 0.5 is the
+#: selector's ``keep_above``, so the first is the tail the loop exists to grow.
+_DOCKED_THRESHOLDS = (0.5, 0.4, 0.3, 0.2)
+
+
+def predict_pool(
+    surrogate: Surrogate,
+    candidates: Sequence[Candidate],
+    *,
+    chunk_size: int = _POOL_PREDICT_CHUNK,
+) -> tuple[list[float], list[float] | None] | None:
+    """Predict the posterior mean and standard deviation for a sampled pool.
+
+    Chunked, because ``Surrogate.predict`` encodes and predicts everything it is
+    given in one call. Returns ``None`` when any chunk fails to predict, rather
+    than a partial pool: the caller writes these alongside the acquisition score
+    of the same molecule, and a column covering an unmarked subset of the rows
+    would be read as covering all of them.
+
+    Parameters
+    ----------
+    surrogate : Surrogate
+        The fitted surrogate this round scored its candidates with.
+    candidates : Sequence[Candidate]
+        The sampled pool, in the order it will be written.
+    chunk_size : int, optional
+        Candidates per prediction call.
+
+    Returns
+    -------
+    result : tuple[list[float], list[float] | None] | None
+        Means and, where the surrogate reports them, standard deviations; or
+        ``None`` when the pool could not be predicted.
+    """
+    if not candidates:
+        return None
+    if chunk_size < 1:
+        raise ValueError(f"chunk_size must be at least 1; got {chunk_size}.")
+    means: list[float] = []
+    standard_deviations: list[float] = []
+    stds_complete = True
+    for start in range(0, len(candidates), chunk_size):
+        chunk = candidates[start : start + chunk_size]
+        predicted = _predict(surrogate, chunk)
+        if predicted is None:
+            return None
+        chunk_means, chunk_stds = predicted
+        means.extend(chunk_means)
+        if chunk_stds is None:
+            stds_complete = False
+        elif stds_complete:
+            standard_deviations.extend(chunk_stds)
+    return means, standard_deviations if stds_complete else None
+
+
+def evaluate_held_out_set(
+    surrogate: Surrogate,
+    held_out: "HeldOutSet",
+    *,
+    include_figure: bool,
+    chunk_size: int = _POOL_PREDICT_CHUNK,
+) -> tuple[dict[str, int | float], dict[str, Figure]]:
+    """Score the surrogate on one fixed evaluation set.
+
+    The same set every round, so "the surrogate was fine at round 2 and had
+    degraded by round 7" can be said on a constant scale. The round's own
+    ``surrogate/general/held_out/*`` panels cannot answer that: they score
+    whatever that round's policy proposed, which moves.
+
+    Metrics come from :func:`activelearning.surrogate.eval_metrics.
+    prediction_metrics` and the figure from ``predicted_vs_observed_figure``,
+    the same functions the offline evaluation uses, so a round's numbers are
+    directly comparable with the arms in the offline W&B projects. The
+    standard deviation includes observation noise, which is the convention
+    those ``coverage_1std`` / ``coverage_2std`` readings were taken under.
+
+    Parameters
+    ----------
+    surrogate : Surrogate
+        The round's fitted surrogate.
+    held_out : HeldOutSet
+        The molecules and targets to score, loaded once per run.
+    include_figure : bool
+        Whether to draw the predicted-versus-observed density.
+    chunk_size : int, optional
+        Molecules per encode-and-predict call.
+
+    Returns
+    -------
+    tuple[dict[str, int | float], dict[str, Figure]]
+        Metrics under ``surrogate/eval_set/<name>/``, and the figure under the
+        same namespace. Both empty when nothing could be predicted.
+    """
+    predicted = _predict_encoded_in_chunks(surrogate, held_out, chunk_size)
+    if predicted is None:
+        _logger.warning(
+            "Could not score the held-out set %s; skipping its metrics.",
+            held_out.name,
+        )
+        return {}, {}
+    means, stds = predicted
+    prefix = f"surrogate/eval_set/{held_out.name}"
+    metrics: dict[str, int | float] = {
+        f"{prefix}/{key}": value
+        for key, value in prediction_metrics(held_out.targets, means, stds).items()
+    }
+    metrics[f"{prefix}/count"] = len(held_out.targets)
+    figures: dict[str, Figure] = {}
+    if include_figure:
+        figure = predicted_vs_observed_figure(
+            title=held_out.name,
+            targets=held_out.targets,
+            mean=means,
+        )
+        if figure is not None:
+            figures[f"{prefix}/predicted_vs_observed"] = figure
+    return metrics, figures
+
+
+def _predict_encoded_in_chunks(
+    surrogate: Surrogate,
+    held_out: "HeldOutSet",
+    chunk_size: int,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Encode and predict a held-out set in chunks, or ``None`` on failure.
+
+    Through ``predict_encoded`` rather than ``predict``: these sets run to
+    hundreds of thousands of rows, and it returns tensors instead of Python
+    lists and takes the observation noise flag the coverage readings need.
+    """
+    encode = getattr(surrogate, "encode_candidates", None)
+    predict_encoded = getattr(surrogate, "predict_encoded", None)
+    if not callable(encode) or not callable(predict_encoded):
+        return None
+    means: list[np.ndarray] = []
+    stds: list[np.ndarray] = []
+    try:
+        for start in range(0, len(held_out.candidates), chunk_size):
+            chunk = held_out.candidates[start : start + chunk_size]
+            prediction = predict_encoded(encode(chunk), observation_noise=True)
+            means.append(np.asarray(prediction["mean"], dtype=np.float64).reshape(-1))
+            stds.append(np.asarray(prediction["std"], dtype=np.float64).reshape(-1))
+    except (NotImplementedError, TypeError, ValueError, RuntimeError, KeyError):
+        _logger.warning("Held-out prediction failed.", exc_info=True)
+        return None
+    if not means:
+        return None
+    return np.concatenate(means), np.concatenate(stds)
 
 
 def surrogate_diagnostics(
@@ -176,7 +342,57 @@ def dataset_diagnostics(
         ]
         if targets:
             metrics[f"dataset/general/fidelity_{fidelity}/target_best"] = max(targets)
+    metrics.update(_docked_distribution_metrics(record))
     return metrics, {}
+
+
+def _docked_distribution_metrics(
+    record: "RoundRecord",
+) -> dict[str, int | float]:
+    """Summarize the distribution of the targets observed in THIS round.
+
+    The round's own observations, not the dataset's: whether the loop is working
+    is whether each round's targets sit higher than the last round's, which the
+    cumulative distribution dilutes as the archive grows. The exceedance counts
+    are the headline, because the tail is what the loop exists to grow and a
+    mean over a floor-dominated distribution moves with the floor.
+    """
+    targets = sorted(
+        target
+        for observation in record.valid_observations
+        if (target := _finite_scalar(observation.y)) is not None
+    )
+    if not targets:
+        return {}
+    metrics: dict[str, int | float] = {
+        "dataset/general/docked/count": len(targets),
+        "dataset/general/docked/y_mean": _mean(targets),
+        "dataset/general/docked/y_median": _quantile(targets, 0.5),
+        "dataset/general/docked/y_max": targets[-1],
+        "dataset/general/docked/y_p90": _quantile(targets, 0.9),
+        "dataset/general/docked/y_p99": _quantile(targets, 0.99),
+        # The mean of the best 100, as the reading least sensitive to how many
+        # molecules a round managed to dock.
+        "dataset/general/docked/y_top100_mean": _mean(targets[-100:]),
+    }
+    for threshold in _DOCKED_THRESHOLDS:
+        above = sum(target >= threshold for target in targets)
+        metrics[f"dataset/general/docked/count_above_{threshold}"] = above
+        metrics[f"dataset/general/docked/frac_above_{threshold}"] = above / len(targets)
+    return metrics
+
+
+def _quantile(sorted_values: Sequence[float], fraction: float) -> float:
+    """Return a quantile of an already-sorted, non-empty sequence.
+
+    Nearest-rank rather than interpolated: these are observed docking targets,
+    and a reported quantile that no molecule actually scored would be harder to
+    reconcile against the CSV the same round writes. A rank exactly between two
+    molecules takes the upper one, written out rather than left to ``round``,
+    whose half-to-even rule would send 0.5 down and 1.5 up.
+    """
+    index = int(fraction * (len(sorted_values) - 1) + 0.5)
+    return float(sorted_values[index])
 
 
 def budget_diagnostics(
