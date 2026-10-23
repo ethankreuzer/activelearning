@@ -7,7 +7,7 @@ from collections.abc import Callable
 import numpy as np
 import pytest
 
-from scripts.stratified_fps import (
+from activelearning.surrogate.stratified_fps import (
     allocate_band_budgets,
     assign_bands,
     count_overlap,
@@ -386,6 +386,41 @@ class TestSelectStratifiedRows:
             assert band["n_pool"] <= band["n_band"]
             assert band["budget_per_size"]["400"] <= band["n_pool"]
         assert diagnostics["sizes"]["400"]["n_rows"] == 400
+
+    def test_keep_above_keeps_every_row_at_or_above_it(self) -> None:
+        targets = _skewed_targets()
+        rows, diagnostics = select_stratified_rows(
+            targets,
+            (400,),
+            encode_rows=self._encode(targets),
+            quantiles=(50.0, 90.0, 99.0),
+            top_fraction=0.25,
+            pool_multiple=3,
+            keep_above=0.6,
+        )
+        selected = rows[400]
+        kept = np.flatnonzero(targets >= 0.6)
+        assert 0 < kept.size < 400
+        assert set(kept.tolist()) <= set(selected.tolist())
+        assert selected.size == 400
+        assert np.unique(selected).size == 400
+        assert diagnostics["n_kept"] == kept.size
+        # The top band keeps its share of the full size, below the threshold.
+        top_edge = diagnostics["band_edges"][-2]
+        in_top_band = (targets[selected] >= top_edge) & (targets[selected] < 0.6)
+        assert int(in_top_band.sum()) == 100
+
+    def test_keep_above_is_rejected_when_it_fills_the_budget(self) -> None:
+        targets = _skewed_targets()
+        with pytest.raises(ValueError, match="keep_above"):
+            select_stratified_rows(
+                targets,
+                (50,),
+                encode_rows=self._encode(targets),
+                quantiles=(50.0, 90.0),
+                pool_multiple=3,
+                keep_above=0.3,
+            )
 
     def test_the_pool_is_encoded_once_in_ascending_row_order(self) -> None:
         targets = _skewed_targets()

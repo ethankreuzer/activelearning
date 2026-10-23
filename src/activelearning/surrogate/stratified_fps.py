@@ -519,9 +519,11 @@ def select_stratified_rows(
     *,
     encode_rows: Callable[[np.ndarray], np.ndarray],
     quantiles: Sequence[float] = DEFAULT_QUANTILES,
+    band_edges: Sequence[float] | np.ndarray | None = None,
     top_fraction: float = DEFAULT_TOP_FRACTION,
     pool_multiple: int | Sequence[int] = DEFAULT_POOL_MULTIPLE,
     band_fill: str = DEFAULT_BAND_FILL,
+    keep_above: float | None = None,
     seed: int = 42,
     device: Any | None = None,
 ) -> tuple[dict[int, np.ndarray], dict[str, Any]]:
@@ -530,6 +532,13 @@ def select_stratified_rows(
     All sizes share one candidate pool and one farthest-point pass per band,
     sized for the largest of them, so each smaller training set is a subset of
     every larger one.
+
+    With ``keep_above``, every row at or above it is kept outright, with no
+    farthest-point sampling, and taken out of the bands. The band edges are
+    unchanged (still quantiles of all of ``targets``), so the top band ends at
+    ``keep_above``. The kept rows come out of each size's total budget; the top
+    band keeps ``top_fraction`` of the full size and the lower bands share
+    what is left.
 
     Parameters
     ----------
@@ -542,7 +551,12 @@ def select_stratified_rows(
         ``(len(rows), n_dims)`` features of those rows, in the given order.
         Injected so callers own the encoder and its cache.
     quantiles : Sequence[float], default=DEFAULT_QUANTILES
-        Inner band edges, as percentages.
+        Inner band edges, as percentages. Ignored when ``band_edges`` is given.
+    band_edges : Sequence[float] or np.ndarray, optional
+        Band edges to use as given, instead of quantiles of ``targets``.
+        Infinite outer edges are added when absent. For a selection repeated
+        over rounds on a growing archive: recomputed quantiles would move with
+        the enrichment and the rounds would not be comparable.
     top_fraction : float, default=DEFAULT_TOP_FRACTION
         Share of each size's budget given to the top band.
     pool_multiple : int or Sequence[int], default=DEFAULT_POOL_MULTIPLE
@@ -553,6 +567,8 @@ def select_stratified_rows(
     band_fill : str, default=DEFAULT_BAND_FILL
         How the lower bands split what the top band leaves; see
         :func:`allocate_band_budgets`.
+    keep_above : float, optional
+        Target at or above which every row is kept. ``None`` keeps none.
     seed : int, default=42
         Seed of the pool draws and of each band's first farthest point.
     device : torch.device or str, optional
@@ -570,8 +586,9 @@ def select_stratified_rows(
     ------
     ValueError
         If ``sizes`` is empty or holds a non-positive entry, if any
-        ``pool_multiple`` is less than one, or if a per-band ``pool_multiple``
-        does not have one entry per band.
+        ``pool_multiple`` is less than one, if a per-band ``pool_multiple``
+        does not have one entry per band, or if ``keep_above`` keeps at least
+        as many rows as the smallest size.
     """
     values = np.asarray(targets, dtype=np.float64)
     requested = sorted({int(size) for size in sizes})
@@ -580,15 +597,46 @@ def select_stratified_rows(
     if requested[0] < 1:
         raise ValueError(f"sizes must be positive; got {sorted(sizes)}.")
 
-    edges = quantile_band_edges(values, quantiles)
+    if band_edges is None:
+        edges = quantile_band_edges(values, quantiles)
+    else:
+        # Edges fixed by the caller, for a selection repeated over rounds on a
+        # growing archive. Quantiles of each round's own archive would chase the
+        # enrichment, so "the top band" would mean something different each
+        # round and the compositions could not be compared.
+        edges = np.asarray(band_edges, dtype=np.float64)
+        if edges.ndim != 1 or edges.size < 2:
+            raise ValueError("band_edges must hold at least two edges.")
+        if np.any(np.diff(edges) <= 0.0):
+            raise ValueError(f"band_edges must be strictly ascending; got {edges}.")
+        if not np.isneginf(edges[0]) or not np.isposinf(edges[-1]):
+            edges = np.concatenate(([-np.inf], edges, [np.inf]))
     bands = assign_bands(values, edges)
     n_bands = edges.size - 1
     multiples = _resolve_pool_multiples(pool_multiple, n_bands)
+    if keep_above is None:
+        kept = np.empty(0, dtype=np.int64)
+    else:
+        kept = np.flatnonzero(values >= keep_above)
+        # Kept rows belong to no band, so no band can select them again.
+        bands[kept] = -1
+    if kept.size >= requested[0]:
+        raise ValueError(
+            f"keep_above={keep_above} keeps {kept.size} rows, at least the "
+            f"smallest requested size {requested[0]}."
+        )
     band_rows = [np.flatnonzero(bands == index) for index in range(n_bands)]
     band_sizes = np.asarray([rows.size for rows in band_rows], dtype=np.int64)
 
+    # The top band keeps its share of the full size; the kept rows come out of
+    # what the lower bands would otherwise share.
     budgets = {
-        size: allocate_band_budgets(band_sizes, size, top_fraction, band_fill=band_fill)
+        size: allocate_band_budgets(
+            band_sizes,
+            size - kept.size,
+            min(1.0, top_fraction * size / (size - kept.size)),
+            band_fill=band_fill,
+        )
         for size in requested
     }
     max_budgets = budgets[requested[-1]]
@@ -636,35 +684,44 @@ def select_stratified_rows(
     pool_features = np.empty(features.shape, dtype=np.float32)
     pool_features[order] = features
 
-    selections: dict[int, list[np.ndarray]] = {size: [] for size in requested}
+    selections: dict[int, list[np.ndarray]] = {size: [kept] for size in requested}
     band_diagnostics: list[dict[str, Any]] = []
     offset = 0
     for index in range(n_bands):
         pool = pools[index]
         band_features = pool_features[offset : offset + pool.size]
         offset += pool.size
-        picked = farthest_point_sample(
-            band_features,
-            int(max_budgets[index]),
-            seed=seed + index,
-            device=device,
-        )
+        # An empty band, which ``keep_above`` produces whenever it takes every
+        # row of one: its budget is capped at its size and so is already zero,
+        # and the farthest-point pass rejects an empty feature matrix rather
+        # than returning nothing. Nothing to select and nothing to measure.
+        if pool.size == 0:
+            picked = np.empty(0, dtype=np.int64)
+            spread_mean = spread_median = null_mean = None
+        else:
+            picked = farthest_point_sample(
+                band_features,
+                int(max_budgets[index]),
+                seed=seed + index,
+                device=device,
+            )
+            # What the spreading bought: the selection's nearest-neighbour
+            # spacing against an equal-sized uniform draw from the same pool.
+            # The pool is itself a uniform draw from the band, so that draw is
+            # the right null.
+            spread_mean, spread_median = nearest_neighbour_spread(
+                band_features[picked], seed=seed + index, device=device
+            )
+            null_rows = rng.choice(
+                pool.size, size=min(picked.size, pool.size), replace=False
+            )
+            null_mean, _ = nearest_neighbour_spread(
+                band_features[null_rows], seed=seed + index, device=device
+            )
         band_global = pool[picked]
         for size in requested:
             selections[size].append(band_global[: int(budgets[size][index])])
         selected_targets = values[band_global]
-        # What the spreading bought: the selection's nearest-neighbour spacing
-        # against an equal-sized uniform draw from the same pool. The pool is
-        # itself a uniform draw from the band, so that draw is the right null.
-        spread_mean, spread_median = nearest_neighbour_spread(
-            band_features[picked], seed=seed + index, device=device
-        )
-        null_rows = rng.choice(
-            pool.size, size=min(picked.size, pool.size), replace=False
-        )
-        null_mean, _ = nearest_neighbour_spread(
-            band_features[null_rows], seed=seed + index, device=device
-        )
         band_diagnostics.append(
             {
                 "band": index,
@@ -704,6 +761,8 @@ def select_stratified_rows(
         "quantiles": [float(level) for level in quantiles],
         "top_fraction": float(top_fraction),
         "band_fill": str(band_fill),
+        "keep_above": None if keep_above is None else float(keep_above),
+        "n_kept": int(kept.size),
         "pool_multiple": [int(multiple) for multiple in multiples],
         "seed": int(seed),
         "n_pool_total": int(ascending_rows.size),

@@ -56,7 +56,7 @@ from typing import Any
 
 import numpy as np
 
-from scripts.surrogate_eval_metrics import (
+from activelearning.surrogate.eval_metrics import (
     error_by_std_figure,
     log_density_figure,
     predicted_vs_observed_figure,

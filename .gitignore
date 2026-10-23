@@ -352,3 +352,10 @@ plots/
 CLAUDE.md
 src/activelearning/sampler/gflownet/OVERVIEW.md
 DOCK3_ORACLE_REVIEW.md
+
+# Job logs, model checkpoints and analysis outputs: large, regenerable, and
+# home is backed up on a small quota. Kept on disk, out of git history.
+slurm_logs/
+minimol_ampc_encoder/
+analyze_archive_diversity/
+analyze_scored_samples_csv/

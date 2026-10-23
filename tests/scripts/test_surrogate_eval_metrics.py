@@ -7,7 +7,7 @@ import math
 import numpy as np
 import pytest
 
-from scripts import surrogate_eval_metrics as metrics
+from activelearning.surrogate import eval_metrics as metrics
 
 
 def test_gaussian_nll_matches_the_closed_form() -> None:

@@ -46,7 +46,7 @@ from scripts.surrogate_eval_io import (  # noqa: E402
     parse_float_column,
     write_json,
 )
-from scripts.surrogate_eval_metrics import (  # noqa: E402
+from activelearning.surrogate.eval_metrics import (  # noqa: E402
     acquisition_enrichment,
     cross_set_top_k_shares,
     score_degeneracy,

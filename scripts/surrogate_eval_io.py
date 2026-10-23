@@ -7,7 +7,7 @@ runners share one implementation rather than repeating the copy-and-paste that
 
 Everything here is pure plumbing: reading and writing files, building the run
 logger, and slicing encoded evaluation sets. The numerical work lives in
-``scripts/surrogate_eval_metrics.py``, and neither module imports torch at
+``activelearning/surrogate/eval_metrics.py``, and neither module imports torch at
 module scope so they stay importable without a GPU.
 """
 
@@ -473,7 +473,7 @@ def prediction_outputs(
         Metrics keyed ``<set>/final/<metric>`` and ``<set>/std_latent/<stat>``,
         and figures keyed ``<set>/figures/<name>``.
     """
-    from scripts.surrogate_eval_metrics import (
+    from activelearning.surrogate.eval_metrics import (
         error_by_std_figure,
         predicted_vs_observed_figure,
         prediction_metrics,
@@ -569,7 +569,7 @@ def score_outputs(
         Metrics keyed ``<set>/acquisition/<scoring>/<stat>`` and figures keyed
         ``<set>/figures/<scoring>/<name>``.
     """
-    from scripts.surrogate_eval_metrics import (
+    from activelearning.surrogate.eval_metrics import (
         acquisition_enrichment,
         log_density_figure,
         score_degeneracy,
@@ -643,7 +643,7 @@ def cross_set_outputs(
     dict[str, float]
         Metrics keyed ``pooled/acquisition/<scoring>/top{k}/<set>_share``.
     """
-    from scripts.surrogate_eval_metrics import cross_set_top_k_shares
+    from activelearning.surrogate.eval_metrics import cross_set_top_k_shares
 
     if len(scores_by_set) < 2:
         return {}
