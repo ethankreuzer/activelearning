@@ -11,6 +11,7 @@ from activelearning.acquisition.config import (
 )
 from activelearning.surrogate.encoder_config import (
     EncoderConfig,
+    FeatureStoreFixedEncoderConfig,
     FixedEncoderConfig,
     GPMoLFormerSmilesEncoderConfig,
     MiniMolAmpcSmilesFixedEncoderConfig,
@@ -135,6 +136,15 @@ def test_surrogate_union_selects_config_by_type(
             "MiniMolAmpcSmilesFixedEncoder",
             {"checkpoint_path": "minimol_resources/model/final.pt"},
             MiniMolAmpcSmilesFixedEncoderConfig,
+        ),
+        (
+            "FeatureStoreFixedEncoder",
+            {
+                "inner": {"type": "MiniMolSmilesFixedEncoder"},
+                "store_path": "store.npy",
+                "smiles_path": "store.smiles.txt",
+            },
+            FeatureStoreFixedEncoderConfig,
         ),
     ],
 )

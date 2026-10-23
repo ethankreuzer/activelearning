@@ -27,18 +27,28 @@ targets' variance. ``prior_mean`` pins the constant mean, the prediction far
 from the data, to a known value such as the mean of the library the training
 set was drawn from, instead of learning it from a training set that may be
 enriched in high scorers.
+
+``accept_abnormal_lbfgsb`` keeps an L-BFGS-B attempt that scipy ends with
+``ABNORMAL`` -- its line search found no further decrease -- instead of letting
+``fit_gpytorch_mll`` discard it and retry from hyperparameters resampled from
+the priors. In float32 that is how an attempt sitting at its optimum often ends.
 """
 
 from __future__ import annotations
 
 import math
-from contextlib import nullcontext
+import warnings
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
-from typing import Any, ContextManager, Iterable, Literal, Optional
+from warnings import WarningMessage
+from typing import Any, ContextManager, Iterable, Iterator, Literal, Optional
 
 import gpytorch
 import torch
+from botorch.exceptions.warnings import OptimizationWarning
+from botorch.fit import DEFAULT_WARNING_HANDLER
 from botorch.models.utils.gpytorch_modules import (
+    MIN_INFERRED_NOISE_LEVEL,
     SQRT2,
     SQRT3,
     get_covar_module_with_dim_scaled_prior,
@@ -47,10 +57,37 @@ from gpytorch.constraints import GreaterThan
 from gpytorch.kernels import Kernel, MaternKernel, RBFKernel, ScaleKernel
 from gpytorch.priors import LogNormalPrior
 
+from matplotlib.figure import Figure
+
 from activelearning.runtime import RuntimeContext
 from activelearning.surrogate.botorch_surrogate import BoTorchGPSurrogate
+from activelearning.surrogate.gp_hyperparameters import gp_hyperparameters
 from activelearning.surrogate.encoder import FixedEncoder
 from activelearning.utils.types import Candidate, Observation
+
+
+def accept_abnormal_lbfgsb_warnings(warning: WarningMessage) -> bool:
+    """Treat an L-BFGS-B ``ABNORMAL`` end as a successful fit attempt.
+
+    A ``warning_handler`` for ``fit_gpytorch_mll``: it returns ``True`` (no
+    retry) for the ``OptimizationWarning`` scipy's ``ABNORMAL`` status raises,
+    and defers to BoTorch's default handler for every other warning.
+
+    Parameters
+    ----------
+    warning : WarningMessage
+        A warning recorded while the optimizer ran.
+
+    Returns
+    -------
+    bool
+        Whether the warning leaves the attempt counted as a success.
+    """
+    if issubclass(warning.category, OptimizationWarning) and "ABNORMAL" in str(
+        warning.message
+    ):
+        return True
+    return DEFAULT_WARNING_HANDLER(warning)
 
 
 class FixedFeatureGPSurrogate(BoTorchGPSurrogate):
@@ -64,10 +101,12 @@ class FixedFeatureGPSurrogate(BoTorchGPSurrogate):
         kernel: Literal["rbf", "matern"] = "rbf",
         outputscale: bool = False,
         prior_mean: Optional[float] = None,
+        noise_std_floor: Optional[float] = None,
         scale_inputs: bool = True,
         standardize_outputs: bool = True,
         fit_kwargs: Optional[dict[str, Any]] = None,
         max_cholesky_size: Optional[int] = None,
+        accept_abnormal_lbfgsb: bool = False,
         is_multi_fidelity: bool = False,
         state_path: Optional[Path] = None,
     ) -> None:
@@ -98,6 +137,13 @@ class FixedFeatureGPSurrogate(BoTorchGPSurrogate):
             through every fit, as in ``ExactDKLSurrogate``. It is converted with
             the outcome transform of each fit, so it stays the same value in
             original units as the training set changes. ``None`` learns it.
+        noise_std_floor : float, optional
+            Lower bound on the observation noise's standard deviation, on the
+            original target scale. Like ``prior_mean`` it is converted with the
+            outcome transform of each fit, so it means the same noise level
+            whatever the training targets' spread. It replaces BoTorch's noise
+            lower bound (1e-4 in standardized variance) and only takes effect
+            where it is higher. ``None`` keeps BoTorch's bound.
         scale_inputs : bool, default=True
             Whether BoTorch min-max normalizes each feature to [0, 1] using the
             training rows. BoTorch's dimension-scaled lengthscale prior assumes
@@ -113,6 +159,11 @@ class FixedFeatureGPSurrogate(BoTorchGPSurrogate):
             L-BFGS-B sees noisy. Set it at or above the training-set size for
             an exact objective. ``None`` keeps GPyTorch's default (800).
             Prediction is unaffected.
+        accept_abnormal_lbfgsb : bool, default=False
+            Whether an L-BFGS-B attempt that ends with scipy's ``ABNORMAL``
+            status is kept rather than retried from resampled hyperparameters.
+            Sets ``fit_kwargs["warning_handler"]`` unless ``fit_kwargs``
+            already has one.
         is_multi_fidelity : bool, default=False
             Whether to append the fidelity confidence as the last input column.
         state_path : Path, optional
@@ -124,7 +175,8 @@ class FixedFeatureGPSurrogate(BoTorchGPSurrogate):
         ------
         ValueError
             If the encoder reports a non-positive ``feature_dim``,
-            ``max_cholesky_size`` is negative, ``kernel`` is unknown, or
+            ``max_cholesky_size`` is negative, ``noise_std_floor`` is not
+            positive, ``kernel`` is unknown, or
             ``ard`` is false, ``kernel`` is ``"matern"`` or ``outputscale`` is
             true in multi-fidelity mode.
         """
@@ -132,6 +184,8 @@ class FixedFeatureGPSurrogate(BoTorchGPSurrogate):
             raise ValueError("encoder.feature_dim must be positive.")
         if max_cholesky_size is not None and max_cholesky_size < 0:
             raise ValueError("max_cholesky_size must be nonnegative.")
+        if noise_std_floor is not None and not noise_std_floor > 0:
+            raise ValueError("noise_std_floor must be positive.")
         if not ard and is_multi_fidelity:
             # A custom kernel replaces SingleTaskMultiFidelityGP and would treat
             # the fidelity column as one more feature.
@@ -146,9 +200,18 @@ class FixedFeatureGPSurrogate(BoTorchGPSurrogate):
         self._kernel = kernel
         self._outputscale = outputscale
         self._prior_mean = None if prior_mean is None else float(prior_mean)
+        self._noise_std_floor = None if noise_std_floor is None else float(noise_std_floor)
         self._encoder = encoder
         self._max_cholesky_size = max_cholesky_size
         self._state_path = None if state_path is None else Path(state_path)
+        fit_kwargs = dict(fit_kwargs or {})
+        if accept_abnormal_lbfgsb:
+            fit_kwargs.setdefault("warning_handler", accept_abnormal_lbfgsb_warnings)
+        # Counted by _record_fit_warnings around each fit, which leaves
+        # fit_kwargs exactly as configured: what BoTorch is passed, and which
+        # handler decides whether an attempt counts as a success, must not
+        # change because the round wants a number out of it.
+        self._fit_warnings: dict[str, float] = {}
         super().__init__(
             scale_inputs=scale_inputs,
             standardize_outputs=standardize_outputs,
@@ -188,7 +251,7 @@ class FixedFeatureGPSurrogate(BoTorchGPSurrogate):
                 torch.load(self._state_path, map_location="cpu", weights_only=True),
             )
             return
-        with self._fit_context():
+        with self._fit_context(), self._record_fit_warnings():
             super().fit(obs_list)
 
     def update(self, observations: Iterable[Observation]) -> None:
@@ -199,8 +262,50 @@ class FixedFeatureGPSurrogate(BoTorchGPSurrogate):
         observations : Iterable[Observation]
             Newly acquired observations.
         """
-        with self._fit_context():
+        with self._fit_context(), self._record_fit_warnings():
             super().update(observations)
+
+    def drain_round_diagnostics(
+        self,
+        *,
+        include_figures: bool,
+        max_points: int,
+    ) -> tuple[dict[str, int | float], dict[str, "Figure"]]:
+        """Report what this round's fit learned.
+
+        The same reader the offline evaluation script writes into its summary,
+        so a run and that script cannot disagree. Read across rounds, the ratio
+        of ``outputscale`` to ``noise`` is how a GP whose training set grows
+        more enriched shows that it is attributing more of the variation to
+        noise -- which would flatten the reward the policy is trained against
+        before any accuracy metric moves.
+
+        Returns
+        -------
+        tuple[dict[str, int | float], dict[str, Figure]]
+            The learned hyperparameters, and no figures. Empty before the first
+            fit.
+        """
+        del include_figures, max_points
+        metrics: dict[str, int | float] = {
+            f"surrogate/fixed_feature_gp/hyperparameters/{key}": value
+            for key, value in gp_hyperparameters(self).items()
+        }
+        if not metrics:
+            # Never fitted, so there is no fit to report on either.
+            return {}, {}
+        # Zero rather than absent, so a clean fit is a point on the chart and a
+        # gap means the surrogate was not drained at all.
+        metrics["surrogate/fixed_feature_gp/fit/abnormal_exits"] = (
+            self._fit_warnings.get("abnormal", 0.0)
+        )
+        metrics["surrogate/fixed_feature_gp/fit/optimization_warnings"] = (
+            self._fit_warnings.get("optimization", 0.0)
+        )
+        metrics["surrogate/fixed_feature_gp/fit/warnings"] = self._fit_warnings.get(
+            "total", 0.0
+        )
+        return metrics, {}
 
     def restore(
         self,
@@ -399,6 +504,35 @@ class FixedFeatureGPSurrogate(BoTorchGPSurrogate):
         super()._build_model(train_X, train_Y)
         if self._prior_mean is not None:
             self._fix_prior_mean(self._prior_mean)
+        if self._noise_std_floor is not None:
+            self._floor_noise(self._noise_std_floor)
+
+    def _floor_noise(self, noise_std_floor: float) -> None:
+        """Raise the likelihood's noise lower bound to ``noise_std_floor``.
+
+        The noise lives in the model's target space, so the floor, a standard
+        deviation on the original scale, is divided by the outcome transform's
+        standard deviation and squared into a variance there. It keeps
+        BoTorch's form of the constraint (no transform, so L-BFGS-B sees it as a
+        plain bound) and never goes below BoTorch's own 1e-4.
+
+        Parameters
+        ----------
+        noise_std_floor : float
+            Lower bound on the noise standard deviation, original scale.
+        """
+        assert self.model is not None
+        transform = getattr(self.model, "outcome_transform", None)
+        std = noise_std_floor
+        if transform is not None:
+            std = noise_std_floor / float(transform.stdvs.reshape(-1)[0])
+        floor = max(std**2, MIN_INFERRED_NOISE_LEVEL)
+        noise_covar = self.model.likelihood.noise_covar
+        start = max(float(noise_covar.noise.detach().max()), floor)
+        # Registering re-initializes the noise at ``start``, which the new bound
+        # allows; ``.to`` puts the bound on the model's device and dtype.
+        constraint = GreaterThan(floor, transform=None, initial_value=start)
+        noise_covar.register_constraint("raw_noise", constraint.to(noise_covar.raw_noise))
 
     def _fix_prior_mean(self, prior_mean: float) -> None:
         """Pin the GP's constant mean and exclude it from the fit.
@@ -424,6 +558,60 @@ class FixedFeatureGPSurrogate(BoTorchGPSurrogate):
             raw_constant.fill_(constant)
         # The optimizer only takes parameters that still require a gradient.
         raw_constant.requires_grad_(False)
+
+    @contextmanager
+    def _record_fit_warnings(self) -> Iterator[None]:
+        """Count the warnings a fit emits, then re-emit them unchanged.
+
+        Recorded around the fit rather than through a ``warning_handler``, so
+        ``fit_kwargs`` reaches BoTorch exactly as configured and the handler
+        that judges an attempt is the configured one.
+
+        The cost of recording here: a handler that ACCEPTS a warning suppresses
+        it, so with ``accept_abnormal_lbfgsb`` an accepted ABNORMAL end never
+        escapes the fit and is not counted. Under the default, which retries
+        and then gives up, the warning does escape and is counted.
+        """
+        self._fit_warnings = {}
+        recorded: list[WarningMessage] = []
+        try:
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                try:
+                    yield
+                finally:
+                    # A snapshot: ``caught`` is the live list the recorder
+                    # appends to, and re-emitting while iterating it would feed
+                    # every warning straight back in without end.
+                    recorded = list(caught)
+                    optimization = [
+                        entry
+                        for entry in recorded
+                        if issubclass(entry.category, OptimizationWarning)
+                    ]
+                    self._fit_warnings = {
+                        "total": float(len(recorded)),
+                        "optimization": float(len(optimization)),
+                        # scipy's own word for an L-BFGS-B run that stopped
+                        # without satisfying its convergence test.
+                        "abnormal": float(
+                            sum(
+                                "ABNORMAL" in str(entry.message)
+                                for entry in optimization
+                            )
+                        ),
+                    }
+        finally:
+            # Outside the recorder, so these reach the caller and the log
+            # rather than the list that was just counted. Nothing is swallowed:
+            # an unattended run still has them in its stderr.
+            for entry in recorded:
+                warnings.warn_explicit(
+                    entry.message,
+                    entry.category,
+                    entry.filename,
+                    entry.lineno,
+                )
 
     def _fit_context(self) -> ContextManager[Any]:
         """Return the GPyTorch settings the fit runs under."""

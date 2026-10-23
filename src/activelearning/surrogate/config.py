@@ -45,6 +45,7 @@ from activelearning.surrogate.objectives import (
     VariationalObjective,
 )
 from activelearning.surrogate.surrogate import Surrogate
+from activelearning.surrogate.training_subset import TrainingSubsetSelectorConfig
 
 
 @runtime_checkable
@@ -294,6 +295,10 @@ class FixedFeatureGPSurrogateConfig(BaseModel):
         Fixed GP prior mean on the original target scale, such as the mean of
         the library the training set was drawn from, held constant through
         every fit. ``null`` learns it.
+    noise_std_floor : float, optional
+        Lower bound on the observation noise standard deviation, on the
+        original target scale and converted with each fit's standardization.
+        ``null`` keeps BoTorch's own bound.
     scale_inputs : bool, default=True
         Whether BoTorch min-max normalizes each feature to [0, 1].
     standardize_outputs : bool, default=True
@@ -304,6 +309,10 @@ class FixedFeatureGPSurrogateConfig(BaseModel):
         GPyTorch's ``max_cholesky_size`` while fitting; at or above the
         training-set size the fit objective is exact rather than a stochastic
         estimate. ``null`` keeps GPyTorch's default.
+    accept_abnormal_lbfgsb : bool, default=False
+        Whether an L-BFGS-B attempt that scipy ends with ``ABNORMAL`` (its line
+        search found no further decrease) is kept instead of retried from
+        hyperparameters resampled from the priors.
     state_path : Path, optional
         A ``surrogate_state.pt`` from an earlier fit of this same configuration
         and training set, restored in place of every fit. Like
@@ -317,10 +326,12 @@ class FixedFeatureGPSurrogateConfig(BaseModel):
     kernel: Literal["rbf", "matern"] = "rbf"
     outputscale: bool = False
     prior_mean: float | None = None
+    noise_std_floor: float | None = Field(default=None, gt=0)
     scale_inputs: bool = True
     standardize_outputs: bool = True
     fit_kwargs: dict[str, Any] = Field(default_factory=dict)
     max_cholesky_size: int | None = Field(default=None, ge=0)
+    accept_abnormal_lbfgsb: bool = False
     state_path: Path | None = None
     # Derived from the oracle's fidelity set by the top-level config validator.
     is_multi_fidelity: bool = False
@@ -355,14 +366,69 @@ class FixedFeatureGPSurrogateConfig(BaseModel):
             kernel=self.kernel,
             outputscale=self.outputscale,
             prior_mean=self.prior_mean,
+            noise_std_floor=self.noise_std_floor,
             scale_inputs=self.scale_inputs,
             standardize_outputs=self.standardize_outputs,
             fit_kwargs=self.fit_kwargs,
             max_cholesky_size=self.max_cholesky_size,
+            accept_abnormal_lbfgsb=self.accept_abnormal_lbfgsb,
             is_multi_fidelity=self.is_multi_fidelity,
             state_path=self.state_path,
         )
 
+
+
+class SubsetFixedFeatureGPSurrogateConfig(FixedFeatureGPSurrogateConfig):
+    """Configuration for the fixed-feature GP fitted on a subset of the archive.
+
+    Takes every field of :class:`FixedFeatureGPSurrogateConfig` except
+    ``state_path``, which assumes one fixed training set.
+
+    Parameters
+    ----------
+    training_subset : TrainingSubsetSelectorConfig
+        How each fit chooses its training rows from the archive.
+    subset_dir : Path, optional
+        Directory receiving one CSV of the chosen rows per fit. ``null`` writes
+        nothing.
+    """
+
+    type: Literal["SubsetFixedFeatureGPSurrogate"] = (  # type: ignore[assignment]
+        "SubsetFixedFeatureGPSurrogate"
+    )
+    training_subset: TrainingSubsetSelectorConfig
+    subset_dir: Path | None = None
+
+    @model_validator(mode="after")
+    def _reject_state_path(self) -> "SubsetFixedFeatureGPSurrogateConfig":
+        """Reject a saved state, which fixes the training set."""
+        if self.state_path is not None:
+            raise ValueError(
+                "SubsetFixedFeatureGPSurrogate does not support state_path: the "
+                "training set changes every fit."
+            )
+        return self
+
+    def build(self) -> Surrogate:
+        """Build the subset fixed-feature GP surrogate."""
+        from activelearning.surrogate.subset_gp import SubsetFixedFeatureGPSurrogate
+
+        return SubsetFixedFeatureGPSurrogate(
+            encoder=self.encoder.build(),
+            selector=self.training_subset.build(),
+            subset_dir=self.subset_dir,
+            ard=self.ard,
+            kernel=self.kernel,
+            outputscale=self.outputscale,
+            prior_mean=self.prior_mean,
+            noise_std_floor=self.noise_std_floor,
+            scale_inputs=self.scale_inputs,
+            standardize_outputs=self.standardize_outputs,
+            fit_kwargs=self.fit_kwargs,
+            max_cholesky_size=self.max_cholesky_size,
+            accept_abnormal_lbfgsb=self.accept_abnormal_lbfgsb,
+            is_multi_fidelity=self.is_multi_fidelity,
+        )
 
 class VariationalGPTrainingConfig(BaseModel):
     """Adam training settings for a fixed-feature variational GP.
@@ -461,6 +527,7 @@ SurrogateConfig = Annotated[
         DummyMeanSurrogateConfig,
         BoTorchGPSurrogateConfig,
         FixedFeatureGPSurrogateConfig,
+        SubsetFixedFeatureGPSurrogateConfig,
         ExactDKLSurrogateConfig,
         VariationalDKLSurrogateConfig,
         VariationalGPSurrogateConfig,

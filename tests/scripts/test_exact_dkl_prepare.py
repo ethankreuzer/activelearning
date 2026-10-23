@@ -312,6 +312,12 @@ def test_sets_flag_restricts_the_work() -> None:
     assert args.selected_sets == {"ampc_331k", "gp_molformer_set"}
 
 
+def test_strat_keep_above_defaults_to_none_and_parses_a_float() -> None:
+    """Unset keeps the earlier selections reproducible; set, it is a target."""
+    assert prep._parse_args([]).strat_keep_above is None
+    assert prep._parse_args(["--strat-keep-above", "0.5"]).strat_keep_above == 0.5
+
+
 class TestParseExtraSets:
     """``--extra-set name=path.csv`` brings an arbitrary pool into the study."""
 

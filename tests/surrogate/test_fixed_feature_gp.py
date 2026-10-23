@@ -7,9 +7,14 @@ from pathlib import Path
 from typing import Any
 
 import gpytorch
+import warnings
+
 import pytest
 import torch
+from botorch.exceptions.errors import ModelFittingError
+from botorch.exceptions.warnings import OptimizationWarning
 from botorch.models import SingleTaskGP
+from botorch.optim.fit import fit_gpytorch_mll_scipy
 from botorch.models.transforms.input import Normalize
 from gpytorch.kernels import MaternKernel, RBFKernel, ScaleKernel
 from pydantic import TypeAdapter
@@ -19,10 +24,16 @@ from activelearning.runtime import RuntimeContext
 from activelearning.surrogate import botorch_surrogate
 from activelearning.surrogate.config import (
     FixedFeatureGPSurrogateConfig,
+    SubsetFixedFeatureGPSurrogateConfig,
     SurrogateConfig,
 )
 from activelearning.surrogate.encoder import FixedEncoder
-from activelearning.surrogate.fixed_feature_gp import FixedFeatureGPSurrogate
+from activelearning.surrogate.fixed_feature_gp import (
+    FixedFeatureGPSurrogate,
+    accept_abnormal_lbfgsb_warnings,
+)
+from activelearning.surrogate.subset_gp import SubsetFixedFeatureGPSurrogate
+from activelearning.surrogate.training_subset import ThresholdRandomSubsetSelector
 from activelearning.utils.types import Candidate, Observation
 
 SMILES = ("C", "CC", "CCO", "CCN", "CCCO", "OCCO", "NCCN", "CCCCC")
@@ -238,6 +249,77 @@ def test_prior_mean_survives_a_restore() -> None:
     assert _prior_mean_original_scale(restored) == pytest.approx(-0.4)
 
 
+def _noise_std_original_scale(surrogate: FixedFeatureGPSurrogate) -> float:
+    """Return the fitted noise standard deviation in original target units."""
+    model = surrogate.get_model()
+    y_std = model.outcome_transform.stdvs.reshape(-1)[0]
+    return float(model.likelihood.noise.reshape(-1)[0].sqrt() * y_std)
+
+
+def _noise_lower_bound(surrogate: FixedFeatureGPSurrogate) -> float:
+    """Return the likelihood's noise lower bound, in standardized variance."""
+    noise_covar = surrogate.get_model().likelihood.noise_covar
+    return float(noise_covar.raw_noise_constraint.lower_bound)
+
+
+def test_noise_floor_is_unset_by_default() -> None:
+    """Without a floor the likelihood keeps BoTorch's own 1e-4 bound."""
+    assert _noise_lower_bound(_fitted(ard=False)) == pytest.approx(1e-4)
+
+
+@pytest.mark.parametrize("floor", [0.3, 0.6])
+def test_noise_floor_bounds_the_noise_in_original_units_through_every_fit(
+    floor: float,
+) -> None:
+    """The fitted noise never drops below the floor, before or after a refit."""
+    surrogate = _fitted(ard=False, outputscale=True, noise_std_floor=floor)
+
+    assert _noise_std_original_scale(surrogate) >= floor * (1 - 1e-4)
+    y_std = float(surrogate.get_model().outcome_transform.stdvs.reshape(-1)[0])
+    assert _noise_lower_bound(surrogate) == pytest.approx((floor / y_std) ** 2)
+
+    # A training set with a different spread converts to a different bound.
+    surrogate.update(
+        [Observation(x="CCCCCC", y=2.0), Observation(x="CCCCCCC", y=2.5)]
+    )
+    assert _noise_std_original_scale(surrogate) >= floor * (1 - 1e-4)
+    new_y_std = float(surrogate.get_model().outcome_transform.stdvs.reshape(-1)[0])
+    assert new_y_std != pytest.approx(y_std)
+    assert _noise_lower_bound(surrogate) == pytest.approx((floor / new_y_std) ** 2)
+
+
+def test_noise_floor_below_botorch_bound_keeps_botorch_bound() -> None:
+    """A floor smaller than BoTorch's own bound does not loosen it."""
+    surrogate = _fitted(ard=False, noise_std_floor=1e-9)
+
+    assert _noise_lower_bound(surrogate) == pytest.approx(1e-4)
+
+
+def test_noise_floor_survives_a_restore() -> None:
+    """A floored surrogate restores to the same bound and fitted noise."""
+    fitted = _fitted(ard=False, outputscale=True, noise_std_floor=0.3)
+    restored = FixedFeatureGPSurrogate(
+        _SmilesFeatureEncoder(), ard=False, outputscale=True, noise_std_floor=0.3
+    )
+    restored.restore(_observations(), fitted.get_state_dict())
+
+    assert _noise_lower_bound(restored) == pytest.approx(_noise_lower_bound(fitted))
+    assert _noise_std_original_scale(restored) == pytest.approx(
+        _noise_std_original_scale(fitted)
+    )
+
+
+@pytest.mark.parametrize("floor", [0.0, -0.1])
+def test_noise_floor_must_be_positive(floor: float) -> None:
+    """A zero or negative floor is rejected, by the surrogate and its config."""
+    with pytest.raises(ValueError, match="noise_std_floor must be positive"):
+        FixedFeatureGPSurrogate(_SmilesFeatureEncoder(), noise_std_floor=floor)
+    with pytest.raises(ValueError):
+        FixedFeatureGPSurrogateConfig(
+            encoder={"type": "MiniMolSmilesFixedEncoder"}, noise_std_floor=floor
+        )
+
+
 def test_scale_inputs_adds_normalize_by_default_and_can_be_disabled() -> None:
     """scale_inputs defaults to BoTorch's per-dimension min-max scaling."""
     assert isinstance(_fitted().get_model().input_transform, Normalize)
@@ -400,6 +482,93 @@ def test_fit_kwargs_reach_fit_gpytorch_mll(monkeypatch: pytest.MonkeyPatch) -> N
     assert seen == [{"max_attempts": 2}]
 
 
+_ABNORMAL = (
+    "`scipy_minimize` terminated with status OptimizationStatus.FAILURE, "
+    "displaying original message from `scipy.optimize.minimize`: ABNORMAL: "
+)
+
+
+def _recorded_warning(message: str, category: type[Warning]) -> Any:
+    """Return the WarningMessage that warnings.warn(message, category) records."""
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        warnings.warn(message, category)
+    return caught[0]
+
+
+def test_abnormal_handler_accepts_only_the_abnormal_failure() -> None:
+    """ABNORMAL counts as success; other optimizer failures still retry."""
+    assert accept_abnormal_lbfgsb_warnings(
+        _recorded_warning(_ABNORMAL, OptimizationWarning)
+    )
+    assert not accept_abnormal_lbfgsb_warnings(
+        _recorded_warning(
+            _ABNORMAL.replace("ABNORMAL: ", "ERROR: "), OptimizationWarning
+        )
+    )
+    # Warnings of other categories go to BoTorch's default handler, which
+    # rethrows them without a retry.
+    with pytest.warns(UserWarning):
+        assert accept_abnormal_lbfgsb_warnings(
+            _recorded_warning(_ABNORMAL, UserWarning)
+        )
+
+
+def _abnormal_optimizer(calls: list[int]) -> Any:
+    """Return an optimizer that fits, then warns as scipy's ABNORMAL end does."""
+
+    def optimizer(mll: Any, closure: Any = None, **kwargs: Any) -> Any:
+        calls.append(1)
+        result = fit_gpytorch_mll_scipy(mll, closure=closure, **kwargs)
+        warnings.warn(_ABNORMAL, OptimizationWarning)
+        return result
+
+    return optimizer
+
+
+def test_accept_abnormal_lbfgsb_keeps_the_first_attempt() -> None:
+    """With the option, an ABNORMAL end is kept rather than retried."""
+    calls: list[int] = []
+    surrogate = FixedFeatureGPSurrogate(
+        _SmilesFeatureEncoder(),
+        accept_abnormal_lbfgsb=True,
+        fit_kwargs={"optimizer": _abnormal_optimizer(calls)},
+    )
+    surrogate.fit(_observations())
+
+    assert calls == [1]
+    assert surrogate.fit_kwargs["warning_handler"] is accept_abnormal_lbfgsb_warnings
+
+
+def test_abnormal_ends_are_retried_by_default() -> None:
+    """Without the option, BoTorch retries every ABNORMAL end, then gives up."""
+    calls: list[int] = []
+    surrogate = FixedFeatureGPSurrogate(
+        _SmilesFeatureEncoder(),
+        fit_kwargs={"optimizer": _abnormal_optimizer(calls), "max_attempts": 2},
+    )
+
+    with pytest.warns(OptimizationWarning), pytest.raises(ModelFittingError):
+        surrogate.fit(_observations())
+    assert calls == [1, 1]
+    assert "warning_handler" not in surrogate.fit_kwargs
+
+
+def test_accept_abnormal_lbfgsb_keeps_an_explicit_warning_handler() -> None:
+    """A warning_handler already in fit_kwargs wins over the option."""
+
+    def handler(warning: Any) -> bool:
+        return False
+
+    surrogate = FixedFeatureGPSurrogate(
+        _SmilesFeatureEncoder(),
+        accept_abnormal_lbfgsb=True,
+        fit_kwargs={"warning_handler": handler},
+    )
+
+    assert surrogate.fit_kwargs["warning_handler"] is handler
+
+
 def test_rejects_malformed_encoder_output() -> None:
     """An encoder returning the wrong width is caught before the GP sees it."""
     surrogate = FixedFeatureGPSurrogate(_MalformedEncoder())
@@ -439,8 +608,10 @@ def test_config_builds_the_surrogate(tmp_path: Path) -> None:
             "kernel": "matern",
             "outputscale": True,
             "prior_mean": 0.04,
+            "noise_std_floor": 0.02,
             "scale_inputs": False,
             "max_cholesky_size": 100,
+            "accept_abnormal_lbfgsb": True,
             "state_path": str(state_path),
         }
     )
@@ -452,8 +623,10 @@ def test_config_builds_the_surrogate(tmp_path: Path) -> None:
     assert surrogate._kernel == "matern"
     assert surrogate._outputscale is True
     assert surrogate._prior_mean == 0.04
+    assert surrogate._noise_std_floor == 0.02
     assert surrogate.scale_inputs is False
     assert surrogate._max_cholesky_size == 100
+    assert surrogate.fit_kwargs["warning_handler"] is accept_abnormal_lbfgsb_warnings
     assert surrogate._state_path == state_path
 
 
@@ -467,5 +640,244 @@ def test_config_defaults_scale_inputs_to_true() -> None:
     assert parsed.kernel == "rbf"
     assert parsed.outputscale is False
     assert parsed.prior_mean is None
+    assert parsed.noise_std_floor is None
     assert parsed.scale_inputs is True
     assert parsed.max_cholesky_size is None
+    assert parsed.accept_abnormal_lbfgsb is False
+
+
+def _subset_surrogate(tmp_path: Path, size: int) -> SubsetFixedFeatureGPSurrogate:
+    """Return a subset GP keeping every y >= 1.0, recording into tmp_path."""
+    return SubsetFixedFeatureGPSurrogate(
+        _SmilesFeatureEncoder(),
+        selector=ThresholdRandomSubsetSelector(size=size, threshold=1.0),
+        subset_dir=tmp_path,
+    )
+
+
+def test_subset_surrogate_fits_on_the_selected_rows_only(tmp_path: Path) -> None:
+    """The GP trains on `size` rows of the archive, including the top tier."""
+    archive = _observations()
+    surrogate = _subset_surrogate(tmp_path, size=5)
+
+    surrogate.fit(archive)
+
+    subset = surrogate.last_subset
+    assert subset is not None
+    train_X, train_Y = surrogate.get_train_data()
+    assert train_X.shape == (5, 4)
+    top = {i for i, observation in enumerate(archive) if observation.y >= 1.0}
+    assert top <= set(subset.indices)
+    assert sorted(train_Y.squeeze(-1).tolist()) == pytest.approx(
+        sorted(archive[i].y for i in subset.indices)
+    )
+    profiling = surrogate.get_fit_profiling()
+    assert profiling["profiling/surrogate/archive_size"] == len(archive)
+    assert profiling["profiling/surrogate/subset_size"] == 5
+    assert profiling["profiling/surrogate/subset_top_count"] == len(top)
+
+
+def test_subset_surrogate_records_each_fit(tmp_path: Path) -> None:
+    """Each fit writes the rows it chose, numbered by fit."""
+    archive = _observations()
+    surrogate = _subset_surrogate(tmp_path, size=5)
+
+    surrogate.fit(archive)
+    surrogate.fit(archive)
+
+    for fit_index in (0, 1):
+        lines = (
+            (tmp_path / f"training_subset_fit_{fit_index:04d}.csv")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        )
+        assert lines[0] == "archive_index,x,fidelity,y"
+        assert len(lines) == 6
+    assert lines[1:] == [
+        f"{i},{archive[i].x},{archive[i].fidelity},{archive[i].y}"
+        for i in surrogate.last_subset.indices
+    ]
+
+
+def test_fixed_feature_gp_reports_its_learned_hyperparameters() -> None:
+    """The fit's own numbers reach the round, from the shared reader."""
+    surrogate = FixedFeatureGPSurrogate(_SmilesFeatureEncoder(), ard=False)
+    surrogate.fit(_observations())
+
+    metrics, figures = surrogate.drain_round_diagnostics(
+        include_figures=True, max_points=1000
+    )
+
+    assert figures == {}
+    prefix = "surrogate/fixed_feature_gp/hyperparameters/"
+    for name in ("noise", "outputscale", "lengthscale_median", "mean_constant"):
+        assert f"{prefix}{name}" in metrics
+    # Signal-to-noise is the reading this exists for, so both parts must be
+    # present and positive.
+    assert metrics[f"{prefix}noise"] > 0.0
+    assert metrics[f"{prefix}outputscale"] > 0.0
+
+
+def test_fixed_feature_gp_reports_a_clean_fit_as_zero_abnormal_exits() -> None:
+    """A clean fit is a zero on the chart, not a gap."""
+    surrogate = FixedFeatureGPSurrogate(_SmilesFeatureEncoder(), ard=False)
+    surrogate.fit(_observations())
+
+    metrics, _ = surrogate.drain_round_diagnostics(
+        include_figures=False, max_points=1000
+    )
+
+    assert metrics["surrogate/fixed_feature_gp/fit/abnormal_exits"] == 0.0
+    assert metrics["surrogate/fixed_feature_gp/fit/optimization_warnings"] == 0.0
+
+
+def test_fixed_feature_gp_counts_an_abnormal_optimizer_exit() -> None:
+    """A fit whose optimizer gives up on ABNORMAL ends is counted.
+
+    The default: BoTorch retries every abnormal end and then raises, so the
+    warning escapes the fit and this counts it.
+    """
+    calls: list[int] = []
+    surrogate = FixedFeatureGPSurrogate(
+        _SmilesFeatureEncoder(),
+        ard=False,
+        fit_kwargs={"optimizer": _abnormal_optimizer(calls), "max_attempts": 2},
+    )
+
+    with pytest.warns(OptimizationWarning), pytest.raises(ModelFittingError):
+        surrogate.fit(_observations())
+    metrics, _ = surrogate.drain_round_diagnostics(
+        include_figures=False, max_points=1000
+    )
+
+    # This is the case the counter exists for. The model is built before the
+    # optimizer runs, so a fit that raised still reports hyperparameters --
+    # the initial ones, never optimized, and indistinguishable from a good
+    # fit's. Only the count says the round should not be trusted.
+    assert metrics["surrogate/fixed_feature_gp/fit/abnormal_exits"] == 2.0
+    assert metrics["surrogate/fixed_feature_gp/fit/optimization_warnings"] == 2.0
+    assert "surrogate/fixed_feature_gp/hyperparameters/noise" in metrics
+
+
+def test_fixed_feature_gp_does_not_swallow_the_warnings_it_counts() -> None:
+    """Recording must leave the warning visible to everyone else."""
+    surrogate = FixedFeatureGPSurrogate(
+        _SmilesFeatureEncoder(),
+        ard=False,
+        fit_kwargs={"optimizer": _abnormal_optimizer([]), "max_attempts": 1},
+    )
+
+    # pytest.warns sits outside the recording context, so it only sees the
+    # warning if it was re-emitted.
+    with pytest.warns(OptimizationWarning), pytest.raises(ModelFittingError):
+        surrogate.fit(_observations())
+
+
+def test_fixed_feature_gp_resets_the_warning_count_each_fit() -> None:
+    """Last round's abnormal exit must not be reported against this round."""
+    surrogate = FixedFeatureGPSurrogate(_SmilesFeatureEncoder(), ard=False)
+    surrogate.fit(_observations())
+    surrogate._fit_warnings["abnormal"] = 3.0
+
+    surrogate.fit(_observations())
+    metrics, _ = surrogate.drain_round_diagnostics(
+        include_figures=False, max_points=1000
+    )
+
+    assert metrics["surrogate/fixed_feature_gp/fit/abnormal_exits"] == 0.0
+
+
+def test_fixed_feature_gp_reports_nothing_before_it_is_fitted() -> None:
+    """An unfitted surrogate has no hyperparameters to read."""
+    surrogate = FixedFeatureGPSurrogate(_SmilesFeatureEncoder())
+
+    metrics, figures = surrogate.drain_round_diagnostics(
+        include_figures=True, max_points=1000
+    )
+
+    assert metrics == {}
+    assert figures == {}
+
+
+def test_subset_surrogate_reports_its_training_set_composition(
+    tmp_path: Path,
+) -> None:
+    """What the GP was shown, beside what it learned from it."""
+    archive = _observations()
+    surrogate = _subset_surrogate(tmp_path, size=5)
+
+    surrogate.fit(archive)
+
+    metrics, _ = surrogate.drain_round_diagnostics(
+        include_figures=True, max_points=1000
+    )
+
+    prefix = "surrogate/subset_gp/train/"
+    assert metrics[f"{prefix}archive_size"] == len(archive)
+    assert metrics[f"{prefix}size"] == 5
+    assert metrics[f"{prefix}archive_fraction"] == pytest.approx(5 / len(archive))
+    top = sum(observation.y >= 1.0 for observation in archive)
+    assert metrics[f"{prefix}top_count"] == top
+    # The chosen rows, not the archive: every row above the threshold is kept,
+    # so the fraction is relative to the 5 fitted molecules.
+    chosen = [archive[index].y for index in surrogate.last_subset.indices]
+    assert metrics[f"{prefix}count_above_0.5"] == sum(y >= 0.5 for y in chosen)
+    assert metrics[f"{prefix}frac_above_0.5"] == pytest.approx(
+        sum(y >= 0.5 for y in chosen) / len(chosen)
+    )
+    assert metrics[f"{prefix}y_max"] == max(chosen)
+    # The composition and the hyperparameters arrive together.
+    assert "surrogate/fixed_feature_gp/hyperparameters/noise" in metrics
+
+
+def test_subset_surrogate_reports_a_full_archive_fraction_when_it_keeps_everything(
+    tmp_path: Path,
+) -> None:
+    """A budget no smaller than the archive makes the selection the identity."""
+    archive = _observations()
+    surrogate = _subset_surrogate(tmp_path, size=len(archive) + 5)
+
+    surrogate.fit(archive)
+    metrics, _ = surrogate.drain_round_diagnostics(
+        include_figures=False, max_points=1000
+    )
+
+    assert metrics["surrogate/subset_gp/train/size"] == len(archive)
+    assert metrics["surrogate/subset_gp/train/archive_fraction"] == 1.0
+
+
+def test_subset_surrogate_rejects_incremental_updates(tmp_path: Path) -> None:
+    """update() would grow the training set past the subset size."""
+    surrogate = _subset_surrogate(tmp_path, size=5)
+    surrogate.fit(_observations())
+
+    with pytest.raises(NotImplementedError, match="fit\\(\\) with the full archive"):
+        surrogate.update(_observations()[:1])
+
+
+def test_subset_config_builds_the_surrogate_and_rejects_state_path(
+    tmp_path: Path,
+) -> None:
+    """The union selects the subset config; a saved state is refused."""
+    data = {
+        "type": "SubsetFixedFeatureGPSurrogate",
+        "encoder": {"type": "MiniMolSmilesFixedEncoder"},
+        "training_subset": {"type": "ThresholdRandom", "size": 10, "threshold": 0.2},
+        "subset_dir": str(tmp_path),
+        "max_cholesky_size": 100,
+        "noise_std_floor": 0.02,
+    }
+
+    parsed = TypeAdapter(SurrogateConfig).validate_python(data)
+
+    assert isinstance(parsed, SubsetFixedFeatureGPSurrogateConfig)
+    surrogate = parsed.build()
+    assert isinstance(surrogate, SubsetFixedFeatureGPSurrogate)
+    assert surrogate._selector.size == 10
+    assert surrogate._subset_dir == tmp_path
+    assert surrogate._max_cholesky_size == 100
+    assert surrogate._noise_std_floor == 0.02
+    with pytest.raises(ValueError, match="does not support state_path"):
+        TypeAdapter(SurrogateConfig).validate_python(
+            {**data, "state_path": str(tmp_path / "state.pt")}
+        )

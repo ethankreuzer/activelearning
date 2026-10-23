@@ -6,7 +6,7 @@ Run once, before any arm. It does two things:
    10M set become their own CSVs, so an arm never loads 10M rows. That matters:
    the study measures peak memory, and loading the full set would dominate the
    measurement it exists to produce. ``--strat-sizes`` additionally writes the
-   stratified farthest-point sets described in :mod:`scripts.stratified_fps`,
+   stratified farthest-point sets described in :mod:`activelearning.surrogate.stratified_fps`,
    which keep half the budget in the top tail and spread the rest over the
    target distribution.
 2. **Builds one MiniMol feature cache per evaluation set.** The 20.5 GB cache at
@@ -628,7 +628,7 @@ def build_stratified_sets(
     tuple[list[ResolvedSet], dict[str, Any]]
         One resolved set per requested size, and the selection diagnostics.
     """
-    from scripts.stratified_fps import select_stratified_rows
+    from activelearning.surrogate.stratified_fps import select_stratified_rows
 
     label = args.strat_label
     pool_name = f"{label}_pool"
@@ -666,6 +666,7 @@ def build_stratified_sets(
         top_fraction=args.strat_top_fraction,
         pool_multiple=args.strat_pool_multiple,
         band_fill=args.strat_band_fill,
+        keep_above=args.strat_keep_above,
         seed=args.strat_seed,
         device=args.encoder_device,
     )
@@ -772,6 +773,17 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
             "the <label>_<n> and <label>_pool caches. Change it whenever the "
             "selection settings change, so a new mix cannot overwrite an "
             "earlier one and leave its arms unreproducible."
+        ),
+    )
+    parser.add_argument(
+        "--strat-keep-above",
+        type=float,
+        default=None,
+        help=(
+            "Keep every row with a target at or above this outright, with no "
+            "farthest-point sampling, out of each size's budget. The band edges "
+            "stay the library quantiles, so the top band ends here. Unset keeps "
+            "none."
         ),
     )
     parser.add_argument("--strat-seed", type=int, default=42)
@@ -979,7 +991,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         # product of the two sets' shares of the 10M pool -- a few hundred rows
         # at most -- but it is measured rather than assumed, because the whole
         # point of these sets is that the off-train metrics become meaningful.
-        from scripts.stratified_fps import count_overlap
+        from activelearning.surrogate.stratified_fps import count_overlap
 
         by_name = {entry.name: entry for entry in resolved_sets}
         overlaps: dict[str, dict[str, int]] = {}
