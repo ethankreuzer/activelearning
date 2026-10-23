@@ -11,6 +11,9 @@
 # two land side by side in ampc-exact-dkl-balanced. What differs is the GP; see
 # config/ampc/fixed_feature_gp_balanced.yaml.
 #
+# TRAIN_SET=fps_keep05 fits the same GP on the FPS + keep-y>=0.5 set instead,
+# in its own W&B project (ampc-fixed-gp-fps-keep-above); see TRAIN_SET below.
+#
 # What to read first: run/fit/converged (1 only if the last L-BFGS-B attempt met
 # scipy's convergence test; BoTorch also accepts running out of iterations) and
 # run/fit/lbfgs_attempts (above 1 means BoTorch restarted from prior draws).
@@ -40,7 +43,64 @@
 
 set -euo pipefail
 
-ARM="balanced_25000_fixedgp"
+# Training set, balanced (data/ampc_balanced_25000.csv), fps_keep05 (the same
+# stratified farthest-point selection with every 10M row at y >= 0.5 kept, built
+# by jobs/exact_dkl_fps_keep05_prepare.sh), fps_keep05_r1 (that selection over
+# the round-1 archive) or fps_keep05_45k (it at 45,000 rows). It sets the config, the directory,
+# the W&B project and group, the training-set tags and the notes together, and
+# nothing else, so the two sets are fitted and evaluated identically:
+#   TRAIN_SET=fps_keep05 PRECISION=32 KERNEL=iso FAMILY=matern OUTPUTSCALE=1 \
+#     PRIOR_MEAN=0.03956042999405787 sbatch --time=2:00:00 jobs/fixed_feature_gp_balanced_nibi.sh
+TRAIN_SET="${TRAIN_SET:-balanced}"
+case "${TRAIN_SET}" in
+  balanced)
+    CONFIG="config/ampc/fixed_feature_gp_balanced.yaml"
+    ARM="balanced_25000_fixedgp"
+    WANDB_PROJECT="ampc-exact-dkl-balanced"
+    WANDB_GROUP="fixed-feature-gp-balanced"
+    SET_TAGS="n25000,proportional,top5pct"
+    MAX_CHOLESKY=30000
+    SET_NOTE="the 25000-molecule BALANCED training set data/ampc_balanced_25000.csv -- the same set, fingerprints and evaluation as balanced-25000-nolayer, the exact-DKL arm the reward-shape study restores."
+    ;;
+  fps_keep05)
+    CONFIG="config/ampc/fixed_feature_gp_fps_keep05.yaml"
+    ARM="fps_keep05_25000_fixedgp"
+    WANDB_PROJECT="ampc-fixed-gp-fps-keep-above"
+    WANDB_GROUP="fixed-feature-gp-fps-keep05"
+    SET_TAGS="n25000,proportional,top5pct,keep-above-0.5"
+    MAX_CHOLESKY=30000
+    SET_NOTE="the 25000-molecule training set data/ampc_fps_keep05_25000.csv: every 10M row at y >= 0.5 (pProp ~4.85) kept outright, then the balanced set's stratified farthest-point selection for the rest (library quantile bands at 50/75/90/95/99/99.75%, the top band [0.232, 0.5) at 5% of the budget, the lower bands proportional to the library, FPS within each band, seed 42). Same fingerprints and evaluation as the balanced arms."
+    ;;
+  fps_keep05_r1)
+    # The same selection over the ROUND-1 archive: the 10M library plus the
+    # 10,000 molecules the first reward-shape round docked
+    # (jobs/exact_dkl_fps_keep05_r1_prepare.sh). Same project and group as the
+    # round-0 arm, so the two fits compare directly.
+    CONFIG="config/ampc/fixed_feature_gp_fps_keep05_r1.yaml"
+    ARM="fps_keep05_r1_25000_fixedgp"
+    WANDB_PROJECT="ampc-fixed-gp-fps-keep-above"
+    WANDB_GROUP="fixed-feature-gp-fps-keep05"
+    SET_TAGS="n25000,proportional,top5pct,keep-above-0.5,round1-archive"
+    MAX_CHOLESKY=30000
+    SET_NOTE="the 25000-molecule training set data/round1/ampc_fps_keep05_r1_25000.csv: the fps_keep05 selection run again over the ROUND-1 archive (the 10M library plus the 9,887 molecules the first reward-shape round docked, 699 of them at y >= 0.5), so every row at y >= 0.5 kept outright is now ~1212 rather than 513, and the bands draw from library and generated molecules together. Selector, hyperparameters, fingerprints and evaluation otherwise identical to the round-0 arm -- this simulates the GP the next active-learning round would fit."
+    ;;
+  fps_keep05_45k)
+    # The same selection at 45,000 rows (SIZE=45000 jobs/exact_dkl_fps_keep05_prepare.sh),
+    # in the same W&B project and group as the 25,000 arm so the two compare
+    # directly.
+    CONFIG="config/ampc/fixed_feature_gp_fps_keep05_45k.yaml"
+    ARM="fps_keep05_45000_fixedgp"
+    WANDB_PROJECT="ampc-fixed-gp-fps-keep-above"
+    WANDB_GROUP="fixed-feature-gp-fps-keep05"
+    SET_TAGS="n45000,proportional,top5pct,keep-above-0.5"
+    MAX_CHOLESKY=50000
+    SET_NOTE="the 45000-molecule training set data/ampc_fps_keep05_n45000_45000.csv: the fps_keep05 selection at 45,000 rows instead of 25,000 -- every 10M row at y >= 0.5 (pProp ~4.85) kept outright, then the balanced set's stratified farthest-point selection for the rest (library quantile bands at 50/75/90/95/99/99.75%, the top band [0.232, 0.5) at 5% of the budget, the lower bands proportional to the library, FPS within each band, seed 42). Same fingerprints and evaluation as the balanced arms."
+    ;;
+  *)
+    echo "TRAIN_SET must be balanced, fps_keep05, fps_keep05_r1 or fps_keep05_45k." >&2
+    exit 2
+    ;;
+esac
 # Fit precision, 64 (the config's) or 32 (the DKL no-layer arm's). It sets the
 # override, the directory, the tags and the notes together, so a float32 run is
 # never labelled float64:
@@ -159,6 +219,8 @@ source .venv/bin/activate
 
 export PYTHONUNBUFFERED=1
 export HF_HUB_OFFLINE=1   # compute nodes have no internet
+# Fewer fragmentation OOMs near the H100's 80 GB, which the 45,000-row fit nears.
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # wandb.init() defaults to online and blocks on api.wandb.ai, which this node
 # cannot reach. Offline writes to ${WANDB_DIR}; sync from a login node after.
 export WANDB_MODE=offline
@@ -169,16 +231,16 @@ export WANDB_DIR="${OUTPUT_DIR}"
 mkdir -p "${WANDB_DIR}" slurm_logs
 
 # Shown on the W&B run's Overview page and kept next to the outputs.
-export WANDB_NOTES="Exact GP (no inducing points, no minibatching) fitted to the 25000-molecule BALANCED training set data/ampc_balanced_25000.csv -- the same set, fingerprints and evaluation as balanced-25000-nolayer, the exact-DKL arm the reward-shape study restores.
+export WANDB_NOTES="Exact GP (no inducing points, no minibatching) fitted to ${SET_NOTE}
 Surrogate: FixedFeatureGPSurrogate, i.e. BoTorch's default SingleTaskGP on the frozen 512-d MiniMol AmpC fingerprints. Kernel: ${KERNEL_NOTE}, and ${SCALE_NOTE}. Likelihood: Gaussian with the LogNormal(-4, 1) noise prior. Mean: ${MEAN_NOTE}. Inputs min-max scaled per dimension to [0, 1] (scale_inputs=true); targets standardized.
-Fit: BoTorch fit_gpytorch_mll (scipy L-BFGS-B) run to convergence, on an exact Cholesky marginal likelihood (max_cholesky_size=30000), float${PRECISION} on one H100. The balanced-25000-nolayer arm instead used a prior-free Matern-5/2 kernel with an output scale on fingerprints divided by one fixed scalar, fitted by 1000 Adam steps in float32 that had not converged.
+Fit: BoTorch fit_gpytorch_mll (scipy L-BFGS-B) run to convergence, on an exact Cholesky marginal likelihood (max_cholesky_size=${MAX_CHOLESKY}), float${PRECISION} on one H100. The balanced-25000-nolayer arm instead used a prior-free Matern-5/2 kernel with an output scale on fingerprints divided by one fixed scalar, fitted by 1000 Adam steps in float32 that had not converged.
 train/epoch/* here is indexed by L-BFGS-B objective evaluation, line searches included, not by epoch. The loss includes the hyperparameter priors, so its level is not comparable with the DKL arm's.
 Acquisition scoring skipped, as for the DKL arms.
-Arm suffix: ${ARM_SUFFIX:-none}. Submitted with: sbatch jobs/fixed_feature_gp_balanced_nibi.sh $*   (Slurm job ${SLURM_JOB_ID:-unknown})"
+Arm suffix: ${ARM_SUFFIX:-none}. Submitted with: TRAIN_SET=${TRAIN_SET} sbatch jobs/fixed_feature_gp_balanced_nibi.sh $*   (Slurm job ${SLURM_JOB_ID:-unknown})"
 printf '%s\n' "${WANDB_NOTES}" > "${OUTPUT_DIR}/arm_description.txt"
 
 uv run --no-sync python -m scripts.exact_dkl_top_n \
-  config/ampc/fixed_feature_gp_balanced.yaml \
+  "${CONFIG}" \
   "runtime.precision=${PRECISION}" \
   "${ARD_OVERRIDE}" \
   ${EXTRA_OVERRIDES[@]+"${EXTRA_OVERRIDES[@]}"} \
@@ -186,10 +248,10 @@ uv run --no-sync python -m scripts.exact_dkl_top_n \
   --cache-dir cache/ampc/exact_dkl_top_n \
   --eval-chunk-size 2000 \
   --skip-scoring \
-  --wandb-project ampc-exact-dkl-balanced \
+  --wandb-project "${WANDB_PROJECT}" \
   --wandb-entity models-mila5723 \
-  --wandb-group fixed-feature-gp-balanced \
-  --wandb-tags "fixed-feature-gp,botorch-default,${FAMILY},${KERNEL_TAG},lbfgs,exact-cholesky,fp${PRECISION},n25000,proportional,top5pct${ARM_SUFFIX:+,${ARM_SUFFIX#_}}" \
+  --wandb-group "${WANDB_GROUP}" \
+  --wandb-tags "fixed-feature-gp,botorch-default,${FAMILY},${KERNEL_TAG},lbfgs,exact-cholesky,fp${PRECISION},${SET_TAGS}${ARM_SUFFIX:+,${ARM_SUFFIX#_}}" \
   --run-name "${ARM//_/-}-${SLURM_JOB_ID}" \
   "$@"
 

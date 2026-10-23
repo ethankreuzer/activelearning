@@ -98,10 +98,17 @@ fi
 # Which restored surrogate the arm trains against. nolayer (the default) is the
 # DKL no-layer state every earlier arm used; fixedgp_iso is the isotropic
 # fixed-feature GP (config/ampc/reward_shape_fixedgp_iso.yaml), identical in
-# every other setting. Like ARM_SUFFIX it comes from the environment, and it
-# sets the config, the state, the directory, the tags and the notes together:
+# every other setting. fixedgp_fps_keep05 is the isotropic Matern GP (output
+# scale, pinned mean) fitted to the FPS + keep-y>=0.5 training set
+# (config/ampc/reward_shape_fixedgp_fps_keep05.yaml). Like ARM_SUFFIX it comes
+# from the environment, and it sets the config, the state, the directory, the
+# tags and the notes together:
 #   SURROGATE=fixedgp_iso sbatch jobs/reward_shape_nibi.sh power 0.1 1000 5000
 SURROGATE="${SURROGATE:-nolayer}"
+# The W&B project. Arms on the balanced training set share ampc-reward-shape;
+# an arm on a different training set gets its own project, so the datasets
+# never mix in one runs table.
+WANDB_PROJECT="ampc-reward-shape"
 if [[ "${SURROGATE}" == nolayer ]]; then
   BASE_CONFIG="config/ampc/reward_shape.yaml"
   FITTED_DIR="outputs/ampc/exact_dkl_top_n/balanced_25000_nolayer"
@@ -114,8 +121,14 @@ elif [[ "${SURROGATE}" == fixedgp_iso ]]; then
   # the directories they already have. _fp32 because a float64 arm of this name
   # was started and cancelled; its directory holds no pool.
   ARM="${ARM}_fixedgp_iso_fp32"
+elif [[ "${SURROGATE}" == fixedgp_fps_keep05 ]]; then
+  BASE_CONFIG="config/ampc/reward_shape_fixedgp_fps_keep05.yaml"
+  FITTED_DIR="outputs/ampc/exact_dkl_top_n/fps_keep05_25000_fixedgp_iso_matern_scaled_pm0.03956_fp32"
+  SURROGATE_TAGS="fixedgp-iso-matern,outputscale,pinned-mean,fps-keep05,fp32"
+  ARM="${ARM}_fixedgp_fps_keep05_fp32"
+  WANDB_PROJECT="ampc-reward-shape-fps-keep-above"
 else
-  echo "SURROGATE must be nolayer or fixedgp_iso." >&2
+  echo "SURROGATE must be nolayer, fixedgp_iso or fixedgp_fps_keep05." >&2
   exit 2
 fi
 # Optional suffix for rerunning an arm whose settings are unchanged, so the
@@ -161,6 +174,8 @@ if [[ ! -f "${STATE_PATH}" ]]; then
   echo "${STATE_PATH} not found: fit that surrogate first, with" >&2
   echo "  sbatch jobs/exact_dkl_balanced.sh 25000 none        (nolayer)" >&2
   echo "  KERNEL=iso sbatch jobs/fixed_feature_gp_balanced_nibi.sh  (fixedgp_iso)" >&2
+  echo "  TRAIN_SET=fps_keep05 PRECISION=32 KERNEL=iso FAMILY=matern OUTPUTSCALE=1 \\" >&2
+  echo "    PRIOR_MEAN=0.03956042999405787 sbatch jobs/fixed_feature_gp_balanced_nibi.sh  (fixedgp_fps_keep05)" >&2
   exit 2
 fi
 # Never overwrite an earlier run's generated pool: it is hours of sampling, and
@@ -175,9 +190,14 @@ fi
 export WANDB_DIR="${OUTPUT_DIR}"
 mkdir -p "${WANDB_DIR}" slurm_logs
 
+TRAIN_SET_TEXT="the 25000-molecule BALANCED training set data/ampc_balanced_25000.csv -- the library-proportional mix, top band floored at 5% of the budget --"
 if [[ "${SURROGATE}" == nolayer ]]; then
   SURROGATE_TEXT="Features: frozen MiniMol AmpC fingerprints with NO trainable layer, the kernel reading the 512-d fingerprints directly. GP prior mean: learned during that fit, not pinned. float32.
 Why this surrogate: it is the first in the study whose uncertainty is not collapsed -- 88% of truths within 2 std on unseen ampc_331k against 6% for the width-256 arm, and a GIBBON effective support of ~21 molecules rather than 2."
+elif [[ "${SURROGATE}" == fixedgp_fps_keep05 ]]; then
+  TRAIN_SET_TEXT="the 25000-molecule training set data/ampc_fps_keep05_25000.csv -- every 10M row at y >= 0.5 kept outright, the rest by the balanced set's stratified farthest-point selection (library quantile bands, top band [0.232, 0.5) at 5% of the budget, lower bands proportional to the library) --"
+  SURROGATE_TEXT="SURROGATE: the ISOTROPIC fixed-feature GP (FixedFeatureGPSurrogate, ard=false) with a Matern-5/2 kernel, a learned output scale and the constant mean PINNED at the 10M library mean 0.03956, fitted to the FPS + keep-y>=0.5 training set (config/ampc/reward_shape_fixedgp_fps_keep05.yaml); every other setting is that of the nolayer arm with the same name. BoTorch's SingleTaskGP on the same frozen 512-d MiniMol AmpC fingerprints, min-max scaled to [0, 1], fitted to convergence by L-BFGS-B in float32.
+Why this surrogate and training set: stratified farthest-point selection is what keeps this GP calibrated (realistic noise and lengthscale), and forcing in every library row at y >= 0.5 improved ranking on every evaluation set at the cost of a small library-wide upward bias (analyze_archive_diversity/ARCHIVE_DIVERSITY_ANALYSIS.md, step 4a). This arm tests it as the reward before the multi-round loop uses it."
 else
   SURROGATE_TEXT="SURROGATE: the ISOTROPIC fixed-feature GP (FixedFeatureGPSurrogate, ard=false), not the DKL no-layer surrogate the earlier arms used; every other setting is that of the nolayer arm with the same name (config/ampc/reward_shape_fixedgp_iso.yaml). BoTorch's SingleTaskGP on the same frozen 512-d MiniMol AmpC fingerprints, min-max scaled to [0, 1], with ONE RBF lengthscale shared by all features under BoTorch's dimension-scaled LogNormal lengthscale prior and the LogNormal(-4, 1) noise prior, fitted to convergence by L-BFGS-B in 80 s in float32 (lengthscale 2.67, noise 0.27 standardized; a float64 fit agrees to four decimals in every hyperparameter and held-out metric). float32, like the nolayer arms.
 Why this surrogate: it is the first one fitted to convergence under priors. Offline it matched or beat the DKL no-layer surrogate on the mean (Pearson 0.70 vs 0.68 on unseen ampc_331k, 0.59 vs 0.59 on gp_molformer_set), with a similar latent std level, but its std ranked errors less well on gp_molformer_set (Spearman 0.17 vs 0.22). This arm tests which of the two makes the better reward."
@@ -204,7 +224,7 @@ fi
 export WANDB_NOTES="REWARD-SHAPE arm ${ARM}: ONE active-learning round, training the S3-GFN policy against a fixed GIBBON acquisition on a frozen surrogate.
 THE QUESTION THIS RUN ASKS: does the trained policy generate molecules the acquisition rates higher than the ones the untrained prior produces? Not validity, not docking -- those are read but are not what this arm is for. The answer comes from scoring BOTH pools afterwards with this same restored surrogate and ONE acquisition object, and comparing two distributions on each: the surrogate posterior MEAN, and log(acquisition). The generated pool is written to ${POOL_LOG_PATH} as soon as generation finishes, then prepared and scored alongside gp_molformer_set (83,811 docked prior samples) via exact_dkl_prepare.py --extra-set and exact_dkl_top_n.py --extra-set, which also reports pooled/acquisition/*/top{k}/<set>_share: which of the two pools the acquisition would actually pick from. Both sets must be scored in the SAME invocation, because GIBBON ranks against sampled posterior max-values and a separate run would draw different ones.
 WHAT IS NEW HERE, against the 2026-10-12 arms: the loss (vargrad, below) and the log-score floor (-150, was -100). Selection scoring now runs in chunks of 64 (acquisition.score_chunk_size, was 256). Every earlier arm, including the first vargrad floor -150 run (job 5493805), died at selection with 'Tried to allocate 12.21 GiB': gpytorch's exact-GP posterior concatenates the 25,000 training molecules onto every candidate in a chunk, so memory scales with the chunk size, and the earlier kernel-side fix never applied to that path. At 64 the same path already ran every S3-GFN training step, and job 5515579 scored a 100k pool with it at ~17 GiB peak. This is therefore the first arm expected to reach docking.${SUFFIX_TEXT}
-Surrogate: RESTORED, NOT REFITTED. The exact GP (no inducing points, no minibatching) is rebuilt on the 25000-molecule BALANCED training set data/ampc_balanced_25000.csv -- the library-proportional mix, top band floored at 5% of the budget -- and its fitted parameters are loaded from ${STATE_PATH} in place of training, so every arm of this study shares one surrogate exactly. See ${FITTED_DIR}/arm_description.txt for how that fit was obtained. ${SURROGATE_TEXT}
+Surrogate: RESTORED, NOT REFITTED. The exact GP (no inducing points, no minibatching) is rebuilt on ${TRAIN_SET_TEXT} and its fitted parameters are loaded from ${STATE_PATH} in place of training, so every arm of this study shares one surrogate exactly. See ${FITTED_DIR}/arm_description.txt for how that fit was obtained. ${SURROGATE_TEXT}
 Acquisition: GIBBON (QLowerBoundMaxValueEntropy), log_space=true so the information gain never underflows, log_output=false so it is returned on the VALUE scale, which is what the reward transform needs. Max-value support is the 25,000 training molecules.
 Reward: transform=${TRANSFORM}, beta=${BETA}. ${REWARD_TEXT}. The loss uses beta * score as log R, so R = exp(beta * score) is always positive even where the logged post-transform score is negative.
 ${NORMALIZER_TEXT}
@@ -233,7 +253,7 @@ TAGS="reward-shape,${TRANSFORM},beta${BETA},${LOSS_TAGS},floor${LOG_SCORE_FLOOR}
 # onto the config's list dies with "Cannot merge DictConfig with ListConfig".
 # Lists are replaced wholesale on merge, which is why job_10k_eager.sh and the
 # reward_* overlays restate the logger too.
-LOGGER="logger={type: MultiLogger, loggers: [{type: ConsoleLogger, project_name: ampc-reward-shape, run_name: ${RUN_NAME}}, {type: WandbLogger, project_name: ampc-reward-shape, run_name: ${RUN_NAME}, entity: models-mila5723, group: reward-shape, tags: [nibi,${TAGS}]}]}"
+LOGGER="logger={type: MultiLogger, loggers: [{type: ConsoleLogger, project_name: ${WANDB_PROJECT}, run_name: ${RUN_NAME}}, {type: WandbLogger, project_name: ${WANDB_PROJECT}, run_name: ${RUN_NAME}, entity: models-mila5723, group: reward-shape, tags: [nibi,${TAGS}]}]}"
 
 # scripts/run_with_sigterm_flush.py wraps activelearning.main so the SIGTERM
 # Slurm sends at the wall clock becomes a clean shutdown, flushing buffered

@@ -796,3 +796,73 @@ def test_ampc_reward_shape_fixedgp_iso_config_parses() -> None:
     for raw in (iso, dkl):
         del raw["surrogate"]
     assert iso == dkl
+
+
+def test_ampc_fixed_feature_gp_fps_keep05_round1_config_parses() -> None:
+    """Ensure the round-1 archive's fit config parses and only moves its data.
+
+    The round-1 arm simulates the next active-learning round's GP, so it must
+    differ from the round-0 arm in the training CSV and its feature cache and
+    in nothing else: same kernel, output scale, pinned mean and evaluation.
+    """
+    config_dir = REPOSITORY_ROOT / "config" / "ampc"
+    config_path = config_dir / "fixed_feature_gp_fps_keep05_r1.yaml"
+
+    config = load_and_parse(config_path, ActiveLearningConfig)
+
+    assert config.surrogate.type == "FixedFeatureGPSurrogate"
+    assert config.surrogate.state_path is None
+    assert config.surrogate.encoder.feature_cache_path == Path(
+        "cache/ampc/exact_dkl_top_n/fps_keep05_r1_25000.npy"
+    )
+
+    raw = OmegaConf.to_container(OmegaConf.load(config_path))
+    round0 = OmegaConf.to_container(
+        OmegaConf.load(config_dir / "fixed_feature_gp_fps_keep05.yaml")
+    )
+    assert raw["dataset"]["initial_data"]["path"] == "data/round1/ampc_fps_keep05_r1_25000.csv"
+    raw["dataset"]["initial_data"]["path"] = round0["dataset"]["initial_data"]["path"]
+    raw["surrogate"]["encoder"]["feature_cache_path"] = round0["surrogate"]["encoder"][
+        "feature_cache_path"
+    ]
+    assert raw == round0
+
+
+def test_ampc_reward_shape_fixedgp_fps_keep05_config_parses() -> None:
+    """Ensure the FPS + keep-y>=0.5 fixed-feature GP reward-shape arm parses.
+
+    It restores the isotropic Matern fit with an output scale and a pinned mean
+    on its own training set, and must otherwise stay identical to
+    reward_shape.yaml, so the arms differ in the surrogate and its training set
+    alone.
+    """
+    config_dir = REPOSITORY_ROOT / "config" / "ampc"
+    config_path = config_dir / "reward_shape_fixedgp_fps_keep05.yaml"
+
+    config = load_and_parse(config_path, ActiveLearningConfig)
+
+    assert config.surrogate.type == "FixedFeatureGPSurrogate"
+    assert config.surrogate.ard is False
+    assert config.surrogate.kernel == "matern"
+    assert config.surrogate.outputscale is True
+    assert config.surrogate.prior_mean == 0.03956042999405787
+    assert config.surrogate.state_path == Path(
+        "outputs/ampc/exact_dkl_top_n/"
+        "fps_keep05_25000_fixedgp_iso_matern_scaled_pm0.03956_fp32/surrogate_state.pt"
+    )
+    assert config.surrogate.encoder.type == "MiniMolAmpcSmilesFixedEncoder"
+    assert config.surrogate.encoder.cache_only is False
+    assert config.surrogate.encoder.feature_cache_path == Path(
+        "cache/ampc/exact_dkl_top_n/fps_keep05_25000.npy"
+    )
+    assert config.runtime.precision == 32
+    assert config.budget.max_rounds == 1
+
+    raw = OmegaConf.to_container(OmegaConf.load(config_path))
+    dkl = OmegaConf.to_container(OmegaConf.load(config_dir / "reward_shape.yaml"))
+    assert raw["dataset"]["initial_data"]["path"] == "data/ampc_fps_keep05_25000.csv"
+    # The training CSV is the only dataset setting allowed to differ.
+    raw["dataset"]["initial_data"]["path"] = dkl["dataset"]["initial_data"]["path"]
+    for config_dict in (raw, dkl):
+        del config_dict["surrogate"]
+    assert raw == dkl

@@ -1,0 +1,126 @@
+# The fixed-feature GP on the stratified farthest-point selection with every
+# 10M row at y >= 0.5 kept (data/ampc_fps_keep05_25000.csv, built by
+# jobs/exact_dkl_fps_keep05_prepare.sh), evaluated exactly as the balanced arm.
+#
+#   TRAIN_SET=fps_keep05 sbatch jobs/fixed_feature_gp_balanced_nibi.sh
+#
+# Identical to fixed_feature_gp_balanced.yaml except the training CSV and its
+# feature cache; the job sets the kernel, output scale, prior mean and
+# precision from the same environment variables.
+#
+# Like exact_dkl_top_n.yaml, which this mirrors outside the surrogate block,
+# the sampler, oracle, selector and budget sections are never built but must
+# stay valid, because ActiveLearningConfig validates the whole file.
+
+runtime:
+  device: cuda
+  # float64, unlike the DKL arm's 32: BoTorch's fitting is tuned for it, and
+  # L-BFGS-B's convergence test needs the precision. A reward-shape arm that
+  # restores this state must run at precision 64 too.
+  precision: 64
+  seed: 42
+
+dataset:
+  type: ListDataset
+  initial_data:
+    path: data/ampc_fps_keep05_25000.csv
+    x_columns: SMILE
+    y_column: y
+    fidelity_column: fidelity
+
+surrogate:
+  type: FixedFeatureGPSurrogate
+  encoder:
+    # The fixed encoder the training cache was written by, so the DKL arm's
+    # cache is read as is.
+    type: MiniMolAmpcSmilesFixedEncoder
+    checkpoint_path: minimol_ampc_encoder/model/final.pt
+    package_path: minimol_ampc_encoder
+    device: cpu  # Never used: inference is disabled by cache_only.
+    batch_size: 64  # Never used: inference is disabled by cache_only below.
+    cache_size: 0  # The persistent per-set cache is the only cache needed.
+    # A cache miss is a loud error rather than silent MiniMol inference.
+    cache_only: true
+    feature_cache_path: cache/ampc/exact_dkl_top_n/fps_keep05_25000.npy
+  # One lengthscale per feature, BoTorch's default. false shares one
+  # lengthscale across all 512 under the same prior; the job sets it from
+  # KERNEL=ard|iso.
+  ard: true
+  # Per-dimension min-max to [0, 1], which the dimension-scaled lengthscale
+  # prior assumes.
+  scale_inputs: true
+  standardize_outputs: true
+  # Above GPyTorch's default of 800 rows the marginal likelihood is a stochastic
+  # estimate (conjugate gradients plus Lanczos quadrature), and L-BFGS-B's line
+  # search assumes a deterministic objective. An exact Cholesky of the
+  # 25,000 x 25,000 kernel is ~5 GB in float64. Only the fit uses it;
+  # prediction keeps GPyTorch's defaults, as the DKL arm's did.
+  max_cholesky_size: 30000
+
+acquisition:
+  # GIBBON by default; the qMFMES arms override `type`. The script scores
+  # GIBBON twice, once on the value scale and once on the log scale, so
+  # log_output is set per scoring pass rather than here.
+  type: QLowerBoundMaxValueEntropy
+  candidate_set_spec:
+    # The support for max-value sampling is the training set itself. At
+    # n <= 3000 the fallback never triggers, so both acquisitions see exactly
+    # the fitted molecules.
+    type: TrainDataCandidateSetSpec
+    fallback_size: 100000
+    seed: 42
+  num_mv_samples: 10
+  score_chunk_size: 5000
+  maximize: true
+  log_space: true
+  log_output: false
+
+sampler:
+  type: S3GFNSampler
+  n_samples: 100000
+  fidelities: [1]
+  model_name_or_path: ibm-research/GP-MoLFormer-Uniq
+  tokenizer_name_or_path: ibm-research/MoLFormer-XL-both-10pct
+  trust_remote_code: true
+  performance_mode: optimized
+  max_length: 80
+  batch_size: 64
+  replay_batch_size: 64
+  generation_batch_size: 128
+  n_train_steps: 2500
+  num_warmup_steps: 10
+  beta: 1.0
+  aux_coefficient: 0.001
+  sa_threshold: 4.0
+
+selector:
+  type: CostAwareSelector
+
+oracle:
+  type: Dock3Oracle
+  mol_repr: smiles
+  indock_template: /home/ethankrz/dock_smiles/ampc_dockfiles/INDOCK
+  dockfiles_dir: /home/ethankrz/dock_smiles/ampc_dockfiles
+  fidelity_costs:
+    1: 1.0
+  fidelity_confidences:
+    1: 1.0
+  num_workers: null
+  ligbuild_timeout: 150
+  hitrate_params: ampc_hitrate_fits/fitted_params.json
+  score_pprop_table: ampc_hitrate_fits/data/full_scores.df
+  hitrate_target: ampc
+  pki_threshold: 6.5
+
+budget:
+  available_budget: 100000.0
+  schedule:
+    type: constant
+    value: 10000.0
+
+logger:
+  # Stripped by the script, which builds its own run logger from the
+  # --wandb-* flags.
+  type: ConsoleLogger
+  project_name: ampc-exact-dkl-top-n
+  run_name: exact-dkl-top-n

@@ -1,0 +1,234 @@
+# S3-GFN molecule experiment: the 10M archive with an exact GP on fine-tuned
+# MiniMol AmpC representations, fitted each round on a fixed-size subset of the
+# archive rather than on all of it.
+#
+# The dataset is the archive: the 10M initial set plus every round's docked
+# acquisitions, all kept. Each round SubsetFixedFeatureGPSurrogate chooses
+# `training_subset.size` rows of it -- every row with y >= threshold, then a
+# fill -- and fits the chosen exact GP (isotropic Matern-5/2 + ScaleKernel,
+# mean pinned at the library mean) on those alone. New acquisitions
+# get no priority; they compete for a place like any other row. The
+# acquisition and the sampler still see the full archive.
+#
+# The fill is a uniform random placeholder until the diversity selection is
+# designed, and `size` below is a placeholder too.
+#
+# Prerequisites: those of s3gfn_minimol_ampc_variational_single_fidelity.yaml,
+# plus the 10M feature store below and its SMILES list (one SMILES per line, in
+# the row order of data/10M_unif_random_subset.csv).
+
+runtime:
+  device: cuda
+  # The chosen surrogate is fitted in float32: with one shared lengthscale its
+  # L-BFGS-B fit converges there (60 s on the balanced 25k set), unlike the
+  # ARD default, which falsely converged in float32.
+  precision: 32
+  seed: 42
+
+dataset:
+  type: ListDataset
+  initial_data:
+    path: data/10M_unif_random_subset.csv
+    x_columns: SMILE
+    y_column: y
+    fidelity_column: fidelity
+
+surrogate:
+  type: SubsetFixedFeatureGPSurrogate
+  encoder:
+    # Rows are looked up by SMILES, so any subset of the 10M is served from the
+    # store; only molecules outside it (new acquisitions) are encoded live,
+    # once each, and kept in the run's shard.
+    type: FeatureStoreFixedEncoder
+    store_path: cache/ampc/s3gfn_minimol_ampc_fingerprints.npy
+    smiles_path: cache/ampc/s3gfn_minimol_ampc_fingerprints.smiles.txt
+    shard_dir: outputs/ampc/subset_fixed_gp/seed_${runtime.seed}/feature_shard
+    inner:
+      type: MiniMolAmpcSmilesFixedEncoder
+      checkpoint_path: minimol_ampc_encoder/model/final.pt
+      package_path: minimol_ampc_encoder
+      device: cuda
+      batch_size: 64
+      cache_size: 0  # The store and the shard are the only caches needed.
+  training_subset:
+    # The selection every arm since 2026-10-22 was built with: keep the top
+    # tier outright, then fill the target bands by farthest-point sampling in
+    # feature space. Replaced ThresholdRandom, whose uniform random fill was a
+    # placeholder, on 2026-10-23.
+    type: StratifiedFPS
+    size: 25000
+    # y at or above this is always kept. 0.5 (pProp ~4.85), the threshold the
+    # fps_keep05 arms used: 513 of the 10M library rows, and the tier the loop
+    # exists to grow. Was 0.349461 (pProp 4.0, 4,580 rows), a direction the GP
+    # fits overturned -- see the Decisions section of
+    # analyze_archive_diversity/ARCHIVE_DIVERSITY_ANALYSIS.md.
+    keep_above: 0.5
+    # Pinned, NOT recomputed per round: the quantiles of the round-0 balanced
+    # archive (50/75/90/95/99/99.75%). Derived edges would move with the
+    # enrichment the loop produces, so the top band would mean something
+    # different each round, and a resumed job would derive them from the
+    # archive it restarted with. See MULTI_ROUND_AL_PLAN.md.
+    band_edges: [0.03482, 0.03909, 0.05816, 0.23182, 0.32965, 0.40834]
+    # Set EXPLICITLY, because the module defaults are the original stratified
+    # settings (top_fraction 0.5, band_fill even, pool_multiple 15) that the
+    # balanced selection was written to replace: half the budget in the top
+    # band gave bias +0.118 and R2 -4.44 on ampc_331k, predicting 0.2-0.3 for a
+    # dense floor of near-zero molecules. These three are the values every arm
+    # since 2026-10-22 used -- see the 'stratified_fps_keep05_r1' block of
+    # cache/ampc/exact_dkl_top_n/prep_manifest.json.
+    top_fraction: 0.05
+    band_fill: proportional
+    # Candidates per selected point: the bulk bands widened, the sparse high
+    # bands left alone. Largely moot while the archive is small, since the pool
+    # clamps to the band's own size, but it matters as the archive grows.
+    pool_multiple: [40, 40, 40, 15, 15, 15, 15]
+    seed: ${runtime.seed}
+  subset_dir: outputs/ampc/subset_fixed_gp/seed_${runtime.seed}/training_subsets
+  # The surrogate chosen for the active-learning experiments (see
+  # scripts/gp_scaling_benchmark.py and the fitted arm
+  # outputs/ampc/exact_dkl_top_n/balanced_25000_fixedgp_iso_matern_scaled_pm0.03956_fp32):
+  # one lengthscale shared by all 512 features, Matern-5/2 in a learned
+  # ScaleKernel, and the constant mean pinned at the 10M library mean.
+  ard: false
+  kernel: matern
+  outputscale: true
+  prior_mean: 0.03956042999405787  # Mean y of data/10M_unif_random_subset.csv.
+  scale_inputs: true
+  standardize_outputs: true
+  # Exact Cholesky for the whole subset; see fixed_feature_gp_balanced.yaml.
+  max_cholesky_size: 30000
+
+acquisition:
+  # Single-fidelity GIBBON (lower-bound MES). With ~10M candidates most BoTorch
+  # GIBBON values underflow to exactly 0 (see diagnostics/mes_gibbon). log_output
+  # returns log(information gain) instead, computed in log space so it never
+  # underflows; scores are therefore negative, and the S3-GFN beta below is set
+  # for log scores.
+  type: QLowerBoundMaxValueEntropy
+  candidate_set_spec:
+    type: TrainDataCandidateSetSpec
+    fallback_size: 100000
+    seed: 42
+  num_mv_samples: 10
+  score_chunk_size: 5000  # Bound candidate encoding and GP posterior memory.
+  maximize: true
+  log_output: true
+
+sampler:
+  type: S3GFNSampler
+  n_samples: 100000  # Generate a 100k-candidate pool per round. The round
+                     # budget below picks how many of them are docked: 1,000
+                     # for the two-round test, at ~32 core-seconds each.
+  fidelities: [1]
+  model_name_or_path: ibm-research/GP-MoLFormer-Uniq
+  tokenizer_name_or_path: ibm-research/MoLFormer-XL-both-10pct
+  trust_remote_code: true
+  performance_mode: optimized
+  max_length: 80
+  batch_size: 64  # Adjust depending on VRAM availability
+  replay_batch_size: 64  # Adjust depending on VRAM availability
+  generation_batch_size: 128  # Adjust depending on VRAM availability
+  n_train_steps: 2500
+  num_warmup_steps: 10
+  # EVERY reward and loss setting below is set explicitly, never left to a
+  # schema default, because the defaults are not what this study uses: `loss`
+  # defaults to rtb, `reward_transform` to exponential and `beta` to 50. The
+  # reward-shape arms got their real values from `sampler.*` overrides in
+  # jobs/reward_shape_nibi.sh, so their YAML never described the run. This one
+  # does, and the validated config (every field, defaults included) is logged
+  # to W&B under `effective.*` so a run in the table always states what it ran.
+  #
+  # VarGrad, not rtb: the decided loss for every S3-GFN policy here. VarGrad
+  # estimates log Z from each batch, which is why initial_log_z needs no
+  # calibration and is left at its default.
+  loss: vargrad
+  # Acquisition scores are log information gains (see log_output flag above),
+  # so log R = beta * log(IG), gives R proportional to IG**beta; `power` takes
+  # the logarithm itself, which is why the acquisition stays on the value
+  # scale.
+  reward_transform: power
+  beta: 0.1
+  # A FIXED floor, the same for every batch, so a molecule's reward depends on
+  # that molecule alone. Earlier arms floored 20 nats below each batch's own
+  # best, which made the reward level swing from batch to batch.
+  log_score_floor: -150.0
+  aux_coefficient: 0.001
+  sa_threshold: 4.0
+
+selector:
+  type: CostAwareSelector
+
+oracle:
+  type: Dock3Oracle
+  mol_repr: smiles
+  indock_template: /home/ethankrz/dock_smiles/ampc_dockfiles/INDOCK
+  dockfiles_dir: /home/ethankrz/dock_smiles/ampc_dockfiles
+  fidelity_costs:
+    1: 1.0
+  fidelity_confidences:
+    1: 1.0
+  # null sizes the docking thread pool from the CPUs this job holds.
+  num_workers: null
+  ligbuild_timeout: 150
+  # The fitted hit-rate paths below are relative to the repository root.
+  hitrate_params: ampc_hitrate_fits/fitted_params.json
+  score_pprop_table: ampc_hitrate_fits/data/full_scores.df
+  hitrate_target: ampc
+  pki_threshold: 6.5
+
+budget:
+  # TEST RUN (2026-10-23): two rounds at 1,000 docking evaluations each, to
+  # exercise the loop end to end rather than to answer anything. The real run
+  # is ~10 rounds at 5,000; see MULTI_ROUND_AL_PLAN.md. Raising these three
+  # numbers together is the only change needed.
+  #
+  # The pool stays at 100,000 generated molecules per round (sampler.n_samples
+  # above): what is shortened is the docking, not the generation or the
+  # policy's view of the acquisition.
+  available_budget: 2000.0  # 2 rounds x 1,000 docking evaluations
+  max_rounds: 2  # Stated rather than left to the budget arithmetic.
+  schedule:
+    type: constant
+    value: 1000.0  # 1,000 docking evaluations per round
+
+logger:
+  type: MultiLogger
+  loggers:
+    - type: ConsoleLogger
+      project_name: ampc_subset_fixed_gp
+      run_name: molecules-s3gfn-minimol-ampc-subset-fixed-gp
+    - type: WandbLogger
+      project_name: ampc_subset_fixed_gp
+      run_name: molecules-s3gfn-minimol-ampc-subset-fixed-gp-10M
+
+run_writer:
+  type: JSONLinesRunWriter
+  output_dir: outputs/ampc/subset_fixed_gp/seed_${runtime.seed}
+  write_samples: true  # Enable this if you want to save the sampled molecules from the sampler.
+  # Per-round CSV of every sampled molecule with its acquisition score, next to
+  # artifacts/acquisition/general/round_NNNN/score_distribution.png.
+  write_sample_scores: true
+  write_config: true
+
+diagnostics:
+  # The surrogate's health on ONE FIXED set every round, which is what makes
+  # "it was fine at round 2 and had degraded by round 7" a statement about the
+  # surrogate rather than about the policy. The per-round
+  # surrogate/general/held_out/* panels score whatever that round proposed, so
+  # they move with the policy and cannot answer it.
+  #
+  # ampc_331k, the same 331,480 docked molecules the offline arms report under
+  # `ampc_331k/final/*` (W&B project ampc-fixed-gp-fps-keep-above), scored with
+  # the same prediction_metrics and predicted_vs_observed figure, so a round's
+  # pearson / r2 / coverage_1std / coverage_2std are directly comparable with
+  # them. Logged under surrogate/eval_set/ampc_331k/.
+  #
+  # Cost: one encode-and-predict pass per round. The encoder is the feature
+  # store above, so molecules it already holds are memory-mapped lookups rather
+  # than MiniMol inference; any it does not hold are encoded once into the
+  # run's shard and are free thereafter.
+  held_out_sets:
+    - name: ampc_331k
+      path: cache/ampc/exact_dkl_top_n/ampc_331k.csv
+      x_column: SMILES
+      y_column: y
