@@ -134,9 +134,87 @@ are worth knowing. Neither is a failure.
   per-node limit).
 - **Test run first: 2 rounds.** Then the real run at about 10.
 
+## Result: the 2-round test (job 24882282)
+
+**COMPLETED**, exit 0:0, 5 h 03 m of a 6 h request, on `g5` (1x H100, 24 CPUs).
+2 rounds, 1,000 docks each, 2,500 policy steps each. Offline W&B run at
+`outputs/ampc/single_fidelity_al/test-2round-1000dock-seed42/wandb/offline-run-20261023_164446-wdvuwdi7`,
+**not yet synced**. The loop ran end to end and the framework is validated.
+
+### Timings (from `stage_history.jsonl`)
+
+| stage | round 1 | round 2 |
+| --- | --- | --- |
+| `surrogate_fit` | 3 min | 4.5 min |
+| `sampler` (2,500 steps) | 57 min | **102 min** |
+| pool encode + select | 29 min | **53 min** |
+| `oracle_query` (1,000 docks) | 25 min | 29 min |
+| round total | ~1 h 54 m | ~3 h 04 m |
+
+Docking is the only stage that matched its estimate. Both compute stages
+roughly **doubled** between rounds -- see open item 4a.
+
+### Enrichment: the question the experiment exists to answer
+
+From `artifacts/acquisition/general/round_000N/scored_samples.csv`, selected
+rows only.
+
+| | round 1 | round 2 |
+| --- | --- | --- |
+| docked ok | 994 | 891 |
+| failures | 6 | **109** |
+| `frac y>=0.3` | 0.2193 (218) | 0.1964 (175) |
+| `frac y>=0.4` | 0.1056 (105) | 0.1403 (125) |
+| **`frac y>=0.5`** | **0.0423 (42)** | **0.0718 (64)** |
+| `frac y>=0.6` | 0.0111 (11) | 0.0168 (15) |
+| mean y | 0.1944 | 0.1801 |
+| median y | 0.1508 | 0.1150 |
+
+**The tail grew while the body did not.** `frac>=0.5` rose 70% and `frac>=0.6`
+rose 51%, but mean AND median y *fell*, and `frac>=0.3` fell. Mass moved into
+both tails at once, which reads as the policy sampling more diversely rather
+than the whole distribution shifting up. Right sign, and **not a measurement**:
+42 vs 64 molecules at 1,000 docks is what the test size allows, as recorded
+under Run shape.
+
+For scale, the archive began as the balanced 25k holding 9 rows at y >= 0.5
+(0.00036), so round 1's 0.0423 is ~100x the archive base rate. That is the
+acquisition working, not an increase over rounds.
+
+### The surrogate improved sharply
+
+| | round 1 | round 2 |
+| --- | --- | --- |
+| `gp_mean` on its own selections | 0.3898 | 0.2288 |
+| actual mean y of those | 0.1944 | 0.1801 |
+| mean `|gp_mean - y|` | 0.2156 | **0.1035** |
+| optimism (`gp_mean - y`) | +0.1954 | +0.0487 |
+
+Mean absolute error halved and optimism on its own picks fell 4x after docking
+1,000 of them. This is the most encouraging number in the run and it is the
+thing `surrogate/eval_set/ampc_331k/*` exists to corroborate on a fixed scale.
+
+### Checks that looked wrong and are not
+
+- **Near-identical maxima** (0.666261 round 1, 0.666306 round 2) are two
+  *different* close analogues, both carboxy-thiophene sulfonamide anilides --
+  not a re-docked duplicate and not a score ceiling.
+- **`gp_mean`/`gp_std` populated** for all 100,000 pool rows both rounds, no
+  zeros and no NaNs (r1 means 0.1162 / 0.0346). `predict_pool` had only ever
+  run under unit tests before this.
+- **Round 2 `surrogate_fit` reported 57 metrics vs round 1's 35.** The extra 22
+  are the band and composition metrics, absent in round 0/1 because selection
+  is the identity when the archive equals the training budget. Expected.
+- **All metrics reached W&B**, verified by key in the offline run:
+  `dataset/general/docked/frac_above_0.5`, `surrogate/eval_set/ampc_331k/pearson`,
+  `surrogate/fixed_feature_gp/hyperparameters/noise`,
+  `sampler/s3gfn/train/unique_rate`, `active_learning/budget/total`.
+
 ## Open
 
-To be discussed before launch.
+Items 0-3 were to be discussed before launch. Items 4 onward came out of the
+2-round test run itself (job 24882282, launched 2026-10-23 16:43) and are for
+after it finishes.
 
 0. **Unrelated pre-existing failures on this branch.** Three tests in
    `tests/surrogate/test_inducing_init.py` fail (`select_stratified` and
@@ -183,6 +261,184 @@ To be discussed before launch.
    already present); the frozen band edges need to be passed in rather than
    recomputed per round. No change to `band_fill` is needed, since proportional
    fill is being kept.
+
+4. **MiniMol encoding throughput is the loop's dominant cost.** Observed live in
+   job 24882282 (the 2-round test), round 1. Revisit when the job finishes --
+   nothing was changed mid-run.
+
+   Measured: `feature_shard/features.npy` grew 7,455 rows between 18:09:46 and
+   18:12:22, i.e. **~48 rows/s**; the 100k generated pool took ~26 min to encode
+   (17:43 -> ~18:13) at ~57 rows/s. For a frozen GNN forward on an H100 that is
+   two orders of magnitude off; `nvidia-smi` inside the job read **0% GPU
+   utilisation** during the stage.
+
+   Volume, from `feature_shard/shard.json` at 18:12: **238,115 rows** in the
+   run-local shard. The pool is 100,001 of them. The other ~140k were encoded
+   *during policy training*: the feature store is keyed by SMILES over the 10M
+   library, generated molecules are not in it, so every molecule the GFlowNet
+   produced across 2,500 steps needed a live fingerprint to get its GP reward.
+   That cost is hidden inside the 57-minute `sampler` stage rather than being
+   reported on its own.
+
+   So one cause, two places it bills:
+
+   | | molecules | where the time appears |
+   | --- | --- | --- |
+   | rate ~50/s | -- | the underlying problem |
+   | training | ~140k | inside the 57 min `sampler` stage |
+   | pool | ~100k | the 26 min stage between `sampler` and docking |
+
+   Suspected cause, **not yet profiled**: `encoder.inner.batch_size: 64` and
+   `sampler.score_chunk_size: 64` are the same 64. 64 was chosen for GP scoring
+   and got reused for MiniMol inference. Two consequences:
+   - `minimol_ampc/encoder.py:encode_graphs` re-runs `trunk.collate` fresh for
+     every batch (its own comment: the positional encoders concatenate into
+     `feat` during forward, so a batch cannot be reused), so the GPU sees
+     64-molecule batches.
+   - Each scoring chunk that misses the store becomes its own `encode` call, and
+     graphium's `_featurize_molecules` spawns a fresh `joblib` pool at
+     `n_jobs=-1` per call. The stderr line `could not featurize 1/59 SMILES` is
+     a call of that size. Pool-spawn overhead per 64 molecules would swamp the
+     featurisation itself, and the CPU accounting agrees: the main Python
+     process had burned ~43 min of CPU against ~39 s per featurisation worker,
+     so the parallel pool was doing almost nothing.
+
+   Fix direction, **revised after looking at the config -- NOT yet done, and it
+   needs a decision**: `encoder.inner.batch_size` (line 53) and
+   `sampler.score_chunk_size` (line 124) are *already* separate keys, both set
+   to 64. Raising the encoder's alone achieves nothing, because the effective
+   batch is `min(call size, batch_size)` and the call size is capped by
+   `score_chunk_size`. Getting large batches therefore means raising
+   `score_chunk_size`, which changes GP scoring memory and is the value the
+   reward-shape arms were validated at. Not changed unilaterally.
+
+   The alternative, which needs no config change, is to batch encode calls
+   *above* the chunk loop: encode the round's novel molecules once in large
+   batches, then let the 64-row scoring chunks read from the shard. Prefer this.
+
+   Re-measure after 4a before spending effort here: 4a was most of the cost, so
+   what remains attributable to batch size is unknown.
+
+   Why it matters: at ~85 min per round of encoding, this is the difference
+   between the 10-round run fitting in a day and needing ~20 h -- past the
+   12-hour checkpointing threshold, which is open item 5.
+
+4a. **Encoding cost scales with accumulated shard size, not new molecules.**
+   Measured in job 24882282 after item 4 was written, and it is the more
+   serious half of the problem.
+
+   `feature_shard/features.npy`: 238,115 rows after round 1, **487,149 rows**
+   after round 2. Round 2 encoded ~249k rows, essentially the same count as
+   round 1's ~238k -- but its pool-encode stage took **53 min against round 1's
+   29 min**, and its `sampler` stage 102 min against 57 min. Same work, double
+   the time, at double the shard size.
+
+   **CONFIRMED in the code**, `src/activelearning/surrogate/feature_store.py`:
+
+   - line 172, `_extend_shard`:
+     `self._shard_features = np.concatenate([self._shard_features, encoded_array])`
+     -- every append reallocates and copies the **entire** shard.
+   - line 178 then calls `_write_shard`, which `np.save`s the whole array via
+     `_atomic_write` (tmp file + `os.replace`) -- a **full file rewrite**. That
+     is the `.features.npy.<rand>.tmp` seen beside `features.npy` at 18:09.
+   - `_extend_shard` fires from `encode` (line 141) on **every call containing
+     any unseen molecule**, which for generated molecules is nearly every call.
+
+   With `score_chunk_size: 64`, a 64-row append triggers a full copy and a full
+   `np.save` of a shard that reaches 487k x 512 float32 = **~1 GB**. That is
+   ~3,750 such rewrites per round, on a **networked filesystem** -- which the
+   Alliance guidance explicitly warns against writing to in tight loops.
+
+   Cost is proportional to shard size at the time of the call, not to new
+   molecules: round 1 grew 0 -> 238k (mean ~119k), round 2 grew 238k -> 487k
+   (mean ~363k), ~3x the array copied and re-saved. Hence double the time for
+   the same encoding work. Quadratic in total molecules.
+
+   **This reframes item 4.** The dominant cost is not MiniMol inference -- it is
+   rewriting a growing 1 GB array thousands of times per round. Item 4's batch
+   size matters mainly because it sets *how often* this fires (64 -> 4,096 would
+   cut the rewrites ~64x), not because of GPU utilisation.
+
+   **FIXED 2026-10-23** in `feature_store.py`, tests pending a run:
+   - `features.npy` is **preallocated** and holds more rows than it uses;
+     `shard.json`'s `row_count` says how many are real. An append writes only
+     its own rows into the mapping (`_reserve_shard_rows`, `_extend_shard`).
+   - Capacity **doubles** when exhausted (`_grow_shard_file`), so the copy runs
+     O(log n) times per run rather than once per append, and the copy goes
+     mapping-to-mapping in 65,536-row chunks so a multi-gigabyte shard never
+     has to fit in memory.
+   - `smiles.txt` is **appended** (`"a"` mode + `fsync`) rather than rewritten.
+   - The **manifest is the commit point**, published last. A crash can leave
+     rows the manifest does not count, never the reverse; `_load_shard`
+     truncates the uncounted SMILES remainder, because leaving them would
+     offset every later row and silently serve one molecule's features for
+     another -- the only failure mode here that announces nothing.
+   - Per-append persistence is **kept deliberately**. It is now one ~128 KB
+     mapping flush plus a small append and a small atomic manifest write per
+     call, instead of a ~1 GB rewrite, and deferring it to a round boundary
+     would trade that cheap durability for a lost round on any crash.
+   - Shards in the old exact-length format still load (capacity == row_count).
+
+   Writes are now proportional to new molecules, so encoding cost should be
+   **constant across rounds**: round 10 costs what round 1 costs. Round totals
+   were 1 h 54 m then 3 h 04 m; re-time two rounds before committing to ten.
+
+   Disk: preallocation plus doubling means the file is larger than its contents.
+   At ~240k rows/round for 10 rounds (~2.4M rows x 512 float32 ~ 5 GB, up to 2x
+   with slack) this lands in **`home`, which is at 26/50 GiB** -- it fits, but
+   `outputs/` on `home` is worth revisiting for a 10-round run.
+
+4b. **Docking failures jumped 18x, 6 -> 109 (10.9% of round 2).**
+   Round 2 reasons: `ligbuild_db2_timeout` 46, `dock64_no_pose_or_score` 33,
+   `ligbuild_build_db2_index_error` 17, `ligbuild_no_tgz` 11,
+   `ligbuild_protomer_build_failed` 2. Round 1's six were the same kinds in
+   single digits.
+
+   The policy is drifting toward molecules the ligand-prep pipeline cannot
+   handle -- larger or more flexible structures that time out in conformer
+   generation. Two consequences:
+   - **Silent selection bias.** The dropped molecules are not a random sample of
+     what was selected, so the docked distribution is conditioned on
+     prep success. Every enrichment number above inherits this.
+   - **Budget leak.** 109 docks were paid for and returned nothing.
+
+   At 11% it is tolerable; over 10 rounds, if it keeps climbing, it is a threat
+   to the experiment. Log the failure-reason breakdown as per-round scalars so
+   the trend is visible rather than reconstructed from CSVs, and decide whether
+   a size/rotatable-bond filter belongs in the selector.
+
+4c. **No `Docking progress` line was ever emitted**, either round, despite
+   2,000 molecules docking. This was an explicit requirement and it did not
+   work. The logic at `dock3_oracle.py:919` is correct (`done % 500` is falsy at
+   500, and `done != total` is false at 1,000, so both should fire), so this is
+   a **logging-handler problem**: `logger.info` is not reaching a handler that
+   writes to the Slurm `.out`/`.err`. Check handler configuration at the
+   `activelearning.applications.molecules.dock3_oracle` logger; the surrounding
+   `logger.warning` calls from graphium *did* appear, so the root logger has a
+   handler and the level or propagation on this one is the likely culprit.
+
+4d. **`round_history.jsonl` holds only the 12 `active_learning/*` counters.**
+   The surrogate, sampler and dataset metrics appear in `stage_history.jsonl`
+   and in the W&B offline directory, but not in the round record -- while the
+   round record's *artifacts* list does carry all 16 figures including
+   `surrogate/eval_set/ampc_331k/predicted_vs_observed`. So figures merge into
+   the round record and metrics do not. `collect_round_diagnostics` does
+   `metrics.update(stage_stash.metrics)` at `orchestration.py:201`, so the
+   stash is not where it goes wrong; trace what `record_round` is handed.
+
+   **No data was lost** -- everything is in the stage records and W&B -- so this
+   is a consistency defect, not a durability one. It does mean a reader of
+   `round_history.jsonl` alone would conclude the run measured nothing.
+
+4e. **3 SMILES were selected in both rounds.** Small, and the archive dedupe is
+   substantially working, but it should be 0: a molecule already docked in round
+   1 is in the archive with a known y and should never be re-selected. Three
+   wasted docks here, and the count may not stay at three as the archive grows.
+
+5. **Checkpoint/resume for the 10-round run.** Rounds are durable
+   (`stage_history.jsonl`, see Done) but there is no resume: a job that dies in
+   round 7 restarts at round 1. Jobs over 12 h are expected to checkpoint, and
+   on round-1 timings the 10-round run exceeds that.
 
 ## Done (2026-10-23, uncommitted, tests pass)
 
