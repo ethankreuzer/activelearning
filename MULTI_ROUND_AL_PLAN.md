@@ -380,8 +380,33 @@ after it finishes.
    - Shards in the old exact-length format still load (capacity == row_count).
 
    Writes are now proportional to new molecules, so encoding cost should be
-   **constant across rounds**: round 10 costs what round 1 costs. Round totals
-   were 1 h 54 m then 3 h 04 m; re-time two rounds before committing to ten.
+   **constant across rounds**: round 10 costs what round 1 costs.
+
+   **What to expect, from measurement rather than modelling.** The shard did not
+   exist in the reward-shape arms: `reward_shape_fixedgp_fps_keep05.yaml:60`
+   uses `MiniMolAmpcSmilesFixedEncoder` directly, with a 4,096-entry in-memory
+   LRU and no `shard_dir`. `FeatureStoreFixedEncoder` was introduced for this
+   experiment, to stop docked acquisitions being re-encoded every round, and it
+   brought the quadratic cost with it. That arm's W&B summary therefore gives
+   the shard-free base rate directly:
+
+   | | s/step | shard | mean shard rows |
+   | --- | --- | --- | --- |
+   | reward-shape, 5,000 steps (3,419 s) | **0.684** | none | -- |
+   | AL round 1, 2,500 steps (3,122 s) | 1.249 | yes | ~69k |
+   | AL round 2, 2,500 steps (5,904 s) | 2.362 | yes | ~312k |
+
+   The shard added 0.57 s/step in round 1 and 1.68 s/step in round 2. So 2,500
+   steps should come back to **~1,710 s, about 29 min**, possibly a little under
+   it since the shard now spares the re-encoding that LRU eviction cost
+   reward-shape. Projected round: ~4 min GP fit + ~29 min training + ~4 min
+   generation + ~11 min pool encode + ~27 min docking = **~1 h 15 m**, flat.
+   Ten rounds ~12.5 h, still at the checkpointing threshold (item 5).
+
+   Round totals were 1 h 54 m then 3 h 04 m. The falsifiable claim is that
+   round 2's `sampler/s3gfn/train/duration_s` comes back near round 1's rather
+   than at double it; that metric is cleaner than wall clock because it excludes
+   docking and generation.
 
    Disk: preallocation plus doubling means the file is larger than its contents.
    At ~240k rows/round for 10 rounds (~2.4M rows x 512 float32 ~ 5 GB, up to 2x
