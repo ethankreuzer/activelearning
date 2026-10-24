@@ -39,19 +39,26 @@ surrogate:
   type: SubsetFixedFeatureGPSurrogate
   encoder:
     # Rows are looked up by SMILES, so any subset of the 10M is served from the
-    # store; only molecules outside it (new acquisitions) are encoded live,
-    # once each, and kept in the run's shard.
+    # store; molecules outside it are encoded live and NOT kept. Nothing the
+    # policy samples while training is worth persisting: that is ~240,000
+    # molecules a round against ~1,700 rows of cross-round reuse, because a
+    # GFlowNet samples novel structures rather than revisiting last round's.
+    # Re-encoding the few thousand that do come back -- the docked acquisitions
+    # once they are in the archive, and the held-out set -- costs a couple of
+    # minutes a round, which is the cheaper side of the trade.
     type: FeatureStoreFixedEncoder
     store_path: cache/ampc/s3gfn_minimol_ampc_fingerprints.npy
     smiles_path: cache/ampc/s3gfn_minimol_ampc_fingerprints.smiles.txt
-    shard_dir: outputs/ampc/single_fidelity_al/${run_name}/feature_shard
     inner:
       type: MiniMolAmpcSmilesFixedEncoder
       checkpoint_path: minimol_ampc_encoder/model/final.pt
       package_path: minimol_ampc_encoder
       device: cuda
       batch_size: 64
-      cache_size: 0  # The store and the shard are the only caches needed.
+      # 10-12% of a round's generated molecules repeat (train/unique_rate 0.88
+      # -0.90) and the repeats arrive close together, so a bounded cache catches
+      # most of them. The value the reward-shape arms ran with.
+      cache_size: 4096
   training_subset:
     # The selection every arm since 2026-10-22 was built with: keep the top
     # tier outright, then fill the target bands by farthest-point sampling in
@@ -232,7 +239,7 @@ logger:
 run_writer:
   type: JSONLinesRunWriter
   # One directory per run, named by the same label as the W&B run, so a rerun
-  # never writes into another run's artifacts, stage history or feature shard.
+  # never writes into another run's artifacts or stage history.
   output_dir: outputs/ampc/single_fidelity_al/${run_name}
   write_samples: true  # Enable this if you want to save the sampled molecules from the sampler.
   # Per-round CSV of every sampled molecule with its acquisition score, next to
@@ -255,8 +262,8 @@ diagnostics:
   #
   # Cost: one encode-and-predict pass per round. The encoder is the feature
   # store above, so molecules it already holds are memory-mapped lookups rather
-  # than MiniMol inference; any it does not hold are encoded once into the
-  # run's shard and are free thereafter.
+  # than MiniMol inference; the ~1,700 it does not hold are encoded every round,
+  # which is seconds.
   held_out_sets:
     - name: ampc_331k
       path: cache/ampc/exact_dkl_top_n/ampc_331k.csv

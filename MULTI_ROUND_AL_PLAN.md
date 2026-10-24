@@ -262,9 +262,11 @@ after it finishes.
    recomputed per round. No change to `band_fill` is needed, since proportional
    fill is being kept.
 
-4. **MiniMol encoding throughput is the loop's dominant cost.** Observed live in
-   job 24882282 (the 2-round test), round 1. Revisit when the job finishes --
-   nothing was changed mid-run.
+4. **MiniMol encoding throughput.** Observed live in job 24882282, round 1.
+   **Superseded in large part by 4a**: the headline rate below was dominated by
+   the shard rewrite, not by MiniMol, and the shard is now gone. Kept because
+   the batching question it raises is still open, and must be re-measured
+   against the shard-free run before any effort goes into it.
 
    Measured: `feature_shard/features.npy` grew 7,455 rows between 18:09:46 and
    18:12:22, i.e. **~48 rows/s**; the 100k generated pool took ~26 min to encode
@@ -323,72 +325,51 @@ after it finishes.
    between the 10-round run fitting in a day and needing ~20 h -- past the
    12-hour checkpointing threshold, which is open item 5.
 
-4a. **Encoding cost scales with accumulated shard size, not new molecules.**
-   Measured in job 24882282 after item 4 was written, and it is the more
-   serious half of the problem.
+4a. ~~**Encoding cost scales with accumulated shard size.**~~ **RESOLVED
+   2026-10-23 by removing the shard**, not by making it cheaper.
 
-   `feature_shard/features.npy`: 238,115 rows after round 1, **487,149 rows**
-   after round 2. Round 2 encoded ~249k rows, essentially the same count as
-   round 1's ~238k -- but its pool-encode stage took **53 min against round 1's
-   29 min**, and its `sampler` stage 102 min against 57 min. Same work, double
-   the time, at double the shard size.
+   Measured first: 238,115 shard rows after round 1, 487,149 after round 2.
+   Round 2 encoded the same ~249k rows as round 1 but its pool-encode stage took
+   53 min against 29, and its `sampler` stage 102 min against 57. Cause, read
+   off the code: `_extend_shard` did
+   `np.concatenate([self._shard_features, encoded_array])` and then re-saved the
+   whole file, and it fired on **every** `encode` call containing an unseen
+   molecule. With `score_chunk_size: 64` that is a ~1 GB copy and rewrite per 64
+   molecules, ~3,750 times a round, on a networked filesystem. Cost was
+   proportional to the shard, not to the molecules added: quadratic.
 
-   **CONFIRMED in the code**, `src/activelearning/surrogate/feature_store.py`:
+   The first fix preallocated the file and appended in place. Then the better
+   question: **what was the shard for?** Its docstring and the config comment
+   both said docked acquisitions. But it sits inside
+   `FeatureStoreEncoder.encode()`, which every caller goes through, so it also
+   persisted everything the S3-GFN sampled while training. The numbers say that
+   is all it did:
 
-   - line 172, `_extend_shard`:
-     `self._shard_features = np.concatenate([self._shard_features, encoded_array])`
-     -- every append reallocates and copies the **entire** shard.
-   - line 178 then calls `_write_shard`, which `np.save`s the whole array via
-     `_atomic_write` (tmp file + `os.replace`) -- a **full file rewrite**. That
-     is the `.features.npy.<rand>.tmp` seen beside `features.npy` at 18:09.
-   - `_extend_shard` fires from `encode` (line 141) on **every call containing
-     any unseen molecule**, which for generated molecules is nearly every call.
+   - round 1 training 140,960 unique molecules, round 2 144,480, pools 100,000
+     each: **140,960 + 144,480 + 200,000 = 485,440** against an actual shard of
+     **487,149**.
+   - The shard is the *sum* of each round's novel molecules, so cross-round
+     reuse is **~1,700 rows out of 487,000**. A GFlowNet samples novel
+     structures; it does not revisit last round's.
 
-   With `score_chunk_size: 64`, a 64-row append triggers a full copy and a full
-   `np.save` of a shard that reaches 487k x 512 float32 = **~1 GB**. That is
-   ~3,750 such rewrites per round, on a **networked filesystem** -- which the
-   Alliance guidance explicitly warns against writing to in tight loops.
+   So the shard stored ~240k rows a round to serve a few thousand rows of real
+   reuse -- the `ampc_331k` misses, and docked acquisitions once they are in the
+   archive and get reselected into a training subset. Re-encoding those costs a
+   couple of minutes a round. **Decision: re-encoding is fine.** The shard, its
+   preallocation, capacity doubling, manifest commit protocol and crash recovery
+   are all deleted; `shard_dir` is gone from the config model and the YAML.
+   Within-round repeats (10-12%, `train/unique_rate` 0.88-0.90) go to the inner
+   encoder's existing bounded cache, `cache_size: 4096`, the value the
+   reward-shape arms ran with.
 
-   Cost is proportional to shard size at the time of the call, not to new
-   molecules: round 1 grew 0 -> 238k (mean ~119k), round 2 grew 238k -> 487k
-   (mean ~363k), ~3x the array copied and re-saved. Hence double the time for
-   the same encoding work. Quadratic in total molecules.
+   This also removes the ~5 GB of `home` the shard would have reached by round
+   10, and makes the loop's encoding behave like reward-shape's, which is the
+   configuration there is a trusted baseline for.
 
-   **This reframes item 4.** The dominant cost is not MiniMol inference -- it is
-   rewriting a growing 1 GB array thousands of times per round. Item 4's batch
-   size matters mainly because it sets *how often* this fires (64 -> 4,096 would
-   cut the rewrites ~64x), not because of GPU utilisation.
-
-   **FIXED 2026-10-23** in `feature_store.py`, tests pending a run:
-   - `features.npy` is **preallocated** and holds more rows than it uses;
-     `shard.json`'s `row_count` says how many are real. An append writes only
-     its own rows into the mapping (`_reserve_shard_rows`, `_extend_shard`).
-   - Capacity **doubles** when exhausted (`_grow_shard_file`), so the copy runs
-     O(log n) times per run rather than once per append, and the copy goes
-     mapping-to-mapping in 65,536-row chunks so a multi-gigabyte shard never
-     has to fit in memory.
-   - `smiles.txt` is **appended** (`"a"` mode + `fsync`) rather than rewritten.
-   - The **manifest is the commit point**, published last. A crash can leave
-     rows the manifest does not count, never the reverse; `_load_shard`
-     truncates the uncounted SMILES remainder, because leaving them would
-     offset every later row and silently serve one molecule's features for
-     another -- the only failure mode here that announces nothing.
-   - Per-append persistence is **kept deliberately**. It is now one ~128 KB
-     mapping flush plus a small append and a small atomic manifest write per
-     call, instead of a ~1 GB rewrite, and deferring it to a round boundary
-     would trade that cheap durability for a lost round on any crash.
-   - Shards in the old exact-length format still load (capacity == row_count).
-
-   Writes are now proportional to new molecules, so encoding cost should be
-   **constant across rounds**: round 10 costs what round 1 costs.
-
-   **What to expect, from measurement rather than modelling.** The shard did not
-   exist in the reward-shape arms: `reward_shape_fixedgp_fps_keep05.yaml:60`
-   uses `MiniMolAmpcSmilesFixedEncoder` directly, with a 4,096-entry in-memory
-   LRU and no `shard_dir`. `FeatureStoreFixedEncoder` was introduced for this
-   experiment, to stop docked acquisitions being re-encoded every round, and it
-   brought the quadratic cost with it. That arm's W&B summary therefore gives
-   the shard-free base rate directly:
+   **What to expect, from measurement rather than modelling.** The reward-shape
+   arms had no shard -- `reward_shape_fixedgp_fps_keep05.yaml:60` uses
+   `MiniMolAmpcSmilesFixedEncoder` directly with a 4,096-entry cache. That arm's
+   W&B summary gives the shard-free base rate:
 
    | | s/step | shard | mean shard rows |
    | --- | --- | --- | --- |
@@ -397,21 +378,15 @@ after it finishes.
    | AL round 2, 2,500 steps (5,904 s) | 2.362 | yes | ~312k |
 
    The shard added 0.57 s/step in round 1 and 1.68 s/step in round 2. So 2,500
-   steps should come back to **~1,710 s, about 29 min**, possibly a little under
-   it since the shard now spares the re-encoding that LRU eviction cost
-   reward-shape. Projected round: ~4 min GP fit + ~29 min training + ~4 min
-   generation + ~11 min pool encode + ~27 min docking = **~1 h 15 m**, flat.
-   Ten rounds ~12.5 h, still at the checkpointing threshold (item 5).
+   steps should come back to **~1,710 s, about 29 min**. Projected round: ~4 min
+   GP fit + ~29 min training + ~4 min generation + ~11 min pool encode + ~27 min
+   docking = **~1 h 15 m, flat across rounds**. Ten rounds ~12.5 h, still at the
+   checkpointing threshold (item 5).
 
-   Round totals were 1 h 54 m then 3 h 04 m. The falsifiable claim is that
-   round 2's `sampler/s3gfn/train/duration_s` comes back near round 1's rather
-   than at double it; that metric is cleaner than wall clock because it excludes
-   docking and generation.
-
-   Disk: preallocation plus doubling means the file is larger than its contents.
-   At ~240k rows/round for 10 rounds (~2.4M rows x 512 float32 ~ 5 GB, up to 2x
-   with slack) this lands in **`home`, which is at 26/50 GiB** -- it fits, but
-   `outputs/` on `home` is worth revisiting for a 10-round run.
+   Round totals were 1 h 54 m then 3 h 04 m. The falsifiable claim is that round
+   2's `sampler/s3gfn/train/duration_s` comes back near round 1's rather than at
+   double it; that metric is cleaner than wall clock because it excludes docking
+   and generation.
 
 4b. **Docking failures jumped 18x, 6 -> 109 (10.9% of round 2).**
    Round 2 reasons: `ligbuild_db2_timeout` 46, `dock64_no_pose_or_score` 33,

@@ -23,8 +23,8 @@
 # ~5 min generating the 100k pool, the pool scored in chunks of 64, a ~1 min GP
 # fit, and 1,000 docking evaluations at ~32 core-seconds each, so ~22 min on 24
 # workers. Call it 1-1.5 h per round. 6 hours is generous for two rounds and
-# leaves room for the first round's one-off live encoding of the ~3% of
-# ampc_331k that the feature store does not already hold.
+# leaves room for the live encoding of the part of ampc_331k that the feature
+# store does not already hold, which is re-done each round.
 #
 # A crash does not lose finished stages: the surrogate fit, the policy training
 # and the docking each write their metrics, figures and results to disk as they
@@ -67,8 +67,8 @@ export HF_HUB_OFFLINE=1   # compute nodes have no internet
 
 CONFIG="config/ampc/subset_fixed_gp.yaml"
 OUTPUT_DIR="outputs/ampc/single_fidelity_al/${RUN_NAME}"
-# One directory per run: artifacts, the stage history, the feature shard and the
-# offline W&B run all land here, so a rerun cannot write into another run's.
+# One directory per run: artifacts, the stage history and the offline W&B run
+# all land here, so a rerun cannot write into another run's.
 if [[ -e "${OUTPUT_DIR}" ]]; then
   echo "${OUTPUT_DIR} already exists; pick another run_name or move it aside." >&2
   exit 2

@@ -382,14 +382,12 @@ class FeatureStoreFixedEncoderConfig(BaseModel):
     inner : MiniMolSmilesFixedEncoderConfig or MiniMolAmpcSmilesFixedEncoderConfig
         The encoder the store was built with. It validates the store and encodes
         live only the molecules the store does not hold; give it no
-        ``feature_cache_path``.
+        ``feature_cache_path``, and a non-zero ``cache_size`` so repeats within
+        a round are absorbed without re-encoding.
     store_path : Path
         Base ``.npy`` feature matrix, with its manifest as the sibling ``.json``.
     smiles_path : Path
         The SMILES the store was built from, one per line in row order.
-    shard_dir : Path, optional
-        Run-local directory keeping the features encoded live, so a resumed run
-        does not encode them again. ``null`` keeps them in memory only.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -402,7 +400,6 @@ class FeatureStoreFixedEncoderConfig(BaseModel):
     ]
     store_path: Path
     smiles_path: Path
-    shard_dir: Path | None = None
 
     def build(self) -> "FeatureStoreEncoder":
         """Build the store-backed fixed encoder."""
@@ -412,7 +409,6 @@ class FeatureStoreFixedEncoderConfig(BaseModel):
             self.inner.build(),
             store_path=self.store_path,
             smiles_path=self.smiles_path,
-            shard_dir=self.shard_dir,
         )
 
 
