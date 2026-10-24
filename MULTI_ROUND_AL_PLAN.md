@@ -388,24 +388,87 @@ after it finishes.
    double it; that metric is cleaner than wall clock because it excludes docking
    and generation.
 
-4b. **Docking failures jumped 18x, 6 -> 109 (10.9% of round 2).**
+4b. **Docking failures climbed 18x, 6 -> 109, i.e. 0.6% -> 10.9% of 1,000
+   selected.** The most important open item: it may bias the result the
+   experiment exists to measure.
+
    Round 2 reasons: `ligbuild_db2_timeout` 46, `dock64_no_pose_or_score` 33,
    `ligbuild_build_db2_index_error` 17, `ligbuild_no_tgz` 11,
    `ligbuild_protomer_build_failed` 2. Round 1's six were the same kinds in
-   single digits.
+   single digits. Three quarters sit in `ligbuild`, i.e. conformer generation,
+   with timeouts the largest single category: size and flexibility, not parsing.
 
-   The policy is drifting toward molecules the ligand-prep pipeline cannot
-   handle -- larger or more flexible structures that time out in conformer
-   generation. Two consequences:
-   - **Silent selection bias.** The dropped molecules are not a random sample of
-     what was selected, so the docked distribution is conditioned on
-     prep success. Every enrichment number above inherits this.
-   - **Budget leak.** 109 docks were paid for and returned nothing.
+   **It is not the halved training budget.** Both rounds ran 2,500 steps, so
+   step count is constant across the jump. And round 1 at 2,500 steps was
+   *better* than every reward-shape arm at 5,000:
 
-   At 11% it is tolerable; over 10 rounds, if it keeps climbing, it is a threat
-   to the experiment. Log the failure-reason breakdown as per-round scalars so
-   the trend is visible rather than reconstructed from CSVs, and decide whether
-   a size/rotatable-bond filter belongs in the selector.
+   | run | steps | selected | dropped | rate |
+   | --- | --- | --- | --- | --- |
+   | reward-shape, power b0.1 fps_keep05 | 5,000 | 10,000 | 113 | 1.1% |
+   | reward-shape, power b0.1 iso | 5,000 | 10,000 | 278 | 2.8% |
+   | reward-shape, power b0.25 | 5,000 | 10,000 | 90 | 0.9% |
+   | AL round 1 | 2,500 | 1,000 | 6 | **0.6%** |
+   | AL round 2 | 2,500 | 1,000 | 109 | **10.9%** |
+
+   **It is the active-learning feedback.** Round 1's policy trained against a GP
+   fit on the balanced 25k -- library molecules, dockable by construction since
+   their y came from docking. Round 2's GP was refit on a subset including 994
+   GFlowNet-generated molecules with real docked y for the first time; the
+   acquisition landscape moved and the policy followed it into chemistry
+   `ligbuild` cannot build. Every reward-shape arm was single-round, so they are
+   all round-1 equivalents and none of them could have shown this. **Round 2 is
+   the first observation of post-feedback behaviour, and nothing says the rate
+   stops climbing at round 3.**
+
+   **The sampler's own metrics all got BETTER over the same step**, which is why
+   none of them can serve as the health check:
+
+   | | round 1 | round 2 |
+   | --- | --- | --- |
+   | `train/validity_rate` | 0.881 | **0.903** |
+   | `generation/invalid_rate` | 0.1024 | **0.0753** |
+   | `generation/yield` | 0.8918 | **0.9213** |
+   | `train/unique_rate` | 0.881 | 0.903 |
+   | `train/reject_rate/disconnected` | 0.0476 | 0.0410 |
+   | `train/reject_rate/unterminated` | 0.0546 | 0.0355 |
+
+   Validity and uniqueness rose while dockability collapsed, so this is not
+   degeneration or mode collapse -- the policy emits cleaner, more distinct,
+   perfectly RDKit-valid molecules that are structurally awkward.
+   **RDKit-valid is not dockable**, and `validity_rate` is blind to the
+   difference.
+
+   **What it costs.** A failed dock is lost outright: `filter_finite_target
+   observations` drops the NaN (`active_learning.py:302`) and the loop warns
+   "Budget was already consumed". No backfill, no promotion of rank 1,001, and
+   `cost/round` is 1,000 in both rounds. So the archive grew 25,000 -> 25,994 ->
+   26,885 after 2,000 docks, and 115 docks bought nothing. The raw rows do
+   survive for analysis: `record_finished_stage` writes the observations before
+   filtering, so all 1,000 are in the stage observations file and in
+   `scored_samples.csv` with their `dock3_failure_reason`.
+
+   **Worse than the wasted budget, the drop is biased.** Molecules are lost by
+   structural difficulty, not at random, so the docked distribution is
+   conditioned on prep success and every round-2 enrichment number -- including
+   `frac y>=0.5` = 0.0718 -- is over the 891 that survived, not the 1,000 chosen.
+
+   **Logging: already there, improved 2026-10-23.** `_log_query_failure_summary`
+   was logging `oracle/dock3/failures/{reason}`, `queried`, `succeeded`,
+   `success_rate` and `workers_used` all along, and they are in the run's W&B.
+   Added: `failure_rate` and `failure_rate/{reason}`, since counts cannot be
+   compared across rounds of different sizes, and **every reason seen so far is
+   now logged each round including zeros**, so a climbing failure mode reads as
+   a curve instead of a point appearing from nowhere at round 2.
+
+   **Still undecided**: whether to backfill. Promoting rank 1,001 would keep the
+   archive growing at the budgeted rate, but it makes docks-per-round
+   data-dependent and means a round's selection is no longer "the top k by
+   acquisition", which is what the experiment holds fixed. Over-selecting by the
+   expected failure rate has the same problem less visibly. At 11% the lost
+   docks cost little, so the recommendation is to leave the behaviour alone and
+   watch the new rate series for two or three more rounds; a rate that keeps
+   climbing makes backfilling worth the complexity, and also makes a
+   size/rotatable-bond filter in the selector worth considering.
 
 4c. ~~**No `Docking progress` line was ever emitted.**~~ **FIXED 2026-10-23.**
 

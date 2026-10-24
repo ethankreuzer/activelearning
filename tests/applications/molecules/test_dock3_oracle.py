@@ -1125,6 +1125,51 @@ class TestQueryFailureSummary:
         assert recorder.metrics["oracle/dock3/success_rate"] == pytest.approx(1.0)
         assert not [key for key in recorder.metrics if "failures" in key]
 
+    def test_logs_a_rate_beside_every_count(self, oracle) -> None:
+        """A count alone cannot be compared between rounds of different sizes."""
+        recorder = _RecordingLogger()
+        oracle.bind_runtime_context(RuntimeContext(logger=recorder))
+        with patch.object(
+            oracle,
+            "_dock3_score",
+            side_effect=[
+                (-67.85, None),
+                (-60.0, None),
+                (float("nan"), "ligbuild_db2_timeout"),
+                (float("nan"), "ligbuild_db2_timeout"),
+            ],
+        ):
+            oracle.query([Candidate(x=key, fidelity=0) for key in "abcd"])
+
+        assert recorder.metrics["oracle/dock3/failure_rate"] == pytest.approx(0.5)
+        assert recorder.metrics[
+            "oracle/dock3/failure_rate/ligbuild_db2_timeout"
+        ] == pytest.approx(0.5)
+
+    def test_a_reason_seen_before_is_logged_as_zero_when_it_does_not_recur(
+        self, oracle
+    ) -> None:
+        """The series has to be continuous to be read as a trend.
+
+        A failure mode that climbs over rounds is the thing worth watching -- in
+        job 24882282 the rate went from 0.6% to 10.9% while every sampler metric
+        improved -- and a reason that simply appears at round 2 with no earlier
+        point reads as noise instead of as a curve.
+        """
+        recorder = _RecordingLogger()
+        oracle.bind_runtime_context(RuntimeContext(logger=recorder))
+        with patch.object(
+            oracle,
+            "_dock3_score",
+            side_effect=[(float("nan"), "ligbuild_db2_timeout"), (-10.0, None)],
+        ):
+            oracle.query([Candidate(x="a", fidelity=0)])
+            oracle.query([Candidate(x="b", fidelity=0)])
+
+        # The second query had no timeout, and says so rather than going silent.
+        assert recorder.metrics["oracle/dock3/failures/ligbuild_db2_timeout"] == 0.0
+        assert recorder.metrics["oracle/dock3/failure_rate"] == pytest.approx(0.0)
+
     def test_is_a_no_op_without_a_bound_logger(self, oracle) -> None:
         with patch.object(oracle, "_dock3_score", return_value=(-10.0, None)):
             observations = oracle.query([Candidate(x="CCO", fidelity=0)])

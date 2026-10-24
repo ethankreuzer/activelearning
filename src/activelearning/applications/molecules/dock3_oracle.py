@@ -746,6 +746,12 @@ class Dock3Oracle(MultiFidelityOracle):
         self._dock_root: Optional[Path] = None
         self._dock_root_lock = threading.Lock()
 
+        # Failure reasons this oracle has reported at least once, so a round
+        # that avoids one still logs a zero for it. Without that a reason first
+        # seen in a later round has no earlier point and its series cannot be
+        # read as a trend -- which is the only reason to plot it.
+        self._reported_failure_reasons: set[str] = set()
+
         # Built once, up front, so a missing or malformed parameter file fails
         # at construction rather than turning every molecule into a NaN.
         self._hit_rate_model = HitRateModel.from_files(
@@ -962,6 +968,15 @@ class Dock3Oracle(MultiFidelityOracle):
             Threads the batch was actually spread over. Logged as
             ``oracle/dock3/workers_used`` so a run's own metrics answer whether
             the CPU allocation was saturated, without external instrumentation.
+
+        Notes
+        -----
+        A rate accompanies every count because the batch size need not be
+        constant between rounds, and in job 24882282 these are the only series
+        that saw the failure rate climb from 0.6% to 10.9% between two rounds:
+        the sampler's own metrics all **improved** over the same step, validity
+        0.881 -> 0.903 and uniqueness likewise, because an RDKit-valid molecule
+        is not necessarily one ``ligbuild`` can build a conformer library for.
         """
         if self.logger is None or not results:
             return
@@ -977,8 +992,20 @@ class Dock3Oracle(MultiFidelityOracle):
         self.logger.log_metric("oracle/dock3/queried", float(total))
         self.logger.log_metric("oracle/dock3/succeeded", float(succeeded))
         self.logger.log_metric("oracle/dock3/success_rate", succeeded / total)
-        for reason, count in sorted(reasons.items()):
-            self.logger.log_metric(f"oracle/dock3/failures/{reason}", float(count))
+        self.logger.log_metric(
+            "oracle/dock3/failure_rate", sum(reasons.values()) / total
+        )
+        # Every reason seen so far, not only this round's, so each series is
+        # continuous and a rising failure mode is visible as a curve rather than
+        # as a point that appears from nowhere.
+        self._reported_failure_reasons.update(reasons)
+        for reason in sorted(self._reported_failure_reasons):
+            self.logger.log_metric(
+                f"oracle/dock3/failures/{reason}", float(reasons.get(reason, 0))
+            )
+            self.logger.log_metric(
+                f"oracle/dock3/failure_rate/{reason}", reasons.get(reason, 0) / total
+            )
 
     def _get_dock_root(self) -> Path:
         """Return this oracle's shared dock root, creating it on first use.
