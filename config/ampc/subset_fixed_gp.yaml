@@ -1,21 +1,23 @@
-# S3-GFN molecule experiment: the 10M archive with an exact GP on fine-tuned
-# MiniMol AmpC representations, fitted each round on a fixed-size subset of the
-# archive rather than on all of it.
+# Single-fidelity active learning: an exact GP on fine-tuned MiniMol AmpC
+# representations, refitted each round on a fixed-size stratified subset of a
+# growing archive, with an S3-GFN policy trained against its acquisition.
 #
-# The dataset is the archive: the 10M initial set plus every round's docked
-# acquisitions, all kept. Each round SubsetFixedFeatureGPSurrogate chooses
-# `training_subset.size` rows of it -- every row with y >= threshold, then a
-# fill -- and fits the chosen exact GP (isotropic Matern-5/2 + ScaleKernel,
-# mean pinned at the library mean) on those alone. New acquisitions
-# get no priority; they compete for a place like any other row. The
-# acquisition and the sampler still see the full archive.
-#
-# The fill is a uniform random placeholder until the diversity selection is
-# designed, and `size` below is a placeholder too.
+# The dataset is the archive, and it STARTS AS THE 25,000-MOLECULE BALANCED
+# SET -- not the 10M library. That set holds 9 rows at y >= 0.5, so the run
+# begins unenriched and the tail has to be grown by the loop itself, which is
+# the thing being tested. Starting from the 10M would hand it 513 outright.
+# Each round the archive gains that round's docked molecules and
+# SubsetFixedFeatureGPSurrogate reselects `training_subset.size` rows of it.
+# At round 0 the archive equals the budget, so the selection is the identity
+# and the GP fits the balanced set exactly. See MULTI_ROUND_AL_PLAN.md.
 #
 # Prerequisites: those of s3gfn_minimol_ampc_variational_single_fidelity.yaml,
 # plus the 10M feature store below and its SMILES list (one SMILES per line, in
 # the row order of data/10M_unif_random_subset.csv).
+
+# Label for this run: both the W&B run name and the output directory, so the
+# two always agree. Override per run from the job script (`run_name=...`).
+run_name: test-2round-1000dock-seed42
 
 runtime:
   device: cuda
@@ -28,7 +30,7 @@ runtime:
 dataset:
   type: ListDataset
   initial_data:
-    path: data/10M_unif_random_subset.csv
+    path: data/ampc_balanced_25000.csv
     x_columns: SMILE
     y_column: y
     fidelity_column: fidelity
@@ -42,7 +44,7 @@ surrogate:
     type: FeatureStoreFixedEncoder
     store_path: cache/ampc/s3gfn_minimol_ampc_fingerprints.npy
     smiles_path: cache/ampc/s3gfn_minimol_ampc_fingerprints.smiles.txt
-    shard_dir: outputs/ampc/subset_fixed_gp/seed_${runtime.seed}/feature_shard
+    shard_dir: outputs/ampc/single_fidelity_al/${run_name}/feature_shard
     inner:
       type: MiniMolAmpcSmilesFixedEncoder
       checkpoint_path: minimol_ampc_encoder/model/final.pt
@@ -83,7 +85,7 @@ surrogate:
     # clamps to the band's own size, but it matters as the archive grows.
     pool_multiple: [40, 40, 40, 15, 15, 15, 15]
     seed: ${runtime.seed}
-  subset_dir: outputs/ampc/subset_fixed_gp/seed_${runtime.seed}/training_subsets
+  subset_dir: outputs/ampc/single_fidelity_al/${run_name}/training_subsets
   # The surrogate chosen for the active-learning experiments (see
   # scripts/gp_scaling_benchmark.py and the fitted arm
   # outputs/ampc/exact_dkl_top_n/balanced_25000_fixedgp_iso_matern_scaled_pm0.03956_fp32):
@@ -99,20 +101,30 @@ surrogate:
   max_cholesky_size: 30000
 
 acquisition:
-  # Single-fidelity GIBBON (lower-bound MES). With ~10M candidates most BoTorch
-  # GIBBON values underflow to exactly 0 (see diagnostics/mes_gibbon). log_output
-  # returns log(information gain) instead, computed in log space so it never
-  # underflows; scores are therefore negative, and the S3-GFN beta below is set
-  # for log scores.
+  # Single-fidelity GIBBON (lower-bound MES) on the VALUE scale, as the
+  # reward-shape arms use it. Most BoTorch GIBBON values underflow to exactly 0
+  # at this scale (see diagnostics/mes_gibbon), so log_space computes the
+  # information gain in log space and never underflows, while log_output=false
+  # returns it as a value.
+  #
+  # The pair is coupled to sampler.reward_transform: `power` takes the
+  # logarithm itself, so log_output=true would take it twice and S3GFNSampler
+  # refuses the combination outright -- which is how job 24881396 died, after
+  # the transform was set to `power` without changing this.
   type: QLowerBoundMaxValueEntropy
   candidate_set_spec:
     type: TrainDataCandidateSetSpec
     fallback_size: 100000
     seed: 42
   num_mv_samples: 10
-  score_chunk_size: 5000  # Bound candidate encoding and GP posterior memory.
+  # 64, as the reward-shape arms use. NOT larger: gpytorch's exact-GP
+  # posterior concatenates all 25,000 training molecules onto every candidate
+  # in a chunk, so memory scales with the chunk size. Every arm before the fix
+  # died at selection with "Tried to allocate 12.21 GiB" (jobs/reward_shape_nibi.sh).
+  score_chunk_size: 64
   maximize: true
-  log_output: true
+  log_space: true
+  log_output: false
 
 sampler:
   type: S3GFNSampler
@@ -154,6 +166,12 @@ sampler:
   log_score_floor: -150.0
   aux_coefficient: 0.001
   sa_threshold: 4.0
+  # Written the moment generation finishes, so a round that later dies in
+  # docking still leaves the 100k pool it produced and a reservoir sample of
+  # what it threw away. The reward-shape arms wrote both; this config did not
+  # until 2026-10-23.
+  pool_log_path: outputs/ampc/single_fidelity_al/${run_name}/generated_pool_round_{round}.csv
+  reject_log_path: outputs/ampc/single_fidelity_al/${run_name}/rejects_round_{round}.csv
 
 selector:
   type: CostAwareSelector
@@ -161,8 +179,18 @@ selector:
 oracle:
   type: Dock3Oracle
   mol_repr: smiles
-  indock_template: /home/ethankrz/dock_smiles/ampc_dockfiles/INDOCK
-  dockfiles_dir: /home/ethankrz/dock_smiles/ampc_dockfiles
+  # The Nibi paths, stated here rather than left to
+  # config/ampc/overrides/nibi_single_fidelity.yaml: that overlay also sets a
+  # run_writer.output_dir, which would clobber this run's own directory, and a
+  # config that needs an overlay to name its oracle does not describe the run.
+  # The previous values (/home/ethankrz/dock_smiles/ampc_dockfiles) do not
+  # exist on this cluster and failed job 24881038 at startup.
+  indock_template: /project/def-mailhoto/share/ampc_chemstep_dockfiles/dockfiles/INDOCK
+  dockfiles_dir: /project/def-mailhoto/share/ampc_chemstep_dockfiles/dockfiles/
+  dockenv_sh: /home/ethankrz/dock/dockenv_nibi.sh
+  # The 2022 build (md5 11c439078b58f861385412a82a28ddb8), which the AmpC grids
+  # were validated against. Do NOT switch to dock-3.8.0, the 2025 build.
+  dock64_exe: /project/def-mailhoto/soft/software/dock-3.8.0-2022/bin/dock64
   fidelity_costs:
     1: 1.0
   fidelity_confidences:
@@ -195,15 +223,17 @@ logger:
   type: MultiLogger
   loggers:
     - type: ConsoleLogger
-      project_name: ampc_subset_fixed_gp
-      run_name: molecules-s3gfn-minimol-ampc-subset-fixed-gp
+      project_name: single-fidelity-active-learning
+      run_name: ${run_name}
     - type: WandbLogger
-      project_name: ampc_subset_fixed_gp
-      run_name: molecules-s3gfn-minimol-ampc-subset-fixed-gp-10M
+      project_name: single-fidelity-active-learning
+      run_name: ${run_name}
 
 run_writer:
   type: JSONLinesRunWriter
-  output_dir: outputs/ampc/subset_fixed_gp/seed_${runtime.seed}
+  # One directory per run, named by the same label as the W&B run, so a rerun
+  # never writes into another run's artifacts, stage history or feature shard.
+  output_dir: outputs/ampc/single_fidelity_al/${run_name}
   write_samples: true  # Enable this if you want to save the sampled molecules from the sampler.
   # Per-round CSV of every sampled molecule with its acquisition score, next to
   # artifacts/acquisition/general/round_NNNN/score_distribution.png.

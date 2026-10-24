@@ -146,6 +146,35 @@ class ActiveLearningConfig(BaseModel):
         )
         return self
 
+    @model_validator(mode="after")
+    def _reject_doubly_logged_reward(self) -> "ActiveLearningConfig":
+        """Refuse a log-scale acquisition under the `power` reward transform.
+
+        The transform takes the logarithm itself, so a log-scale acquisition
+        would have it taken twice. S3GFNSampler already rejects the pair, but
+        only once sample() is reached -- minutes into a job, after the
+        surrogate has been fitted. Checked here it costs a second on a login
+        node. Job 24881396 died the other way round.
+
+        Raises
+        ------
+        ValueError
+            If the acquisition returns log-scale scores while the sampler's
+            reward transform is ``power``.
+        """
+        if (
+            getattr(self.acquisition, "log_output", False)
+            and getattr(self.sampler, "reward_transform", None) == "power"
+        ):
+            raise ValueError(
+                "acquisition.log_output is true and sampler.reward_transform is "
+                "'power', so the logarithm would be taken twice. Set "
+                "log_output: false (with log_space: true the information gain is "
+                "still computed in log space and cannot underflow), or use the "
+                "'exponential' transform."
+            )
+        return self
+
 
 def _direct_oracle_fidelity_confidences(oracle_config: object) -> dict[int, float]:
     """Resolve fidelity confidences for a non-composite oracle config.
