@@ -512,6 +512,69 @@ class MiniMolSmilesFixedEncoder(FixedEncoder):
         if self._persistent_features is not None:
             return True
 
+        opened = self._open_feature_file(feature_path, manifest_path)
+        if opened is None:
+            return False
+        features, manifest = opened
+        self._persistent_features = features
+        self._persistent_row_count = manifest["row_count"]
+        self._persistent_manifest = manifest
+        return True
+
+    def open_feature_store(
+        self,
+        feature_path: Path,
+        values: Sequence[str],
+    ) -> np.memmap:
+        """Open a persisted feature matrix for lookup by row.
+
+        The ordered-prefix cache can serve only the exact row list it was built
+        from. This opens the same file for random access instead, after checking
+        that it was written by this encoder for exactly ``values`` in this order,
+        so row ``i`` of the result holds the features of ``values[i]``.
+
+        Parameters
+        ----------
+        feature_path : Path
+            The ``.npy`` feature file; its manifest is the sibling ``.json``.
+        values : Sequence[str]
+            The SMILES the file was built from, in row order.
+
+        Returns
+        -------
+        np.memmap
+            Read-only ``(len(values), 512)`` float32 matrix.
+
+        Raises
+        ------
+        FileNotFoundError
+            If neither the feature file nor its manifest exists.
+        ValueError
+            If the manifest does not match this encoder or ``values``.
+        """
+        feature_path = Path(feature_path)
+        opened = self._open_feature_file(feature_path, Path(f"{feature_path}.json"))
+        if opened is None:
+            raise FileNotFoundError(f"MiniMol feature store not found: {feature_path}")
+        features, manifest = opened
+        if manifest["row_count"] != len(values) or (
+            _hash_ordered_strings(values) != manifest["input_sha256"]
+        ):
+            raise ValueError(
+                f"MiniMol feature store {feature_path} was not built from these "
+                f"{len(values)} SMILES in this order."
+            )
+        return features
+
+    def _open_feature_file(
+        self,
+        feature_path: Path,
+        manifest_path: Path,
+    ) -> tuple[np.memmap, dict[str, Any]] | None:
+        """Memory-map a feature file after verifying it against its manifest.
+
+        Returns ``None`` when neither file exists.
+        """
         feature_exists = feature_path.is_file()
         manifest_exists = manifest_path.is_file()
         if not feature_exists and not manifest_exists:
@@ -520,7 +583,7 @@ class MiniMolSmilesFixedEncoder(FixedEncoder):
                     "MiniMol feature cache paths must be regular files: "
                     f"{feature_path} and {manifest_path}."
                 )
-            return False
+            return None
         if feature_exists != manifest_exists:
             raise ValueError(
                 "MiniMol feature cache is incomplete; both the .npy feature "
@@ -645,10 +708,7 @@ class MiniMolSmilesFixedEncoder(FixedEncoder):
                 f"{features.dtype} and shape {features.shape}."
             )
 
-        self._persistent_features = features
-        self._persistent_row_count = row_count
-        self._persistent_manifest = manifest
-        return True
+        return features, manifest
 
     def _load_matching_feature_prefix(
         self,

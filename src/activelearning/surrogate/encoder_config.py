@@ -15,6 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from activelearning.surrogate.sequence.config import HuggingFaceEncoderConfig
 
 if TYPE_CHECKING:
+    from activelearning.surrogate.feature_store import FeatureStoreEncoder
     from activelearning.surrogate.sequence.huggingface_encoder import (
         HuggingFaceSequenceEncoder,
     )
@@ -373,6 +374,48 @@ class MiniMolAmpcSmilesFixedEncoderConfig(_MiniMolCacheConfig):
         )
 
 
+class FeatureStoreFixedEncoderConfig(BaseModel):
+    """Configuration for fixed features looked up by SMILES in a persisted store.
+
+    Parameters
+    ----------
+    inner : MiniMolSmilesFixedEncoderConfig or MiniMolAmpcSmilesFixedEncoderConfig
+        The encoder the store was built with. It validates the store and encodes
+        live only the molecules the store does not hold; give it no
+        ``feature_cache_path``.
+    store_path : Path
+        Base ``.npy`` feature matrix, with its manifest as the sibling ``.json``.
+    smiles_path : Path
+        The SMILES the store was built from, one per line in row order.
+    shard_dir : Path, optional
+        Run-local directory keeping the features encoded live, so a resumed run
+        does not encode them again. ``null`` keeps them in memory only.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["FeatureStoreFixedEncoder"] = "FeatureStoreFixedEncoder"
+    input_representation: ClassVar[str] = "smiles"
+    inner: Annotated[
+        Union[MiniMolSmilesFixedEncoderConfig, MiniMolAmpcSmilesFixedEncoderConfig],
+        Field(discriminator="type"),
+    ]
+    store_path: Path
+    smiles_path: Path
+    shard_dir: Path | None = None
+
+    def build(self) -> "FeatureStoreEncoder":
+        """Build the store-backed fixed encoder."""
+        from activelearning.surrogate.feature_store import FeatureStoreEncoder
+
+        return FeatureStoreEncoder(
+            self.inner.build(),
+            store_path=self.store_path,
+            smiles_path=self.smiles_path,
+            shard_dir=self.shard_dir,
+        )
+
+
 EncoderConfig = Annotated[
     Union[
         SelfiesTransformerEncoderConfig,
@@ -388,6 +431,7 @@ FixedEncoderConfig = Annotated[
     Union[
         MiniMolSmilesFixedEncoderConfig,
         MiniMolAmpcSmilesFixedEncoderConfig,
+        FeatureStoreFixedEncoderConfig,
     ],
     Field(discriminator="type"),
 ]

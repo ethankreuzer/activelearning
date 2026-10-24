@@ -242,6 +242,31 @@ def test_configured_feature_cache_ignores_empty_batches(
     assert fake_minimol == []
 
 
+
+def test_open_feature_store_reads_rows_of_a_written_cache(
+    fake_minimol: list[_FakeMiniMol],
+    tmp_path: Path,
+) -> None:
+    """A cache opens for lookup by row, but only for the exact rows it holds."""
+    feature_path = tmp_path / "store.npy"
+    smiles = ["CC", "CO", "CCN"]
+    written = minimol_module.MiniMolSmilesFixedEncoder(
+        feature_cache_path=feature_path
+    ).encode(smiles, device=torch.device("cpu"))
+    encoder = minimol_module.MiniMolSmilesFixedEncoder()
+
+    store = encoder.open_feature_store(feature_path, smiles)
+
+    assert torch.equal(torch.from_numpy(store[[2, 0]].copy()), written[[2, 0]])
+    with pytest.raises(ValueError, match="in this order"):
+        encoder.open_feature_store(feature_path, list(reversed(smiles)))
+    with pytest.raises(ValueError, match="in this order"):
+        encoder.open_feature_store(feature_path, smiles[:2])
+    with pytest.raises(FileNotFoundError):
+        encoder.open_feature_store(tmp_path / "missing.npy", smiles)
+    # Only the first encode ran MiniMol; opening the store never does.
+    assert len(fake_minimol) == 1
+
 def test_prepare_inputs_rejects_non_string_values(
     fake_minimol: list[_FakeMiniMol],
 ) -> None:
