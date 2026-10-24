@@ -407,15 +407,35 @@ after it finishes.
    the trend is visible rather than reconstructed from CSVs, and decide whether
    a size/rotatable-bond filter belongs in the selector.
 
-4c. **No `Docking progress` line was ever emitted**, either round, despite
-   2,000 molecules docking. This was an explicit requirement and it did not
-   work. The logic at `dock3_oracle.py:919` is correct (`done % 500` is falsy at
-   500, and `done != total` is false at 1,000, so both should fire), so this is
-   a **logging-handler problem**: `logger.info` is not reaching a handler that
-   writes to the Slurm `.out`/`.err`. Check handler configuration at the
-   `activelearning.applications.molecules.dock3_oracle` logger; the surrounding
-   `logger.warning` calls from graphium *did* appear, so the root logger has a
-   handler and the level or propagation on this one is the likely culprit.
+4c. ~~**No `Docking progress` line was ever emitted.**~~ **FIXED 2026-10-23.**
+
+   Cause: **nothing in the codebase ever called `logging.basicConfig` or added a
+   handler.** With no handler on the root logger, Python's last-resort fallback
+   applies -- WARNING and above, to stderr -- so *every* `logger.info` in the
+   library was discarded, not just this one. The logic at `dock3_oracle.py:919`
+   was correct all along. graphium's lines appeared only because they are
+   warnings.
+
+   Fix: `configure_logging()` in `main.py`, called first in `main()`, which
+   `scripts/run_with_sigterm_flush.py` goes through so the job path is covered.
+   - A stdout handler at the root, and **only** `activelearning` lowered to
+     INFO. At the root it would turn on every dependency's INFO logging --
+     botorch, matplotlib, wandb, graphium -- and bury the run's output.
+   - **stdout**, so a job's log lands in the one file not already full of
+     RDKit's parse complaints; those come from C++ on stderr and no Python
+     logging setting affects them.
+   - `ACTIVELEARNING_LOG_LEVEL` overrides the level, so a quiet or a debug run
+     needs no edit and no resubmit.
+   - Idempotent, so configuring twice does not double every line.
+
+   Verified directly: `isEnabledFor(INFO)` on the docking logger is False
+   before the call and True after, and the progress line reaches stdout.
+   Covered by `tests/test_logging_setup.py`.
+
+   Worth knowing: this means **every other `logger.info` in the library now
+   appears too**, which is a lot of output nobody has seen before. Watch the
+   first job's `.out` for noise and raise individual call sites to `debug` if
+   any of them are chatty.
 
 4d. **`round_history.jsonl` holds only the 12 `active_learning/*` counters.**
    The surrogate, sampler and dataset metrics appear in `stage_history.jsonl`

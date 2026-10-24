@@ -25,8 +25,11 @@ Examples
 import argparse
 import hashlib
 import json
+import logging
+import os
 import shlex
 import subprocess
+import sys
 from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -38,6 +41,55 @@ from activelearning.utils.config_loader import load_config
 
 if TYPE_CHECKING:
     from activelearning.config import ActiveLearningConfig
+
+
+#: Environment variable overriding how much of the library's own logging is
+#: shown, by name (``DEBUG``, ``INFO``, ``WARNING``, ...).
+_LOG_LEVEL_VARIABLE = "ACTIVELEARNING_LOG_LEVEL"
+
+#: Marks the handler this module installed, so configuring twice is harmless.
+_HANDLER_NAME = "activelearning-stdout"
+
+
+def configure_logging(level: int | str | None = None) -> None:
+    """Send this library's logging to stdout, third-party logging to warnings.
+
+    Nothing configured the ``logging`` module before this, so the root logger
+    had no handler and Python's last-resort fallback applied: WARNING and above,
+    to stderr, and every ``logger.info`` in the library discarded. That is why
+    job 24882282 docked 2,000 molecules without printing one progress line.
+
+    Only the ``activelearning`` logger is lowered to INFO. Doing it at the root
+    would turn on every dependency's INFO logging -- botorch, matplotlib, wandb
+    and graphium among them -- and bury the run's own output.
+
+    Records go to **stdout** so a job's log is in one file, the one not already
+    full of RDKit's parse complaints, which it writes to stderr from C++ and
+    which no Python logging setting affects.
+
+    Parameters
+    ----------
+    level : int or str, optional
+        Level for the ``activelearning`` logger. Defaults to the
+        ``ACTIVELEARNING_LOG_LEVEL`` environment variable, else INFO.
+    """
+    if level is None:
+        level = os.environ.get(_LOG_LEVEL_VARIABLE) or logging.INFO
+    root = logging.getLogger()
+    if not any(handler.name == _HANDLER_NAME for handler in root.handlers):
+        handler = logging.StreamHandler(sys.stdout)
+        handler.name = _HANDLER_NAME
+        handler.setFormatter(
+            logging.Formatter(
+                "%(asctime)s %(levelname)s %(name)s: %(message)s",
+                datefmt="%Y-%m-%d %H:%M:%S",
+            )
+        )
+        root.addHandler(handler)
+    # The root stays at WARNING; only this library is verbose.
+    if root.level == logging.NOTSET or root.level > logging.WARNING:
+        root.setLevel(logging.WARNING)
+    logging.getLogger("activelearning").setLevel(level)
 
 
 def _parse_args(
@@ -104,6 +156,7 @@ def process_arguments(
 
 def main(argv: Sequence[str] | None = None) -> None:
     """Load config, build components, run the active learning loop."""
+    configure_logging()
     raw_cfg, cfg, config_paths, overrides = process_arguments(argv)
 
     from activelearning.active_learning import active_learning
