@@ -328,6 +328,16 @@ def active_learning(
                 - budget.available_budget,
                 "active_learning/budget/round": round_budget,
                 "active_learning/budget/remaining": budget.available_budget,
+                # The run's whole budget, repeated every round. Constant by
+                # construction, but without it a chart of cost or remaining
+                # budget has no scale, and the runs table cannot be sorted or
+                # filtered by how much a run was allowed to spend.
+                "active_learning/budget/total": initial_budget,
+                "active_learning/budget/spent_fraction": (
+                    (initial_budget - budget.available_budget) / initial_budget
+                    if initial_budget > 0
+                    else 0.0
+                ),
             }
 
             # What the surrogate predicted for every molecule in the pool, for
