@@ -148,3 +148,186 @@ def test_requires_an_inner_encoder_that_opens_stores() -> None:
 
     with pytest.raises(TypeError, match="open_feature_store"):
         FeatureStoreEncoder(_Plain(), store_path="a.npy", smiles_path="a.txt")
+
+
+def _encoder(tmp_path: Path, inner: FixedEncoder | None = None) -> FeatureStoreEncoder:
+    """A shard-backed encoder over the usual base store."""
+    store_path, smiles_path = _store(tmp_path)
+    return FeatureStoreEncoder(
+        inner if inner is not None else _StoreEncoder(),
+        store_path=store_path,
+        smiles_path=smiles_path,
+        shard_dir=tmp_path / "shard",
+    )
+
+
+def _manifest(tmp_path: Path) -> dict[str, Any]:
+    """The shard's published manifest."""
+    import json
+
+    return json.loads((tmp_path / "shard" / "shard.json").read_text(encoding="utf-8"))
+
+
+def _novel(count: int, *, offset: int = 0) -> list[str]:
+    """Distinct molecules no base store in these tests holds."""
+    return [f"O{'C' * (index + offset + 2)}O" for index in range(count)]
+
+
+def test_the_shard_file_is_preallocated_rather_than_rewritten(
+    tmp_path: Path,
+) -> None:
+    """The fix for job 24882282: appending must not rewrite the whole matrix.
+
+    A file longer than its row count is the whole mechanism -- the manifest says
+    how many rows are real, so an append writes only the rows it adds.
+    """
+    encoder = _encoder(tmp_path)
+
+    encoder.encode(_novel(3), device=torch.device("cpu"))
+
+    features = np.load(tmp_path / "shard" / "features.npy", mmap_mode="r")
+    assert features.shape[0] > 3
+    assert _manifest(tmp_path)["row_count"] == 3
+    assert encoder.shard_size == 3
+
+
+def test_appending_does_not_touch_the_rows_already_there(tmp_path: Path) -> None:
+    """Rows must be written in place, leaving their predecessors untouched."""
+    encoder = _encoder(tmp_path)
+    cpu = torch.device("cpu")
+    first = encoder.encode(_novel(2), device=cpu)
+
+    encoder.encode(_novel(2, offset=10), device=cpu)
+
+    assert torch.equal(encoder.encode(_novel(2), device=cpu), first)
+
+
+def test_the_shard_grows_past_its_initial_capacity(tmp_path: Path) -> None:
+    """Crossing the capacity boundary is the one path that copies."""
+    from activelearning.surrogate import feature_store
+
+    monkey = feature_store._INITIAL_SHARD_CAPACITY
+    feature_store._INITIAL_SHARD_CAPACITY = 2
+    try:
+        encoder = _encoder(tmp_path)
+        cpu = torch.device("cpu")
+        # Two appends either side of the boundary, then one that leaps it.
+        kept = encoder.encode(_novel(2), device=cpu)
+        encoder.encode(_novel(5, offset=20), device=cpu)
+
+        assert encoder.shard_size == 7
+        assert _manifest(tmp_path)["row_count"] == 7
+        # The copy preserved what was already written.
+        assert torch.equal(encoder.encode(_novel(2), device=cpu), kept)
+        features = np.load(tmp_path / "shard" / "features.npy", mmap_mode="r")
+        assert features.shape[0] >= 7
+    finally:
+        feature_store._INITIAL_SHARD_CAPACITY = monkey
+
+
+def test_a_grown_shard_survives_a_restart(tmp_path: Path) -> None:
+    """The capacity boundary must not corrupt what a later run reads back."""
+    from activelearning.surrogate import feature_store
+
+    monkey = feature_store._INITIAL_SHARD_CAPACITY
+    feature_store._INITIAL_SHARD_CAPACITY = 2
+    try:
+        cpu = torch.device("cpu")
+        encoder = _encoder(tmp_path)
+        expected = encoder.encode(_novel(6), device=cpu)
+    finally:
+        feature_store._INITIAL_SHARD_CAPACITY = monkey
+
+    resumed_inner = _StoreEncoder()
+    resumed = _encoder(tmp_path, resumed_inner)
+
+    assert resumed.shard_size == 6
+    assert torch.equal(resumed.encode(_novel(6), device=torch.device("cpu")), expected)
+    assert resumed_inner.calls == []
+
+
+def test_smiles_written_but_never_committed_are_discarded(tmp_path: Path) -> None:
+    """A crash between appending SMILES and publishing the manifest.
+
+    The surplus names rows that were never committed. Keeping them would offset
+    every row appended afterwards, which would silently serve one molecule's
+    features for another -- the one failure here that announces nothing.
+    """
+    cpu = torch.device("cpu")
+    encoder = _encoder(tmp_path)
+    expected = encoder.encode(_novel(2), device=cpu)
+    smiles_path = tmp_path / "shard" / "smiles.txt"
+    with smiles_path.open("a", encoding="utf-8") as stream:
+        stream.write("NEVER_COMMITTED\n")
+
+    resumed = _encoder(tmp_path)
+
+    assert resumed.shard_size == 2
+    assert smiles_path.read_text(encoding="utf-8").splitlines() == _novel(2)
+    # The next append lands on row 2, not row 3.
+    assert torch.equal(resumed.encode(_novel(2), device=cpu), expected)
+    resumed.encode(_novel(1, offset=30), device=cpu)
+    assert resumed.shard_size == 3
+
+
+def test_a_shard_shorter_than_its_row_count_is_refused(tmp_path: Path) -> None:
+    """Too few rows means committed features are missing, which is corruption."""
+    _encoder(tmp_path).encode(_novel(2), device=torch.device("cpu"))
+    manifest_path = tmp_path / "shard" / "shard.json"
+    import json
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["row_count"] = 10_000
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="inconsistent"):
+        _encoder(tmp_path)
+
+
+def test_a_non_integer_row_count_is_refused(tmp_path: Path) -> None:
+    """The row count decides which rows are real; it cannot be guessed at."""
+    _encoder(tmp_path).encode(_novel(2), device=torch.device("cpu"))
+    manifest_path = tmp_path / "shard" / "shard.json"
+    import json
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["row_count"] = "2"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="non-integer row_count"):
+        _encoder(tmp_path)
+
+
+def test_an_exact_length_shard_from_the_old_format_still_loads(
+    tmp_path: Path,
+) -> None:
+    """Shards written before preallocation have capacity equal to row count."""
+    shard = tmp_path / "shard"
+    shard.mkdir()
+    import json
+
+    np.save(
+        shard / "features.npy",
+        np.array([_features(v) for v in _novel(2)], dtype=np.float32),
+    )
+    (shard / "smiles.txt").write_text(
+        "".join(f"{v}\n" for v in _novel(2)), encoding="utf-8"
+    )
+    identity = {
+        "encoder_class": (
+            f"{_StoreEncoder.__module__}.{_StoreEncoder.__qualname__}"
+        ),
+        "feature_dim": 3,
+    }
+    (shard / "shard.json").write_text(
+        json.dumps({"identity": identity, "row_count": 2}), encoding="utf-8"
+    )
+    inner = _StoreEncoder()
+    encoder = _encoder(tmp_path, inner)
+
+    assert encoder.shard_size == 2
+    # Served from the shard, not re-encoded, and appending still works.
+    encoder.encode(_novel(2), device=torch.device("cpu"))
+    assert inner.calls == []
+    encoder.encode(_novel(1, offset=40), device=torch.device("cpu"))
+    assert encoder.shard_size == 3

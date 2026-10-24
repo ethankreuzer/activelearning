@@ -29,6 +29,16 @@ _SHARD_FEATURES = "features.npy"
 _SHARD_SMILES = "smiles.txt"
 _SHARD_MANIFEST = "shard.json"
 
+#: Rows the shard file is created with. The file is preallocated and holds more
+#: rows than it uses, so an append writes only the new rows instead of rewriting
+#: the whole matrix: ``shard.json`` records how many of them are real.
+_INITIAL_SHARD_CAPACITY = 4096
+
+#: Rows copied at a time when the shard outgrows its file. Copying through the
+#: mapping rather than through an array keeps a doubling of a multi-gigabyte
+#: shard off the heap.
+_SHARD_COPY_CHUNK = 65_536
+
 
 @runtime_checkable
 class SupportsFeatureStore(Protocol):
@@ -89,6 +99,10 @@ class FeatureStoreEncoder(FixedEncoder):
         self._base: np.ndarray | None = None
         self._base_index: dict[str, int] | None = None
         self._shard_features = np.empty((0, self.feature_dim), dtype=np.float32)
+        # Rows of ``_shard_features`` that hold a molecule, as against the rows
+        # the file is merely long enough for.
+        self._shard_count = 0
+        self._shard_capacity = 0
         self._shard_smiles: list[str] = []
         self._shard_index: dict[str, int] = {}
         if self._shard_dir is not None:
@@ -120,7 +134,7 @@ class FeatureStoreEncoder(FixedEncoder):
     @property
     def shard_size(self) -> int:
         """Number of molecules encoded live and kept in the shard."""
-        return len(self._shard_smiles)
+        return self._shard_count
 
     def encode(self, values: Sequence[Any], *, device: torch.device) -> Tensor:
         """Return features for ``values`` in order, from the store where possible."""
@@ -157,7 +171,14 @@ class FeatureStoreEncoder(FixedEncoder):
         self._base = base
 
     def _extend_shard(self, values: Sequence[str]) -> None:
-        """Encode the values the shard lacks, add them, and persist the shard."""
+        """Encode the values the shard lacks, add them, and persist the new rows.
+
+        The rows are appended in place. Growing the shard by concatenation and
+        rewriting the whole file, which is what this did until 2026-10-23, costs
+        time proportional to the shard rather than to the molecules added: in
+        job 24882282 that made every round slower than the one before it, with a
+        ~1 GB rewrite per 64 molecules on a networked filesystem.
+        """
         new = list(dict.fromkeys(v for v in values if v not in self._shard_index))
         if not new:
             return
@@ -168,14 +189,87 @@ class FeatureStoreEncoder(FixedEncoder):
                 "Inner encoder output must have shape "
                 f"{(len(new), self.feature_dim)}, got {encoded_array.shape}."
             )
-        start = len(self._shard_smiles)
-        self._shard_features = np.concatenate([self._shard_features, encoded_array])
+        start = self._shard_count
+        self._reserve_shard_rows(len(new))
+        self._shard_features[start : start + len(new)] = encoded_array
+        self._shard_count = start + len(new)
         self._shard_smiles.extend(new)
         self._shard_index.update(
             (value, start + offset) for offset, value in enumerate(new)
         )
         if self._shard_dir is not None:
-            self._write_shard()
+            self._persist_shard_rows(new)
+
+    def _reserve_shard_rows(self, extra: int) -> None:
+        """Make room for ``extra`` more rows, doubling the file when it is full.
+
+        Doubling is what keeps appending cheap on average: the copy below runs
+        O(log n) times over a run rather than once per append.
+        """
+        needed = self._shard_count + extra
+        if needed <= self._shard_capacity:
+            return
+        capacity = max(_INITIAL_SHARD_CAPACITY, self._shard_capacity * 2, needed)
+        if self._shard_dir is None:
+            grown = np.empty((capacity, self.feature_dim), dtype=np.float32)
+            grown[: self._shard_count] = self._shard_features[: self._shard_count]
+            self._shard_features = grown
+        else:
+            self._grow_shard_file(capacity)
+        self._shard_capacity = capacity
+
+    def _grow_shard_file(self, capacity: int) -> None:
+        """Replace the shard file with a longer one holding the same rows."""
+        assert self._shard_dir is not None
+        self._shard_dir.mkdir(parents=True, exist_ok=True)
+        path = self._shard_dir / _SHARD_FEATURES
+        descriptor, name = tempfile.mkstemp(
+            prefix=f".{_SHARD_FEATURES}.", suffix=".tmp", dir=self._shard_dir
+        )
+        os.close(descriptor)
+        temporary = Path(name)
+        try:
+            grown = np.lib.format.open_memmap(
+                temporary,
+                mode="w+",
+                dtype=np.float32,
+                shape=(capacity, self.feature_dim),
+            )
+            try:
+                # Chunked, and straight from one mapping to the other, so a
+                # multi-gigabyte shard never has to fit in memory at once.
+                for begin in range(0, self._shard_count, _SHARD_COPY_CHUNK):
+                    end = min(begin + _SHARD_COPY_CHUNK, self._shard_count)
+                    grown[begin:end] = self._shard_features[begin:end]
+                grown.flush()
+            finally:
+                _close_memmap(grown)
+            # Only now is the old mapping expendable.
+            _close_memmap(self._shard_features)
+            self._shard_features = np.empty((0, self.feature_dim), dtype=np.float32)
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+        self._shard_features = np.lib.format.open_memmap(path, mode="r+")
+
+    def _persist_shard_rows(self, new: Sequence[str]) -> None:
+        """Commit the rows just appended, the manifest last.
+
+        The manifest is the commit point: it is published only once the features
+        and the SMILES are on disk, so a crash can leave rows the manifest does
+        not count, but never count rows that are not there. ``_load_shard``
+        discards the uncounted remainder.
+        """
+        assert self._shard_dir is not None
+        features = self._shard_features
+        if isinstance(features, np.memmap):
+            features.flush()
+        smiles_path = self._shard_dir / _SHARD_SMILES
+        with smiles_path.open("a", encoding="utf-8") as stream:
+            stream.write("".join(f"{value}\n" for value in new))
+            stream.flush()
+            os.fsync(stream.fileno())
+        self._write_manifest()
 
     def _shard_identity(self) -> dict[str, Any]:
         """Identify the encoder a shard was written by."""
@@ -197,43 +291,75 @@ class FeatureStoreEncoder(FixedEncoder):
                 f"Feature shard {self._shard_dir} was written by a different "
                 f"encoder: {manifest.get('identity')}."
             )
-        features = np.load(self._shard_dir / _SHARD_FEATURES, allow_pickle=False)
-        smiles = (
-            (self._shard_dir / _SHARD_SMILES).read_text(encoding="utf-8").splitlines()
+        row_count = manifest.get("row_count")
+        if not isinstance(row_count, int) or isinstance(row_count, bool):
+            raise ValueError(
+                f"Feature shard {self._shard_dir} has a non-integer row_count: "
+                f"{row_count!r}."
+            )
+        if row_count < 0:
+            raise ValueError(
+                f"Feature shard {self._shard_dir} has a negative row_count: "
+                f"{row_count}."
+            )
+        features = np.lib.format.open_memmap(
+            self._shard_dir / _SHARD_FEATURES, mode="r+"
         )
-        if features.shape != (len(smiles), self.feature_dim) or len(smiles) != (
-            manifest.get("row_count")
+        smiles_path = self._shard_dir / _SHARD_SMILES
+        smiles = smiles_path.read_text(encoding="utf-8").splitlines()
+        # The file is preallocated, so it is long enough rather than exact. Too
+        # short, or too few SMILES, means rows the manifest counts are missing.
+        if (
+            features.ndim != 2
+            or features.shape[1] != self.feature_dim
+            or features.shape[0] < row_count
+            or len(smiles) < row_count
         ):
             raise ValueError(
                 f"Feature shard {self._shard_dir} is inconsistent: "
-                f"{features.shape} features for {len(smiles)} SMILES."
+                f"{features.shape} features and {len(smiles)} SMILES for "
+                f"{row_count} rows."
             )
-        self._shard_features = features.astype(np.float32, copy=False)
+        if len(smiles) > row_count:
+            # A crash between appending the SMILES and publishing the manifest.
+            # The surplus names rows that were never committed; leaving them
+            # would offset every row appended from here on.
+            smiles = smiles[:row_count]
+            smiles_path.write_text(
+                "".join(f"{value}\n" for value in smiles), encoding="utf-8"
+            )
+        self._shard_features = features
+        self._shard_capacity = int(features.shape[0])
+        self._shard_count = row_count
         self._shard_smiles = smiles
         self._shard_index = {value: row for row, value in enumerate(smiles)}
 
-    def _write_shard(self) -> None:
-        """Rewrite the shard atomically; the manifest is published last."""
+    def _write_manifest(self) -> None:
+        """Publish the row count atomically, which commits the rows below it."""
         assert self._shard_dir is not None
         self._shard_dir.mkdir(parents=True, exist_ok=True)
-        _atomic_write(
-            self._shard_dir / _SHARD_FEATURES,
-            lambda stream: np.save(stream, self._shard_features, allow_pickle=False),
-        )
-        smiles_text = "".join(f"{value}\n" for value in self._shard_smiles)
-        _atomic_write(
-            self._shard_dir / _SHARD_SMILES,
-            lambda stream: stream.write(smiles_text.encode("utf-8")),
-        )
         manifest = {
             "identity": self._shard_identity(),
-            "row_count": len(self._shard_smiles),
+            "row_count": self._shard_count,
         }
         manifest_text = json.dumps(manifest, sort_keys=True, indent=2) + "\n"
         _atomic_write(
             self._shard_dir / _SHARD_MANIFEST,
             lambda stream: stream.write(manifest_text.encode("utf-8")),
         )
+
+
+def _close_memmap(features: np.ndarray) -> None:
+    """Release a memory mapping now rather than when the garbage collector runs.
+
+    Growing the shard replaces the file the old mapping refers to, and a
+    deterministic close keeps the superseded file from outliving the rename.
+    """
+    if isinstance(features, np.memmap):
+        features.flush()
+        mapping = getattr(features, "_mmap", None)
+        if mapping is not None:
+            mapping.close()
 
 
 def _atomic_write(path: Path, write: Callable[[BinaryIO], object]) -> None:
