@@ -147,7 +147,7 @@ sampler:
   batch_size: 64  # Adjust depending on VRAM availability
   replay_batch_size: 64  # Adjust depending on VRAM availability
   generation_batch_size: 128  # Adjust depending on VRAM availability
-  n_train_steps: 2500
+  n_train_steps: 5000  # The real run's; the two-round test trained 2,500.
   num_warmup_steps: 10
   # EVERY reward and loss setting below is set explicitly, never left to a
   # schema default, because the defaults are not what this study uses: `loss`

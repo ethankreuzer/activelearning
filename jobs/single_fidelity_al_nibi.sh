@@ -19,12 +19,17 @@
 # 48-worker per-node cap is the ceiling. Over 14 CPUs per GPU likely bills as
 # more than one GPU on this cluster; that is accepted for the throughput.
 #
-# Time. The 2-round test: per round ~28 min of policy training (2,500 steps),
-# ~5 min generating the 100k pool, the pool scored in chunks of 64, a ~1 min GP
-# fit, and 1,000 docking evaluations at ~32 core-seconds each, so ~22 min on 24
-# workers. Call it 1-1.5 h per round. 6 hours is generous for two rounds and
-# leaves room for the live encoding of the part of ampc_331k that the feature
-# store does not already hold, which is re-done each round.
+# Time. The 10-round run (`<run_name> 10 5000`): per round ~1 h of policy
+# training (5,000 steps at the ~0.7 s/step the shard-free 2-round test
+# measured), ~4 min generating the 100k pool, ~2.5 min selecting, ~1.5 min
+# scoring the pool, a ~1 min GP fit, and 5,000 docking evaluations at the
+# ~27 min per 1,000 that test measured on 24 workers, so ~2.3 h. Call it
+# ~3.5 h per round, ~35 h for ten. 48 hours leaves room for the docking to
+# slow as the archive and the policy change. There is no resume: a run that
+# dies is rerun from round 0.
+#
+# Memory. The shard-free 2-round test peaked at ~44 GB; 80 GB leaves room for
+# the archive growing to ~65k rows.
 #
 # A crash does not lose finished stages: the surrogate fit, the policy training
 # and the docking each write their metrics, figures and results to disk as they
@@ -34,8 +39,8 @@
 
 #SBATCH --gpus=h100:1
 #SBATCH --cpus-per-task=24
-#SBATCH --mem=250G
-#SBATCH --time=6:00:00
+#SBATCH --mem=80G
+#SBATCH --time=48:00:00
 #SBATCH --job-name=single_fidelity_al
 #SBATCH --account=def-yvesbrun_gpu
 #SBATCH --output=slurm_logs/single_fidelity_al_%j.out
