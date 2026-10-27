@@ -27,9 +27,9 @@
 #      fit the high scorers".
 #   2. gp_molformer_set/acquisition/gibbon_*/top1000_enrichment,
 #      effective_support and fraction_at_floor -- "are the GIBBON values still
-#      usable as a reward". ampc_331k is predicted but NOT scored here
-#      (--predict-only below): its GIBBON pass was 73% of the 50k arm's 49
-#      minutes on an RTX 8000, while predicting it takes seconds.
+#      usable as a reward". ampc_331k is predicted but NOT scored unless
+#      SCORE_AMPC=1: its GIBBON pass was 73% of the 50k arm's 49 minutes on
+#      an RTX 8000, while predicting it takes seconds.
 #      The support is capped at 100,000 (see the config): the whole training
 #      set at 50k and 100k, a stratified 100,000 at 300k -- what each size would
 #      get in an AL round. run/acquisition/*/acqf_support_size records it.
@@ -46,7 +46,7 @@
 # arm, so the fit cost scales only with the step count. The memory and wall time
 # are dominated by GIBBON scoring, as they were for the balanced arm (peak 10.4
 # GB allocated at a 25,000-row support); the support here is capped at 100,000,
-# up to four times that, so --score-chunk-size stays at 256 and the first 300k arm
+# up to four times that, so --score-chunk-size stays at 256 (scaled with M) and the first 300k arm
 # measures the real wall time (stage_profile.csv) for later ones to trim.
 #
 # Any GPU with 32 GB or more is enough for that peak, but an untyped request
@@ -124,7 +124,49 @@ for argument in "${@:3}"; do
       "so the directory, tags and notes follow it." >&2
     exit 2
   fi
+  if [[ "${argument}" == surrogate.num_inducing=* \
+     || "${argument}" == --score-chunk-size* || "${argument}" == --predict-only* ]]; then
+    echo "Set the inducing points with M=<count> and ampc_331k scoring with" \
+      "SCORE_AMPC=1, not ${argument}, so the directory, tags and notes follow it." >&2
+    exit 2
+  fi
 done
+
+# Inducing points. GIBBON scores each candidate as its own q=1 batch, and the
+# variational posterior builds an (M + 1)^2 covariance per candidate, so a
+# chunk's memory grows with M^2. The chunk is scaled by (1024 / M)^2 to keep it
+# at the ~1 GB that 256 candidates take at M = 1024 (10.7 GB peak allocated on
+# the 300k arm): 64 at M = 2048.
+M="${M:-1024}"
+if [[ ! "${M}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "M must be a positive integer." >&2
+  exit 2
+fi
+SCORE_CHUNK=$(( 256 * 1024 * 1024 / (M * M) ))
+(( SCORE_CHUNK < 1 )) && SCORE_CHUNK=1
+
+# ampc_331k is predicted but not scored unless SCORE_AMPC=1: its two GIBBON
+# passes were 73% of the 50k arm's run time. Score it to check that a settled
+# configuration's rewards are still realistic on a library-like distribution.
+SCORE_AMPC="${SCORE_AMPC:-0}"
+case "${SCORE_AMPC}" in
+  0)
+    AMPC_ARGS=(--predict-only ampc_331k)
+    AMPC_SUFFIX=""
+    AMPC_TAG="ampc331k-predict-only"
+    AMPC_NOTE="ampc_331k is predicted but not scored with GIBBON, so it has prediction metrics and no acquisition metrics and is not in the cross-set pool."
+    ;;
+  1)
+    AMPC_ARGS=()
+    AMPC_SUFFIX="_ampcscored"
+    AMPC_TAG="ampc331k-scored"
+    AMPC_NOTE="ampc_331k is predicted AND scored with GIBBON, and is in the cross-set pool."
+    ;;
+  *)
+    echo "SCORE_AMPC must be 0 or 1." >&2
+    exit 2
+    ;;
+esac
 
 # The schedule. By default 300 epochs from a peak of 1e-2, as the first arms
 # ran. STEPS fixes the number of Adam steps instead, so arms of different sizes
@@ -154,7 +196,7 @@ if [[ "${LR}" != "1e-2" || -n "${STEPS}" ]]; then
   SCHEDULE_SUFFIX="_lr${LR}_steps${TOTAL_STEPS}"
 fi
 
-ARM="${SET_LABEL}_${SIZE}_svgp_M1024_iso_matern_scaled_pm0.03956_${OBJECTIVE_ARG}_cosine${SCHEDULE_SUFFIX}_fp32"
+ARM="${SET_LABEL}_${SIZE}_svgp_M${M}_iso_matern_scaled_pm0.03956_${OBJECTIVE_ARG}_cosine${SCHEDULE_SUFFIX}_fp32${AMPC_SUFFIX}"
 
 source .venv/bin/activate
 
@@ -169,19 +211,17 @@ export WANDB_DIR="${OUTPUT_DIR}"
 mkdir -p "${WANDB_DIR}" slurm_logs
 
 # Shown on the W&B run's Overview page and kept next to the outputs.
-export WANDB_NOTES="Sparse variational GP with 1024 learned inducing points, fitted to the ${SIZE}-molecule arm of the training-set scaling study (${TRAIN_CSV}).
+export WANDB_NOTES="Sparse variational GP with ${M} learned inducing points, fitted to the ${SIZE}-molecule arm of the training-set scaling study (${TRAIN_CSV}).
 The arms are NESTED subsets of data/10M_unif_random_subset.csv built by scripts/build_svgp_scaling_sets.py: every arm holds the same 16292 molecules above y 0.2617 (pProp 3.5) whole, and the filler budget is split evenly across the four bands cut at pProp 2.0, 2.5, 3.0 and 3.5, by farthest point sampling in the frozen MiniMol space. Bands stop at pProp 2.0 because the shipped score/pProp table's eight-decimal cumul_prop column makes pProp constant at 1.5988 for every score from -7.045 to +71.665, which is the library's minimum and holds 101313 molecules; recovered DOCK scores for all 10M put the median at 1.6443 and the 99th percentile at 2.7299. Tail supervision is therefore constant across arms while bulk grows, so the arms isolate how much bulk the surrogate absorbs; the tail's share falls from 32.4% at 50k to 5.4% at 300k by construction.
 Surrogate, unchanged across arms and taken from the winning balanced arm: Matern-5/2 with ONE lengthscale shared by all 512 features under BoTorch's dimension-scaled LogNormal prior and 0.025 floor; inputs min-max scaled to [0, 1] on the training rows' range; a learned ScaleKernel output scale; BoTorch's LogNormal(-4, 1) noise prior and 1e-4 floor; the constant mean PINNED at 0.03956042999405787 (the 10M library mean); float32. Both floors use gpytorch's softplus rather than BoTorch's untransformed bound, because Adam cannot enforce a bound.
 Fitted on ${OBJECTIVE_NOTE}, by Adam on 4096-row minibatches for ${EPOCHS} epochs (${TOTAL_STEPS} steps) with the learning rate cosine-annealed from ${LR} to 1e-4. Minibatched, unlike the balanced arm, so a step costs the same in every arm: an epoch is ceil(${SIZE}/4096) steps, so train/epoch/* is comparable across arms only against the step count.
 GIBBON's max-value support is CAPPED at 100000 observations (acquisition.candidate_set_spec.max_support_size), as it would be in an AL round: the 50k and 100k arms use their whole training set, and the 300k arm a 100000-row subset chosen by the deterministic fidelity/target-stratified reservoir, which keeps the arm's best molecule. run/acquisition/*/acqf_support_size records the size used.
-Evaluated on the held-out generated tail set ${GENTAIL_SET} -- molecules the 10-round run docked that are NOT in the 10M, so no arm trained on them -- alongside the standard sets. ampc_331k is predicted but not scored with GIBBON, so it has prediction metrics and no acquisition metrics and is not in the cross-set pool. Fit and GIBBON scoring in one job.
+Evaluated on the held-out generated tail set ${GENTAIL_SET} -- molecules the 10-round run docked that are NOT in the 10M, so no arm trained on them -- alongside the standard sets. ${AMPC_NOTE} GIBBON scored ${SCORE_CHUNK} candidates per chunk. Fit and GIBBON scoring in one job.
 Submitted with: sbatch jobs/variational_gp_scaling_mila.sh $*   (Slurm job ${SLURM_JOB_ID:-unknown})"
 printf '%s\n' "${WANDB_NOTES}" > "${OUTPUT_DIR}/arm_description.txt"
 
-# --score-chunk-size: each candidate is its own q=1 batch and the variational
-# posterior builds a (1024 + 1)^2 covariance per candidate, so 256 is ~1 GB in
-# float32. Unchanged from the balanced arm; the support is four times larger
-# here, which costs time rather than per-chunk memory.
+# --score-chunk-size is ${SCORE_CHUNK}, scaled with M above. The support is four
+# times the balanced arm's, which costs time rather than per-chunk memory.
 uv run --no-sync python -m scripts.exact_dkl_top_n \
   config/ampc/variational_gp_scaling.yaml \
   "dataset.initial_data.path=${TRAIN_CSV}" \
@@ -189,16 +229,17 @@ uv run --no-sync python -m scripts.exact_dkl_top_n \
   "surrogate.training_params.variational_objective=${OBJECTIVE}" \
   "surrogate.training_params.lr=${LR}" \
   "surrogate.training_params.epochs=${EPOCHS}" \
+  "surrogate.num_inducing=${M}" \
   --output-dir "${OUTPUT_DIR}" \
   --cache-dir cache/ampc/exact_dkl_top_n \
   --eval-chunk-size 2000 \
-  --score-chunk-size 256 \
+  --score-chunk-size "${SCORE_CHUNK}" \
   --extra-set "${GENTAIL_SET}" \
-  --predict-only ampc_331k \
+  ${AMPC_ARGS[@]+"${AMPC_ARGS[@]}"} \
   --wandb-project ampc-Variational-GP \
   --wandb-entity models-mila5723 \
   --wandb-group variational-gp-scaling \
-  --wandb-tags "variational-gp,svgp,M1024,scaling,${SET_LABEL},n${SIZE},${OBJECTIVE_ARG},${OBJECTIVE},isotropic,matern,outputscale,pinned-mean,noise-prior,lengthscale-prior,scale-inputs,adam,minibatch4096,lr-cosine,lr${LR},steps${TOTAL_STEPS},fp32,nested,even-fill,keep-pprop3.5,support-cap100k,ampc331k-predict-only" \
+  --wandb-tags "variational-gp,svgp,M${M},scaling,${SET_LABEL},n${SIZE},${OBJECTIVE_ARG},${OBJECTIVE},isotropic,matern,outputscale,pinned-mean,noise-prior,lengthscale-prior,scale-inputs,adam,minibatch4096,lr-cosine,lr${LR},steps${TOTAL_STEPS},fp32,nested,even-fill,keep-pprop3.5,support-cap100k,${AMPC_TAG},chunk${SCORE_CHUNK}" \
   --run-name "${ARM//_/-}-${SLURM_JOB_ID}" \
   "${@:3}"
 
