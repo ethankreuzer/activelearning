@@ -118,9 +118,43 @@ for argument in "${@:3}"; do
     echo "Set the objective with the first argument (elbo|pll), not ${argument}." >&2
     exit 2
   fi
+  if [[ "${argument}" == surrogate.training_params.lr=* \
+     || "${argument}" == surrogate.training_params.epochs=* ]]; then
+    echo "Set the schedule with LR=<peak> and STEPS=<count>, not ${argument}," \
+      "so the directory, tags and notes follow it." >&2
+    exit 2
+  fi
 done
 
-ARM="${SET_LABEL}_${SIZE}_svgp_M1024_iso_matern_scaled_pm0.03956_${OBJECTIVE_ARG}_cosine_fp32"
+# The schedule. By default 300 epochs from a peak of 1e-2, as the first arms
+# ran. STEPS fixes the number of Adam steps instead, so arms of different sizes
+# (and AL rounds on a growing archive) get the same optimization: epochs is
+# rounded up to whole epochs of ceil(SIZE / 4096) minibatches. Either way the
+# rate is cosine-annealed from LR to the config's lr_min of 1e-4.
+#   LR=3e-3 STEPS=10000 sbatch jobs/variational_gp_scaling_mila.sh elbo 300000
+LR="${LR:-1e-2}"
+STEPS="${STEPS:-}"
+if [[ ! "${LR}" =~ ^[0-9]*\.?[0-9]+([eE][-+]?[0-9]+)?$ ]]; then
+  echo "LR must be a positive number." >&2
+  exit 2
+fi
+STEPS_PER_EPOCH=$(( (SIZE + 4095) / 4096 ))
+if [[ -z "${STEPS}" ]]; then
+  EPOCHS=300
+elif [[ "${STEPS}" =~ ^[1-9][0-9]*$ ]]; then
+  EPOCHS=$(( (STEPS + STEPS_PER_EPOCH - 1) / STEPS_PER_EPOCH ))
+else
+  echo "STEPS must be a positive integer." >&2
+  exit 2
+fi
+TOTAL_STEPS=$(( EPOCHS * STEPS_PER_EPOCH ))
+# Empty for the default schedule, so the first arms keep their names.
+SCHEDULE_SUFFIX=""
+if [[ "${LR}" != "1e-2" || -n "${STEPS}" ]]; then
+  SCHEDULE_SUFFIX="_lr${LR}_steps${TOTAL_STEPS}"
+fi
+
+ARM="${SET_LABEL}_${SIZE}_svgp_M1024_iso_matern_scaled_pm0.03956_${OBJECTIVE_ARG}_cosine${SCHEDULE_SUFFIX}_fp32"
 
 source .venv/bin/activate
 
@@ -138,7 +172,7 @@ mkdir -p "${WANDB_DIR}" slurm_logs
 export WANDB_NOTES="Sparse variational GP with 1024 learned inducing points, fitted to the ${SIZE}-molecule arm of the training-set scaling study (${TRAIN_CSV}).
 The arms are NESTED subsets of data/10M_unif_random_subset.csv built by scripts/build_svgp_scaling_sets.py: every arm holds the same 16292 molecules above y 0.2617 (pProp 3.5) whole, and the filler budget is split evenly across the four bands cut at pProp 2.0, 2.5, 3.0 and 3.5, by farthest point sampling in the frozen MiniMol space. Bands stop at pProp 2.0 because the shipped score/pProp table's eight-decimal cumul_prop column makes pProp constant at 1.5988 for every score from -7.045 to +71.665, which is the library's minimum and holds 101313 molecules; recovered DOCK scores for all 10M put the median at 1.6443 and the 99th percentile at 2.7299. Tail supervision is therefore constant across arms while bulk grows, so the arms isolate how much bulk the surrogate absorbs; the tail's share falls from 32.4% at 50k to 5.4% at 300k by construction.
 Surrogate, unchanged across arms and taken from the winning balanced arm: Matern-5/2 with ONE lengthscale shared by all 512 features under BoTorch's dimension-scaled LogNormal prior and 0.025 floor; inputs min-max scaled to [0, 1] on the training rows' range; a learned ScaleKernel output scale; BoTorch's LogNormal(-4, 1) noise prior and 1e-4 floor; the constant mean PINNED at 0.03956042999405787 (the 10M library mean); float32. Both floors use gpytorch's softplus rather than BoTorch's untransformed bound, because Adam cannot enforce a bound.
-Fitted on ${OBJECTIVE_NOTE}, by Adam on 4096-row minibatches for 300 epochs with the learning rate cosine-annealed from 1e-2 to 1e-4. Minibatched, unlike the balanced arm, so a step costs the same in every arm: an epoch is ceil(${SIZE}/4096) steps, so train/epoch/* is comparable across arms only against the step count.
+Fitted on ${OBJECTIVE_NOTE}, by Adam on 4096-row minibatches for ${EPOCHS} epochs (${TOTAL_STEPS} steps) with the learning rate cosine-annealed from ${LR} to 1e-4. Minibatched, unlike the balanced arm, so a step costs the same in every arm: an epoch is ceil(${SIZE}/4096) steps, so train/epoch/* is comparable across arms only against the step count.
 GIBBON's max-value support is CAPPED at 100000 observations (acquisition.candidate_set_spec.max_support_size), as it would be in an AL round: the 50k and 100k arms use their whole training set, and the 300k arm a 100000-row subset chosen by the deterministic fidelity/target-stratified reservoir, which keeps the arm's best molecule. run/acquisition/*/acqf_support_size records the size used.
 Evaluated on the held-out generated tail set ${GENTAIL_SET} -- molecules the 10-round run docked that are NOT in the 10M, so no arm trained on them -- alongside the standard sets. ampc_331k is predicted but not scored with GIBBON, so it has prediction metrics and no acquisition metrics and is not in the cross-set pool. Fit and GIBBON scoring in one job.
 Submitted with: sbatch jobs/variational_gp_scaling_mila.sh $*   (Slurm job ${SLURM_JOB_ID:-unknown})"
@@ -153,6 +187,8 @@ uv run --no-sync python -m scripts.exact_dkl_top_n \
   "dataset.initial_data.path=${TRAIN_CSV}" \
   "surrogate.encoder.feature_cache_path=${TRAIN_CACHE}" \
   "surrogate.training_params.variational_objective=${OBJECTIVE}" \
+  "surrogate.training_params.lr=${LR}" \
+  "surrogate.training_params.epochs=${EPOCHS}" \
   --output-dir "${OUTPUT_DIR}" \
   --cache-dir cache/ampc/exact_dkl_top_n \
   --eval-chunk-size 2000 \
@@ -162,7 +198,7 @@ uv run --no-sync python -m scripts.exact_dkl_top_n \
   --wandb-project ampc-Variational-GP \
   --wandb-entity models-mila5723 \
   --wandb-group variational-gp-scaling \
-  --wandb-tags "variational-gp,svgp,M1024,scaling,${SET_LABEL},n${SIZE},${OBJECTIVE_ARG},${OBJECTIVE},isotropic,matern,outputscale,pinned-mean,noise-prior,lengthscale-prior,scale-inputs,adam,minibatch4096,lr-cosine,fp32,nested,even-fill,keep-pprop3.5,support-cap100k,ampc331k-predict-only" \
+  --wandb-tags "variational-gp,svgp,M1024,scaling,${SET_LABEL},n${SIZE},${OBJECTIVE_ARG},${OBJECTIVE},isotropic,matern,outputscale,pinned-mean,noise-prior,lengthscale-prior,scale-inputs,adam,minibatch4096,lr-cosine,lr${LR},steps${TOTAL_STEPS},fp32,nested,even-fill,keep-pprop3.5,support-cap100k,ampc331k-predict-only" \
   --run-name "${ARM//_/-}-${SLURM_JOB_ID}" \
   "${@:3}"
 
