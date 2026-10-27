@@ -107,13 +107,13 @@ acquisition:
   # log_output is set per scoring pass rather than here.
   type: QLowerBoundMaxValueEntropy
   candidate_set_spec:
-    # The support for max-value sampling. The balanced arm used its whole
-    # training set, which is not usable here: the support would be 50,000
-    # molecules in one arm and 300,000 in another, so GIBBON would sample its
-    # max values from supports differing sixfold and the arms' acquisition
-    # values would not be comparable. max_support_size pins it to the same
-    # 100,000 for every arm, chosen by the deterministic fidelity/target
-    # stratified reservoir, which also keeps each arm's best molecule.
+    # The support for max-value sampling, CAPPED at 100,000 as it would be in
+    # an AL round. max_support_size is a ceiling, not a target: the 50k and
+    # 100k arms use their whole training set, and only the 300k arm is drawn
+    # down to 100,000 by the deterministic fidelity/target stratified
+    # reservoir, which also keeps the arm's best molecule. The supports
+    # therefore differ in size (50,000 / 100,000 / 100,000), on purpose: each
+    # arm sees what its size would get in the pipeline.
     # fallback_size stays the smaller size the out-of-memory retry drops to; if
     # that retry ever fires, exact_dkl_top_n.py fails the run rather than
     # quietly changing the support.

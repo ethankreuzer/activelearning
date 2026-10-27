@@ -27,8 +27,9 @@
 #      fit the high scorers".
 #   2. ampc_331k/acquisition/gibbon_*/top1000_enrichment, effective_support and
 #      fraction_at_floor -- "are the GIBBON values still usable as a reward".
-#      The support is pinned at 100,000 for every arm (see the config), so these
-#      are comparable; run/acquisition/*/acqf_support_size confirms it.
+#      The support is capped at 100,000 (see the config): the whole training
+#      set at 50k and 100k, a stratified 100,000 at 300k -- what each size would
+#      get in an AL round. run/acquisition/*/acqf_support_size records it.
 #   3. ampc_331k and gp_molformer_set coverage_2std and spearman_std_error, and
 #      the *_unseen variants.
 #   4. run/hyperparameters/* across arms. The balanced PLL arm collapsed its
@@ -41,8 +42,8 @@
 # Resources. The fit is a 4096 x 1024 cross-covariance per step regardless of
 # arm, so the fit cost scales only with the step count. The memory and wall time
 # are dominated by GIBBON scoring, as they were for the balanced arm (peak 10.4
-# GB allocated at a 25,000-row support); the support here is pinned at 100,000,
-# four times that, so --score-chunk-size stays at 256 and the first 300k arm
+# GB allocated at a 25,000-row support); the support here is capped at 100,000,
+# up to four times that, so --score-chunk-size stays at 256 and the first 300k arm
 # measures the real wall time (stage_profile.csv) for later ones to trim.
 #
 # Any GPU with 32 GB or more is enough for that peak, so no type is requested.
@@ -131,7 +132,7 @@ export WANDB_NOTES="Sparse variational GP with 1024 learned inducing points, fit
 The arms are NESTED subsets of data/10M_unif_random_subset.csv built by scripts/build_svgp_scaling_sets.py: every arm holds the same 16292 molecules above y 0.2617 (pProp 3.5) whole, and the filler budget is split evenly across the four bands cut at pProp 2.0, 2.5, 3.0 and 3.5, by farthest point sampling in the frozen MiniMol space. Bands stop at pProp 2.0 because the shipped score/pProp table's eight-decimal cumul_prop column makes pProp constant at 1.5988 for every score from -7.045 to +71.665, which is the library's minimum and holds 101313 molecules; recovered DOCK scores for all 10M put the median at 1.6443 and the 99th percentile at 2.7299. Tail supervision is therefore constant across arms while bulk grows, so the arms isolate how much bulk the surrogate absorbs; the tail's share falls from 32.4% at 50k to 5.4% at 300k by construction.
 Surrogate, unchanged across arms and taken from the winning balanced arm: Matern-5/2 with ONE lengthscale shared by all 512 features under BoTorch's dimension-scaled LogNormal prior and 0.025 floor; inputs min-max scaled to [0, 1] on the training rows' range; a learned ScaleKernel output scale; BoTorch's LogNormal(-4, 1) noise prior and 1e-4 floor; the constant mean PINNED at 0.03956042999405787 (the 10M library mean); float32. Both floors use gpytorch's softplus rather than BoTorch's untransformed bound, because Adam cannot enforce a bound.
 Fitted on ${OBJECTIVE_NOTE}, by Adam on 4096-row minibatches for 300 epochs with the learning rate cosine-annealed from 1e-2 to 1e-4. Minibatched, unlike the balanced arm, so a step costs the same in every arm: an epoch is ceil(${SIZE}/4096) steps, so train/epoch/* is comparable across arms only against the step count.
-GIBBON's max-value support is PINNED at 100000 observations for every arm (acquisition.candidate_set_spec.max_support_size), chosen by the deterministic fidelity/target-stratified reservoir. Without it the support would be the whole training set and the arms' acquisition values would not be comparable.
+GIBBON's max-value support is CAPPED at 100000 observations (acquisition.candidate_set_spec.max_support_size), as it would be in an AL round: the 50k and 100k arms use their whole training set, and the 300k arm a 100000-row subset chosen by the deterministic fidelity/target-stratified reservoir, which keeps the arm's best molecule. run/acquisition/*/acqf_support_size records the size used.
 Evaluated on the held-out generated tail set ${GENTAIL_SET} -- molecules the 10-round run docked that are NOT in the 10M, so no arm trained on them -- alongside the standard sets. Fit and GIBBON scoring in one job.
 Submitted with: sbatch jobs/variational_gp_scaling_mila.sh $*   (Slurm job ${SLURM_JOB_ID:-unknown})"
 printf '%s\n' "${WANDB_NOTES}" > "${OUTPUT_DIR}/arm_description.txt"
@@ -153,7 +154,7 @@ uv run --no-sync python -m scripts.exact_dkl_top_n \
   --wandb-project ampc-Variational-GP \
   --wandb-entity models-mila5723 \
   --wandb-group variational-gp-scaling \
-  --wandb-tags "variational-gp,svgp,M1024,scaling,${SET_LABEL},n${SIZE},${OBJECTIVE_ARG},${OBJECTIVE},isotropic,matern,outputscale,pinned-mean,noise-prior,lengthscale-prior,scale-inputs,adam,minibatch4096,lr-cosine,fp32,nested,even-fill,keep-pprop3.5,support100k" \
+  --wandb-tags "variational-gp,svgp,M1024,scaling,${SET_LABEL},n${SIZE},${OBJECTIVE_ARG},${OBJECTIVE},isotropic,matern,outputscale,pinned-mean,noise-prior,lengthscale-prior,scale-inputs,adam,minibatch4096,lr-cosine,fp32,nested,even-fill,keep-pprop3.5,support-cap100k" \
   --run-name "${ARM//_/-}-${SLURM_JOB_ID}" \
   "${@:3}"
 
