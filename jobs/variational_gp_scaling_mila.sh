@@ -25,8 +25,11 @@
 #      10-round run's policy and are NOT in the 10M library, so no arm trained
 #      on them. r2, bias and coverage_2std here are the answer to "does it still
 #      fit the high scorers".
-#   2. ampc_331k/acquisition/gibbon_*/top1000_enrichment, effective_support and
-#      fraction_at_floor -- "are the GIBBON values still usable as a reward".
+#   2. gp_molformer_set/acquisition/gibbon_*/top1000_enrichment,
+#      effective_support and fraction_at_floor -- "are the GIBBON values still
+#      usable as a reward". ampc_331k is predicted but NOT scored here
+#      (--predict-only below): its GIBBON pass was 73% of the 50k arm's 49
+#      minutes on an RTX 8000, while predicting it takes seconds.
 #      The support is capped at 100,000 (see the config): the whole training
 #      set at 50k and 100k, a stratified 100,000 at 300k -- what each size would
 #      get in an AL round. run/acquisition/*/acqf_support_size records it.
@@ -137,7 +140,7 @@ The arms are NESTED subsets of data/10M_unif_random_subset.csv built by scripts/
 Surrogate, unchanged across arms and taken from the winning balanced arm: Matern-5/2 with ONE lengthscale shared by all 512 features under BoTorch's dimension-scaled LogNormal prior and 0.025 floor; inputs min-max scaled to [0, 1] on the training rows' range; a learned ScaleKernel output scale; BoTorch's LogNormal(-4, 1) noise prior and 1e-4 floor; the constant mean PINNED at 0.03956042999405787 (the 10M library mean); float32. Both floors use gpytorch's softplus rather than BoTorch's untransformed bound, because Adam cannot enforce a bound.
 Fitted on ${OBJECTIVE_NOTE}, by Adam on 4096-row minibatches for 300 epochs with the learning rate cosine-annealed from 1e-2 to 1e-4. Minibatched, unlike the balanced arm, so a step costs the same in every arm: an epoch is ceil(${SIZE}/4096) steps, so train/epoch/* is comparable across arms only against the step count.
 GIBBON's max-value support is CAPPED at 100000 observations (acquisition.candidate_set_spec.max_support_size), as it would be in an AL round: the 50k and 100k arms use their whole training set, and the 300k arm a 100000-row subset chosen by the deterministic fidelity/target-stratified reservoir, which keeps the arm's best molecule. run/acquisition/*/acqf_support_size records the size used.
-Evaluated on the held-out generated tail set ${GENTAIL_SET} -- molecules the 10-round run docked that are NOT in the 10M, so no arm trained on them -- alongside the standard sets. Fit and GIBBON scoring in one job.
+Evaluated on the held-out generated tail set ${GENTAIL_SET} -- molecules the 10-round run docked that are NOT in the 10M, so no arm trained on them -- alongside the standard sets. ampc_331k is predicted but not scored with GIBBON, so it has prediction metrics and no acquisition metrics and is not in the cross-set pool. Fit and GIBBON scoring in one job.
 Submitted with: sbatch jobs/variational_gp_scaling_mila.sh $*   (Slurm job ${SLURM_JOB_ID:-unknown})"
 printf '%s\n' "${WANDB_NOTES}" > "${OUTPUT_DIR}/arm_description.txt"
 
@@ -155,10 +158,11 @@ uv run --no-sync python -m scripts.exact_dkl_top_n \
   --eval-chunk-size 2000 \
   --score-chunk-size 256 \
   --extra-set "${GENTAIL_SET}" \
+  --predict-only ampc_331k \
   --wandb-project ampc-Variational-GP \
   --wandb-entity models-mila5723 \
   --wandb-group variational-gp-scaling \
-  --wandb-tags "variational-gp,svgp,M1024,scaling,${SET_LABEL},n${SIZE},${OBJECTIVE_ARG},${OBJECTIVE},isotropic,matern,outputscale,pinned-mean,noise-prior,lengthscale-prior,scale-inputs,adam,minibatch4096,lr-cosine,fp32,nested,even-fill,keep-pprop3.5,support-cap100k" \
+  --wandb-tags "variational-gp,svgp,M1024,scaling,${SET_LABEL},n${SIZE},${OBJECTIVE_ARG},${OBJECTIVE},isotropic,matern,outputscale,pinned-mean,noise-prior,lengthscale-prior,scale-inputs,adam,minibatch4096,lr-cosine,fp32,nested,even-fill,keep-pprop3.5,support-cap100k,ampc331k-predict-only" \
   --run-name "${ARM//_/-}-${SLURM_JOB_ID}" \
   "${@:3}"
 

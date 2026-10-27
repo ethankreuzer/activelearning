@@ -724,6 +724,32 @@ class TestResolveStudySets:
         with pytest.raises(SystemExit, match="already a study set"):
             arm.resolve_study_sets(["pool", "pool"])
 
+    def test_a_predict_only_set_is_predicted_but_not_scored(self) -> None:
+        study_sets, _ = arm.resolve_study_sets([], ["ampc_331k"])
+
+        by_name = {s.name: s for s in study_sets}
+        assert by_name["ampc_331k"].predict is True
+        assert by_name["ampc_331k"].score is False
+        assert by_name["gp_molformer_set"].score is True
+        assert [s.name for s in study_sets] == [s.name for s in arm.STUDY_SETS]
+
+    def test_a_predict_only_set_leaves_the_cross_set_pool(self) -> None:
+        """An unscored set has no scores to pool."""
+        _, pool = arm.resolve_study_sets(["gentail"], ["ampc_331k"])
+
+        assert pool == {"gp_molformer_set", "gentail"}
+
+    def test_an_extra_set_can_be_predict_only(self) -> None:
+        study_sets, pool = arm.resolve_study_sets(["gentail"], ["gentail"])
+
+        assert study_sets[-1].score is False
+        assert "gentail" not in pool
+
+    @pytest.mark.parametrize("name", ["val_set", "not_a_set"])
+    def test_rejects_a_predict_only_name_that_is_not_scored(self, name: str) -> None:
+        with pytest.raises(SystemExit, match="not a scored set"):
+            arm.resolve_study_sets([], [name])
+
 
 # FixedFeatureGPSurrogate: BoTorch's default exact GP, fitted by L-BFGS-B.
 

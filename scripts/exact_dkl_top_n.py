@@ -160,6 +160,7 @@ CROSS_SET_POOL = frozenset({"ampc_331k", "gp_molformer_set"})
 
 def resolve_study_sets(
     extra_names: Sequence[str],
+    predict_only: Sequence[str] = (),
 ) -> tuple[tuple[StudySet, ...], frozenset[str]]:
     """Return the sets to evaluate and the ones to pool, including extras.
 
@@ -170,10 +171,16 @@ def resolve_study_sets(
     its posterior max-values once, so all sets are ranked against the same
     draw, which two separate runs would not guarantee.
 
+    A ``predict_only`` set keeps its predictions and prediction metrics but is
+    not scored, and so leaves the pool. Scoring is per candidate, so on
+    ``ampc_331k`` it is most of a run's time while its prediction takes seconds.
+
     Parameters
     ----------
     extra_names : Sequence of str
         Names given to ``--extra-set``, each already prepared into the cache.
+    predict_only : Sequence of str, default=()
+        Names given to ``--predict-only``, each a scored set.
 
     Returns
     -------
@@ -183,7 +190,8 @@ def resolve_study_sets(
     Raises
     ------
     SystemExit
-        If a name is already a study set, or is repeated.
+        If an extra name is already a study set, or is repeated, or a
+        predict-only name is not a set that would be scored.
     """
     known = {study_set.name for study_set in STUDY_SETS}
     for name in extra_names:
@@ -193,7 +201,19 @@ def resolve_study_sets(
     study_sets = STUDY_SETS + tuple(
         StudySet(name, predict=True, score=True) for name in extra_names
     )
-    return study_sets, CROSS_SET_POOL | frozenset(extra_names)
+    scored = {study_set.name for study_set in study_sets if study_set.score}
+    for name in predict_only:
+        if name not in scored:
+            raise SystemExit(
+                f"--predict-only {name!r} is not a scored set; scored sets are "
+                f"{sorted(scored)}."
+            )
+    unscored = frozenset(predict_only)
+    study_sets = tuple(
+        StudySet(s.name, predict=s.predict, score=False) if s.name in unscored else s
+        for s in study_sets
+    )
+    return study_sets, (CROSS_SET_POOL | frozenset(extra_names)) - unscored
 
 
 @dataclass(frozen=True)
@@ -859,6 +879,18 @@ def _parse_args(argv: Sequence[str] | None) -> tuple[argparse.Namespace, list[st
             "sampled max-values; scoring them in separate runs would not."
         ),
     )
+    parser.add_argument(
+        "--predict-only",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help=(
+            "A scored set to predict but not score, such as ampc_331k. "
+            "Repeatable. Its prediction metrics and figures are kept; its "
+            "acquisition metrics are not computed and it leaves the cross-set "
+            "pool."
+        ),
+    )
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument(
         "--score-limit",
@@ -981,6 +1013,7 @@ def run_configuration(
         "skip_scoring": args.skip_scoring,
         "allow_live_encoding": args.allow_live_encoding,
         "extra_sets": ",".join(args.extra_set),
+        "predict_only_sets": ",".join(args.predict_only),
         "cache_dir": str(args.cache_dir),
         "output_dir": str(args.output_dir),
         # The exact invocation: config paths, overrides and script flags.
@@ -1100,7 +1133,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         )
     plan = scoring_plan(acquisition_type)
     training_cache = Path(str(encoder_cfg.get("feature_cache_path")))
-    study_sets, cross_set_pool = resolve_study_sets(args.extra_set)
+    study_sets, cross_set_pool = resolve_study_sets(
+        args.extra_set, args.predict_only
+    )
     check_required_paths(args.cache_dir, study_sets, training_cache)
 
     profiler = StageProfiler(
