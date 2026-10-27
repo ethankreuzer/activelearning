@@ -1,0 +1,162 @@
+# Reward-shape arm on the sparse variational GP chosen by the training-set
+# scaling study: the 300k nested set, ELBO, 1024 inducing points, cosine from
+# 3e-3 over 10,064 steps (svgpscale_300000_svgp_M1024_iso_matern_scaled_
+# pm0.03956_elbo_cosine_lr3e-3_steps10064_fp32, fitted on Mila).
+#
+#   SURROGATE=svgp300k LOG_SCORE_FLOOR=-500 sbatch --cpus-per-task=24 \
+#     jobs/reward_shape_nibi.sh power 0.1 1000 5000
+#
+# Needs, on Nibi:
+#   - data/ampc_svgpscale_300000.csv and cache/ampc/exact_dkl_top_n/svgpscale_300000.npy,
+#     built here by jobs/build_svgp_scaling_sets_nibi.sh,
+#   - the Mila fit's surrogate_state.pt copied to the state_path below.
+#
+# Everything outside the surrogate, the dataset and the acquisition's support is
+# reward_shape_fixedgp_fps_keep05.yaml's. The floor matters more here than for
+# the exact GPs: this GP is far more confident (latent std ~0.007 against
+# ~0.03), so log GIBBON runs one to two orders of magnitude lower -- median
+# -2,688 and 99th percentile -1,146 on gp_molformer_set, against -61 and -9 for
+# the round-0 exact GP on its round-1 policy samples. -150 would tie every
+# prior-like molecule, so the floor is set per arm by LOG_SCORE_FLOOR.
+
+runtime:
+  device: cuda
+  # 32, matching the fit the state was saved from.
+  precision: 32
+  seed: 42
+
+dataset:
+  # The restore is handed the 300,000 molecules the fit saw: they rebuild the
+  # input scaling check and are the rows GIBBON's max-value support is drawn
+  # from.
+  type: ListDataset
+  initial_data:
+    path: data/ampc_svgpscale_300000.csv
+    x_columns: SMILE
+    y_column: y
+    fidelity_column: fidelity
+
+surrogate:
+  type: VariationalGPSurrogate
+  # Restored in place of training; the settings below must match the fit, or
+  # load_state_dict raises.
+  state_path: outputs/ampc/variational_gp/svgpscale_300000_svgp_M1024_iso_matern_scaled_pm0.03956_elbo_cosine_lr3e-3_steps10064_fp32/surrogate_state.pt
+  encoder:
+    # The encoder the training cache was written by. cache_only false, since
+    # generated SMILES are in no cache; the 300,000 training molecules are an
+    # exact ordered prefix of this cache, so the restore re-encodes them free.
+    type: MiniMolAmpcSmilesFixedEncoder
+    checkpoint_path: minimol_ampc_encoder/model/final.pt
+    package_path: minimol_ampc_encoder
+    device: cuda
+    batch_size: 64
+    cache_size: 4096
+    cache_only: false
+    feature_cache_path: cache/ampc/exact_dkl_top_n/svgpscale_300000.npy
+  training_params:
+    # Unused by a restore; stated so the config describes the fit it restores.
+    epochs: 136
+    lr: 3.0e-3
+    batch_size: 4096
+    lr_schedule: cosine
+    lr_min: 1.0e-4
+    variational_objective: VariationalELBO
+  num_inducing: 1024
+  inducing_init: random
+  ard: false
+  lengthscale_prior: true
+  scale_inputs: true
+  noise_prior: true
+  prior_mean: 0.03956042999405787  # Mean y of data/10M_unif_random_subset.csv.
+  standardize_outputs: true
+
+acquisition:
+  type: QLowerBoundMaxValueEntropy
+  candidate_set_spec:
+    # As in the scaling study: the max-value support is capped at 100,000 of
+    # the 300,000 training rows by the deterministic fidelity/target-stratified
+    # reservoir, which keeps the best molecule.
+    type: TrainDataCandidateSetSpec
+    max_support_size: 100000
+    fallback_size: 50000
+    seed: 42
+  num_mv_samples: 10
+  # 256 is ~1 GB per chunk at 1024 inducing points (10.7 GB peak in the
+  # scaling runs); the exact GPs needed 64 because they concatenate their
+  # training rows onto every candidate, which this model does not.
+  score_chunk_size: 256
+  maximize: true
+  log_space: true
+  log_output: false
+
+sampler:
+  type: S3GFNSampler
+  n_samples: 100000
+  fidelities: [1]
+  model_name_or_path: ibm-research/GP-MoLFormer-Uniq
+  tokenizer_name_or_path: ibm-research/MoLFormer-XL-both-10pct
+  trust_remote_code: true
+  performance_mode: optimized
+  max_length: 80
+  batch_size: 64
+  replay_batch_size: 64
+  generation_batch_size: 128
+  # Transform, beta, steps and floor are set per arm by jobs/reward_shape_nibi.sh.
+  n_train_steps: 5000
+  num_warmup_steps: 10
+  reward_transform: power
+  beta: 0.1
+  log_score_floor: -500.0
+  initial_log_z: -8.0
+  log_z_learning_rate: 0.01
+  aux_coefficient: 0.001
+  sa_threshold: 4.0
+
+selector:
+  type: CostAwareSelector
+
+oracle:
+  type: Dock3Oracle
+  mol_repr: smiles
+  indock_template: /home/ethankrz/dock_smiles/ampc_dockfiles/INDOCK
+  dockfiles_dir: /home/ethankrz/dock_smiles/ampc_dockfiles
+  fidelity_costs:
+    1: 1.0
+  fidelity_confidences:
+    1: 1.0
+  num_workers: null
+  ligbuild_timeout: 150
+  hitrate_params: ampc_hitrate_fits/fitted_params.json
+  score_pprop_table: ampc_hitrate_fits/data/full_scores.df
+  hitrate_target: ampc
+  pki_threshold: 6.5
+
+budget:
+  available_budget: 10000.0
+  schedule:
+    type: constant
+    value: 10000.0
+  # Required with surrogate.state_path: train the policy once against a fixed
+  # surrogate and look at what it generated.
+  max_rounds: 1
+
+logger:
+  # Run names and tags are overridden per arm by jobs/reward_shape_nibi.sh.
+  type: MultiLogger
+  loggers:
+    - type: ConsoleLogger
+      project_name: ampc-reward-shape-svgp
+      run_name: reward-shape
+    - type: WandbLogger
+      project_name: ampc-reward-shape-svgp
+      run_name: reward-shape
+      entity: models-mila5723
+      group: reward-shape
+      tags: [reward-shape]
+
+run_writer:
+  type: JSONLinesRunWriter
+  output_dir: outputs/ampc/reward_shape/default
+  write_samples: true
+  write_sample_scores: true
+  write_config: true

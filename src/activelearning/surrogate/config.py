@@ -490,6 +490,9 @@ class VariationalGPSurrogateConfig(BaseModel):
     noise_prior: bool = False
     prior_mean: float | None = None
     scale_inputs: bool = False
+    # A saved fit restored in place of every fit, as for
+    # FixedFeatureGPSurrogateConfig.state_path; one round only.
+    state_path: Path | None = None
     _is_multi_fidelity: bool = PrivateAttr(default=False)
 
     @model_validator(mode="after")
@@ -547,6 +550,7 @@ class VariationalGPSurrogateConfig(BaseModel):
             noise_prior=self.noise_prior,
             prior_mean=self.prior_mean,
             scale_inputs=self.scale_inputs,
+            state_path=self.state_path,
         )
 
 

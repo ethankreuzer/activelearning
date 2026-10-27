@@ -6,6 +6,7 @@ import math
 import time
 from collections.abc import Callable, Iterable
 from math import sqrt
+from pathlib import Path
 from typing import Any
 
 import gpytorch
@@ -262,6 +263,7 @@ class VariationalGPSurrogate(BoTorchGPSurrogate):
         noise_prior: bool = False,
         prior_mean: float | None = None,
         scale_inputs: bool = False,
+        state_path: Path | str | None = None,
     ) -> None:
         """Initialize a fixed-feature variational GP surrogate.
 
@@ -314,6 +316,12 @@ class VariationalGPSurrogate(BoTorchGPSurrogate):
             rows' range, as BoTorch's ``Normalize`` does. Callers still pass and
             receive unscaled features; the scaling is applied inside the model.
             The inducing points live in the scaled space.
+        state_path : Path or str, optional
+            A ``surrogate_state.pt`` from an earlier fit of this same
+            configuration and training set, restored in place of every fit, as
+            ``FixedFeatureGPSurrogate.state_path`` is. The fit's observations
+            still become the training rows the acquisition draws its support
+            from, so they must be the ones the state was fitted to.
         """
         if is_multi_fidelity and target_fidelity is None:
             raise ValueError("target_fidelity must be set when is_multi_fidelity=True.")
@@ -373,6 +381,7 @@ class VariationalGPSurrogate(BoTorchGPSurrogate):
         self._epoch_callback: EpochCallback | None = None
         self._last_lr = float(training_params.lr)
         self._warm_start: tuple[dict[str, torch.Tensor], str] | None = None
+        self._state_path = None if state_path is None else Path(state_path)
         batch_size = getattr(training_params, "batch_size", None)
         if batch_size is not None and batch_size < 1:
             raise ValueError("training_params.batch_size must be positive.")
@@ -458,13 +467,22 @@ class VariationalGPSurrogate(BoTorchGPSurrogate):
     def fit(self, observations: Iterable[Observation]) -> None:
         """Rebuild and fit the variational GP on all supplied observations.
 
-        A state passed to :meth:`load_state_dict` beforehand is restored instead of
-        training; one passed to :meth:`warm_start_from` is loaded and then trained.
+        A state passed to :meth:`load_state_dict` beforehand, or saved at
+        ``state_path``, is restored instead of training; one passed to
+        :meth:`warm_start_from` is loaded and then trained.
         """
         self._fit_profiling = {}
         observation_list = list(observations)
         if not observation_list:
             return
+        if (
+            self._state_path is not None
+            and self._pending_state_dict is None
+            and self._warm_start is None
+        ):
+            self._pending_state_dict = torch.load(
+                self._state_path, map_location="cpu", weights_only=True
+            )
         if self._is_multi_fidelity and not self._fidelity_confidences:
             raise ValueError(
                 "Multi-fidelity mode requires fidelity confidences before fitting."

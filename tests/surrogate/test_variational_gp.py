@@ -566,6 +566,46 @@ def test_variational_gp_restore_reproduces_a_scaled_fit() -> None:
         unscaled.restore(observations, state)
 
 
+def test_variational_gp_state_path_restores_instead_of_training(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A saved state restores the same predictions without running a fit.
+
+    The reward-shape arms rely on this: a wrong restore would not crash, it
+    would silently run them on a different surrogate.
+    """
+    observations = _grid_observations(scale=40.0, shift=-7.0)
+    candidates = [Candidate(x=[1.0, 20.0]), Candidate(x=[30.0, -3.0])]
+    torch.manual_seed(0)
+    source = VariationalGPSurrogate(
+        encoder=_NumericFixedEncoder(),
+        training_params=_training(),
+        num_inducing=4,
+        **_borrowed_settings(),
+    )
+    source.fit(observations)
+    state_path = tmp_path / "surrogate_state.pt"
+    torch.save(source.get_state_dict(), state_path)
+    expected = source.predict(candidates)
+
+    def no_training(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("A restore must not train.")
+
+    restored = VariationalGPSurrogate(
+        encoder=_NumericFixedEncoder(),
+        training_params=_training(),
+        num_inducing=4,
+        state_path=state_path,
+        **_borrowed_settings(),
+    )
+    monkeypatch.setattr(restored, "_train_variational_gp", no_training)
+    restored.fit(observations)
+    actual = restored.predict(candidates)
+
+    assert actual["mean"] == pytest.approx(expected["mean"])
+    assert actual["std"] == pytest.approx(expected["std"])
+
+
 def test_variational_gp_rejects_borrowed_settings_in_multi_fidelity() -> None:
     """The fidelity column must not be scaled or share the feature lengthscale."""
     with pytest.raises(ValueError, match="single-fidelity only"):

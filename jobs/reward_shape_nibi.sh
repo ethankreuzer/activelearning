@@ -70,7 +70,15 @@ fi
 #                    it. INITIAL_LOG_Z and LOG_Z_LR are then unused, and kept
 #                    only so switching back to rtb needs no edit here.
 #   LOG_Z_LR         learning rate of the log_z scalar (the policy's is 1e-4).
-LOG_SCORE_FLOOR="-150"
+#                    Overridable per arm since 2026-10-27: the variational GP's
+#                    log scores run one to two orders of magnitude lower than
+#                    the exact GPs', so -150 would tie every prior-like molecule.
+#                      LOG_SCORE_FLOOR=-500 SURROGATE=svgp300k sbatch ...
+LOG_SCORE_FLOOR="${LOG_SCORE_FLOOR:--150}"
+if [[ ! "${LOG_SCORE_FLOOR}" =~ ^-[0-9]+(\.[0-9]+)?$ ]]; then
+  echo "LOG_SCORE_FLOOR must be a negative number, e.g. -500." >&2
+  exit 2
+fi
 LOSS="vargrad"
 LOG_Z_LR="0.01"
 
@@ -127,8 +135,16 @@ elif [[ "${SURROGATE}" == fixedgp_fps_keep05 ]]; then
   SURROGATE_TAGS="fixedgp-iso-matern,outputscale,pinned-mean,fps-keep05,fp32"
   ARM="${ARM}_fixedgp_fps_keep05_fp32"
   WANDB_PROJECT="ampc-reward-shape-fps-keep-above"
+elif [[ "${SURROGATE}" == svgp300k ]]; then
+  # The sparse variational GP the scaling study settled on, fitted on Mila and
+  # copied here (config/ampc/reward_shape_svgp300k.yaml).
+  BASE_CONFIG="config/ampc/reward_shape_svgp300k.yaml"
+  FITTED_DIR="outputs/ampc/variational_gp/svgpscale_300000_svgp_M1024_iso_matern_scaled_pm0.03956_elbo_cosine_lr3e-3_steps10064_fp32"
+  SURROGATE_TAGS="svgp,M1024,elbo,svgpscale-300k,lr3e-3,steps10064,pinned-mean,fp32"
+  ARM="${ARM}_svgp300k_m1024_fp32"
+  WANDB_PROJECT="ampc-reward-shape-svgp"
 else
-  echo "SURROGATE must be nolayer, fixedgp_iso or fixedgp_fps_keep05." >&2
+  echo "SURROGATE must be nolayer, fixedgp_iso, fixedgp_fps_keep05 or svgp300k." >&2
   exit 2
 fi
 # Optional suffix for rerunning an arm whose settings are unchanged, so the
@@ -176,6 +192,7 @@ if [[ ! -f "${STATE_PATH}" ]]; then
   echo "  KERNEL=iso sbatch jobs/fixed_feature_gp_balanced_nibi.sh  (fixedgp_iso)" >&2
   echo "  TRAIN_SET=fps_keep05 PRECISION=32 KERNEL=iso FAMILY=matern OUTPUTSCALE=1 \\" >&2
   echo "    PRIOR_MEAN=0.03956042999405787 sbatch jobs/fixed_feature_gp_balanced_nibi.sh  (fixedgp_fps_keep05)" >&2
+  echo "  (svgp300k: fitted on Mila by LR=3e-3 STEPS=10000 jobs/variational_gp_scaling_mila.sh elbo 300000; copy its surrogate_state.pt here)" >&2
   exit 2
 fi
 # Never overwrite an earlier run's generated pool: it is hours of sampling, and
@@ -191,7 +208,17 @@ export WANDB_DIR="${OUTPUT_DIR}"
 mkdir -p "${WANDB_DIR}" slurm_logs
 
 TRAIN_SET_TEXT="the 25000-molecule BALANCED training set data/ampc_balanced_25000.csv -- the library-proportional mix, top band floored at 5% of the budget --"
-if [[ "${SURROGATE}" == nolayer ]]; then
+# Set by the svgp300k branch; the exact-GP wording is filled in after the
+# chain, once TRAIN_SET_TEXT has its final value.
+RESTORE_TEXT=""
+SUPPORT_TEXT=""
+if [[ "${SURROGATE}" == svgp300k ]]; then
+  TRAIN_SET_TEXT="the 300,000-molecule NESTED scaling set data/ampc_svgpscale_300000.csv -- every 10M row above y 0.2617 (pProp 3.5) kept whole (16,292), the rest split evenly across four bands by farthest-point sampling --"
+  RESTORE_TEXT="The sparse variational GP is rebuilt on ${TRAIN_SET_TEXT} and its fitted parameters -- 1024 inducing points and their variational distribution, kernel, noise, input scaling and output standardization -- are loaded from ${STATE_PATH} in place of training."
+  SUPPORT_TEXT="Max-value support is capped at 100,000 of the 300,000 training molecules by the deterministic fidelity/target-stratified reservoir, as in the scaling study; candidates are scored 256 per chunk."
+  SURROGATE_TEXT="SURROGATE: the SPARSE VARIATIONAL GP (VariationalGPSurrogate) the training-set scaling study settled on (W&B ampc-Variational-GP): 1024 inducing points started at random training rows, Matern-5/2 with ONE lengthscale under BoTorch's dimension-scaled prior, learned output scale, LogNormal(-4, 1) noise prior, mean PINNED at 0.03956, inputs min-max scaled, float32; fitted by Adam on the ELBO, 4096-row minibatches, 10,064 steps cosine-annealed from 3e-3 to 1e-4.
+Why this surrogate: 300k rows fixed the low-y overprediction of smaller sets (unseen ampc_331k bias +0.061, RMSE 0.068; gp_molformer_set RMSE 0.023) with GIBBON's ranking unchanged, at the cost of an overconfident tail (gentail 2-std coverage 54%, bias -0.089). It is far more confident than the exact GPs, so log GIBBON runs much lower (gp_molformer_set median -2,688, 99th percentile -1,146): the floor of ${LOG_SCORE_FLOOR} is set for that range, not the exact GPs' -150."
+elif [[ "${SURROGATE}" == nolayer ]]; then
   SURROGATE_TEXT="Features: frozen MiniMol AmpC fingerprints with NO trainable layer, the kernel reading the 512-d fingerprints directly. GP prior mean: learned during that fit, not pinned. float32.
 Why this surrogate: it is the first in the study whose uncertainty is not collapsed -- 88% of truths within 2 std on unseen ampc_331k against 6% for the width-256 arm, and a GIBBON effective support of ~21 molecules rather than 2."
 elif [[ "${SURROGATE}" == fixedgp_fps_keep05 ]]; then
@@ -201,6 +228,11 @@ Why this surrogate and training set: stratified farthest-point selection is what
 else
   SURROGATE_TEXT="SURROGATE: the ISOTROPIC fixed-feature GP (FixedFeatureGPSurrogate, ard=false), not the DKL no-layer surrogate the earlier arms used; every other setting is that of the nolayer arm with the same name (config/ampc/reward_shape_fixedgp_iso.yaml). BoTorch's SingleTaskGP on the same frozen 512-d MiniMol AmpC fingerprints, min-max scaled to [0, 1], with ONE RBF lengthscale shared by all features under BoTorch's dimension-scaled LogNormal lengthscale prior and the LogNormal(-4, 1) noise prior, fitted to convergence by L-BFGS-B in 80 s in float32 (lengthscale 2.67, noise 0.27 standardized; a float64 fit agrees to four decimals in every hyperparameter and held-out metric). float32, like the nolayer arms.
 Why this surrogate: it is the first one fitted to convergence under priors. Offline it matched or beat the DKL no-layer surrogate on the mean (Pearson 0.70 vs 0.68 on unseen ampc_331k, 0.59 vs 0.59 on gp_molformer_set), with a similar latent std level, but its std ranked errors less well on gp_molformer_set (Spearman 0.17 vs 0.22). This arm tests which of the two makes the better reward."
+fi
+
+if [[ -z "${RESTORE_TEXT}" ]]; then
+  RESTORE_TEXT="The exact GP (no inducing points, no minibatching) is rebuilt on ${TRAIN_SET_TEXT} and its fitted parameters are loaded from ${STATE_PATH} in place of training, so every arm of this study shares one surrogate exactly."
+  SUPPORT_TEXT="Max-value support is the 25,000 training molecules."
 fi
 
 if [[ "${TRANSFORM}" == power ]]; then
@@ -224,8 +256,8 @@ fi
 export WANDB_NOTES="REWARD-SHAPE arm ${ARM}: ONE active-learning round, training the S3-GFN policy against a fixed GIBBON acquisition on a frozen surrogate.
 THE QUESTION THIS RUN ASKS: does the trained policy generate molecules the acquisition rates higher than the ones the untrained prior produces? Not validity, not docking -- those are read but are not what this arm is for. The answer comes from scoring BOTH pools afterwards with this same restored surrogate and ONE acquisition object, and comparing two distributions on each: the surrogate posterior MEAN, and log(acquisition). The generated pool is written to ${POOL_LOG_PATH} as soon as generation finishes, then prepared and scored alongside gp_molformer_set (83,811 docked prior samples) via exact_dkl_prepare.py --extra-set and exact_dkl_top_n.py --extra-set, which also reports pooled/acquisition/*/top{k}/<set>_share: which of the two pools the acquisition would actually pick from. Both sets must be scored in the SAME invocation, because GIBBON ranks against sampled posterior max-values and a separate run would draw different ones.
 WHAT IS NEW HERE, against the 2026-10-12 arms: the loss (vargrad, below) and the log-score floor (-150, was -100). Selection scoring now runs in chunks of 64 (acquisition.score_chunk_size, was 256). Every earlier arm, including the first vargrad floor -150 run (job 5493805), died at selection with 'Tried to allocate 12.21 GiB': gpytorch's exact-GP posterior concatenates the 25,000 training molecules onto every candidate in a chunk, so memory scales with the chunk size, and the earlier kernel-side fix never applied to that path. At 64 the same path already ran every S3-GFN training step, and job 5515579 scored a 100k pool with it at ~17 GiB peak. This is therefore the first arm expected to reach docking.${SUFFIX_TEXT}
-Surrogate: RESTORED, NOT REFITTED. The exact GP (no inducing points, no minibatching) is rebuilt on ${TRAIN_SET_TEXT} and its fitted parameters are loaded from ${STATE_PATH} in place of training, so every arm of this study shares one surrogate exactly. See ${FITTED_DIR}/arm_description.txt for how that fit was obtained. ${SURROGATE_TEXT}
-Acquisition: GIBBON (QLowerBoundMaxValueEntropy), log_space=true so the information gain never underflows, log_output=false so it is returned on the VALUE scale, which is what the reward transform needs. Max-value support is the 25,000 training molecules.
+Surrogate: RESTORED, NOT REFITTED. ${RESTORE_TEXT} See ${FITTED_DIR}/arm_description.txt for how that fit was obtained. ${SURROGATE_TEXT}
+Acquisition: GIBBON (QLowerBoundMaxValueEntropy), log_space=true so the information gain never underflows, log_output=false so it is returned on the VALUE scale, which is what the reward transform needs. ${SUPPORT_TEXT}
 Reward: transform=${TRANSFORM}, beta=${BETA}. ${REWARD_TEXT}. The loss uses beta * score as log R, so R = exp(beta * score) is always positive even where the logged post-transform score is negative.
 ${NORMALIZER_TEXT}
 What to read: the per-training-step figures sampler/s3gfn/acq/trajectory (is the policy finding more informative molecules), reward/effective_support (how many of the 64 molecules in a batch the reward spreads over -- toward 1 means collapse, toward 64 means the policy will not move), reward/concentration, and train/batch_health (valid / synthesizable / unique). acq rising while validity or uniqueness falls is the policy fleeing the data the GP was fitted on. Four more: ${RESIDUAL_TEXT}; train/prior_divergence estimates KL(policy || prior), 0 for an inert policy and unbounded for one being torn off its prior; reward/above_floor_fraction is the share of each batch scoring above the ${LOG_SCORE_FLOOR}-nat floor, about 0.03 under the prior and the thing that should climb; train/gradient_norm is the gradient norm before clipping against the threshold of 10.
