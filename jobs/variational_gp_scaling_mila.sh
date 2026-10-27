@@ -46,14 +46,18 @@
 # up to four times that, so --score-chunk-size stays at 256 and the first 300k arm
 # measures the real wall time (stage_profile.csv) for later ones to trim.
 #
-# Any GPU with 32 GB or more is enough for that peak, so no type is requested.
+# Any GPU with 32 GB or more is enough for that peak, but an untyped request
+# lands on whichever card is free first, usually an RTX 8000. The fit runs in
+# plain float32 (no TF32), where an L40S (~90 TFLOPS) is about five times an
+# RTX 8000 and faster than an A100, and Mila has ~90 L40S nodes in both main
+# and unkillable. Override with --gres=gpu:<type>:1 on the sbatch line.
 # The balanced arms took 7-8 minutes at 3.5 GB host RSS on Nibi, so 32G and 3
 # hours leave ample room and fit unkillable's 6 CPU / 32G / 1 GPU cap.
 # unkillable because it is never preempted: a preempted arm would be requeued
 # onto an output directory that already holds its state, which the script
 # refuses to reuse.
 #SBATCH --partition=unkillable
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:l40s:1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
 #SBATCH --time=3:00:00
