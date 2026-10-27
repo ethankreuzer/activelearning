@@ -352,6 +352,41 @@ class TestTrainDataCandidateSetSpec:
         assert 0 in indices
         assert {observations[index].fidelity for index in indices} == {0, 1}
 
+    def test_max_support_size_caps_the_support_without_the_fallback(self) -> None:
+        """A deliberate cap selects the same rows a same-sized fallback would."""
+        observations = [
+            Observation(x=[float(index), 0.0], y=float(index), fidelity=index % 2)
+            for index in range(40)
+        ]
+        capped = TrainDataCandidateSetSpec(
+            fallback_size=4, seed=7, max_support_size=8
+        )
+        uncapped = TrainDataCandidateSetSpec(fallback_size=8, seed=7)
+        capped.update(observations)
+        uncapped.update(observations)
+
+        assert capped._select_fallback_indices(
+            maximize=True, size=8
+        ) == uncapped._select_fallback_indices(maximize=True)
+        # The cap and the out-of-memory retry stay separate sizes.
+        assert len(capped._select_fallback_indices(maximize=True)) == 4
+
+    def test_max_support_size_is_inert_below_the_cap(self) -> None:
+        """A support already inside the cap is kept whole."""
+        observations = [
+            Observation(x=[float(index), 0.0], y=float(index), fidelity=0)
+            for index in range(5)
+        ]
+        spec = TrainDataCandidateSetSpec(fallback_size=2, max_support_size=100)
+        spec.update(observations)
+
+        assert spec._select_fallback_indices(maximize=True, size=100) == list(range(5))
+
+    def test_max_support_size_must_be_positive(self) -> None:
+        """A nonsensical cap is rejected at construction."""
+        with pytest.raises(ValueError, match="max_support_size"):
+            TrainDataCandidateSetSpec(max_support_size=0)
+
     def test_fallback_reuses_fitted_training_rows(
         self,
         fitted_sf_surrogate: BoTorchGPSurrogate,

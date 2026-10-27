@@ -551,6 +551,9 @@ def test_run_configuration_records_the_cost_confounders() -> None:
     assert config["eval_chunk_size"] == 5000
     assert config["n_ampc_331k"] == 331480
     assert config["scorings"] == "gibbon_value,gibbon_log"
+    assert config["skip_scoring"] is False
+    assert config["cache_dir"] == "cache/ampc/exact_dkl_top_n"
+    assert isinstance(config["argv"], str)
 
 
 def test_in_training_mask_marks_exact_smiles_matches() -> None:
@@ -873,3 +876,31 @@ def test_fixed_feature_gp_balanced_config_parses() -> None:
     assert config.surrogate.scale_inputs is True
     assert config.surrogate.state_path is None
     assert config.runtime.precision == 64
+
+
+def test_variational_gp_balanced_config_parses() -> None:
+    """The variational arm's config validates and borrows the exact GP's settings."""
+    from activelearning.config import ActiveLearningConfig
+    from activelearning.utils.config_loader import load_and_parse
+
+    config_path = (
+        Path(__file__).resolve().parents[2]
+        / "config"
+        / "ampc"
+        / "variational_gp_balanced.yaml"
+    )
+
+    config = load_and_parse(config_path, ActiveLearningConfig)
+
+    assert config.surrogate.type == arm.VARIATIONAL_GP_TYPE
+    assert config.surrogate.encoder.type == arm.SURROGATE_ENCODERS[config.surrogate.type]
+    assert config.surrogate.encoder.cache_only is True
+    assert config.surrogate.is_multi_fidelity is False
+    assert config.surrogate.num_inducing == 1024
+    assert config.surrogate.ard is False
+    assert config.surrogate.lengthscale_prior is True
+    assert config.surrogate.noise_prior is True
+    assert config.surrogate.scale_inputs is True
+    assert config.surrogate.prior_mean == pytest.approx(0.03956042999405787)
+    assert config.surrogate.training_params.batch_size is None
+    assert config.runtime.precision == 32

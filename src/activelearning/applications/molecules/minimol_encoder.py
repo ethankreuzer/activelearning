@@ -740,14 +740,79 @@ class MiniMolSmilesFixedEncoder(FixedEncoder):
             cached_features = torch.from_numpy(prefix)
         return cached_features.to(dtype=torch.float32)
 
+    def publish_feature_cache(
+        self,
+        values: Sequence[str],
+        features: Tensor | np.ndarray,
+        feature_cache_path: str | Path,
+    ) -> Path:
+        """Write a feature cache for features this encoder did not compute.
+
+        Every molecule of a subset selected from a larger store already has its
+        fingerprint in that store, so publishing the subset's cache is a copy,
+        not inference. This writes the same format :meth:`encode` would have
+        written, so a later ``cache_only`` encoder reads it as its own.
+
+        The caller is responsible for the features being this encoder's: they
+        are written as given, and the manifest then claims this encoder's
+        identity for them.
+
+        Parameters
+        ----------
+        values : Sequence[str]
+            The SMILES the features belong to, in row order.
+        features : Tensor or np.ndarray
+            Shape ``(len(values), 512)`` features of ``values``, in order.
+        feature_cache_path : str or Path
+            Destination ``.npy``; its manifest is the sibling ``.json``.
+
+        Returns
+        -------
+        Path
+            The published feature path.
+
+        Raises
+        ------
+        ValueError
+            If ``features`` does not have one 512-wide row per value.
+        """
+        strings = self._validate_smiles(values)
+        matrix = (
+            features
+            if isinstance(features, Tensor)
+            else torch.from_numpy(np.ascontiguousarray(features))
+        )
+        if matrix.ndim != 2 or matrix.shape != (
+            len(strings),
+            MINIMOL_FINGERPRINT_DIM,
+        ):
+            raise ValueError(
+                "features must have shape "
+                f"{(len(strings), MINIMOL_FINGERPRINT_DIM)}, got "
+                f"{tuple(matrix.shape)}."
+            )
+        path = Path(feature_cache_path).expanduser()
+        self._write_feature_cache(strings, matrix, feature_path=path)
+        return path
+
     def _write_feature_cache(
         self,
         strings: list[str],
         features: Tensor,
+        *,
+        feature_path: Path | None = None,
     ) -> None:
-        """Atomically publish a new feature cache."""
-        feature_path = self.feature_cache_path
-        manifest_path = self._feature_cache_manifest_path
+        """Atomically publish a new feature cache.
+
+        Writes to ``self.feature_cache_path`` unless ``feature_path`` names
+        another destination, which :meth:`publish_feature_cache` uses to write a
+        cache for a set this encoder is not itself configured for.
+        """
+        if feature_path is None:
+            feature_path = self.feature_cache_path
+            manifest_path = self._feature_cache_manifest_path
+        else:
+            manifest_path = Path(f"{feature_path}.json")
         if feature_path is None or manifest_path is None:
             raise RuntimeError("MiniMol feature cache path is unavailable.")
         feature_path.parent.mkdir(parents=True, exist_ok=True)
@@ -810,6 +875,10 @@ class MiniMolSmilesFixedEncoder(FixedEncoder):
             temporary_feature_path.unlink(missing_ok=True)
             temporary_manifest_path.unlink(missing_ok=True)
 
+        if feature_path != self.feature_cache_path:
+            # Published for another set, so it is not this encoder's own cache
+            # to adopt; loading it would bind this encoder to the wrong rows.
+            return
         if not self._load_feature_cache():
             raise RuntimeError("MiniMol feature cache was not published.")
 

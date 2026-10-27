@@ -267,6 +267,54 @@ def test_open_feature_store_reads_rows_of_a_written_cache(
     # Only the first encode ran MiniMol; opening the store never does.
     assert len(fake_minimol) == 1
 
+def test_publish_feature_cache_writes_a_cache_without_encoding(
+    fake_minimol: list[_FakeMiniMol],
+    tmp_path: Path,
+) -> None:
+    """A subset's cache can be published from features a store already holds."""
+    store_path = tmp_path / "store.npy"
+    library = ["CC", "CO", "CCN", "CCO"]
+    written = minimol_module.MiniMolSmilesFixedEncoder(
+        feature_cache_path=store_path
+    ).encode(library, device=torch.device("cpu"))
+    encoder = minimol_module.MiniMolSmilesFixedEncoder()
+    store = encoder.open_feature_store(store_path, library)
+
+    rows = [3, 1]
+    subset = [library[row] for row in rows]
+    subset_path = tmp_path / "subset.npy"
+    published = encoder.publish_feature_cache(subset, store[rows], subset_path)
+
+    assert published == subset_path
+    # The published cache serves the subset as its own, with no MiniMol call.
+    reader = minimol_module.MiniMolSmilesFixedEncoder(
+        feature_cache_path=subset_path, cache_only=True
+    )
+    assert torch.equal(
+        reader.encode(subset, device=torch.device("cpu")), written[rows]
+    )
+    # Publishing elsewhere must not have bound the publishing encoder to it.
+    assert encoder.feature_cache_path is None
+    assert len(fake_minimol) == 1
+
+
+def test_publish_feature_cache_rejects_mismatched_features(
+    fake_minimol: list[_FakeMiniMol],
+    tmp_path: Path,
+) -> None:
+    """Features that are not one 512-wide row per value are refused."""
+    encoder = minimol_module.MiniMolSmilesFixedEncoder()
+
+    with pytest.raises(ValueError, match="features must have shape"):
+        encoder.publish_feature_cache(
+            ["CC", "CO"],
+            torch.zeros(3, minimol_module.MINIMOL_FINGERPRINT_DIM),
+            tmp_path / "bad.npy",
+        )
+    assert not (tmp_path / "bad.npy").exists()
+    assert fake_minimol == []
+
+
 def test_prepare_inputs_rejects_non_string_values(
     fake_minimol: list[_FakeMiniMol],
 ) -> None:

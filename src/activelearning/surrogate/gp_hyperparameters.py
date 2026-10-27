@@ -1,4 +1,4 @@
-"""Read the learned hyperparameters of a fitted exact GP.
+"""Read the learned hyperparameters of a fitted GP surrogate.
 
 Lifted out of ``scripts/exact_dkl_top_n.py``, which wrote them into the offline
 evaluation summary, so the active-learning loop can log the same numbers every
@@ -18,18 +18,22 @@ import numpy as np
 def gp_hyperparameters(surrogate: Any) -> dict[str, float]:
     """Read the learned hyperparameters of an exact GP.
 
-    The variational study's reader looks for ``_gp_model`` and a variational
-    strategy and returns nothing here. Two kernel structures occur in this
-    study: ``EncoderKernel(base_kernel=ScaleKernel(MaternKernel))`` for
-    ``ExactDKLSurrogate``, and BoTorch's bare ``RBFKernel`` for
-    ``FixedFeatureGPSurrogate``. The reader walks ``base_kernel`` down to the
-    kernel with lengthscales; a kernel with no ``ScaleKernel`` has an output
-    scale of exactly 1.
+    Three kernel structures occur: ``EncoderKernel(base_kernel=ScaleKernel(
+    MaternKernel))`` for ``ExactDKLSurrogate``, BoTorch's bare ``RBFKernel``
+    (or a configured variant) for ``FixedFeatureGPSurrogate``, and
+    ``ScaleKernel(MaternKernel)`` for ``VariationalGPSurrogate``. The reader
+    walks ``base_kernel`` down to the kernel with lengthscales; a kernel with no
+    ``ScaleKernel`` has an output scale of exactly 1.
+
+    The variational GP's model is an adapter that wraps the GP and likelihood
+    and carries its output standardization as two numbers rather than an
+    outcome transform; both forms are read.
 
     Parameters
     ----------
     surrogate : Any
-        A fitted ``ExactDKLSurrogate`` or ``FixedFeatureGPSurrogate``.
+        A fitted ``ExactDKLSurrogate``, ``FixedFeatureGPSurrogate`` or
+        ``VariationalGPSurrogate``.
 
     Returns
     -------
@@ -42,18 +46,26 @@ def gp_hyperparameters(surrogate: Any) -> dict[str, float]:
     if not surrogate.is_fitted():
         return {}
     model = surrogate.get_model()
-    kernel = model.covar_module
+    gp = getattr(model, "gp_model", model)
+    likelihood = getattr(model, "gp_likelihood", None)
+    if likelihood is None:
+        likelihood = model.likelihood
+    kernel = gp.covar_module
     outputscale = 1.0
     while not kernel.has_lengthscale:
         if hasattr(kernel, "outputscale"):
             outputscale = float(kernel.outputscale.detach())
         kernel = kernel.base_kernel
     lengthscale = kernel.lengthscale.detach().reshape(-1)
-    noise = float(model.likelihood.noise.detach().mean())
+    noise = float(likelihood.noise.detach().mean())
     transform = getattr(model, "outcome_transform", None)
-    y_mean = 0.0 if transform is None else float(transform.means.reshape(-1)[0])
-    y_std = 1.0 if transform is None else float(transform.stdvs.reshape(-1)[0])
-    mean_constant = float(model.mean_module.constant.detach().reshape(-1)[0])
+    if transform is not None:
+        y_mean = float(transform.means.reshape(-1)[0])
+        y_std = float(transform.stdvs.reshape(-1)[0])
+    else:
+        y_mean = float(getattr(model, "outcome_mean", 0.0))
+        y_std = float(getattr(model, "outcome_std", 1.0))
+    mean_constant = float(gp.mean_module.constant.detach().reshape(-1)[0])
     return {
         "noise": noise,
         # The targets are standardized, so the interpretable noise is on the

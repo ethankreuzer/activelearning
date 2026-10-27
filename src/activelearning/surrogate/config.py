@@ -439,12 +439,28 @@ class VariationalGPTrainingConfig(BaseModel):
         Objective maximized during fitting; see
         :mod:`activelearning.surrogate.objectives` for how the choice affects the
         posterior variance.
+    lr_schedule : {"constant", "cosine"}
+        ``constant`` keeps ``lr`` throughout. ``cosine`` anneals it to ``lr_min``
+        over every optimizer step of the fit (epochs times batches per epoch).
+    lr_min : float
+        Final learning rate of the cosine schedule; unused when constant.
     """
 
     epochs: int = Field(default=50, ge=1)
     lr: float = Field(default=1e-3, gt=0.0)
     batch_size: int | None = Field(default=None, ge=1)
     variational_objective: VariationalObjective = DEFAULT_VARIATIONAL_OBJECTIVE
+    lr_schedule: Literal["constant", "cosine"] = "constant"
+    lr_min: float = Field(default=0.0, ge=0.0)
+
+    @model_validator(mode="after")
+    def _validate_lr_min(self) -> "VariationalGPTrainingConfig":
+        """Reject a cosine floor above the starting rate."""
+        if self.lr_min > self.lr:
+            raise ValueError(
+                f"lr_min ({self.lr_min}) must not exceed lr ({self.lr})."
+            )
+        return self
 
 
 class VariationalGPSurrogateConfig(BaseModel):
@@ -467,6 +483,13 @@ class VariationalGPSurrogateConfig(BaseModel):
     )
     inducing_kmeans_max_rows: int = Field(default=200_000, ge=1)
     inducing_init_seed: int = 0
+    # Each off by default, which is the historical model; see
+    # VariationalGPSurrogate for what each borrows from BoTorch's exact GP.
+    ard: bool = True
+    lengthscale_prior: bool = False
+    noise_prior: bool = False
+    prior_mean: float | None = None
+    scale_inputs: bool = False
     _is_multi_fidelity: bool = PrivateAttr(default=False)
 
     @model_validator(mode="after")
@@ -519,6 +542,11 @@ class VariationalGPSurrogateConfig(BaseModel):
             inducing_strata_fractions=tuple(self.inducing_strata_fractions),
             inducing_kmeans_max_rows=self.inducing_kmeans_max_rows,
             inducing_init_seed=self.inducing_init_seed,
+            ard=self.ard,
+            lengthscale_prior=self.lengthscale_prior,
+            noise_prior=self.noise_prior,
+            prior_mean=self.prior_mean,
+            scale_inputs=self.scale_inputs,
         )
 
 

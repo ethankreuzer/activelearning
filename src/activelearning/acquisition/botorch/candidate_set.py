@@ -216,11 +216,21 @@ class TrainDataCandidateSetSpec(CandidateSetSpec):
     or unrepresentative of the full search space.
     """
 
-    def __init__(self, fallback_size: int = 100_000, seed: int = 42) -> None:
+    def __init__(
+        self,
+        fallback_size: int = 100_000,
+        seed: int = 42,
+        max_support_size: Optional[int] = None,
+    ) -> None:
         if fallback_size < 1:
             raise ValueError(f"fallback_size must be > 0, got {fallback_size}")
+        if max_support_size is not None and max_support_size < 1:
+            raise ValueError(
+                f"max_support_size must be > 0, got {max_support_size}"
+            )
         self.fallback_size = fallback_size
         self.seed = seed
+        self.max_support_size = max_support_size
         self._cached_observations: list[Observation] = []
 
     @property
@@ -294,14 +304,36 @@ class TrainDataCandidateSetSpec(CandidateSetSpec):
         *,
         maximize: bool,
         target_fidelity_value: Optional[float] = None,
+        size: Optional[int] = None,
     ) -> torch.Tensor:
-        """Build a bounded support stratified by fidelity and target value."""
+        """Build a bounded support stratified by fidelity and target value.
+
+        Parameters
+        ----------
+        surrogate : BoTorchGPSurrogate
+            Fitted surrogate whose encoder provides the support's features.
+        maximize : bool
+            Direction the target is optimized in, which decides which extreme
+            is kept outright and how the strata are ordered.
+        target_fidelity_value : float, optional
+            Unused; the observations already carry their fidelity.
+        size : int, optional
+            How many observations to keep. Defaults to ``fallback_size``, the
+            size the out-of-memory retry uses. ``max_support_size`` passes its
+            own value here instead, so a support capped on purpose and a support
+            shrunk after a failure stay distinguishable.
+
+        Returns
+        -------
+        torch.Tensor
+            Encoded support of at most ``size`` rows.
+        """
         if not self._cached_observations:
             raise RuntimeError(
                 "TrainDataCandidateSetSpec has no cached candidates. "
                 "Call update() with observations before build_fallback()."
             )
-        indices = self._select_fallback_indices(maximize=maximize)
+        indices = self._select_fallback_indices(maximize=maximize, size=size)
         if len(indices) == len(self._cached_observations):
             return self.build(
                 surrogate,
@@ -324,10 +356,16 @@ class TrainDataCandidateSetSpec(CandidateSetSpec):
         ]
         return surrogate.encode_candidates(candidates)  # type: ignore[attr-defined]
 
-    def _select_fallback_indices(self, *, maximize: bool) -> list[int]:
+    def _select_fallback_indices(
+        self,
+        *,
+        maximize: bool,
+        size: Optional[int] = None,
+    ) -> list[int]:
         """Select deterministic fidelity/target-stratified observation indices."""
         observation_count = len(self._cached_observations)
-        if observation_count <= self.fallback_size:
+        limit = self.fallback_size if size is None else size
+        if observation_count <= limit:
             return list(range(observation_count))
 
         generator = random.Random(self.seed)
@@ -353,11 +391,11 @@ class TrainDataCandidateSetSpec(CandidateSetSpec):
                 best_by_fidelity[fidelity] = index
 
             reservoir = reservoirs.setdefault(fidelity, [])
-            if len(reservoir) < self.fallback_size:
+            if len(reservoir) < limit:
                 reservoir.append(index)
             else:
                 replacement = generator.randrange(seen)
-                if replacement < self.fallback_size:
+                if replacement < limit:
                     reservoir[replacement] = index
 
         strata_by_fidelity: list[list[torch.Tensor]] = []
@@ -388,12 +426,12 @@ class TrainDataCandidateSetSpec(CandidateSetSpec):
         extreme_indices = [
             best_by_fidelity[fidelity] for fidelity in sorted(best_by_fidelity)
         ]
-        if self.fallback_size < len(extreme_indices):
+        if limit < len(extreme_indices):
             return sorted(
                 extreme_indices,
                 key=lambda index: float(self._cached_observations[index].y),
                 reverse=maximize,
-            )[: self.fallback_size]
+            )[:limit]
 
         selected = list(extreme_indices)
         selected_set = set(selected)
@@ -407,7 +445,7 @@ class TrainDataCandidateSetSpec(CandidateSetSpec):
                             1 if stratum_index == 0 else 0,
                         )
                     )
-        while len(selected) < self.fallback_size:
+        while len(selected) < limit:
             added = False
             for entry_index, (stratum, position) in enumerate(strata_with_positions):
                 while position < stratum.numel():
@@ -419,7 +457,7 @@ class TrainDataCandidateSetSpec(CandidateSetSpec):
                         added = True
                         break
                 strata_with_positions[entry_index] = (stratum, position)
-                if len(selected) >= self.fallback_size:
+                if len(selected) >= limit:
                     break
             if not added:
                 break

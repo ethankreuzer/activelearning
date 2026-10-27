@@ -11,6 +11,7 @@ single-fidelity variants. The multi-fidelity variants in
 same base.
 """
 
+import logging
 import warnings
 from abc import abstractmethod
 from typing import Any, ClassVar, Iterable, Literal, Optional
@@ -36,6 +37,8 @@ from activelearning.runtime import RuntimeContext
 from activelearning.surrogate.surrogate import Surrogate
 from activelearning.utils.types import Observation
 
+
+_logger = logging.getLogger(__name__)
 
 class _MaxValueEntropyBase(QBatchBoTorchAcquisition):
     """Shared base for max-value entropy acquisition functions.
@@ -118,6 +121,10 @@ class _MaxValueEntropyBase(QBatchBoTorchAcquisition):
             candidate_set = self._build_fallback_candidate_set()
             return self._construct_botorch_acquisition(candidate_set)
 
+        capped = self._capped_candidate_set()
+        if capped is not None:
+            return self._construct_botorch_acquisition(capped)
+
         candidate_set: torch.Tensor | None = None
         retry_info: tuple[str, str, int] | None = None
         try:
@@ -177,6 +184,44 @@ class _MaxValueEntropyBase(QBatchBoTorchAcquisition):
         result : Any
             The BoTorch acquisition object.
         """
+
+    def _capped_candidate_set(self) -> torch.Tensor | None:
+        """Build the support a deliberate ``max_support_size`` cap asks for.
+
+        A train-data support is the whole training set, so an arm fitted to
+        300,000 molecules would sample its max values from a support six times
+        the one a 50,000-molecule arm uses, and the two arms' acquisition values
+        would not be comparable. ``max_support_size`` pins the support size
+        instead, using the same deterministic fidelity/target-stratified
+        selection the out-of-memory retry uses -- but chosen up front, so
+        ``_fallback_active`` keeps meaning "the full support failed" and a study
+        that treats that as disqualifying still can.
+
+        Returns
+        -------
+        torch.Tensor or None
+            The capped support, or ``None`` when no cap applies and the full
+            support should be built.
+        """
+        spec = self._candidate_set_spec
+        if not isinstance(spec, TrainDataCandidateSetSpec):
+            return None
+        cap = spec.max_support_size
+        if cap is None or spec.observation_count <= cap:
+            return None
+        assert self._botorch_surrogate is not None
+        _logger.info(
+            "%s: capping the candidate support at %d of %d observations.",
+            self._display_name,
+            cap,
+            spec.observation_count,
+        )
+        return spec.build_fallback(
+            self._botorch_surrogate,
+            maximize=self.maximize,
+            target_fidelity_value=self._resolved_target_fidelity_value,
+            size=cap,
+        )
 
     def _build_fallback_candidate_set(self) -> torch.Tensor:
         """Build the bounded support after full-support recovery activates."""

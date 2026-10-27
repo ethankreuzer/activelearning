@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import time
 from collections.abc import Callable, Iterable
 from math import sqrt
@@ -11,8 +12,16 @@ import gpytorch
 import torch
 from torch import Tensor
 from botorch.models.model import Model
+from botorch.models.utils.gpytorch_modules import (
+    MIN_INFERRED_NOISE_LEVEL,
+    SQRT2,
+    SQRT3,
+)
 from botorch.posteriors.gpytorch import GPyTorchPosterior
+from gpytorch.constraints import GreaterThan
+from gpytorch.priors import LogNormalPrior
 from torch.optim import Adam
+from torch.optim.lr_scheduler import CosineAnnealingLR
 
 from activelearning.runtime import RuntimeContext
 from activelearning.surrogate.botorch_surrogate import BoTorchGPSurrogate
@@ -44,6 +53,44 @@ WARM_START_TRAINABLE = ("all", "variance")
 
 _VARIANCE_ONLY_PARAMETERS = ("chol_variational_covar", "raw_noise")
 
+#: Learning-rate schedules a fit may use. ``cosine`` anneals from ``lr`` to
+#: ``lr_min`` over every optimizer step of the fit.
+LR_SCHEDULES = ("constant", "cosine")
+
+#: Features whose training range is below this are left unscaled, as BoTorch's
+#: ``Normalize`` leaves them.
+_MIN_INPUT_RANGE = 1e-8
+
+
+def _matern_kernel(
+    input_dim: int, *, ard: bool, lengthscale_prior: bool
+) -> gpytorch.kernels.MaternKernel:
+    """Return the Matern-5/2 base kernel the variational GP is built with.
+
+    Without ``lengthscale_prior`` it is the historical prior-free kernel, started
+    at ``sqrt(input_dim)``. With it, it takes the prior, floor and starting point
+    of BoTorch's ``get_covar_module_with_dim_scaled_prior``, which assume inputs
+    on [0, 1]. The one departure is the floor's parameterization: BoTorch's has
+    no transform, because L-BFGS-B enforces it as a bound, whereas Adam needs the
+    softplus transform to stay above it.
+    """
+    ard_num_dims = input_dim if ard else None
+    if not lengthscale_prior:
+        kernel = gpytorch.kernels.MaternKernel(ard_num_dims=ard_num_dims)
+        kernel.lengthscale = sqrt(input_dim)
+        return kernel
+    # Scaled by the input dimension even when isotropic: on [0, 1] inputs the
+    # distance summed over all features grows like sqrt(input_dim).
+    prior = LogNormalPrior(loc=SQRT2 + math.log(input_dim) * 0.5, scale=SQRT3)
+    kernel = gpytorch.kernels.MaternKernel(
+        nu=2.5,
+        ard_num_dims=ard_num_dims,
+        lengthscale_prior=prior,
+        lengthscale_constraint=GreaterThan(2.5e-2),
+    )
+    kernel.lengthscale = prior.mode
+    return kernel
+
 
 def _synchronize_profile_device(device: torch.device) -> None:
     """Wait for pending CUDA work before measuring a device-bound operation."""
@@ -62,8 +109,13 @@ class _VariationalGP(gpytorch.models.ApproximateGP):
         device: torch.device | None = None,
         inducing_points: torch.Tensor | None = None,
         initial_lengthscale: float | None = None,
+        base_kernel: gpytorch.kernels.Kernel | None = None,
     ) -> None:
-        """Initialize the variational GP in a fixed-dimensional feature space."""
+        """Initialize the variational GP in a fixed-dimensional feature space.
+
+        ``base_kernel`` replaces the default ARD Matern inside the ``ScaleKernel``;
+        ``initial_lengthscale`` applies to the default only.
+        """
         if inducing_points is None:
             inducing_points = torch.randn(
                 num_inducing,
@@ -89,11 +141,11 @@ class _VariationalGP(gpytorch.models.ApproximateGP):
         )
         super().__init__(variational_strategy)
         self.mean_module = gpytorch.means.ConstantMean()
-        self.covar_module = gpytorch.kernels.ScaleKernel(
-            gpytorch.kernels.MaternKernel(ard_num_dims=input_dim)
-        )
-        if initial_lengthscale is not None:
-            self.covar_module.base_kernel.lengthscale = initial_lengthscale
+        if base_kernel is None:
+            base_kernel = gpytorch.kernels.MaternKernel(ard_num_dims=input_dim)
+            if initial_lengthscale is not None:
+                base_kernel.lengthscale = initial_lengthscale
+        self.covar_module = gpytorch.kernels.ScaleKernel(base_kernel)
 
     def forward(self, x: torch.Tensor) -> gpytorch.distributions.MultivariateNormal:
         """Evaluate the latent GP distribution at feature-space inputs."""
@@ -112,13 +164,42 @@ class _VariationalBoTorchAdapter(Model):
         likelihood: gpytorch.likelihoods.GaussianLikelihood,
         outcome_mean: float = 0.0,
         outcome_std: float = 1.0,
+        input_offset: torch.Tensor | None = None,
+        input_coefficient: torch.Tensor | None = None,
     ) -> None:
-        """Initialize the adapter around a GP and Gaussian likelihood."""
+        """Initialize the adapter around a GP and Gaussian likelihood.
+
+        With ``input_offset`` and ``input_coefficient``, inputs are mapped to
+        ``(X - offset) / coefficient`` before the GP sees them, so callers pass
+        features as the encoder produced them.
+        """
         super().__init__()
         self._gp = gp_model
         self._likelihood = likelihood
         self._outcome_mean = outcome_mean
         self._outcome_std = outcome_std
+        self._input_offset = input_offset
+        self._input_coefficient = input_coefficient
+
+    @property
+    def gp_model(self) -> _VariationalGP:
+        """Return the wrapped variational GP."""
+        return self._gp
+
+    @property
+    def gp_likelihood(self) -> gpytorch.likelihoods.GaussianLikelihood:
+        """Return the wrapped Gaussian likelihood."""
+        return self._likelihood
+
+    @property
+    def outcome_mean(self) -> float:
+        """Return the mean the targets were standardized with."""
+        return self._outcome_mean
+
+    @property
+    def outcome_std(self) -> float:
+        """Return the standard deviation the targets were standardized with."""
+        return self._outcome_std
 
     @property
     def num_outputs(self) -> int:
@@ -144,6 +225,8 @@ class _VariationalBoTorchAdapter(Model):
             )
         self._gp.eval()
         self._likelihood.eval()
+        if self._input_offset is not None and self._input_coefficient is not None:
+            X = (X - self._input_offset.to(X)) / self._input_coefficient.to(X)
         distribution = self._gp(X)
         if observation_noise:
             distribution = self._likelihood(distribution)
@@ -174,6 +257,11 @@ class VariationalGPSurrogate(BoTorchGPSurrogate):
         inducing_strata_fractions: tuple[float, ...] = DEFAULT_STRATA_FRACTIONS,
         inducing_kmeans_max_rows: int = 200_000,
         inducing_init_seed: int = 0,
+        ard: bool = True,
+        lengthscale_prior: bool = False,
+        noise_prior: bool = False,
+        prior_mean: float | None = None,
+        scale_inputs: bool = False,
     ) -> None:
         """Initialize a fixed-feature variational GP surrogate.
 
@@ -205,9 +293,41 @@ class VariationalGPSurrogate(BoTorchGPSurrogate):
             Largest number of rows of one stratum that k-means is fitted to.
         inducing_init_seed : int, default=0
             Seed of the generator behind the stratified and k-means draws.
+        ard : bool, default=True
+            Whether each feature gets its own lengthscale. ``False`` shares one
+            across all features.
+        lengthscale_prior : bool, default=False
+            Whether the lengthscale takes the prior, floor and starting point of
+            BoTorch's ``get_covar_module_with_dim_scaled_prior``. That prior
+            assumes inputs on [0, 1], so pair it with ``scale_inputs``.
+        noise_prior : bool, default=False
+            Whether the noise takes BoTorch's ``LogNormal(-4, 1)`` prior, its
+            ``1e-4`` floor and its starting point at the prior's mode. ``False``
+            keeps the historical prior-free noise started at 0.1.
+        prior_mean : float, optional
+            Constant mean pinned on the original target scale and excluded from
+            training. It is converted with each fit's output standardization, so
+            it means the same value whatever the training targets. ``None``
+            learns it.
+        scale_inputs : bool, default=False
+            Whether each feature is min-max scaled to [0, 1] with the training
+            rows' range, as BoTorch's ``Normalize`` does. Callers still pass and
+            receive unscaled features; the scaling is applied inside the model.
+            The inducing points live in the scaled space.
         """
         if is_multi_fidelity and target_fidelity is None:
             raise ValueError("target_fidelity must be set when is_multi_fidelity=True.")
+        if is_multi_fidelity and (
+            not ard
+            or lengthscale_prior
+            or noise_prior
+            or prior_mean is not None
+            or scale_inputs
+        ):
+            raise ValueError(
+                "ard=False, lengthscale_prior, noise_prior, prior_mean and "
+                "scale_inputs are single-fidelity only."
+            )
         if encoder.feature_dim < 1:
             raise ValueError("encoder.feature_dim must be positive.")
         if num_inducing < 1:
@@ -235,6 +355,13 @@ class VariationalGPSurrogate(BoTorchGPSurrogate):
         self._inducing_strata_fractions = tuple(inducing_strata_fractions)
         self._inducing_kmeans_max_rows = inducing_kmeans_max_rows
         self._inducing_init_seed = inducing_init_seed
+        self._ard = ard
+        self._lengthscale_prior = lengthscale_prior
+        self._noise_prior = noise_prior
+        self._prior_mean = None if prior_mean is None else float(prior_mean)
+        self._scale_inputs = scale_inputs
+        self._input_offset: torch.Tensor | None = None
+        self._input_coefficient: torch.Tensor | None = None
         self._standardize_outputs = standardize_outputs
         self._gp_model: _VariationalGP | None = None
         self._likelihood: gpytorch.likelihoods.GaussianLikelihood | None = None
@@ -244,6 +371,7 @@ class VariationalGPSurrogate(BoTorchGPSurrogate):
         self._y_std = 1.0
         self._fit_profiling: dict[str, float] = {}
         self._epoch_callback: EpochCallback | None = None
+        self._last_lr = float(training_params.lr)
         self._warm_start: tuple[dict[str, torch.Tensor], str] | None = None
         batch_size = getattr(training_params, "batch_size", None)
         if batch_size is not None and batch_size < 1:
@@ -312,6 +440,15 @@ class VariationalGPSurrogate(BoTorchGPSurrogate):
         self._warm_start = (state_dict, trainable)
         self._pending_state_dict = None
 
+    @property
+    def last_lr(self) -> float:
+        """Return the learning rate of the latest optimizer step.
+
+        Before any step it is the configured starting rate. Read by an epoch
+        callback, it is the rate the epoch's last step used.
+        """
+        return self._last_lr
+
     def bind_runtime_context(self, runtime_context: RuntimeContext) -> None:
         """Bind runtime settings to the encoder and variational GP stack."""
         super().bind_runtime_context(runtime_context)
@@ -349,13 +486,15 @@ class VariationalGPSurrogate(BoTorchGPSurrogate):
         ).unsqueeze(-1)
         self._train_Y = train_y
         self._model_train_Y = self._standardize_targets(train_y)
+        self._fit_input_scaling()
         pending_state = self._pending_state_dict
         self._pending_state_dict = None
         warm_start = self._warm_start
         self._warm_start = None
         self._build_variational_model()
         self._apply_runtime_context()
-        self._remove_noise_prior()
+        if not self._noise_prior:
+            self._remove_noise_prior()
         if warm_start is not None:
             state_dict, trainable = warm_start
             self.load_state_dict(state_dict)
@@ -369,6 +508,51 @@ class VariationalGPSurrogate(BoTorchGPSurrogate):
             self.load_state_dict(pending_state)
         else:
             self._train_variational_gp(len(observation_list))
+
+    def restore(
+        self,
+        observations: Iterable[Observation],
+        state_dict: dict[str, torch.Tensor],
+    ) -> None:
+        """Rebuild a fitted surrogate from its observations and saved state.
+
+        The same contract as ``FixedFeatureGPSurrogate.restore``: the state is
+        loaded in place of training, and the observations become the training
+        rows the acquisition's candidate set is drawn from.
+
+        Parameters
+        ----------
+        observations : Iterable[Observation]
+            The observations the saved surrogate was fitted to.
+        state_dict : dict[str, torch.Tensor]
+            The state returned by :meth:`get_state_dict` after that fit.
+        """
+        observation_list = list(observations)
+        if not observation_list:
+            raise ValueError("Cannot restore a surrogate without observations.")
+        self._warm_start = None
+        self._pending_state_dict = state_dict
+        self.fit(observation_list)
+
+    def _fit_input_scaling(self) -> None:
+        """Record the training rows' per-feature range when inputs are scaled."""
+        if not self._scale_inputs:
+            return
+        assert self._train_X is not None
+        lower = self._train_X.amin(dim=0)
+        span = self._train_X.amax(dim=0) - lower
+        self._input_offset = lower.to(device=self.device, dtype=self.dtype)
+        self._input_coefficient = torch.where(
+            span < _MIN_INPUT_RANGE, torch.ones_like(span), span
+        ).to(device=self.device, dtype=self.dtype)
+
+    def _to_model_inputs(self, features: torch.Tensor) -> torch.Tensor:
+        """Map encoder features into the space the GP and inducing points live in."""
+        if self._input_offset is None or self._input_coefficient is None:
+            return features
+        return (features - self._input_offset.to(features)) / (
+            self._input_coefficient.to(features)
+        )
 
     def _freeze_for_warm_start(self, trainable: str) -> None:
         """Freeze every parameter a warm-started fit must not train."""
@@ -415,10 +599,22 @@ class VariationalGPSurrogate(BoTorchGPSurrogate):
             dtype=self.dtype,
             device=self.device,
         )
+        if self._input_offset is not None and self._input_coefficient is not None:
+            state["input_offset"] = self._input_offset
+            state["input_coefficient"] = self._input_coefficient
         return state
 
     def load_state_dict(self, state_dict: dict[str, torch.Tensor]) -> None:
         """Restore fitted state immediately or defer until model construction."""
+        # Checked before any weights are copied: a state from a differently
+        # configured surrogate would otherwise fail inside torch on the first
+        # mismatched tensor, with an error that does not name the setting.
+        if self._scale_inputs != ("input_offset" in state_dict):
+            raise ValueError(
+                "The state was saved with scale_inputs="
+                f"{'input_offset' in state_dict}, but this surrogate has "
+                f"scale_inputs={self._scale_inputs}."
+            )
         if self._gp_model is None or self._likelihood is None:
             self._pending_state_dict = state_dict
             return
@@ -437,11 +633,20 @@ class VariationalGPSurrogate(BoTorchGPSurrogate):
         self._likelihood.load_state_dict(likelihood_state)
         self._y_mean = float(state_dict["outcome_mean"].item())
         self._y_std = float(state_dict["outcome_std"].item())
+        if self._scale_inputs:
+            self._input_offset = state_dict["input_offset"].to(
+                device=self.device, dtype=self.dtype
+            )
+            self._input_coefficient = state_dict["input_coefficient"].to(
+                device=self.device, dtype=self.dtype
+            )
         self._botorch_adapter = _VariationalBoTorchAdapter(
             self._gp_model,
             self._likelihood,
             outcome_mean=self._y_mean,
             outcome_std=self._y_std,
+            input_offset=self._input_offset,
+            input_coefficient=self._input_coefficient,
         ).to(device=self.device, dtype=self.dtype)
         self._gp_model.eval()
         self._likelihood.eval()
@@ -485,7 +690,7 @@ class VariationalGPSurrogate(BoTorchGPSurrogate):
         """Predict means and standard deviations on the original target scale."""
         if self._gp_model is None or self._likelihood is None:
             raise RuntimeError("Surrogate has not been fitted yet.")
-        encoded = self.encode_candidates(candidates)
+        encoded = self._to_model_inputs(self.encode_candidates(candidates))
         self._gp_model.eval()
         self._likelihood.eval()
         with torch.no_grad():
@@ -637,7 +842,9 @@ class VariationalGPSurrogate(BoTorchGPSurrogate):
                 )
                 standardized = (chunk_targets - self._y_mean) / self._y_std
                 with gpytorch.settings.cholesky_jitter(1e-1):
-                    loss = -objective(self._gp_model(chunk), standardized)
+                    loss = -objective(
+                        self._gp_model(self._to_model_inputs(chunk)), standardized
+                    )
                 total += float(loss.item()) * chunk.shape[0]
         return total / rows
 
@@ -662,19 +869,25 @@ class VariationalGPSurrogate(BoTorchGPSurrogate):
                 (self._num_inducing,),
                 device=self._train_X.device,
             )
-            points = self._train_X[sample_indices]
+            points = self._to_model_inputs(self._train_X[sample_indices])
         elif self._inducing_init == "stratified":
-            points = select_stratified(
-                self._train_X,
-                self._model_train_Y,
-                self._num_inducing,
-                self._inducing_strata_quantiles,
-                self._inducing_strata_fractions,
-                seed=self._inducing_init_seed,
+            # Scaling is per feature, so scaling the chosen rows equals choosing
+            # from the scaled rows.
+            points = self._to_model_inputs(
+                select_stratified(
+                    self._train_X,
+                    self._model_train_Y,
+                    self._num_inducing,
+                    self._inducing_strata_quantiles,
+                    self._inducing_strata_fractions,
+                    seed=self._inducing_init_seed,
+                )
             )
         else:
+            # k-means distances are not invariant to per-feature scaling, so the
+            # centres are fitted in the space the GP sees.
             points = select_kmeans(
-                self._train_X,
+                self._to_model_inputs(self._train_X),
                 self._model_train_Y,
                 self._num_inducing,
                 self._inducing_strata_quantiles,
@@ -696,16 +909,52 @@ class VariationalGPSurrogate(BoTorchGPSurrogate):
             dtype=self.dtype,
             device=self.device,
             inducing_points=inducing_points,
-            initial_lengthscale=sqrt(input_dim),
+            base_kernel=_matern_kernel(
+                input_dim, ard=self._ard, lengthscale_prior=self._lengthscale_prior
+            ),
         )
-        self._likelihood = gpytorch.likelihoods.GaussianLikelihood()
+        if self._prior_mean is not None:
+            self._fix_prior_mean(self._prior_mean)
+        self._likelihood = self._build_likelihood()
         self._botorch_adapter = _VariationalBoTorchAdapter(
             self._gp_model,
             self._likelihood,
             outcome_mean=self._y_mean,
             outcome_std=self._y_std,
+            input_offset=self._input_offset,
+            input_coefficient=self._input_coefficient,
         )
         self.model = self._gp_model
+
+    def _build_likelihood(self) -> gpytorch.likelihoods.GaussianLikelihood:
+        """Return the Gaussian likelihood, with BoTorch's noise prior if set.
+
+        As with the lengthscale floor, BoTorch's noise floor has no transform
+        because L-BFGS-B enforces it as a bound; here it keeps gpytorch's
+        softplus so Adam stays above it.
+        """
+        if not self._noise_prior:
+            return gpytorch.likelihoods.GaussianLikelihood()
+        prior = LogNormalPrior(loc=-4.0, scale=1.0)
+        likelihood = gpytorch.likelihoods.GaussianLikelihood(
+            noise_prior=prior,
+            noise_constraint=GreaterThan(MIN_INFERRED_NOISE_LEVEL),
+        )
+        likelihood.noise = prior.mode
+        return likelihood
+
+    def _fix_prior_mean(self, prior_mean: float) -> None:
+        """Pin the constant mean at ``prior_mean`` and exclude it from training.
+
+        The constant lives on the standardized scale the GP is trained on, so the
+        original-scale value goes through this fit's standardization.
+        """
+        assert self._gp_model is not None
+        raw_constant = self._gp_model.mean_module.raw_constant
+        with torch.no_grad():
+            raw_constant.fill_((prior_mean - self._y_mean) / self._y_std)
+        # The optimizer only takes parameters that still require a gradient.
+        raw_constant.requires_grad_(False)
 
     def _apply_runtime_context(self) -> None:
         """Move all fitted GP modules to the active runtime device and dtype."""
@@ -812,26 +1061,33 @@ class VariationalGPSurrogate(BoTorchGPSurrogate):
             if parameter.requires_grad
         ]
         optimizer = Adam(trainable_parameters, lr=self._training.lr)
+        batch_size = getattr(self._training, "batch_size", None)
+        steps_per_epoch = 1 if batch_size is None else math.ceil(num_data / batch_size)
+        scheduler = self._build_lr_scheduler(
+            optimizer, self._training.epochs * steps_per_epoch
+        )
+        self._last_lr = float(self._training.lr)
         parameters = [
             parameter
             for group in optimizer.param_groups
             for parameter in group["params"]
         ]
         targets = self._model_train_Y.squeeze(-1)
-        batch_size = getattr(self._training, "batch_size", None)
         _synchronize_profile_device(self.device)
         fit_started = time.perf_counter()
         callback_seconds = 0.0
         if batch_size is None:
+            train_inputs = self._to_model_inputs(self._train_X)
             for epoch in range(self._training.epochs):
                 self._gp_model.train()
                 self._likelihood.train()
                 optimizer.zero_grad()
                 with gpytorch.settings.cholesky_jitter(1e-1):
-                    loss = -objective(self._gp_model(self._train_X), targets)
+                    loss = -objective(self._gp_model(train_inputs), targets)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(parameters, max_norm=1.0)
                 optimizer.step()
+                self._advance_lr(optimizer, scheduler)
                 if self._epoch_callback is not None:
                     callback_seconds += self._run_epoch_callback(
                         epoch, float(loss.item())
@@ -851,9 +1107,11 @@ class VariationalGPSurrogate(BoTorchGPSurrogate):
                 )
                 for start in range(0, num_data, batch_size):
                     batch_indices = permutation[start : start + batch_size]
-                    batch_x = self._train_X.index_select(0, batch_indices).to(
-                        device=self.device,
-                        dtype=self.dtype,
+                    batch_x = self._to_model_inputs(
+                        self._train_X.index_select(0, batch_indices).to(
+                            device=self.device,
+                            dtype=self.dtype,
+                        )
                     )
                     batch_targets = targets.index_select(0, batch_indices).to(
                         device=self.device,
@@ -868,6 +1126,7 @@ class VariationalGPSurrogate(BoTorchGPSurrogate):
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(parameters, max_norm=1.0)
                     optimizer.step()
+                    self._advance_lr(optimizer, scheduler)
                     # The last batch of an epoch is short, so weight by its real size.
                     # Accumulated on device: one `.item()` per batch would force a CUDA
                     # synchronization on every one of the ~1000 steps in an epoch.
@@ -896,6 +1155,35 @@ class VariationalGPSurrogate(BoTorchGPSurrogate):
             )
         self._gp_model.eval()
         self._likelihood.eval()
+
+    def _build_lr_scheduler(
+        self, optimizer: Adam, total_steps: int
+    ) -> CosineAnnealingLR | None:
+        """Return the configured learning-rate scheduler, or ``None`` for constant.
+
+        Training parameters are duck-typed, so objects without the setting keep
+        the historical constant rate.
+        """
+        schedule = getattr(self._training, "lr_schedule", "constant")
+        if schedule not in LR_SCHEDULES:
+            raise ValueError(
+                f"lr_schedule must be one of {LR_SCHEDULES}, got {schedule!r}."
+            )
+        if schedule == "constant":
+            return None
+        return CosineAnnealingLR(
+            optimizer,
+            T_max=max(total_steps, 1),
+            eta_min=float(getattr(self._training, "lr_min", 0.0)),
+        )
+
+    def _advance_lr(
+        self, optimizer: Adam, scheduler: CosineAnnealingLR | None
+    ) -> None:
+        """Record the rate the step just used, then advance the schedule."""
+        self._last_lr = float(optimizer.param_groups[0]["lr"])
+        if scheduler is not None:
+            scheduler.step()
 
     def _run_epoch_callback(self, epoch: int, mean_loss: float) -> float:
         """Invoke the epoch callback if installed and return the seconds it took.

@@ -1,0 +1,148 @@
+# Sparse variational GP (inducing points) on the frozen MiniMol AmpC
+# fingerprints, fitted to the 25,000-molecule balanced training set and
+# evaluated exactly as the exact-DKL and fixed-feature-GP arms are, by
+# scripts/exact_dkl_top_n.py, into the W&B project ampc-Variational-GP.
+#
+#   sbatch jobs/variational_gp_balanced_nibi.sh elbo|pll
+#
+# A preliminary test, kept small: same training set, fingerprints and
+# evaluation sets as balanced_25000_fixedgp_iso_matern_scaled_pm0.03956_fp32,
+# the exact GP the 10-round single-fidelity run used, and as much of that GP as
+# carries over to a variational one:
+#   - Matern-5/2 with ONE lengthscale shared by all 512 features, under BoTorch's
+#     dimension-scaled LogNormal prior and 0.025 floor;
+#   - inputs min-max scaled to [0, 1] with the training rows' range, which that
+#     prior assumes;
+#   - a learned ScaleKernel output scale;
+#   - BoTorch's LogNormal(-4, 1) noise prior and 1e-4 floor;
+#   - the constant mean PINNED at the 10M library mean;
+#   - float32.
+# What differs is the approximation: 1024 learned inducing points instead of
+# conditioning on all 25,000 rows, trained by Adam on ELBO or PLL instead of
+# L-BFGS-B on the exact marginal likelihood. Both floors keep gpytorch's
+# softplus parameterization, since Adam (unlike L-BFGS-B) cannot enforce a
+# bound. The priors enter the objective divided by the dataset size, as they
+# do in BoTorch's exact marginal likelihood.
+#
+# Like exact_dkl_top_n.yaml, which this mirrors outside the surrogate block,
+# the sampler, oracle, selector and budget sections are never built but must
+# stay valid, because ActiveLearningConfig validates the whole file.
+
+runtime:
+  device: cuda
+  # The precision the 10-round exact GP and the earlier variational arms ran at.
+  precision: 32
+  seed: 42
+
+dataset:
+  type: ListDataset
+  initial_data:
+    path: data/ampc_balanced_25000.csv
+    x_columns: SMILE
+    y_column: y
+    fidelity_column: fidelity
+
+surrogate:
+  type: VariationalGPSurrogate
+  encoder:
+    # The fixed encoder the training cache was written by, so the existing
+    # cache is read as is.
+    type: MiniMolAmpcSmilesFixedEncoder
+    checkpoint_path: minimol_ampc_encoder/model/final.pt
+    package_path: minimol_ampc_encoder
+    device: cpu  # Never used: inference is disabled by cache_only.
+    batch_size: 64  # Never used: inference is disabled by cache_only below.
+    cache_size: 0  # The persistent per-set cache is the only cache needed.
+    # A cache miss is a loud error rather than silent MiniMol inference.
+    cache_only: true
+    feature_cache_path: cache/ampc/exact_dkl_top_n/balanced_25000.npy
+  training_params:
+    # Full batch: the 25,000 x 1024 cross-covariance fits on one GPU, so every
+    # step sees every row, as the exact GP's fit does, and an "epoch" in the
+    # train/epoch/* charts is one Adam step. The earlier variational settings
+    # (50 epochs of 10,000-row batches at 1e-3) were sized for 10M rows and
+    # would give 25,000 rows about 150 steps.
+    epochs: 2000
+    lr: 1.0e-2
+    batch_size: null
+    # The job sets this per arm: VariationalELBO or PredictiveLogLikelihood.
+    variational_objective: VariationalELBO
+  num_inducing: 1024
+  # Uniform training rows. The stratified and k-means starts cannot be used at
+  # this size: their top stratum (top 0.1%) holds 25 rows and would be allotted
+  # 192 points.
+  inducing_init: random
+  ard: false
+  lengthscale_prior: true
+  scale_inputs: true
+  noise_prior: true
+  prior_mean: 0.03956042999405787  # Mean y of data/10M_unif_random_subset.csv.
+  standardize_outputs: true
+
+acquisition:
+  # GIBBON by default; the qMFMES arms override `type`. The script scores
+  # GIBBON twice, once on the value scale and once on the log scale, so
+  # log_output is set per scoring pass rather than here.
+  type: QLowerBoundMaxValueEntropy
+  candidate_set_spec:
+    # The support for max-value sampling is the training set itself. At
+    # n <= 3000 the fallback never triggers, so both acquisitions see exactly
+    # the fitted molecules.
+    type: TrainDataCandidateSetSpec
+    fallback_size: 100000
+    seed: 42
+  num_mv_samples: 10
+  score_chunk_size: 5000
+  maximize: true
+  log_space: true
+  log_output: false
+
+sampler:
+  type: S3GFNSampler
+  n_samples: 100000
+  fidelities: [1]
+  model_name_or_path: ibm-research/GP-MoLFormer-Uniq
+  tokenizer_name_or_path: ibm-research/MoLFormer-XL-both-10pct
+  trust_remote_code: true
+  performance_mode: optimized
+  max_length: 80
+  batch_size: 64
+  replay_batch_size: 64
+  generation_batch_size: 128
+  n_train_steps: 2500
+  num_warmup_steps: 10
+  beta: 1.0
+  aux_coefficient: 0.001
+  sa_threshold: 4.0
+
+selector:
+  type: CostAwareSelector
+
+oracle:
+  type: Dock3Oracle
+  mol_repr: smiles
+  indock_template: /home/ethankrz/dock_smiles/ampc_dockfiles/INDOCK
+  dockfiles_dir: /home/ethankrz/dock_smiles/ampc_dockfiles
+  fidelity_costs:
+    1: 1.0
+  fidelity_confidences:
+    1: 1.0
+  num_workers: null
+  ligbuild_timeout: 150
+  hitrate_params: ampc_hitrate_fits/fitted_params.json
+  score_pprop_table: ampc_hitrate_fits/data/full_scores.df
+  hitrate_target: ampc
+  pki_threshold: 6.5
+
+budget:
+  available_budget: 100000.0
+  schedule:
+    type: constant
+    value: 10000.0
+
+logger:
+  # Stripped by the script, which builds its own run logger from the
+  # --wandb-* flags.
+  type: ConsoleLogger
+  project_name: ampc-exact-dkl-top-n
+  run_name: exact-dkl-top-n

@@ -53,11 +53,18 @@ class TrainDataCandidateSetSpecConfig(BaseModel):
     type: Literal["TrainDataCandidateSetSpec"] = "TrainDataCandidateSetSpec"
     fallback_size: int = Field(default=100_000, ge=1)
     seed: int = Field(default=42, ge=0)
+    #: Cap the support at this many observations up front, rather than only
+    #: after the full support fails. The support is otherwise the whole training
+    #: set, so arms fitted to different amounts of data sample their max values
+    #: from supports of different sizes and their acquisition values cannot be
+    #: compared. ``None`` leaves the support uncapped.
+    max_support_size: Optional[int] = Field(default=None, ge=1)
 
     def build(self) -> CandidateSetSpec:
         return TrainDataCandidateSetSpec(
             fallback_size=self.fallback_size,
             seed=self.seed,
+            max_support_size=self.max_support_size,
         )
 
 

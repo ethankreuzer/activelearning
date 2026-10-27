@@ -11,6 +11,11 @@ evaluated by identical code. For it the ``train/epoch/*`` series are indexed by
 objective evaluation rather than epoch, and ``run/fit/converged`` records
 whether the last L-BFGS-B attempt reached scipy's convergence criterion.
 
+It also fits ``VariationalGPSurrogate``, the sparse variational GP with
+inducing points, on the same fingerprints and evaluation sets. It trains by
+Adam with the per-epoch callback, as the DKL arms do; in full-batch mode an
+epoch is one optimizer step.
+
 Two things about this script are deliberate and easy to "simplify" wrongly:
 
 **It never calls ``acquisition.score()`` or ``surrogate.predict()``.**
@@ -95,11 +100,15 @@ PER_EPOCH_HYPERPARAMETERS = ("noise", "outputscale", "lengthscale_median")
 #: BoTorch's default exact GP on the fixed fingerprints, fitted by L-BFGS-B.
 FIXED_FEATURE_GP_TYPE = "FixedFeatureGPSurrogate"
 
+#: The sparse variational GP on the fixed fingerprints, fitted by Adam.
+VARIATIONAL_GP_TYPE = "VariationalGPSurrogate"
+
 #: The surrogates this study runs, each with the encoder type it is run with.
 #: The DKL encoder can carry a trainable layer; the fixed one never does.
 SURROGATE_ENCODERS = {
     "ExactDKLSurrogate": "MiniMolAmpcSmilesEncoder",
     FIXED_FEATURE_GP_TYPE: "MiniMolAmpcSmilesFixedEncoder",
+    VARIATIONAL_GP_TYPE: "MiniMolAmpcSmilesFixedEncoder",
 }
 
 #: Appended to a set's name for the metrics computed on only the molecules the
@@ -302,6 +311,10 @@ def make_epoch_callback(
         for name in PER_EPOCH_HYPERPARAMETERS:
             if name in hyperparameters:
                 metrics[f"train/epoch/{name}"] = hyperparameters[name]
+        # The variational GP's rate, which a schedule changes every step.
+        last_lr = getattr(surrogate, "last_lr", None)
+        if last_lr is not None:
+            metrics["train/epoch/lr"] = float(last_lr)
         loss_rows.append({"epoch": float(epoch), **metrics})
         log_scalars(logger, metrics)
         logger.log_step(epoch)
@@ -940,6 +953,18 @@ def run_configuration(
         "max_cholesky_size": surrogate.get("max_cholesky_size"),
         "epochs": training.get("epochs"),
         "lr": training.get("lr"),
+        # Variational GP only; None for the exact GPs.
+        "batch_size": training.get("batch_size"),
+        "variational_objective": training.get("variational_objective"),
+        "lr_schedule": training.get("lr_schedule"),
+        "lr_min": training.get("lr_min"),
+        "num_inducing": surrogate.get("num_inducing"),
+        "inducing_init": surrogate.get("inducing_init"),
+        "ard": surrogate.get("ard"),
+        "kernel": surrogate.get("kernel"),
+        "outputscale": surrogate.get("outputscale"),
+        "lengthscale_prior": surrogate.get("lengthscale_prior"),
+        "noise_prior": surrogate.get("noise_prior"),
         "num_mv_samples": acquisition.get("num_mv_samples"),
         "num_fantasies": acquisition.get("num_fantasies"),
         "num_y_samples": acquisition.get("num_y_samples"),
@@ -953,7 +978,13 @@ def run_configuration(
         "eval_chunk_size": args.eval_chunk_size,
         "score_chunk_size": args.score_chunk_size,
         "score_limit": args.score_limit,
+        "skip_scoring": args.skip_scoring,
+        "allow_live_encoding": args.allow_live_encoding,
+        "extra_sets": ",".join(args.extra_set),
+        "cache_dir": str(args.cache_dir),
         "output_dir": str(args.output_dir),
+        # The exact invocation: config paths, overrides and script flags.
+        "argv": " ".join(sys.argv),
         "loaded_state": None if args.load_state is None else str(args.load_state),
         **dict(resolved.get("provenance", {})),
         "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
@@ -1029,6 +1060,17 @@ def main(argv: Sequence[str] | None = None) -> None:
             "scale_inputs=%s, max_cholesky_size=%s.",
             surrogate_cfg.get("scale_inputs"),
             surrogate_cfg.get("max_cholesky_size"),
+        )
+    elif surrogate_type == VARIATIONAL_GP_TYPE:
+        _logger.info(
+            "Surrogate: sparse variational GP on the fingerprints, "
+            "num_inducing=%s, objective=%s, ard=%s, scale_inputs=%s.",
+            surrogate_cfg.get("num_inducing"),
+            dict(surrogate_cfg.get("training_params", {})).get(
+                "variational_objective"
+            ),
+            surrogate_cfg.get("ard"),
+            surrogate_cfg.get("scale_inputs"),
         )
     else:
         # Stated, not compared against a fixed expectation: the arms sweep the
@@ -1152,6 +1194,11 @@ def main(argv: Sequence[str] | None = None) -> None:
                     set_sizes=set_sizes,
                 )
             )
+            # The VALIDATED config as well, as the active-learning loop logs it.
+            # resolved_config above is the YAML plus overrides, so a setting left
+            # to its schema default (an inducing-point seed, a stratum split) is
+            # absent from it; this carries every field, default or not.
+            logger.log_config({"effective": cfg.model_dump(mode="json")})
 
             loss_rows: list[dict[str, float]] = []
             lbfgs_attempts: list[dict[str, Any]] = []

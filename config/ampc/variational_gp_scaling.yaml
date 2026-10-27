@@ -1,0 +1,178 @@
+# Sparse variational GP (inducing points) on the frozen MiniMol AmpC
+# fingerprints, fitted to one arm of the training-set scaling study and
+# evaluated by scripts/exact_dkl_top_n.py into the W&B project
+# ampc-Variational-GP.
+#
+#   sbatch jobs/variational_gp_scaling_nibi.sh pll 50000
+#   sbatch jobs/variational_gp_scaling_nibi.sh pll 300000
+#
+# The arms come from jobs/build_svgp_scaling_sets_nibi.sh and are NESTED: the
+# 50k set is a subset of the 100k set, which is a subset of the 300k set, and
+# all three hold the same 16,292 molecules above y 0.2617 (pProp 3.5). Only the
+# bulk grows. Comparing the arms therefore measures how much bulk this surrogate
+# can absorb at fixed tail supervision -- the thing that decides whether the AL
+# loop can drop the archive/train split the exact GP forced on it.
+#
+# The job sets the training set and its feature cache per arm; everything below
+# is held fixed across arms so that the dataset is the only thing that varies.
+# The surrogate settings are those of
+# balanced_25000_svgp_M1024_iso_matern_scaled_pm0.03956_pll_fp32, the arm that
+# won the preliminary ELBO/PLL comparison on the 25,000-molecule balanced set:
+#   - Matern-5/2 with ONE lengthscale shared by all 512 features, under BoTorch's
+#     dimension-scaled LogNormal prior and 0.025 floor;
+#   - inputs min-max scaled to [0, 1] with the training rows' range;
+#   - a learned ScaleKernel output scale;
+#   - BoTorch's LogNormal(-4, 1) noise prior and 1e-4 floor;
+#   - the constant mean PINNED at the 10M library mean;
+#   - 1024 learned inducing points, float32.
+#
+# What differs from the balanced arm, and why:
+#   - MINIBATCHES. A 300,000 x 1024 cross-covariance per step is not worth the
+#     memory, and the whole point of a variational GP is that it does not need
+#     the full batch. batch_size 4096 makes an epoch 13, 25 or 74 steps across
+#     the three arms, so epochs are NOT comparable between arms; steps are.
+#     Read train/epoch/* against the step count, and note the loss includes the
+#     KL term and the priors divided by n.
+#   - COSINE ANNEALING, added after the balanced arms: the ELBO arm's loss spiked
+#     at steps 1435-1450 and settled worse (outputscale 0.88 -> 0.41), and the
+#     PLL arm's lengthscale and outputscale were still drifting at step 2000 on
+#     a flat loss, so where training stopped was deciding the hyperparameters.
+#   - The candidate set for max-value sampling can no longer be the training set
+#     itself at 300,000 rows, so it is drawn down to 100,000 (see `acquisition`).
+#
+# Like exact_dkl_top_n.yaml, which this mirrors outside the surrogate block,
+# the sampler, oracle, selector and budget sections are never built but must
+# stay valid, because ActiveLearningConfig validates the whole file.
+
+runtime:
+  device: cuda
+  # The precision the 10-round exact GP and the earlier variational arms ran at.
+  precision: 32
+  seed: 42
+
+dataset:
+  type: ListDataset
+  initial_data:
+    # The job sets this per arm; the default is the smallest.
+    path: data/ampc_svgpscale_50000.csv
+    x_columns: SMILE
+    y_column: y
+    fidelity_column: fidelity
+
+surrogate:
+  type: VariationalGPSurrogate
+  encoder:
+    # The fixed encoder the training cache was written by, so the existing
+    # cache is read as is.
+    type: MiniMolAmpcSmilesFixedEncoder
+    checkpoint_path: minimol_ampc_encoder/model/final.pt
+    package_path: minimol_ampc_encoder
+    device: cpu  # Never used: inference is disabled by cache_only.
+    batch_size: 64  # Never used: inference is disabled by cache_only below.
+    cache_size: 0  # The persistent per-set cache is the only cache needed.
+    # A cache miss is a loud error rather than silent MiniMol inference.
+    cache_only: true
+    # The job sets this per arm, to match the training set above.
+    feature_cache_path: cache/ampc/exact_dkl_top_n/svgpscale_50000.npy
+  training_params:
+    # Minibatched, unlike the balanced arm: at 300,000 rows a full-batch step
+    # builds a 300,000 x 1024 cross-covariance, and a sparse variational GP
+    # exists precisely so it need not. 4096 rows per step keeps the step cost
+    # identical across arms, so the arms differ in how many steps an epoch
+    # takes (13, 25 and 74) rather than in what a step costs.
+    epochs: 300
+    lr: 1.0e-2
+    batch_size: 4096
+    # Annealed to lr_min over the whole run. Held constant, the balanced arms
+    # ended on a flat loss with the lengthscale and output scale still drifting.
+    lr_schedule: cosine
+    lr_min: 1.0e-4
+    # The job sets this per arm: VariationalELBO or PredictiveLogLikelihood.
+    variational_objective: PredictiveLogLikelihood
+  num_inducing: 1024
+  # Uniform training rows. The stratified and k-means starts cannot be used at
+  # this size: their top stratum (top 0.1%) holds 25 rows and would be allotted
+  # 192 points.
+  inducing_init: random
+  ard: false
+  lengthscale_prior: true
+  scale_inputs: true
+  noise_prior: true
+  prior_mean: 0.03956042999405787  # Mean y of data/10M_unif_random_subset.csv.
+  standardize_outputs: true
+
+acquisition:
+  # GIBBON by default; the qMFMES arms override `type`. The script scores
+  # GIBBON twice, once on the value scale and once on the log scale, so
+  # log_output is set per scoring pass rather than here.
+  type: QLowerBoundMaxValueEntropy
+  candidate_set_spec:
+    # The support for max-value sampling. The balanced arm used its whole
+    # training set, which is not usable here: the support would be 50,000
+    # molecules in one arm and 300,000 in another, so GIBBON would sample its
+    # max values from supports differing sixfold and the arms' acquisition
+    # values would not be comparable. max_support_size pins it to the same
+    # 100,000 for every arm, chosen by the deterministic fidelity/target
+    # stratified reservoir, which also keeps each arm's best molecule.
+    # fallback_size stays the smaller size the out-of-memory retry drops to; if
+    # that retry ever fires, exact_dkl_top_n.py fails the run rather than
+    # quietly changing the support.
+    type: TrainDataCandidateSetSpec
+    max_support_size: 100000
+    fallback_size: 50000
+    seed: 42
+  num_mv_samples: 10
+  score_chunk_size: 5000
+  maximize: true
+  log_space: true
+  log_output: false
+
+sampler:
+  type: S3GFNSampler
+  n_samples: 100000
+  fidelities: [1]
+  model_name_or_path: ibm-research/GP-MoLFormer-Uniq
+  tokenizer_name_or_path: ibm-research/MoLFormer-XL-both-10pct
+  trust_remote_code: true
+  performance_mode: optimized
+  max_length: 80
+  batch_size: 64
+  replay_batch_size: 64
+  generation_batch_size: 128
+  n_train_steps: 2500
+  num_warmup_steps: 10
+  beta: 1.0
+  aux_coefficient: 0.001
+  sa_threshold: 4.0
+
+selector:
+  type: CostAwareSelector
+
+oracle:
+  type: Dock3Oracle
+  mol_repr: smiles
+  indock_template: /home/ethankrz/dock_smiles/ampc_dockfiles/INDOCK
+  dockfiles_dir: /home/ethankrz/dock_smiles/ampc_dockfiles
+  fidelity_costs:
+    1: 1.0
+  fidelity_confidences:
+    1: 1.0
+  num_workers: null
+  ligbuild_timeout: 150
+  hitrate_params: ampc_hitrate_fits/fitted_params.json
+  score_pprop_table: ampc_hitrate_fits/data/full_scores.df
+  hitrate_target: ampc
+  pki_threshold: 6.5
+
+budget:
+  available_budget: 100000.0
+  schedule:
+    type: constant
+    value: 10000.0
+
+logger:
+  # Stripped by the script, which builds its own run logger from the
+  # --wandb-* flags.
+  type: ConsoleLogger
+  project_name: ampc-exact-dkl-top-n
+  run_name: exact-dkl-top-n
