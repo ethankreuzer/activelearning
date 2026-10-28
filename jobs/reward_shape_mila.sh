@@ -50,23 +50,46 @@
 # at step 1,200 and decayed because the policy had converged onto an
 # off-manifold mode, which is the same window in which validity fell off a cliff.
 #
-# Resources. No docking, so this is the sampler plus one selection pass: ~0.9
-# s/step on an H100 (Nibi job 24057277), generation 8-25 min depending on how
-# much validity the arm lost, selection ~3.5 min on the 100k pool. An L40S is
-# slower than an H100 for this, so 5,000 steps should land near 2.5 h and 2,500
-# near 1.5 h; 6 h leaves margin until the first arm measures it
-# (stage_profile.csv). unkillable because a preempted arm would be requeued onto
-# an output directory that already holds its generated pool, which the guard
-# below refuses to reuse; its cap is 1 GPU / 6 CPU / 32G. The svgp300k GIBBON
-# pass peaked at 10.4 GB on the GPU and ~3.5 GB host RSS in the scaling study,
-# so 32G host is enough -- if an arm OOMs, move it to --partition=main and raise
-# --mem rather than trimming the pool, since the pool size is what the Nibi arms
-# used and changing it would break the comparison.
-#SBATCH --partition=unkillable
-#SBATCH --gres=gpu:l40s:1
-#SBATCH --cpus-per-task=6
-#SBATCH --mem=32G
-#SBATCH --time=6:00:00
+# Resources. No docking, so this is the sampler plus one selection pass. Measured
+# on the Nibi H100 arms of 2026-10-27 (sampler/s3gfn/{train,generation}/duration_s
+# in stage_history.jsonl): 3,974 s and 3,673 s for 5,000 training steps, i.e.
+# 0.73-0.80 s/step; generation of the 100k pool 493 s and 1,505 s, a 3x spread
+# that tracks how much validity the arm lost; selection ~3.5 min.
+#
+# A100 and not L40S or H100. Memory is not the constraint -- the svgp300k GIBBON
+# pass peaked at 10.4 GB on the GPU and ~3.5 GB host RSS in the scaling study, so
+# a 24 GB card fits and the 80 GB a100l only buys queue time. The constraint is
+# bandwidth: this is autoregressive SMILES decoding plus a 1024-inducing-point GP
+# solve per batch, small kernels that never fill the tensor cores, so H100's
+# advantage over A100 is ~1.3-1.6x here rather than the headline figure and is
+# not worth its contention. For the same reason skip V100 (no bf16, a third of
+# A100's bandwidth) and A6000 (Ampere, but 768 GB/s against A100's 2,039).
+# Expect ~52-64 min of training for 3,000 steps and ~85-105 min for 5,000, so 4 h
+# covers the longest arm with its slowest generation pass. Mila names the 40 GB
+# part a100 and the 80 GB part a100l; confirm with `sinfo -o "%P %l %G"`.
+#
+# main and not unkillable, which caps a user at one job and would run the arms
+# serially. The tradeoff is preemption: a requeued arm lands on an output
+# directory that already holds its generated pool, which the guard below refuses
+# to reuse, so resubmit it with ARM_SUFFIX=_rerun rather than deleting the pool.
+# short-unkillable (3 h, up to 4 GPUs, non-preemptible) fits a 3,000-step arm and
+# avoids that entirely. If an arm OOMs, raise --mem rather than trimming the
+# pool: its size is what the Nibi arms used and changing it breaks the comparison.
+#
+# 4 CPUs and 24G, half of main's per-user quota (8 CPUs / 48G / 2 GPUs), so two
+# arms run concurrently. Four is not a compromise: nothing in this job path uses
+# CPU parallelism, because resolve_num_workers is read only by Dock3Oracle and
+# CxcalcOracle and the oracle here is the ConstantOracle stub, so the CPUs serve
+# host-side torch ops and the selection pass's dataframes and the hour is spent
+# on the GPU regardless. 24G against a measured ~3.5 GB host RSS leaves 7x; the
+# largest host allocation is the 300k training set and its feature cache, under a
+# gigabyte. Submit all the arms at once: a third one exceeding the quota stays
+# pending on an association limit rather than being rejected.
+#SBATCH --partition=main
+#SBATCH --gres=gpu:a100:1
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=24G
+#SBATCH --time=4:00:00
 #SBATCH --job-name=ampc_reward_shape_mila
 #SBATCH --output=slurm_logs/ampc_reward_shape_mila_%j.out
 #SBATCH --error=slurm_logs/ampc_reward_shape_mila_%j.err
@@ -98,9 +121,20 @@ if [[ ! "${LOG_SCORE_FLOOR}" =~ ^-[0-9]+(\.[0-9]+)?$ ]]; then
 fi
 LOSS="vargrad"
 LOG_Z_LR="0.01"
-# The default is -500 here and -150 on Nibi: every Mila arm runs against
-# svgp300k, whose log GIBBON sits one to two orders of magnitude below the
-# exact GPs', and -150 would tie every prior-like molecule.
+# The default is -500 here and -150 on Nibi, because svgp300k's log GIBBON sits
+# one to two orders of magnitude below the exact GPs'. That default is NOT a
+# recommendation. The first reading of it was that a shallow floor would tie
+# every prior-like molecule on this surrogate; counting the trained pools of
+# 2026-10-27 says otherwise. Fraction of the 100k pool clearing each floor, from
+# the beta=0.03/-500 arm's scored_samples.csv: nonzero acq 0.2298, >= -500
+# 0.2280, >= -250 0.2137, >= -150 0.1776, >= -100 0.1373. About 77% of the pool
+# has acq exactly 0.0 -- GIBBON underflowed, so it is at -inf and tied at any
+# floor -- and the band between -500 and -150 is nearly empty. Raising the floor
+# therefore barely changes WHICH molecules are graded and mostly shrinks the gap
+# between the tied mass and the tail, which is the mechanism by which it protects
+# validity (see REWARD_SHAPE_FLOOR_ABLATION.md). Floors of -250 and -150 are the
+# ones worth scanning; the cost of going shallow is a longer warmup before
+# above_floor_fraction leaves zero, not a degenerate reward.
 
 # Only svgp300k. The exact-GP and fixed-feature-GP states this study's other
 # surrogates need were fitted on Nibi and do not exist here; svgp300k was
@@ -169,7 +203,7 @@ mkdir -p "${WANDB_DIR}" slurm_logs
 export WANDB_NOTES="REWARD-SHAPE TUNING arm ${ARM}, on Mila, WITHOUT DOCKING. One active-learning round training the S3-GFN policy against a fixed GIBBON acquisition on a frozen surrogate, then one stubbed oracle query.
 THE QUESTION THIS RUN ASKS: at this (beta, floor, step count), does the policy keep finding higher-acquisition molecules without losing validity (the floor's failure mode) or collapsing onto a few modes (beta's failure mode)? The answer is entirely in the per-step sampler figures; nothing downstream of the oracle is meaningful.
 ORACLE IS A STUB. oracle=ConstantOracle returns the same label for every molecule, and the budget is 1, so one molecule is 'labelled' at a made-up value and the round closes. Mila has no AmpC receptor files and no dock64, so the real Dock3Oracle cannot even be constructed here. IGNORE dataset/general/docked/*, surrogate/general/held_out/* and every other y-derived number in this run: they describe the stub, not chemistry. The docked comparison is done on Nibi, for the winning arm only.
-Surrogate: RESTORED, NOT REFITTED. The sparse variational GP is rebuilt on the 300,000-molecule nested scaling set data/ampc_svgpscale_300000.csv and its fitted parameters -- 1024 inducing points and their variational distribution, kernel, noise, input scaling and output standardization -- are loaded from ${STATE_PATH} in place of training. See ${FITTED_DIR}/arm_description.txt for how that fit was obtained. It is far more confident than the exact GPs, so log GIBBON runs much lower (gp_molformer_set median -2,688, 99th percentile -1,146): the floor of ${LOG_SCORE_FLOOR} is set for that range, not the exact GPs' -150.
+Surrogate: RESTORED, NOT REFITTED. The sparse variational GP is rebuilt on the 300,000-molecule nested scaling set data/ampc_svgpscale_300000.csv and its fitted parameters -- 1024 inducing points and their variational distribution, kernel, noise, input scaling and output standardization -- are loaded from ${STATE_PATH} in place of training. See ${FITTED_DIR}/arm_description.txt for how that fit was obtained. It is far more confident than the exact GPs, so log GIBBON runs much lower (gp_molformer_set median -2,688, 99th percentile -1,146): the floor of ${LOG_SCORE_FLOOR} is set for that range rather than the exact GPs'. That range is wider than it is populated: about 77% of a trained pool has acq exactly 0.0, hence -inf and tied at any floor, so the fraction graded only falls from 0.228 to 0.178 between floor -500 and -150. A shallow floor on this surrogate does not tie everything; it shrinks the gap between the tied mass and the tail, which is why it protects validity.
 Acquisition: GIBBON (QLowerBoundMaxValueEntropy), log_space=true so the information gain never underflows, log_output=false so it is returned on the VALUE scale, which is what the reward transform needs. Max-value support is capped at 100,000 of the 300,000 training molecules by the deterministic fidelity/target-stratified reservoir, as in the scaling study.
 Reward: transform=${TRANSFORM}, beta=${BETA}, log(acq) floored at the FIXED value ${LOG_SCORE_FLOOR} nats, the same for every batch, so a molecule's reward depends on that molecule alone and everything below the floor is tied. Loss: VARGRAD, so there is no log_z parameter and an offset shared by the whole batch contributes no gradient; INITIAL_LOG_Z (${INITIAL_LOG_Z}) and LOG_Z_LR (${LOG_Z_LR}) are passed but UNUSED.
 WHAT THE THREE DOCKED ARMS OF 2026-10-27/28 ESTABLISHED, which this scan follows up: floor depth governs VALIDITY and beta governs DIVERSITY, and they fail in different directions. Both floor -500 arms held validity >= 0.83 while spanning a 2x range of above-floor fraction and a 3x range of prior_divergence; the single floor -1000 arm fell to 0.545, because a deep floor pays out for being slightly unusual rather than genuinely good and the cheapest route to unusual in SMILES space is syntactic. Separately, beta=0.1 at floor -500 kept validity 0.882 and the largest prior_divergence of any arm (16.5) but rejected 90.1% of its generations as duplicates, yielding 7,273 unique molecules from 2,000,000 attempts.
