@@ -69,11 +69,14 @@
 # part a100 and the 80 GB part a100l; confirm with `sinfo -o "%P %l %G"`.
 #
 # main and not unkillable, which caps a user at one job and would run the arms
-# serially. The tradeoff is preemption: a requeued arm lands on an output
-# directory that already holds its generated pool, which the guard below refuses
-# to reuse, so resubmit it with ARM_SUFFIX=_rerun rather than deleting the pool.
-# short-unkillable (3 h, up to 4 GPUs, non-preemptible) fits a 3,000-step arm and
-# avoids that entirely. If an arm OOMs, raise --mem rather than trimming the
+# serially; main carries every GPU type, so the a100 request schedules there.
+# Preemption is the long partition's tradeoff, not main's, so it is not a reason
+# to avoid main here -- but if an arm is ever requeued for any reason it lands on
+# an output directory that already holds its generated pool, which the guard
+# below refuses to reuse: resubmit with ARM_SUFFIX=_rerun rather than deleting
+# the pool. short-unkillable is an alternative for a short arm, at the cost of
+# scheduling only onto 4-GPU nodes; check its wall limit with `sinfo -o "%P %l"`
+# before relying on it. If an arm OOMs, raise --mem rather than trimming the
 # pool: its size is what the Nibi arms used and changing it breaks the comparison.
 #
 # 4 CPUs and 24G, half of main's per-user quota (8 CPUs / 48G / 2 GPUs), so two
