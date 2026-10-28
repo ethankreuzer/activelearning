@@ -14,6 +14,7 @@ from activelearning.oracle.augmented_function_oracle import (
     Hartmann6DOracle,
 )
 from activelearning.oracle.composite_oracle import CompositeOracle
+from activelearning.oracle.constant_oracle import ConstantOracle
 from activelearning.oracle.oracle import Oracle
 
 
@@ -54,6 +55,67 @@ class Hartmann6DOracleConfig(BaseModel):
             Configured :class:`~activelearning.oracle.augmented_function_oracle.Hartmann6DOracle`.
         """
         return Hartmann6DOracle(self.fidelity_costs, self.fidelity_confidences)
+
+
+class ConstantOracleConfig(BaseModel):
+    """Configuration for the constant-label stub oracle.
+
+    For diagnostic runs on machines with no oracle. See
+    :class:`~activelearning.oracle.constant_oracle.ConstantOracle` for what the
+    labels do and do not mean.
+    """
+
+    type: Literal["ConstantOracle"] = "ConstantOracle"
+    value: float = 0.0
+    # Declaratory only: the oracle ignores x entirely. ActiveLearningConfig
+    # still checks that sampler, encoder and oracle agree on one molecular
+    # representation (config._extract_molecule_representation), and an oracle
+    # exposing no mol_repr fails that check under S3GFNSampler. A plain str
+    # rather than Literal["smiles"], since a constant label is equally
+    # meaningless for any representation this stands in for.
+    mol_repr: str = "smiles"
+    # ActiveLearningConfig reads fidelity metadata straight off the oracle
+    # config (config._extract_oracle_fidelity_confidences), which requires
+    # either 'fidelity_costs' or 'sub_oracles', so this is not optional
+    # styling -- a stub declaring its own 'cost'/'fidelity' pair fails to
+    # validate. The default matches the level the reward-shape samplers emit.
+    fidelity_costs: dict[int, float] = Field(default_factory=lambda: {1: 1.0})
+    fidelity_confidences: dict[int, float] | None = None
+
+    @model_validator(mode="after")
+    def validate_single_fidelity(self) -> "ConstantOracleConfig":
+        """Validate that exactly one fidelity level is declared.
+
+        Returns
+        -------
+        ConstantOracleConfig
+            This validated configuration instance.
+
+        Raises
+        ------
+        ValueError
+            If zero or more than one fidelity level is declared.
+        """
+        if len(self.fidelity_costs) != 1:
+            raise ValueError(
+                "ConstantOracle is single-fidelity and must declare exactly one "
+                f"fidelity level in fidelity_costs; got {sorted(self.fidelity_costs)}."
+            )
+        return self
+
+    def build(self) -> Oracle:
+        """Build the configured constant oracle.
+
+        Returns
+        -------
+        Oracle
+            Configured :class:`~activelearning.oracle.constant_oracle.ConstantOracle`.
+        """
+        return ConstantOracle(
+            value=self.value,
+            fidelity_costs=self.fidelity_costs,
+            fidelity_confidences=self.fidelity_confidences,
+        )
 
 
 class CompositeOracleConfig(BaseModel):
@@ -491,6 +553,7 @@ OracleConfig = Annotated[
     Union[
         BraninOracleConfig,
         Hartmann6DOracleConfig,
+        ConstantOracleConfig,
         CompositeOracleConfig,
         XTBIPEAOracleConfig,
         Dock3OracleConfig,
