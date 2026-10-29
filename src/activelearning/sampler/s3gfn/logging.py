@@ -35,6 +35,12 @@ class _RoundMetrics:
     raw_reward_scores: list[float] = field(default_factory=list)
     raw_reward_means: list[float] = field(default_factory=list)
     raw_reward_maxes: list[float] = field(default_factory=list)
+    # Only the progress line reads these two; they are kept per step beside the
+    # mean and max so it can show the spread of a batch rather than one end of
+    # it, which is what distinguishes a batch tied on the floor from one that
+    # has started to grade.
+    raw_reward_mins: list[float] = field(default_factory=list)
+    raw_reward_medians: list[float] = field(default_factory=list)
     unique_counts: list[int] = field(default_factory=list)
     # Training-step numbers for the series below, which are recorded only when a
     # step produced valid molecules. Without them a step that yielded nothing
@@ -154,6 +160,8 @@ class _RoundMetrics:
             self.reward_steps.append(step_number)
             self.raw_reward_means.append(_mean(reward_values))
             self.raw_reward_maxes.append(max(reward_values))
+            self.raw_reward_mins.append(min(reward_values))
+            self.raw_reward_medians.append(_median(reward_values))
             concentration = reward_concentration(reward_values, beta)
             self.reward_ratio_maxes.append(concentration.ratio_max)
             self.reward_ratio_medians.append(concentration.ratio_median)
@@ -296,10 +304,25 @@ class S3GFNLoggingMixin:
             or step_number == self.n_train_steps
         ):
             return
+        # The reward series skip a step that produced no valid molecule, so the
+        # last entry is this step's only when it was recorded for this step.
+        # Printing a stale triple here would be worse than printing none: a
+        # batch that graded once and then stopped producing anything valid is
+        # exactly the state this line exists to catch.
+        round_metrics = self.round_metrics
+        if round_metrics.reward_steps and round_metrics.reward_steps[-1] == step_number:
+            reward_summary = (
+                f"reward min/median/max="
+                f"{round_metrics.raw_reward_mins[-1]:.4g}/"
+                f"{round_metrics.raw_reward_medians[-1]:.4g}/"
+                f"{round_metrics.raw_reward_maxes[-1]:.4g}"
+            )
+        else:
+            reward_summary = "reward min/median/max=n/a"
         _logger.info(
             "S3-GFN training step %d/%d: generated=%d, valid=%d, "
             "invalid=%d, synthesizable=%d, positive_buffer=%d, "
-            "negative_buffer=%d.",
+            "negative_buffer=%d, %s.",
             step_number,
             self.n_train_steps,
             generated_count,
@@ -308,6 +331,7 @@ class S3GFNLoggingMixin:
             synthesizable_count,
             len(positive_buffer),
             len(negative_buffer) if negative_buffer is not None else 0,
+            reward_summary,
         )
 
     def drain_round_diagnostics(
