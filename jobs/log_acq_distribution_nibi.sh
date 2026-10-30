@@ -91,9 +91,16 @@ fi
 
 mkdir -p "${OUT_DIR}" slurm_logs
 
+# reward_transform=exponential is INERT HERE and is set only to get past config
+# validation: ActiveLearningConfig rejects log_output=true together with the
+# 'power' transform, because power takes a logarithm the log-scale acquisition
+# has already taken. That check is right for a real arm and wrong for this job,
+# which never builds the sampler -- it scores and exits. Nothing about the
+# acquisition or the surrogate changes.
 uv run --no-sync python scripts/log_acq_distribution.py \
   "${BASE_CONFIG}" \
   "acquisition.log_output=true" \
+  "sampler.reward_transform=exponential" \
   --out "${OUT_CSV}" \
   "$@"
 

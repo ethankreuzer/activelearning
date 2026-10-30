@@ -28,7 +28,13 @@ Usage::
 
     python scripts/log_acq_distribution.py config/ampc/reward_shape_svgp300k.yaml \\
         acquisition.log_output=true \\
+        sampler.reward_transform=exponential \\
         --out outputs/ampc/log_acq_distribution/svgp300k.csv
+
+The transform override is inert -- this script never builds the sampler -- and
+is needed only because ``ActiveLearningConfig`` rejects ``log_output=true``
+alongside the ``power`` transform, which would take a logarithm twice. That
+check is right for an arm and does not apply to a scoring pass.
 """
 
 from __future__ import annotations
