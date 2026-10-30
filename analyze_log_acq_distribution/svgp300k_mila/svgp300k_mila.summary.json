@@ -1,0 +1,44 @@
+{
+  "botorch_acqf_built": true,
+  "config_paths": [
+    "/home/mila/k/kreuzere/activelearning/config/ampc/reward_shape_svgp300k.yaml"
+  ],
+  "cuda_device": "NVIDIA A100-SXM4-40GB",
+  "fallback_active": false,
+  "gp_latent_std": [
+    0.0046612913720309734,
+    0.0074598237575807915,
+    0.01441191229969263
+  ],
+  "host": "cn-d001.server.mila.quebec",
+  "log_acq": {
+    "fraction_above": {
+      "-1000": 0.04331,
+      "-150": 0.00101,
+      "-250": 0.0019133333333333333,
+      "-500": 0.0064,
+      "-744.44": 0.015843333333333334,
+      "-875": 0.026523333333333333
+    },
+    "mean_nats": -1906.818283000631,
+    "n_nonfinite": 0,
+    "n_scored": 300000,
+    "quantiles_nats": {
+      "p0": -5055.3908197896035,
+      "p0.1": -3661.8883196972133,
+      "p1": -3274.0903828927976,
+      "p10": -2692.8856733063712,
+      "p100": -4.746871410948524,
+      "p50": -1863.5931723830656,
+      "p90": -1213.9623428388938,
+      "p99": -619.3953975686626,
+      "p99.9": -149.07022656156303
+    },
+    "underflow_fraction": 0.9841566666666667
+  },
+  "n_observations": 300000,
+  "python": "3.11.18",
+  "scoring_minutes": 14.160180773834387,
+  "seed": 42,
+  "torch_version": "2.5.1+cu124"
+}
