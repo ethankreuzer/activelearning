@@ -15,14 +15,12 @@ single representation for deduplication and downstream scoring.
 from __future__ import annotations
 
 import copy
-import csv
 import logging
 import math
 import random
 import time
 import warnings
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Callable, Iterable, Literal, Sequence
 
 import torch
@@ -145,7 +143,6 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
         log_score_floor: float | None = None,
         aux_coefficient: float = 1.0e-4,
         buffer_size: int = 6400,
-        seed_buffer_path: str | None = None,
         sa_threshold: float = 4.0,
         sampling_temperature: float = 1.0,
         gradient_clip_norm: float = 10.0,
@@ -252,16 +249,6 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
             negative replay buffer and auxiliary loss.
         buffer_size : int, optional
             Capacity of each replay buffer.
-        seed_buffer_path : str or None, optional
-            CSV of known high-acquisition molecules, in a ``smiles`` column,
-            inserted into the positive replay buffer before step 1. ``None``,
-            the default, starts the buffer empty, which is how every arm before
-            2026-10-30 ran. Seeding removes the wait for a first molecule to
-            clear the reward floor: until that happens every reward in the batch
-            is tied, the variance the loss is built on is zero, and the policy
-            trains on the prior term alone. Any molecules the file names are
-            re-scored in-run with this round's acquisition, so only the SMILES
-            are read; see :meth:`_seed_positive_buffer`.
         sa_threshold : float, optional
             Maximum synthetic accessibility score accepted as synthesizable.
         sampling_temperature : float, optional
@@ -395,7 +382,6 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
         self.log_score_floor = log_score_floor
         self.aux_coefficient = aux_coefficient
         self.buffer_size = buffer_size
-        self.seed_buffer_path = seed_buffer_path
         self.sa_threshold = sa_threshold
         self.sampling_temperature = sampling_temperature
         self.gradient_clip_norm = gradient_clip_norm
@@ -495,14 +481,6 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
             synthesizability = SAScoreSynthesizability(threshold=self.sa_threshold)
             positive_buffer, negative_buffer = self._create_replay_buffers(
                 pad_token_id=model.pad_token_id
-            )
-            self.round_metrics.seeded_buffer_size = self._seed_positive_buffer(
-                model=model,
-                positive_buffer=positive_buffer,
-                synthesizability=synthesizability,
-                molecule_chem=molecule_chem,
-                acquisition=acquisition,
-                cost_fn=cost_fn,
             )
             if self.compile_strategy != "none":
                 model.compile_policy(
@@ -678,130 +656,6 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
             else None
         )
         return positive_buffer, negative_buffer
-
-    def _seed_positive_buffer(
-        self,
-        *,
-        model: S3GFNModel,
-        positive_buffer: ReplayBuffer,
-        synthesizability: SAScoreSynthesizability,
-        molecule_chem: Any,
-        acquisition: Any,
-        cost_fn: Callable[[Sequence[Candidate]], list[float]] | None,
-    ) -> int:
-        """Insert known high-acquisition molecules before training starts.
-
-        An empty positive buffer makes the first part of every round a lottery:
-        the reward is tied at the floor for every molecule, so it contributes
-        nothing to a variance and the policy is trained by the prior term alone
-        until some generation happens to clear the floor. Seeding gives the
-        replay loss a non-degenerate reward at step 1 instead.
-
-        The molecules are **re-scored here**, with this round's acquisition,
-        rather than read from the file. GIBBON redraws its max-value samples on
-        every ``update()``, so scores computed in another process are not on the
-        same scale as the ones this round assigns to generated molecules -- and
-        it is precisely the difference between those two that the replay
-        weighting acts on. Scoring runs through :meth:`_prepare_batch`, the same
-        path a training batch takes, which also applies this round's reward
-        transform and floor and classifies synthesizability.
-
-        Seeds are inserted in descending reward order because insertion is
-        greedy on Tanimoto similarity (``replay_buffer.py:288``): best-first
-        keeps the strongest member of each similarity cluster and rejects later
-        near-duplicates against it, rather than letting a weaker molecule take
-        the slot and be displaced.
-
-        Parameters
-        ----------
-        model : S3GFNModel
-            Round model, used to encode the seed SMILES into token ids.
-        positive_buffer : ReplayBuffer
-            Buffer to insert into, normally still empty.
-        synthesizability : SAScoreSynthesizability
-            Classifier applied to the seeds, so they face the same membership
-            rule as generated molecules.
-        molecule_chem : Any
-            RDKit chemistry module used for canonicalization.
-        acquisition : Any
-            This round's acquisition, used to score the seeds.
-        cost_fn : callable, optional
-            Cost weighting applied as it is to a training batch.
-
-        Returns
-        -------
-        int
-            Seeds actually retained. This is normally fewer than the file holds:
-            molecules within 0.75 Tanimoto of an already-stored seed are
-            rejected, so the count depends on how diverse the file is.
-        """
-        if self.seed_buffer_path is None:
-            return 0
-        smiles = _read_seed_smiles(self.seed_buffer_path)
-        if not smiles:
-            _logger.warning(
-                "S3-GFN seed buffer file %s holds no molecules; "
-                "starting with an empty positive buffer.",
-                self.seed_buffer_path,
-            )
-            return 0
-
-        prepared = self._prepare_batch(
-            model=model,
-            smiles=smiles,
-            fidelity_indices=None,
-            synthesizability=synthesizability,
-            molecule_chem=molecule_chem,
-            acquisition=acquisition,
-            cost_fn=cost_fn,
-        )
-        scores = prepared.reward_scores.detach().cpu()
-        order = sorted(
-            (index for index, ok in enumerate(prepared.synthesizable) if ok),
-            key=lambda index: float(scores[index]),
-            reverse=True,
-        )
-        if not order:
-            _logger.warning(
-                "None of the %d seed molecule(s) in %s is synthesizable at "
-                "sa_threshold=%g; starting with an empty positive buffer.",
-                len(smiles),
-                self.seed_buffer_path,
-                self.sa_threshold,
-            )
-            return 0
-
-        selected = torch.tensor(
-            order,
-            dtype=torch.long,
-            device=prepared.input_ids.device,
-        )
-        positive_buffer.add_batch(
-            prepared.input_ids[selected],
-            tuple(prepared.smiles[index] for index in order),
-            [float(scores[index]) for index in order],
-        )
-        # The buffer's own occupancy, not add_batch's accepted count. Inserting
-        # descending means a later seed can never displace an earlier one, so
-        # the two agree here -- but occupancy is what the replay weighting draws
-        # from, and it stays correct if the insertion order ever changes.
-        added = len(positive_buffer)
-        # Already sorted descending, so the ends and the middle are the summary
-        # without sorting again.
-        retained = [float(scores[index]) for index in order]
-        _logger.info(
-            "S3-GFN positive buffer seeded from %s: %d molecule(s) read, %d "
-            "synthesizable, %d retained after diversity filtering; "
-            "reward score max %.1f, median %.1f, min %.1f.",
-            self.seed_buffer_path,
-            len(smiles),
-            len(order),
-            added,
-            retained[0],
-            retained[len(retained) // 2],
-            retained[-1],
-        )
-        return added
 
     def _build_training_optimizer(
         self,
@@ -1499,46 +1353,6 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
         torch.manual_seed(seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
-
-
-def _read_seed_smiles(path: str) -> list[str]:
-    """Read the SMILES column of a replay-buffer seed file.
-
-    Only the molecules are read. Any score column is provenance for whoever
-    built the file: GIBBON redraws its max-value samples on every acquisition
-    update, so a score computed elsewhere is not on this round's scale and
-    must not be carried into the buffer.
-
-    Parameters
-    ----------
-    path : str
-        CSV holding a ``smiles`` column, as written by
-        ``scripts/build_seed_molecules.py``.
-
-    Returns
-    -------
-    list of str
-        Molecule strings in file order, blanks dropped.
-
-    Raises
-    ------
-    FileNotFoundError
-        If the file does not exist.
-    ValueError
-        If the file has no ``smiles`` column.
-    """
-    seed_path = Path(path)
-    if not seed_path.exists():
-        raise FileNotFoundError(f"Replay-buffer seed file {path} does not exist.")
-    with seed_path.open(newline="") as handle:
-        reader = csv.DictReader(handle)
-        if reader.fieldnames is None or "smiles" not in reader.fieldnames:
-            raise ValueError(f"Replay-buffer seed file {path} has no 'smiles' column.")
-        return [
-            row["smiles"].strip()
-            for row in reader
-            if row.get("smiles") and row["smiles"].strip()
-        ]
 
 
 def _canonicalize_with_reason(

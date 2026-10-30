@@ -361,10 +361,6 @@ class S3GFNSamplerConfig(BaseModel):
     Weight of the auxiliary loss.
     buffer_size : int, default=6400
     Maximum replay-buffer size.
-    seed_buffer_path : str or None, default=None
-    CSV of known high-acquisition molecules, in a ``smiles`` column, inserted
-    into the positive replay buffer before step 1. ``None`` starts it empty.
-    The molecules are re-scored in-run, so only the SMILES are read.
     sa_threshold : float, default=4.0
     Synthetic-accessibility threshold.
     sampling_temperature : float, default=1.0
@@ -432,7 +428,6 @@ class S3GFNSamplerConfig(BaseModel):
     log_score_floor: FiniteFloat | None = None
     aux_coefficient: float = Field(default=1.0e-4, ge=0.0)
     buffer_size: int = Field(default=6400, gt=0)
-    seed_buffer_path: str | None = None
     sa_threshold: float = Field(default=4.0, ge=0.0)
     sampling_temperature: PositiveFloat = 1.0
     gradient_clip_norm: PositiveFloat = 10.0
@@ -519,7 +514,6 @@ class S3GFNSamplerConfig(BaseModel):
             log_score_floor=self.log_score_floor,
             aux_coefficient=self.aux_coefficient,
             buffer_size=self.buffer_size,
-            seed_buffer_path=self.seed_buffer_path,
             sa_threshold=self.sa_threshold,
             sampling_temperature=self.sampling_temperature,
             gradient_clip_norm=self.gradient_clip_norm,

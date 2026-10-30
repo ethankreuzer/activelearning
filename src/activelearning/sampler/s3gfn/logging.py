@@ -84,9 +84,6 @@ class _RoundMetrics:
     final_candidates: tuple[Candidate, ...] = ()
     positive_buffer_size: int = 0
     negative_buffer_size: int = 0
-    # Seeds retained in the positive buffer before step 1. Zero is the
-    # unseeded behaviour every arm before 2026-10-30 ran.
-    seeded_buffer_size: int = 0
     training_duration_s: float | None = None
     generation_duration_s: float | None = None
 
@@ -373,7 +370,6 @@ class S3GFNLoggingMixin:
                 ),
                 "sampler/s3gfn/train/positive_buffer": round_metrics.positive_buffer_size,
                 "sampler/s3gfn/train/negative_buffer": round_metrics.negative_buffer_size,
-                "sampler/s3gfn/train/seeded_buffer": round_metrics.seeded_buffer_size,
                 "sampler/s3gfn/generation/attempts": generation_attempts,
                 "sampler/s3gfn/generation/yield": _safe_ratio(
                     final_candidate_count, generation_attempts
