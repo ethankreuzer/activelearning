@@ -1293,3 +1293,60 @@ def test_al_loop_retries_a_failed_query_when_skip_observed_is_off():
     # round, and the sort is stable: every round re-queries the same five.
     assert len(oracle.queried_xs) > len(set(oracle.queried_xs))
     assert set(oracle.queried_xs) == {0, 1, 2, 3, 4}
+
+
+def test_al_loop_records_the_already_queried_count_per_round():
+    """The exclusion count and rate reach the round record."""
+    run_writer = RecordingRunWriter()
+    oracle = _RecordingNaNOracle()
+    # The whole pool every round, so round 2 sees round 1's five as queried.
+    sampler = _make_pool_sampler_single_fidelity(20, 20)
+    selector = TopKAcquisitionSelector(num_samples=5)
+    budget = Budget(available_budget=20.0, schedule=lambda _: 20.0)
+
+    active_learning(
+        dataset=ListDataset(),
+        surrogate=DummyMeanSurrogate(),
+        acquisition=DummyAcquisition(),
+        sampler=sampler,
+        selector=selector,
+        oracle=oracle,
+        budget=budget,
+        run_writer=run_writer,
+    )
+
+    counts = [
+        record["metrics"]["active_learning/samples/already_queried"]
+        for record in run_writer.rounds
+    ]
+    rates = [
+        record["metrics"]["active_learning/samples/already_queried_rate"]
+        for record in run_writer.rounds
+    ]
+    # Nothing had been queried before round 1; every later round has the
+    # previous rounds' five docks each to skip.
+    assert counts == [0, 5, 10, 15]
+    assert rates == [0.0, 0.25, 0.5, 0.75]
+
+
+def test_al_loop_omits_the_already_queried_count_when_the_check_is_off():
+    """A run not doing the check reports no count rather than a zero."""
+    run_writer = RecordingRunWriter()
+    oracle = _RecordingNaNOracle()
+    sampler = _make_pool_sampler_single_fidelity(20, 20)
+    selector = TopKAcquisitionSelector(num_samples=5, skip_observed=False)
+
+    active_learning(
+        dataset=ListDataset(),
+        surrogate=DummyMeanSurrogate(),
+        acquisition=DummyAcquisition(),
+        sampler=sampler,
+        selector=selector,
+        oracle=oracle,
+        budget=Budget(available_budget=20.0, schedule=lambda _: 20.0),
+        run_writer=run_writer,
+    )
+
+    assert run_writer.rounds
+    for record in run_writer.rounds:
+        assert "active_learning/samples/already_queried" not in record["metrics"]

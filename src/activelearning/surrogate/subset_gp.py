@@ -18,6 +18,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, Iterable, Literal, Optional
 
+import torch
 from matplotlib.figure import Figure
 
 from activelearning.surrogate.encoder import FixedEncoder
@@ -33,6 +34,125 @@ from activelearning.utils.types import Observation
 #: The same ones the round's docked molecules are reported against, so the
 #: archive enriching and the training set following it read on one scale.
 _COMPOSITION_THRESHOLDS = (0.5, 0.4, 0.3, 0.2)
+
+
+#: Bytes per GiB, so the metrics read on the scale an `nvidia-smi` total does.
+_BYTES_PER_GIB = float(1 << 30)
+
+
+def _cuda_available() -> bool:
+    """Whether CUDA memory statistics can be read at all."""
+    return torch.cuda.is_available()
+
+
+def _cuda_reserved_gib() -> float | None:
+    """Reserved CUDA memory right now, or ``None`` with no CUDA device."""
+    if not _cuda_available():
+        return None
+    return torch.cuda.memory_reserved() / _BYTES_PER_GIB
+
+
+def _reset_cuda_peak() -> None:
+    """Start a fresh peak window, so the peak read after a fit is that fit's."""
+    if _cuda_available():
+        torch.cuda.reset_peak_memory_stats()
+
+
+def _release_cached_cuda_blocks() -> None:
+    """Return PyTorch's cached-but-unused CUDA blocks to the driver.
+
+    The allocator does not hand freed blocks back on its own, so the previous
+    round's fit stays *reserved* even though nothing holds it. That reserve is
+    not reusable by the next fit's large contiguous allocations, and at this
+    scale it is the difference between fitting and not: probe job 26162761
+    entered round 2 with 48.63 GiB reserved against the 48.58 GiB round 1 had
+    peaked at, i.e. essentially all of round 1's fit, none of it live. Round 2
+    then had to find a second ~48 GiB beside it and peaked at 72.48 GiB of
+    79.18. At 45,000 rows the same pattern ran out of device (job 26162757) and
+    at 50,000 it ran out sooner (job 26159147), both with the OOM naming
+    several GiB "reserved by PyTorch but unallocated".
+
+    Called immediately before the fit rather than after it, because what
+    matters is that the memory is free when the kernel matrix is allocated, and
+    because the reading taken either side of this call is what separates the
+    cached reserve from the genuinely resident policy, prior and encoder.
+
+    The cost is that the fit re-acquires its blocks from the driver instead of
+    reusing a warm pool: fractions of a second against a fit measured in
+    minutes.
+    """
+    if _cuda_available():
+        torch.cuda.empty_cache()
+
+
+def _cuda_fit_memory_metrics(
+    reserved_before_release: float | None,
+    reserved_before_fit: float | None,
+) -> dict[str, float]:
+    """Report what the fit cost on the GPU, and what it had to share with.
+
+    An exact GP's kernel matrix is ``n * n`` floats, so the fit is the loop's
+    binding resource and it grows quadratically in the training-set size. The
+    fit does not have the device to itself: the S3-GFN policy and prior, the
+    encoder, and the previous round's acquisition state are all resident, and
+    nothing releases the last of those before a refit. So a fit that succeeds
+    in isolation can still fail in the loop, and the margin cannot be inferred
+    from the training-set size alone.
+
+    ``reserved_before_fit`` is therefore the important number, not the peak: it
+    is everything resident that the fit did NOT allocate, which is the term a
+    benchmark of the fit alone cannot see. Without it, a crash is the only
+    evidence of how close a round came.
+
+    The pair either side of :func:`_release_cached_cuda_blocks` separates two
+    things a single reading conflates: ``released`` is allocator cache, which
+    costs nothing to give back, while ``reserved_before_fit`` is the genuinely
+    resident policy, prior, encoder and acquisition state, which does not go
+    away and is what actually bounds the training-set size.
+
+    Parameters
+    ----------
+    reserved_before_release : float or None
+        Reserved GiB sampled before the cached blocks were released. ``None``
+        skips every metric.
+    reserved_before_fit : float or None
+        Reserved GiB sampled after that release and immediately before the fit.
+
+    Returns
+    -------
+    dict[str, float]
+        What was resident before the fit, how much of it was merely cached, the
+        fit's peak reserved, the device total and the headroom left at the
+        peak. Empty with no CUDA device, so a CPU run and the tests record
+        nothing rather than zeros that read as measurements.
+    """
+    if (
+        reserved_before_release is None
+        or reserved_before_fit is None
+        or not _cuda_available()
+    ):
+        return {}
+    peak = torch.cuda.max_memory_reserved() / _BYTES_PER_GIB
+    total = torch.cuda.get_device_properties(
+        torch.cuda.current_device()
+    ).total_memory / _BYTES_PER_GIB
+    return {
+        # What the fit had to share the device with, after the allocator's
+        # cache was handed back: the live policy, prior, encoder and the
+        # acquisition state the previous round left behind. This is the term
+        # that bounds the training-set size.
+        "profiling/surrogate/cuda_reserved_before_fit_gib": reserved_before_fit,
+        # Allocator cache the previous round left reserved but unused, freed
+        # before this fit. Large here means the release is doing the work.
+        "profiling/surrogate/cuda_released_before_fit_gib": (
+            reserved_before_release - reserved_before_fit
+        ),
+        "profiling/surrogate/cuda_peak_reserved_fit_gib": peak,
+        "profiling/surrogate/cuda_total_gib": total,
+        # How close this round came to the OOM. Falling toward zero over rounds
+        # is the warning a crash would otherwise be the first sign of.
+        "profiling/surrogate/cuda_headroom_at_peak_gib": total - peak,
+    }
 
 
 def _composition_metrics(
@@ -178,6 +298,11 @@ class SubsetFixedFeatureGPSurrogate(FixedFeatureGPSurrogate):
     def fit(self, observations: Iterable[Observation]) -> None:
         """Select the training rows from the archive and fit on them alone.
 
+        Records the fit's CUDA memory alongside its timings, because the exact
+        GP's kernel matrix is the loop's binding resource and the only evidence
+        otherwise is a crash. See :func:`_cuda_fit_memory_metrics` for what the
+        numbers mean and why the pre-fit reading is the important one.
+
         Parameters
         ----------
         observations : Iterable[Observation]
@@ -201,6 +326,13 @@ class SubsetFixedFeatureGPSurrogate(FixedFeatureGPSurrogate):
             _band_metrics(getattr(self._selector, "last_diagnostics", {}))
         )
 
+        # Hand back the previous round's cached blocks before allocating this
+        # round's kernel matrix; see _release_cached_cuda_blocks for why that is
+        # the difference between fitting and not at this scale.
+        reserved_before_release = _cuda_reserved_gib()
+        _release_cached_cuda_blocks()
+        reserved_before_fit = _cuda_reserved_gib()
+        _reset_cuda_peak()
         started = time.perf_counter()
         super().fit(training)
         self._fit_profiling = {
@@ -209,6 +341,9 @@ class SubsetFixedFeatureGPSurrogate(FixedFeatureGPSurrogate):
             "profiling/surrogate/archive_size": float(len(archive)),
             "profiling/surrogate/subset_size": float(len(training)),
             "profiling/surrogate/subset_top_count": float(subset.top_count),
+            **_cuda_fit_memory_metrics(
+                reserved_before_release, reserved_before_fit
+            ),
         }
 
     def drain_round_diagnostics(

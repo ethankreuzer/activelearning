@@ -27,8 +27,30 @@ class Selector(ABC, ALRuntimeMixin):
     """
 
     def _clear_selection_scores(self) -> None:
-        """Discard score data left by a previous selection call."""
+        """Discard transient data left by a previous selection call.
+
+        Both the scores and the excluded count describe one call, so a later
+        call that does not produce them must not leave the previous call's
+        values readable.
+        """
         self._pending_selection_scores: SelectionScores | None = None
+        self._pending_excluded_count: int | None = None
+
+    def drain_excluded_count(self) -> int | None:
+        """Return and clear how many pool candidates were already queried.
+
+        Returns
+        -------
+        int or None
+            The count from the most recent selection, or ``None`` when the
+            check did not run -- because the selector is not configured to skip
+            already-queried candidates, or because no identity was available.
+            ``None`` and ``0`` are kept distinct so a run that is not doing the
+            check does not report that it found nothing to skip.
+        """
+        count = getattr(self, "_pending_excluded_count", None)
+        self._pending_excluded_count = None
+        return count
 
     def _record_selection_scores(
         self,
@@ -105,6 +127,9 @@ class Selector(ABC, ALRuntimeMixin):
             ``x`` that :func:`candidate_identity` cannot canonicalize.
         """
         if not candidates or (not observations and not attempted):
+            # The check ran and had nothing to exclude, which is a cold start,
+            # not an absent check: report 0 rather than leaving a gap.
+            self._pending_excluded_count = 0
             return set()
 
         observed: set[Hashable] = set()
@@ -123,6 +148,8 @@ class Selector(ABC, ALRuntimeMixin):
                 type(self).__name__,
                 source_count,
             )
+            # Left as None: the check could not run, which is not the same as
+            # running and finding nothing to skip.
             return set()
 
         excluded = set()
@@ -150,6 +177,7 @@ class Selector(ABC, ALRuntimeMixin):
                 len(excluded),
                 len(candidates),
             )
+        self._pending_excluded_count = len(excluded)
         return excluded
 
     @abstractmethod

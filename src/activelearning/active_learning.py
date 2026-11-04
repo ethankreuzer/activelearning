@@ -273,6 +273,14 @@ def active_learning(
             # run writer can persist them and diagnostics can summarize them.
             score_drain = getattr(selector, "drain_selection_scores", None)
             selection_scores = score_drain() if callable(score_drain) else None
+            # How much of the pool the selector refused because it had already
+            # been queried. Worth a series of its own: it rises exactly when
+            # the sampler starts re-proposing what it has already been
+            # rewarded for, which a count of selected candidates cannot show.
+            excluded_drain = getattr(selector, "drain_excluded_count", None)
+            num_already_queried = (
+                excluded_drain() if callable(excluded_drain) else None
+            )
 
             # No candidates selected for this round; terminate to avoid stalling.
             if not selected_samples:
@@ -337,6 +345,20 @@ def active_learning(
                 "active_learning/round": num_rounds,
                 "active_learning/samples/proposed": len(samples),
                 "active_learning/samples/selected": len(selected_samples),
+                # A rate beside the count, so the series is readable when the
+                # pool size is not held fixed.
+                **(
+                    {
+                        "active_learning/samples/already_queried": (
+                            num_already_queried
+                        ),
+                        "active_learning/samples/already_queried_rate": (
+                            num_already_queried / len(samples) if samples else 0.0
+                        ),
+                    }
+                    if num_already_queried is not None
+                    else {}
+                ),
                 "active_learning/observations/new": len(valid_observations),
                 "active_learning/observations/dropped": num_dropped,
                 "active_learning/observations/total": total_observations,

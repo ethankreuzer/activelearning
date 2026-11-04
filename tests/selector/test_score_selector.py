@@ -334,3 +334,47 @@ def test_attempted_at_another_fidelity_does_not_exclude() -> None:
     )
 
     assert [candidate.x for candidate in selected] == ["CCO"]
+
+
+def test_excluded_count_is_drained_once() -> None:
+    """The count describes one selection and is not readable twice."""
+    selector = TopKAcquisitionSelector(num_samples=1)
+    acquisition = Mock()
+    acquisition.score.return_value = [30.0, 20.0, 10.0]
+    candidates = [Candidate(x=smiles) for smiles in ("CCO", "CCN", "CCC")]
+
+    selector(
+        candidates,
+        acquisition=acquisition,
+        observations=[Observation(x="CCO", y=0.5)],
+        attempted=[Candidate(x="CCN")],
+    )
+
+    assert selector.drain_excluded_count() == 2
+    assert selector.drain_excluded_count() is None
+
+
+def test_excluded_count_is_zero_on_a_cold_start() -> None:
+    """Nothing queried yet is a real zero, not an absent check."""
+    selector = TopKAcquisitionSelector(num_samples=1)
+    acquisition = Mock()
+    acquisition.score.return_value = [10.0]
+
+    selector([Candidate(x="CCO")], acquisition=acquisition, observations=[])
+
+    assert selector.drain_excluded_count() == 0
+
+
+def test_excluded_count_is_none_when_the_check_is_off() -> None:
+    """A run not doing the check must not report finding nothing to skip."""
+    selector = TopKAcquisitionSelector(num_samples=1, skip_observed=False)
+    acquisition = Mock()
+    acquisition.score.return_value = [10.0]
+
+    selector(
+        [Candidate(x="CCO")],
+        acquisition=acquisition,
+        observations=[Observation(x="CCO", y=0.5)],
+    )
+
+    assert selector.drain_excluded_count() is None

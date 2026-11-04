@@ -881,3 +881,40 @@ def test_subset_config_builds_the_surrogate_and_rejects_state_path(
         TypeAdapter(SurrogateConfig).validate_python(
             {**data, "state_path": str(tmp_path / "state.pt")}
         )
+
+
+def test_subset_surrogate_records_fit_timings_without_cuda(tmp_path: Path) -> None:
+    """The fit profiling is always present; the CUDA metrics are conditional.
+
+    The memory metrics exist to make the loop's binding resource measurable, so
+    they must not make a CPU run fail, and they must not report zeros that
+    would read as a measured headroom of nothing.
+    """
+    surrogate = _subset_surrogate(tmp_path, size=5)
+    surrogate.fit(_observations())
+
+    profiling = surrogate.get_fit_profiling()
+    assert profiling["profiling/surrogate/gp_fit_s"] > 0.0
+    assert profiling["profiling/surrogate/subset_size"] == 5.0
+
+    cuda_keys = [key for key in profiling if "cuda" in key]
+    if torch.cuda.is_available():
+        assert sorted(cuda_keys) == [
+            "profiling/surrogate/cuda_headroom_at_peak_gib",
+            "profiling/surrogate/cuda_peak_reserved_fit_gib",
+            "profiling/surrogate/cuda_released_before_fit_gib",
+            "profiling/surrogate/cuda_reserved_before_fit_gib",
+            "profiling/surrogate/cuda_total_gib",
+        ]
+        total = profiling["profiling/surrogate/cuda_total_gib"]
+        peak = profiling["profiling/surrogate/cuda_peak_reserved_fit_gib"]
+        assert total > 0.0
+        assert 0.0 <= peak <= total
+        assert profiling[
+            "profiling/surrogate/cuda_headroom_at_peak_gib"
+        ] == pytest.approx(total - peak)
+        # Releasing cached blocks can only lower what is reserved, so the
+        # released amount is never negative.
+        assert profiling["profiling/surrogate/cuda_released_before_fit_gib"] >= 0.0
+    else:
+        assert cuda_keys == []
