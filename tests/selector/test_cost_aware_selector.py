@@ -4,7 +4,7 @@ import math
 import pytest
 
 from activelearning.selector.cost_aware_selector import CostAwareSelector
-from activelearning.utils.types import Candidate
+from activelearning.utils.types import Candidate, Observation
 
 
 @pytest.fixture
@@ -327,3 +327,44 @@ def test_cost_aware_selector_snapshot_keeps_zero_cost_ratio_infinite(selector):
     assert math.isinf(snapshot.ranking_scores[0])
     assert snapshot.ranking_scores[1:] == (10.0, 30.0)
     assert snapshot.selected_indices == (0, 2, 1)
+
+
+def test_already_observed_candidates_do_not_consume_budget() -> None:
+    """Budget skips a candidate whose label the dataset already holds."""
+    selector = CostAwareSelector()
+    acquisition = Mock()
+    acquisition.score.return_value = [30.0, 20.0, 10.0]
+    pool = [Candidate(x=smiles) for smiles in ("CCO", "CCN", "CCC")]
+
+    selected = selector(
+        pool,
+        acquisition=acquisition,
+        cost_fn=lambda cands: [1.0] * len(cands),
+        round_budget=2.0,
+        observations=[Observation(x="CCO", y=0.5)],
+    )
+
+    # "CCO" has the best bang-for-buck and is skipped anyway; its budget goes
+    # to the next two candidates instead of buying a known label.
+    assert [candidate.x for candidate in selected] == ["CCN", "CCC"]
+    snapshot = selector.drain_selection_scores()
+    assert snapshot is not None
+    assert snapshot.selected_indices == (1, 2)
+
+
+def test_cost_aware_skip_observed_false_keeps_the_old_behaviour() -> None:
+    """The opt-out spends budget on an already-observed candidate."""
+    selector = CostAwareSelector(skip_observed=False)
+    acquisition = Mock()
+    acquisition.score.return_value = [30.0, 20.0]
+    pool = [Candidate(x=smiles) for smiles in ("CCO", "CCN")]
+
+    selected = selector(
+        pool,
+        acquisition=acquisition,
+        cost_fn=lambda cands: [1.0] * len(cands),
+        round_budget=1.0,
+        observations=[Observation(x="CCO", y=0.5)],
+    )
+
+    assert [candidate.x for candidate in selected] == ["CCO"]

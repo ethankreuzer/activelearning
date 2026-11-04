@@ -180,3 +180,157 @@ def test_score_selector_clears_snapshot_after_empty_and_failed_calls() -> None:
     with pytest.raises(ValueError, match="match the candidate pool"):
         selector(candidates, acquisition=acquisition)
     assert selector.drain_selection_scores() is None
+
+
+def test_already_observed_candidates_are_not_selected() -> None:
+    """A candidate the oracle has answered for is scored but never selected."""
+    selector = TopKAcquisitionSelector(num_samples=2)
+    acquisition = Mock()
+    acquisition.score.return_value = [30.0, 20.0, 10.0, 5.0]
+    candidates = [Candidate(x=smiles) for smiles in ("CCO", "CCN", "CCC", "CCF")]
+
+    selected = selector(
+        candidates,
+        acquisition=acquisition,
+        observations=[Observation(x="CCO", y=0.5)],
+    )
+
+    # "CCO" outranks everything and is still skipped; the cut moves down to
+    # include "CCC" so the round still queries num_samples candidates.
+    assert [candidate.x for candidate in selected] == ["CCN", "CCC"]
+    # The excluded candidate was scored all the same, so the pool's own
+    # acquisition distribution stays on the record.
+    acquisition.score.assert_called_once_with(candidates)
+    snapshot = selector.drain_selection_scores()
+    assert snapshot is not None
+    assert snapshot.acquisition_scores == (30.0, 20.0, 10.0, 5.0)
+    # Recorded indices index the pool as sampled, not a filtered copy.
+    assert snapshot.selected_indices == (1, 2)
+
+
+def test_skip_observed_false_reproduces_the_unchecked_selection() -> None:
+    """The opt-out re-docks, which is what the pre-check runs did."""
+    selector = TopKAcquisitionSelector(num_samples=2, skip_observed=False)
+    acquisition = Mock()
+    acquisition.score.return_value = [30.0, 20.0, 10.0]
+    candidates = [Candidate(x=smiles) for smiles in ("CCO", "CCN", "CCC")]
+
+    selected = selector(
+        candidates,
+        acquisition=acquisition,
+        observations=[Observation(x="CCO", y=0.5)],
+    )
+
+    assert [candidate.x for candidate in selected] == ["CCO", "CCN"]
+
+
+def test_observations_at_another_fidelity_do_not_exclude() -> None:
+    """A candidate is only excluded at a fidelity it was observed at."""
+    selector = TopKAcquisitionSelector(num_samples=1)
+    acquisition = Mock()
+    acquisition.score.return_value = [10.0]
+    candidates = [Candidate(x="CCO", fidelity=1)]
+
+    selected = selector(
+        candidates,
+        acquisition=acquisition,
+        observations=[Observation(x="CCO", y=0.5, fidelity=0)],
+    )
+
+    assert [candidate.x for candidate in selected] == ["CCO"]
+
+
+def test_a_fully_observed_pool_selects_nothing() -> None:
+    """Rather than re-query, the selector returns an empty selection."""
+    selector = TopKAcquisitionSelector(num_samples=2)
+    acquisition = Mock()
+    acquisition.score.return_value = [10.0, 20.0]
+    candidates = [Candidate(x="CCO"), Candidate(x="CCN")]
+
+    selected = selector(
+        candidates,
+        acquisition=acquisition,
+        observations=[Observation(x="CCO", y=0.1), Observation(x="CCN", y=0.2)],
+    )
+
+    assert selected == []
+    # No selection was made, so no snapshot should be left behind.
+    assert selector.drain_selection_scores() is None
+
+
+def test_unidentifiable_candidates_are_left_selectable() -> None:
+    """An x that cannot be canonicalized is never silently dropped."""
+
+    class Opaque:
+        def __init__(self, tag: str) -> None:
+            self.tag = tag
+
+    selector = TopKAcquisitionSelector(num_samples=1)
+    acquisition = Mock()
+    acquisition.score.return_value = [10.0]
+    opaque = Opaque("a")
+    candidates = [Candidate(x=opaque)]
+
+    selected = selector(
+        candidates,
+        acquisition=acquisition,
+        observations=[Observation(x="CCO", y=0.5)],
+    )
+
+    assert selected == candidates
+
+
+def test_failed_queries_are_not_retried() -> None:
+    """A query that returned no usable label is still not selected again.
+
+    The loop drops an unusable label before the dataset sees it, so the only
+    record that the price was already paid is the attempted list.
+    """
+    selector = TopKAcquisitionSelector(num_samples=2)
+    acquisition = Mock()
+    acquisition.score.return_value = [30.0, 20.0, 10.0, 5.0]
+    candidates = [Candidate(x=smiles) for smiles in ("CCO", "CCN", "CCC", "CCF")]
+
+    selected = selector(
+        candidates,
+        acquisition=acquisition,
+        # "CCO" was docked and produced no pose; it is in neither the dataset
+        # nor the valid observations, and only `attempted` knows about it.
+        observations=[],
+        attempted=[Candidate(x="CCO")],
+    )
+
+    assert [candidate.x for candidate in selected] == ["CCN", "CCC"]
+
+
+def test_observed_and_attempted_exclusions_combine() -> None:
+    """The dataset's labels and this run's failures both exclude."""
+    selector = TopKAcquisitionSelector(num_samples=2)
+    acquisition = Mock()
+    acquisition.score.return_value = [40.0, 30.0, 20.0, 10.0]
+    candidates = [Candidate(x=smiles) for smiles in ("CCO", "CCN", "CCC", "CCF")]
+
+    selected = selector(
+        candidates,
+        acquisition=acquisition,
+        observations=[Observation(x="CCO", y=0.5)],
+        attempted=[Candidate(x="CCN")],
+    )
+
+    assert [candidate.x for candidate in selected] == ["CCC", "CCF"]
+
+
+def test_attempted_at_another_fidelity_does_not_exclude() -> None:
+    """A failure at one fidelity leaves another fidelity selectable."""
+    selector = TopKAcquisitionSelector(num_samples=1)
+    acquisition = Mock()
+    acquisition.score.return_value = [10.0]
+    candidates = [Candidate(x="CCO", fidelity=1)]
+
+    selected = selector(
+        candidates,
+        acquisition=acquisition,
+        attempted=[Candidate(x="CCO", fidelity=0)],
+    )
+
+    assert [candidate.x for candidate in selected] == ["CCO"]

@@ -169,6 +169,14 @@ def active_learning(
         held_out_sets = tuple(
             spec.load() for spec in diagnostics_config.held_out_sets
         )
+        # Every candidate sent to the oracle, whatever came back. The dataset
+        # cannot stand in for this: a query that returns no usable label is
+        # dropped before the dataset sees it, so without this list a failed
+        # query stays as attractive to the selector as it was the first time
+        # and is retried, at full price, for the same failure, every round.
+        # Held only for this run; nothing here resumes a previous one, and a
+        # resume would have to rebuild it from the rounds' queried_observations.
+        attempted_candidates: list[Candidate] = []
 
         while budget.available_budget > 0 and (
             budget.max_rounds is None or num_rounds < budget.max_rounds
@@ -254,6 +262,11 @@ def active_learning(
                         acquisition=acquisition,
                         cost_fn=oracle.get_costs,
                         round_budget=round_budget,
+                        # The same list the surrogate was fitted on, so a
+                        # selector that skips already-observed candidates reads
+                        # exactly the labels the dataset holds this round.
+                        observations=observations,
+                        attempted=attempted_candidates,
                     )
                 )
             # Keep the selector's per-candidate scores for this round's record so the
@@ -286,6 +299,10 @@ def active_learning(
 
             with profile_operation(profiling, "oracle/query"):
                 new_observations = list(oracle.query(selected_samples))
+            # Recorded before the results are validated or filtered: the price
+            # was paid for every one of these, so none of them should be
+            # queried again, least of all the ones that failed.
+            attempted_candidates.extend(selected_samples)
             _validate_oracle_results(selected_samples, new_observations)
 
             # The measurements themselves, written before anything else can

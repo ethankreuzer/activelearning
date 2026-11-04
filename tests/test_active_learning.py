@@ -636,7 +636,11 @@ def test_active_learning_writes_scored_samples_next_to_score_figure(
 
 
 def test_active_learning_accepts_list_returning_selector_without_score_hook() -> None:
-    """A custom selector only needs to implement the list-returning call API."""
+    """A custom selector needs only the list-returning call API.
+
+    It does not have to subclass ``Selector`` or expose score telemetry; it does
+    have to tolerate the keywords the loop passes.
+    """
 
     class ListReturningSelector:
         """Select the first candidate without exposing score telemetry."""
@@ -647,9 +651,16 @@ def test_active_learning_accepts_list_returning_selector_without_score_hook() ->
             acquisition=None,
             cost_fn=None,
             round_budget=None,
+            # The loop passes what every selector may need -- currently also
+            # `observations` and `attempted`, for skipping candidates already
+            # queried. A selector that does not subclass Selector has to
+            # tolerate them, which is what this absorbs; declaring them one by
+            # one would make this test fail whenever the loop learns to pass
+            # something new, which is not what it is here to check.
+            **loop_kwargs,
         ) -> list[Candidate]:
             """Return one candidate from the sampled pool."""
-            _ = acquisition, cost_fn, round_budget
+            _ = acquisition, cost_fn, round_budget, loop_kwargs
             return list(candidates[:1])
 
     run_writer = RecordingRunWriter()
@@ -909,12 +920,16 @@ class RuntimeLoggingSelector(TopKAcquisitionSelector):
         acquisition: Optional[DummyAcquisition] = None,
         cost_fn: Optional[Callable[[Sequence[Candidate]], list[float]]] = None,
         round_budget: Optional[float] = None,
+        observations: Optional[Sequence[Observation]] = None,
+        attempted: Optional[Sequence[Candidate]] = None,
     ):
         result = super().__call__(
             candidates,
             acquisition=acquisition,
             cost_fn=cost_fn,
             round_budget=round_budget,
+            observations=observations,
+            attempted=attempted,
         )
         if self.logger is not None:
             self.logger.log_metric("selector/general/selected", len(result))
@@ -1191,3 +1206,90 @@ def test_active_learning_run_writer_records_only_valid_observations():
     assert len(run_writer.rounds) == 1
     assert run_writer.rounds[0]["valid_observations"] == stored_observations
     assert [observation.x for observation in stored_observations] == [0, 2]
+
+
+class _RecordingNaNOracle(MultiFidelityOracle):
+    """Oracle that always fails, and remembers every candidate it was given.
+
+    This is the shape that matters for docking: the query costs its full price,
+    returns nothing usable, and so leaves no trace in the dataset.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            fidelity_configs={
+                0: {
+                    "cost_per_sample": 1.0,
+                    "score_fn": lambda _x: float("nan"),
+                    "fidelity_confidence": 1.0,
+                }
+            }
+        )
+        self.queried_xs: list[int] = []
+
+    def query(self, candidates: Sequence[Candidate]) -> list[Observation]:
+        self.queried_xs.extend(int(candidate.x) for candidate in candidates)
+        return list(super().query(candidates))
+
+
+def test_al_loop_does_not_retry_a_failed_query_in_a_later_round():
+    """A candidate whose query failed is not selected again.
+
+    The dataset stays empty, so it cannot be what rules these out; only the
+    loop's record of what it already sent to the oracle can.
+    """
+    oracle = _RecordingNaNOracle()
+    # num_samples == the pool size, so the sampler returns the whole pool
+    # rather than drawing from it: the same 20 candidates every round, with no
+    # multinomial draw to make the outcome depend on chance. Without the check
+    # the ranking is tied, the sort is stable, and round 2 would re-select
+    # exactly what round 1 did.
+    sampler = _make_pool_sampler_single_fidelity(20, 20)
+    selector = TopKAcquisitionSelector(num_samples=5)
+    # 1.0 per sample and 5 per round, so 4 rounds over a pool of 20: the check
+    # has to walk down the ranking every round to fill the batch at all.
+    budget = Budget(available_budget=20.0, schedule=lambda _: 20.0)
+
+    dataset_out, _cost, num_rounds = active_learning(
+        dataset=ListDataset(),
+        surrogate=DummyMeanSurrogate(),
+        acquisition=DummyAcquisition(),
+        sampler=sampler,
+        selector=selector,
+        oracle=oracle,
+        budget=budget,
+    )
+
+    assert num_rounds > 1, "a single round cannot show a repeat"
+    assert dataset_out.get_observations_iterable() == []
+    assert len(oracle.queried_xs) == len(set(oracle.queried_xs)), (
+        "a failed query was retried: "
+        f"{sorted(x for x in set(oracle.queried_xs) if oracle.queried_xs.count(x) > 1)}"
+    )
+    # Every round filled its batch from what was left, so the pool was walked
+    # through exactly once rather than the first five being re-docked.
+    assert sorted(oracle.queried_xs) == list(range(20))
+
+
+def test_al_loop_retries_a_failed_query_when_skip_observed_is_off():
+    """The opt-out restores the behaviour the pre-check runs had."""
+    oracle = _RecordingNaNOracle()
+    sampler = _make_pool_sampler_single_fidelity(20, 20)
+    selector = TopKAcquisitionSelector(num_samples=5, skip_observed=False)
+    budget = Budget(available_budget=20.0, schedule=lambda _: 20.0)
+
+    _dataset_out, _cost, num_rounds = active_learning(
+        dataset=ListDataset(),
+        surrogate=DummyMeanSurrogate(),
+        acquisition=DummyAcquisition(),
+        sampler=sampler,
+        selector=selector,
+        oracle=oracle,
+        budget=budget,
+    )
+
+    assert num_rounds > 1
+    # Nothing is excluded, the pool and the tied ranking are identical every
+    # round, and the sort is stable: every round re-queries the same five.
+    assert len(oracle.queried_xs) > len(set(oracle.queried_xs))
+    assert set(oracle.queried_xs) == {0, 1, 2, 3, 4}

@@ -2,7 +2,7 @@ from typing import Callable, Optional, Sequence
 
 from activelearning.acquisition.acquisition import Acquisition
 from activelearning.selector.selector import Selector
-from activelearning.utils.types import Candidate
+from activelearning.utils.types import Candidate, Observation
 
 # Absolute tolerance for budget comparisons to avoid floating-point accumulation
 # drift when many small-cost candidates are summed
@@ -17,7 +17,18 @@ class CostAwareSelector(Selector):
 
     Divides ``acquisition.score(candidates)`` by oracle cost, so any
     acquisition-level cost weighting is compounded here.
+
+    Parameters
+    ----------
+    skip_observed : bool
+        Leave candidates the oracle has already answered for out of the
+        selection, so no budget is spent on a label the dataset already holds.
+        Defaults to ``True``. Set it ``False`` only to reproduce a run made
+        before this check existed.
     """
+
+    def __init__(self, skip_observed: bool = True) -> None:
+        self.skip_observed = skip_observed
 
     def __call__(
         self,
@@ -25,6 +36,8 @@ class CostAwareSelector(Selector):
         acquisition: Optional[Acquisition] = None,
         cost_fn: Optional[Callable[[Sequence[Candidate]], list[float]]] = None,
         round_budget: Optional[float] = None,
+        observations: Optional[Sequence[Observation]] = None,
+        attempted: Optional[Sequence[Candidate]] = None,
     ) -> list[Candidate]:
         """Select candidates greedily to maximize utility within budget.
 
@@ -46,6 +59,14 @@ class CostAwareSelector(Selector):
             Function returning per-candidate costs.
         round_budget : Optional[float]
             Maximum budget for this selection round.
+        observations : Optional[Sequence[Observation]]
+            Everything observed so far. With ``skip_observed``, candidates
+            already observed at their own fidelity are scored but never
+            selected, leaving their budget for candidates whose labels are
+            still unknown.
+        attempted : Optional[Sequence[Candidate]]
+            Every candidate already sent to the oracle, whatever it returned,
+            so budget is not spent re-running a query that already failed.
         Returns
         -------
         result : list[Candidate]
@@ -94,12 +115,20 @@ class CostAwareSelector(Selector):
             reverse=True,
         )
 
+        excluded = (
+            self._excluded_pool_indices(candidates, observations, attempted)
+            if self.skip_observed
+            else set()
+        )
+
         # Greedily select candidates until budget exhausted
         selected = []
         selected_indices = []
         budget_used = 0.0
 
         for idx in ranked_indices:
+            if idx in excluded:
+                continue
             candidate_cost = costs[idx]
             if budget_used + candidate_cost <= round_budget + _BUDGET_ATOL:
                 selected.append(candidates[idx])

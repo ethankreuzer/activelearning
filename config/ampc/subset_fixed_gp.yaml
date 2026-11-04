@@ -182,6 +182,24 @@ sampler:
 
 selector:
   type: CostAwareSelector
+  # Never dock a molecule this run has already docked, whether or not the dock
+  # produced a score. Two leaks, both measured on the 10-round run
+  # sf-10round-5000dock-5000steps-seed42, which predates this check:
+  #   - 1,080 of ~50,000 docks (2.2%) re-docked a molecule the archive already
+  #     had a y for, 44 of them at y >= 0.66. The policy is rewarded for the
+  #     molecules it found, so it re-proposes them, and their high GP mean
+  #     keeps their acquisition high enough to re-enter the selection: the
+  #     repeats concentrate on the best molecules. Those rows also entered the
+  #     archive twice, where the GP's training-subset selector weighted them
+  #     twice.
+  #   - 4,117 docks (8.2%) failed, mostly dock64_no_pose_or_score. A failed
+  #     dock leaves no row in the archive, so nothing stopped the same molecule
+  #     being docked again in a later round for the same failure. The loop now
+  #     remembers every molecule it sent to the oracle, not just the ones that
+  #     came back with a score.
+  # Stated rather than left to the schema default, which is also true. Set this
+  # false to reproduce the pre-check behaviour.
+  skip_observed: true
 
 oracle:
   type: Dock3Oracle
