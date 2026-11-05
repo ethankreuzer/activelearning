@@ -387,6 +387,13 @@ def active_learning(
             # reads it.
             sampled_means: list[float] | None = None
             sampled_stds: list[float] | None = None
+            # The TOTAL sd as well. `sampled_stds` is the LATENT one, which
+            # is what GIBBON consumed; residual calibration has to divide by
+            # the total one, and it cannot be recovered afterwards because the
+            # two differ by the fitted noise, which moves every round. The
+            # second posterior call rides on the encode this pass already paid
+            # for.
+            sampled_total_stds: list[float] | None = None
             if getattr(run_writer, "write_sample_scores", False):
                 with profile_operation(profiling, "surrogate/predict_pool"):
                     pool_predictions = predict_pool(surrogate, samples)
@@ -397,7 +404,11 @@ def active_learning(
                         num_rounds,
                     )
                 else:
-                    sampled_means, sampled_stds = pool_predictions
+                    (
+                        sampled_means,
+                        sampled_stds,
+                        sampled_total_stds,
+                    ) = pool_predictions
 
             preliminary_record = RoundRecord(
                 round_index=num_rounds,
@@ -418,6 +429,7 @@ def active_learning(
                 selection_scores=selection_scores,
                 sampled_means=sampled_means,
                 sampled_stds=sampled_stds,
+                sampled_total_stds=sampled_total_stds,
             )
             with profile_operation(profiling, "diagnostics/total"):
                 (

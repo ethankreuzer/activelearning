@@ -84,6 +84,15 @@ class RoundRecord:
     #: molecule but not what the surrogate predicted for it.
     sampled_means: Sequence[float] | None = None
     sampled_stds: Sequence[float] | None = None
+    #: The TOTAL standard deviation for the same molecules -- latent plus the
+    #: fitted observation noise. Written as ``gp_total_std``. ``gp_std`` above
+    #: is the LATENT one, which is what GIBBON consumes; this one is what
+    #: residual calibration must divide by, since a residual contains the
+    #: measurement noise and dividing by the latent sd would make a calibrated
+    #: GP look overconfident by construction. Recorded because it cannot be
+    #: recovered from ``gp_std`` afterwards: the two differ by the fitted noise,
+    #: which is re-fitted every round.
+    sampled_total_stds: Sequence[float] | None = None
 
 
 class RunWriter(ABC):
@@ -527,11 +536,18 @@ class JSONLinesRunWriter(RunWriter):
         surrogate_stds = _aligned_predictions(
             record.sampled_stds, len(candidates), "sampled_stds", record.round_index
         )
+        surrogate_total_stds = _aligned_predictions(
+            record.sampled_total_stds,
+            len(candidates),
+            "sampled_total_stds",
+            record.round_index,
+        )
         prediction_columns = [
             name
             for name, values in (
                 ("gp_mean", surrogate_means),
                 ("gp_std", surrogate_stds),
+                ("gp_total_std", surrogate_total_stds),
             )
             if values is not None
         ]
@@ -592,7 +608,11 @@ class JSONLinesRunWriter(RunWriter):
                     "" if target is None else _csv_value(target),
                     *(
                         values[index]
-                        for values in (surrogate_means, surrogate_stds)
+                        for values in (
+                            surrogate_means,
+                            surrogate_stds,
+                            surrogate_total_stds,
+                        )
                         if values is not None
                     ),
                     *(

@@ -54,14 +54,32 @@ def predict_pool(
     candidates: Sequence[Candidate],
     *,
     chunk_size: int = _POOL_PREDICT_CHUNK,
-) -> tuple[list[float], list[float] | None] | None:
-    """Predict the posterior mean and standard deviation for a sampled pool.
+) -> tuple[list[float], list[float] | None, list[float] | None] | None:
+    """Predict the mean, total and latent standard deviation for a sampled pool.
 
     Chunked, because ``Surrogate.predict`` encodes and predicts everything it is
     given in one call. Returns ``None`` when any chunk fails to predict, rather
     than a partial pool: the caller writes these alongside the acquisition score
     of the same molecule, and a column covering an unmarked subset of the rows
     would be read as covering all of them.
+
+``predict`` returns the LATENT standard deviation: it calls
+    ``model.posterior`` without ``observation_noise``, which BoTorch defaults
+    to ``False``. That is the one GIBBON consumes, so it is the second output
+    and the long-standing ``gp_std`` column.
+
+    The TOTAL standard deviation -- latent plus the fitted observation noise --
+    is the third output, and ``predict`` cannot produce it at all since it does
+    not expose the flag. It comes from one encode and a second posterior call
+    per chunk via :func:`_predict_latent_and_total_in_chunks`. The encode
+    dominates for a store-backed encoder, so the extra call is close to free
+    against the pass that was already happening. It is needed because residual
+    calibration divides by the total sd -- a residual contains the measurement
+    noise, so dividing by the latent sd makes a calibrated GP look
+    overconfident by construction -- and it cannot be recovered from the latent
+    sd afterwards, because the noise is re-fitted every round. ``None`` for a
+    surrogate without ``encode_candidates``/``predict_encoded``, which records
+    no total column rather than a wrong one.
 
     Parameters
     ----------
@@ -74,9 +92,10 @@ def predict_pool(
 
     Returns
     -------
-    result : tuple[list[float], list[float] | None] | None
-        Means and, where the surrogate reports them, standard deviations; or
-        ``None`` when the pool could not be predicted.
+    result : tuple[list[float], list[float] | None, list[float] | None] | None
+        Means, LATENT standard deviations where the surrogate reports them, and
+        TOTAL ones where it can produce them; or ``None`` when the pool could
+        not be predicted.
     """
     if not candidates:
         return None
@@ -96,7 +115,24 @@ def predict_pool(
             stds_complete = False
         elif stds_complete:
             standard_deviations.extend(chunk_stds)
-    return means, standard_deviations if stds_complete else None
+    # A second pass for the TOTAL standard deviation, which `predict` above
+    # cannot expose: it omits observation_noise, which BoTorch defaults to
+    # False, so everything above is the latent sd. Its own chunking and failure
+    # handling, so a surrogate that cannot produce it loses one column rather
+    # than the whole pool.
+    predicted_pair = _predict_latent_and_total_in_chunks(
+        surrogate, candidates, chunk_size
+    )
+    total_stds = (
+        None
+        if predicted_pair is None
+        else [float(value) for value in predicted_pair[2]]
+    )
+    return (
+        means,
+        standard_deviations if stds_complete else None,
+        total_stds,
+    )
 
 
 def evaluate_held_out_set(

@@ -814,3 +814,61 @@ def test_selected_samples_carry_the_reward_scale_too(tmp_path) -> None:
     assert [float(row["reward_input_score"]) for row in rows] == pytest.approx(
         [math.log(0.2), math.log(0.9)]
     )
+
+
+def test_scored_samples_carry_the_total_std_calibration_divides_by(
+    tmp_path,
+) -> None:
+    """gp_total_std beside gp_std, which is the LATENT one.
+
+    `predict` omits observation_noise and BoTorch defaults it to False, so
+    gp_std is latent -- what GIBBON consumes. Residual calibration has to
+    divide by the TOTAL sd instead, because a residual contains the
+    measurement noise and dividing by the latent sd would make a calibrated
+    GP look overconfident by construction. The two differ by the fitted noise,
+    which is re-fitted every round, so neither recovers the other.
+    """
+    run_writer = JSONLinesRunWriter(output_dir=tmp_path)
+    run_writer.start_run({})
+    record = replace(
+        _scored_round_record(_SCORES),
+        sampled_means=[0.10, 0.20, 0.30, 0.40],
+        sampled_stds=[0.05, 0.06, 0.07, 0.08],
+        sampled_total_stds=[0.09, 0.10, 0.11, 0.12],
+    )
+
+    run_writer.record_round(record)
+
+    with (tmp_path / _SCORED_SAMPLES_PATH).open(newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    assert [float(row["gp_std"]) for row in rows] == [0.05, 0.06, 0.07, 0.08]
+    assert [float(row["gp_total_std"]) for row in rows] == [0.09, 0.10, 0.11, 0.12]
+    # The total sd is the larger of the two by construction: it is the latent
+    # variance plus a non-negative noise variance.
+    assert all(
+        float(row["gp_total_std"]) > float(row["gp_std"]) for row in rows
+    )
+
+
+def test_scored_samples_omit_the_total_std_when_it_was_not_predicted(
+    tmp_path,
+) -> None:
+    """A surrogate that cannot give the total sd gains no empty column.
+
+    The latent sd is still written: losing the total column must not cost the
+    posterior that was available.
+    """
+    run_writer = JSONLinesRunWriter(output_dir=tmp_path)
+    run_writer.start_run({})
+    record = replace(
+        _scored_round_record(_SCORES),
+        sampled_means=[0.10, 0.20, 0.30, 0.40],
+        sampled_stds=[0.05, 0.06, 0.07, 0.08],
+    )
+
+    run_writer.record_round(record)
+
+    with (tmp_path / _SCORED_SAMPLES_PATH).open(newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    assert "gp_total_std" not in rows[0]
+    assert [float(row["gp_std"]) for row in rows] == [0.05, 0.06, 0.07, 0.08]
