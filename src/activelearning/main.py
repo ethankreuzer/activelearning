@@ -27,11 +27,14 @@ import hashlib
 import json
 import logging
 import os
+import platform
 import shlex
+import socket
 import subprocess
 import sys
 from collections.abc import Iterator, Sequence
 from datetime import datetime, timezone
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -282,8 +285,100 @@ def _build_run_metadata(
             **_git_working_tree_state(),
             "resolved_config_md5": _stable_md5(resolved_config),
             "input_files": _collect_input_files(config_paths, resolved_config),
+            # A commit identifies the code; it does not identify what ran it.
+            # Across a multi-month study the cluster's modules and the
+            # environment move underneath a fixed SHA, and a number that cannot
+            # say which torch produced it cannot be defended later.
+            "environment": _environment_record(),
+            # Which Slurm job this was, so the run directory points at the
+            # .out/.err that hold its OOM traces, warnings and timings. Matched
+            # by timestamp otherwise, which is guesswork once two runs overlap.
+            "slurm": _slurm_record(),
         },
     }
+
+
+#: Slurm environment variables worth recording. The job id is what links a run
+#: to its scheduler logs; the rest identify the hardware the numbers came from,
+#: which a GPU-model-dependent memory ceiling makes material.
+_SLURM_ENVIRONMENT_KEYS = (
+    "SLURM_JOB_ID",
+    "SLURM_ARRAY_JOB_ID",
+    "SLURM_ARRAY_TASK_ID",
+    "SLURM_JOB_NAME",
+    "SLURM_JOB_ACCOUNT",
+    "SLURM_JOB_PARTITION",
+    "SLURM_JOB_NODELIST",
+    "SLURM_CPUS_PER_TASK",
+    "SLURM_MEM_PER_NODE",
+    "SLURM_GPUS",
+    "SLURM_JOB_GPUS",
+    "SLURM_SUBMIT_DIR",
+)
+
+#: Packages whose version changes the numbers rather than the logging. Recorded
+#: by name so a missing one is absent rather than crashing the record.
+_RECORDED_PACKAGES = (
+    "torch",
+    "gpytorch",
+    "botorch",
+    "numpy",
+    "scipy",
+    "pandas",
+    "rdkit",
+    "transformers",
+    "wandb",
+    "matplotlib",
+)
+
+
+def _environment_record() -> dict[str, Any]:
+    """Return the interpreter, host, CUDA and package versions of this run.
+
+    Everything here is best-effort: a missing package or an import that fails
+    is recorded as ``None`` rather than raising, because provenance must never
+    be the reason a run does not start.
+    """
+    record: dict[str, Any] = {
+        "python_version": sys.version.split()[0],
+        "platform": platform.platform(),
+        "hostname": socket.gethostname(),
+        "executable": sys.executable,
+        "packages": {},
+    }
+    for name in _RECORDED_PACKAGES:
+        try:
+            record["packages"][name] = version(name)
+        except PackageNotFoundError:
+            record["packages"][name] = None
+    try:
+        import torch
+
+        record["torch_cuda_version"] = torch.version.cuda
+        record["cuda_available"] = bool(torch.cuda.is_available())
+        record["gpu_names"] = (
+            [
+                torch.cuda.get_device_properties(index).name
+                for index in range(torch.cuda.device_count())
+            ]
+            if torch.cuda.is_available()
+            else []
+        )
+    except Exception:  # pragma: no cover - torch is always present in practice
+        record["torch_cuda_version"] = None
+        record["cuda_available"] = None
+        record["gpu_names"] = []
+    return record
+
+
+def _slurm_record() -> dict[str, str] | None:
+    """Return the Slurm variables this job was given, or None outside Slurm."""
+    present = {
+        key: value
+        for key in _SLURM_ENVIRONMENT_KEYS
+        if (value := os.environ.get(key)) is not None
+    }
+    return present or None
 
 
 #: Filename of the saved working-tree patch, inside the run's output directory.
