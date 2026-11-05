@@ -7,7 +7,10 @@ from activelearning.acquisition.acquisition import Acquisition
 from activelearning.budget.budget import Budget
 from activelearning.dataset.dataset import Dataset
 from activelearning.logger.logger import Logger
-from activelearning.monitoring.diagnostics import predict_pool
+from activelearning.monitoring.diagnostics import (
+    docked_chemistry_diagnostics,
+    predict_pool,
+)
 from activelearning.monitoring.diagnostics_config import DiagnosticsConfig
 from activelearning.monitoring.orchestration import (
     StageStash,
@@ -286,6 +289,19 @@ def active_learning(
             if not selected_samples:
                 break
 
+            # What fraction of the molecules this round is about to spend its
+            # whole budget docking are valid and synthesizable. Computed before
+            # the oracle runs, on the selection itself, because that is the set
+            # the budget buys -- the failures the oracle returns are a separate
+            # question, answerable afterwards from the saved SMILES.
+            docked_chemistry: dict[str, float] = {}
+            if diagnostics_config.docked_sa_threshold is not None:
+                with profile_operation(profiling, "diagnostics/docked_chemistry"):
+                    docked_chemistry = docked_chemistry_diagnostics(
+                        selected_samples,
+                        sa_threshold=diagnostics_config.docked_sa_threshold,
+                    )
+
             # Query oracle to obtain total cost for the samples.
             with profile_operation(profiling, "oracle/get_costs"):
                 costs = oracle.get_costs(selected_samples)
@@ -377,6 +393,10 @@ def active_learning(
                     if initial_budget > 0
                     else 0.0
                 ),
+                # Core metrics rather than diagnostics: these describe what the
+                # budget was spent on, and a round that cannot say that has not
+                # recorded its own result. Empty unless configured.
+                **docked_chemistry,
             }
 
             # What the surrogate predicted for every molecule in the pool, for

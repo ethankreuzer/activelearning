@@ -1027,3 +1027,110 @@ def _combine_prediction_panels(
         ),
         fidelities=tuple(fidelity for panel in panels for fidelity in panel.fidelities),
     )
+
+
+#: Namespace for the chemistry profile of the candidates sent to the oracle.
+_DOCKED_CHEMISTRY_PREFIX = "active_learning/docked"
+
+
+def docked_chemistry_diagnostics(
+    candidates: Sequence[Candidate],
+    *,
+    sa_threshold: float,
+) -> dict[str, float]:
+    """Profile the validity and synthesizability of one round's docked set.
+
+    The candidates handed to the oracle are the molecules a round spends its
+    whole budget on, and neither property is otherwise recorded for them. The
+    sampler's own ``validity_rate`` and ``synthesizable_rate`` are measured on
+    TRAINING batches, and the pool the selection is drawn from is filtered for
+    canonicalization and duplication only -- never for synthesizability -- so
+    nothing upstream states what fraction of the docked molecules a chemist
+    could make.
+
+    Validity is expected to be 1.0, because the generator admits a candidate
+    only after RDKit canonicalizes it. It is measured rather than assumed: a
+    rate below 1.0 means the pool filter regressed or an unfiltered candidate
+    source was configured, which is worth an explicit series rather than a
+    silent assumption.
+
+    Parameters
+    ----------
+    candidates : Sequence[Candidate]
+        The candidates selected for this round's oracle queries. ``x`` is read
+        as a SMILES string; a candidate whose ``x`` is not a string counts as
+        invalid rather than raising, so a non-molecular run cannot break the
+        loop by enabling this diagnostic.
+    sa_threshold : float
+        Strict upper bound on the SA score counted as synthesizable, matching
+        the sampler's ``sa_threshold`` so the two series mean the same thing.
+
+    Returns
+    -------
+    dict[str, float]
+        Counts and rates under ``active_learning/docked/``. Empty when
+        ``candidates`` is empty, so a round that selected nothing contributes
+        no misleading zero-of-zero rate.
+
+    Raises
+    ------
+    activelearning.sampler.s3gfn._optional.S3GFNOptionalDependencyError
+        If RDKit is unavailable. The diagnostic is opt-in, so a run that cannot
+        score molecules should not have asked for it.
+    """
+    if not candidates:
+        return {}
+
+    # Imported here, not at module scope: this is the one diagnostic that needs
+    # RDKit, and monitoring must stay importable without the molecule extra.
+    from activelearning.sampler.s3gfn._optional import require_rdkit
+    from activelearning.sampler.s3gfn.synthesizability import (
+        SAScoreSynthesizability,
+        passes_sa_threshold,
+    )
+
+    chem, _, _ = require_rdkit()
+    # One scorer for this call, sized to the batch: the docked sets are
+    # disjoint across rounds by construction, so a cache outliving the round
+    # would hold entries that can never be hit again.
+    scorer = SAScoreSynthesizability(
+        threshold=sa_threshold, cache_size=len(candidates)
+    )
+
+    total = len(candidates)
+    valid = 0
+    synthesizable = 0
+    sa_scores: list[float] = []
+    for candidate in candidates:
+        smiles = candidate.x
+        if not isinstance(smiles, str) or chem.MolFromSmiles(smiles) is None:
+            continue
+        valid += 1
+        score = scorer.score(smiles)
+        sa_scores.append(score)
+        if passes_sa_threshold(score, sa_threshold):
+            synthesizable += 1
+
+    metrics = {
+        f"{_DOCKED_CHEMISTRY_PREFIX}/total": float(total),
+        f"{_DOCKED_CHEMISTRY_PREFIX}/valid_count": float(valid),
+        f"{_DOCKED_CHEMISTRY_PREFIX}/validity_rate": valid / total,
+        f"{_DOCKED_CHEMISTRY_PREFIX}/synthesizable_count": float(synthesizable),
+        f"{_DOCKED_CHEMISTRY_PREFIX}/synthesizable_rate": synthesizable / total,
+        f"{_DOCKED_CHEMISTRY_PREFIX}/sa_threshold": float(sa_threshold),
+    }
+    if sa_scores:
+        # The threshold is one cut through a distribution; the mean and the
+        # median say whether a flat rate is hiding a drift toward the cut.
+        ordered = sorted(sa_scores)
+        middle = len(ordered) // 2
+        metrics[f"{_DOCKED_CHEMISTRY_PREFIX}/sa_score_mean"] = float(
+            sum(ordered) / len(ordered)
+        )
+        metrics[f"{_DOCKED_CHEMISTRY_PREFIX}/sa_score_median"] = float(
+            ordered[middle]
+            if len(ordered) % 2
+            else 0.5 * (ordered[middle - 1] + ordered[middle])
+        )
+        metrics[f"{_DOCKED_CHEMISTRY_PREFIX}/sa_score_max"] = float(ordered[-1])
+    return metrics
