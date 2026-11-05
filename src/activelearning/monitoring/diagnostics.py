@@ -12,8 +12,11 @@ import torch
 from matplotlib.figure import Figure
 
 from activelearning.surrogate.eval_metrics import (
+    MIN_CALIBRATION_POINTS,
     predicted_vs_observed_figure,
     prediction_metrics,
+    variance_calibration_figure,
+    variance_calibration_metrics,
 )
 from activelearning.surrogate.plotting import (
     PredictionPanel,
@@ -157,6 +160,21 @@ def evaluate_held_out_set(
         )
         if figure is not None:
             figures[f"{prefix}/predicted_vs_observed"] = figure
+
+    # Whether the LATENT variance -- the one the acquisition consumes, which the
+    # metrics above never see -- is worth believing. On this set because it is
+    # the same molecules every round, so the slope is comparable across rounds.
+    calibration_metrics, calibration_figures = latent_calibration_diagnostics(
+        surrogate,
+        prefix=prefix,
+        title=held_out.name,
+        candidates=held_out.candidates,
+        targets=held_out.targets,
+        include_figure=include_figure,
+        chunk_size=chunk_size,
+    )
+    metrics.update(calibration_metrics)
+    figures.update(calibration_figures)
     return metrics, figures
 
 
@@ -191,6 +209,138 @@ def _predict_encoded_in_chunks(
     return np.concatenate(means), np.concatenate(stds)
 
 
+#: Observed target at or above which a molecule counts as the potent tail, for
+#: the y-stratified calibration readouts. 0.5 is the training subset's
+#: ``keep_above``: the tier the loop exists to grow, and the one whose
+#: acquisition decides where the docking budget goes.
+DEFAULT_HIGH_TARGET_THRESHOLD = 0.5
+
+
+def latent_calibration_diagnostics(
+    surrogate: Surrogate,
+    *,
+    prefix: str,
+    title: str,
+    candidates: Sequence[Candidate],
+    targets: Sequence[float],
+    include_figure: bool,
+    chunk_size: int = _POOL_PREDICT_CHUNK,
+    high_target_threshold: float = DEFAULT_HIGH_TARGET_THRESHOLD,
+) -> tuple[dict[str, int | float], dict[str, Figure]]:
+    """Is the latent variance the acquisition consumes worth believing?
+
+    Every other uncertainty panel in this module reads the TOTAL predictive
+    standard deviation, observation noise included. The acquisition does not:
+    GIBBON consumes the latent variance, so a surrogate whose latent variance
+    is far too small sends the docking budget to molecules it is wrongly
+    confident about, while ``rmse``, ``r2`` and ``coverage_1std`` stay healthy
+    because the noise term masks the error. This measures that directly.
+
+    Both standard deviations come from one encode per chunk and two posterior
+    calls, since the encoding dominates for a store-backed encoder.
+
+    Strata, because a pooled curve hides the case that matters. A surrogate can
+    be calibrated across the bulk of near-inactive molecules and overconfident
+    precisely in the potent tail, and the tail is where the budget goes:
+
+    ``all``
+        Every finite row.
+    ``low_y`` / ``high_y``
+        Split at ``high_target_threshold``. A stratum with fewer than
+        ``MIN_CALIBRATION_POINTS`` rows reports ``nan`` rather than a slope
+        fitted to a handful of molecules, so the high-target stratum stays
+        silent in early rounds and begins reporting as the loop fills it.
+
+    Returns
+    -------
+    tuple[dict, dict[str, Figure]]
+        Metrics under ``<prefix>/calibration/<stratum>/<name>`` and, with
+        ``include_figure``, the reliability curve under
+        ``<prefix>/calibration/reliability``. Both empty when the surrogate
+        cannot produce latent predictions.
+    """
+    predicted = _predict_latent_and_total_in_chunks(surrogate, candidates, chunk_size)
+    if predicted is None:
+        return {}, {}
+    means, latent_stds, total_stds = predicted
+    observed = np.asarray(targets, dtype=np.float64).reshape(-1)
+    if observed.size != means.size:
+        _logger.warning(
+            "Calibration skipped for %s: %d targets against %d predictions.",
+            title,
+            observed.size,
+            means.size,
+        )
+        return {}, {}
+
+    high = observed >= high_target_threshold
+    strata: dict[str, tuple[np.ndarray, ...]] = {
+        "all": (observed, means, latent_stds, total_stds),
+        "low_y": (
+            observed[~high],
+            means[~high],
+            latent_stds[~high],
+            total_stds[~high],
+        ),
+        "high_y": (observed[high], means[high], latent_stds[high], total_stds[high]),
+    }
+
+    metrics: dict[str, int | float] = {}
+    for name, (y, mu, latent, total) in strata.items():
+        for key, value in variance_calibration_metrics(y, mu, latent, total).items():
+            metrics[f"{prefix}/calibration/{name}/{key}"] = value
+    metrics[f"{prefix}/calibration/high_target_threshold"] = float(
+        high_target_threshold
+    )
+
+    figures: dict[str, Figure] = {}
+    if include_figure:
+        figure = variance_calibration_figure(title=title, strata=strata)
+        if figure is not None:
+            figures[f"{prefix}/calibration/reliability"] = figure
+    return metrics, figures
+
+
+def _predict_latent_and_total_in_chunks(
+    surrogate: Surrogate,
+    candidates: Sequence[Candidate],
+    chunk_size: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+    """Return means, latent standard deviations and total ones, or ``None``.
+
+    Needs ``encode_candidates`` and ``predict_encoded``: ``predict`` does not
+    expose the observation-noise flag, so it cannot give the latent standard
+    deviation at all. A surrogate without them records no calibration rather
+    than a wrong one.
+    """
+    encode = getattr(surrogate, "encode_candidates", None)
+    predict_encoded = getattr(surrogate, "predict_encoded", None)
+    if not callable(encode) or not callable(predict_encoded) or not candidates:
+        return None
+    means: list[np.ndarray] = []
+    latent_stds: list[np.ndarray] = []
+    total_stds: list[np.ndarray] = []
+    try:
+        for start in range(0, len(candidates), chunk_size):
+            chunk = candidates[start : start + chunk_size]
+            features = encode(chunk)
+            latent = predict_encoded(features, observation_noise=False)
+            total = predict_encoded(features, observation_noise=True)
+            means.append(np.asarray(latent["mean"], dtype=np.float64).reshape(-1))
+            latent_stds.append(np.asarray(latent["std"], dtype=np.float64).reshape(-1))
+            total_stds.append(np.asarray(total["std"], dtype=np.float64).reshape(-1))
+    except (NotImplementedError, TypeError, ValueError, RuntimeError, KeyError):
+        _logger.warning("Latent calibration prediction failed.", exc_info=True)
+        return None
+    if not means:
+        return None
+    return (
+        np.concatenate(means),
+        np.concatenate(latent_stds),
+        np.concatenate(total_stds),
+    )
+
+
 def surrogate_diagnostics(
     surrogate: Surrogate,
     record: "RoundRecord",
@@ -217,12 +367,40 @@ def surrogate_diagnostics(
         max_points=max_points,
     )
     metrics: dict[str, int | float] = {}
+    figures: dict[str, Figure] = {}
     if current_panel is not None:
         _add_prediction_metrics(
             metrics,
             "surrogate/general/held_out/current_round",
             current_panel,
         )
+        # Latent-variance calibration on the molecules the POLICY proposed and
+        # the acquisition actually ranked. The fixed evaluation set says whether
+        # the surrogate is calibrated on the library; this says whether it is
+        # calibrated where the budget was spent, which is off-distribution and
+        # can differ sharply. Predicted before these enter the archive, so the
+        # reading stays leakage-free like the metrics above.
+        # Candidates and targets must be filtered TOGETHER: a failed dock
+        # returns a non-finite y, so taking all the candidates and only the
+        # finite targets would misalign every pair after the first failure.
+        # ~8% of docks failed in the completed 10-round run.
+        scored = [
+            (candidate, target)
+            for candidate, observation in zip(
+                record.selected_candidates, record.queried_observations
+            )
+            if (target := _finite_scalar(observation.y)) is not None
+        ]
+        calibration_metrics, calibration_figures = latent_calibration_diagnostics(
+            surrogate,
+            prefix="surrogate/general/held_out/current_round",
+            title="Current round (policy proposals)",
+            candidates=[candidate for candidate, _ in scored],
+            targets=[target for _, target in scored],
+            include_figure=include_figures,
+        )
+        metrics.update(calibration_metrics)
+        figures.update(calibration_figures)
 
     updated_history = append_prequential_panel(
         prequential_history,
@@ -237,7 +415,6 @@ def surrogate_diagnostics(
             rolling_panel,
         )
 
-    figures: dict[str, Figure] = {}
     if include_figures:
         figure_panels: list[PredictionPanel] = []
         if current_panel is not None:

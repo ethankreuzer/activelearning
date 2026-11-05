@@ -60,6 +60,25 @@ surrogate:
       # most of them. The value the reward-shape arms ran with.
       cache_size: 4096
   training_subset:
+    # HOW THE LABELED DATA IS MANAGED OVER ROUNDS. This node is the choice, and
+    # the alternative is not a variant of the block below but a replacement of
+    # it:
+    #
+    #   StratifiedFPS (here)  A fixed-size subset of the archive, reselected
+    #       every round. The fit stays `size` rows however large the archive
+    #       gets, so cost and memory are flat and the round count is bounded by
+    #       the docking budget. What sf-10round-5000dock-5000steps-seed42 ran.
+    #
+    #   FullArchive           No subsetting; the GP fits the whole archive,
+    #       which grows each round. The kernel matrix is O(n^2), so the round
+    #       count is bounded by VRAM instead: ~6 rounds from a 25,000-row start.
+    #       Select it from the job script (`dataset_mode=full`). It REPLACES
+    #       this node rather than merging onto it, which takes two pieces --
+    #       config/ampc/overrides/full_archive.yaml nulls the node and an
+    #       override supplies the new one -- because FullArchive has no `size`,
+    #       `keep_above` or `band_edges` and forbids them. Do not hand-edit this
+    #       node to switch: a half-merged node is refused at config load.
+    #
     # The selection every arm since 2026-10-22 was built with: keep the top
     # tier outright, then fill the target bands by farthest-point sampling in
     # feature space. Replaced ThresholdRandom, whose uniform random fill was a
@@ -230,10 +249,16 @@ oracle:
   pki_threshold: 6.5
 
 budget:
-  # TEST RUN (2026-10-23): two rounds at 1,000 docking evaluations each, to
-  # exercise the loop end to end rather than to answer anything. The real run
-  # is ~10 rounds at 5,000; see MULTI_ROUND_AL_PLAN.md. Raising these three
-  # numbers together is the only change needed.
+  # The values below are the END-TO-END TEST's (2026-10-23): two rounds at
+  # 1,000 docking evaluations each, to exercise the loop rather than to answer
+  # anything. Every real run overrides all three from the job script, which is
+  # where the shape of a run is recorded -- `jobs/single_fidelity_al_nibi.sh
+  # <run_name> <rounds> <docks_per_round>`. The completed 10-round run was
+  # `10 5000`; see MULTI_ROUND_AL_PLAN.md.
+  #
+  # With `dataset_mode=full` the round count is NOT free: the GP fits the whole
+  # archive, which gains ~4,700 rows a round and hits its 46,000-row VRAM cap
+  # after about six. Asking for more ends the run with a ValueError mid-flight.
   #
   # The pool stays at 100,000 generated molecules per round (sampler.n_samples
   # above): what is shortened is the docking, not the generation or the

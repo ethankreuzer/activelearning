@@ -12,11 +12,14 @@ from torch import Tensor
 
 from activelearning.surrogate.encoder import FixedEncoder
 from activelearning.surrogate.training_subset import (
+    FullArchiveSubsetSelector,
+    FullArchiveSubsetSelectorConfig,
     StratifiedFPSSubsetSelector,
     StratifiedFPSSubsetSelectorConfig,
     ThresholdRandomSubsetSelector,
     ThresholdRandomSubsetSelectorConfig,
     TrainingSubsetSelectorConfig,
+    predicted_fit_peak_gib,
 )
 from activelearning.utils.types import Observation
 
@@ -215,3 +218,152 @@ def test_stratified_fps_config_builds_the_selector() -> None:
     assert selector.keep_above == 0.5
     assert selector.band_edges == [0.03482, 0.23182]
     assert selector.seed == 7
+
+
+def test_full_archive_selects_every_row_in_order() -> None:
+    """No selection: the training set is the archive, whatever its size."""
+    archive = _archive([0.01 * i for i in range(137)])
+    selector = FullArchiveSubsetSelector()
+
+    subset = selector.select(archive, encoder=_UnusedEncoder())
+
+    assert subset.indices == list(range(137))
+
+
+def test_full_archive_grows_with_the_archive() -> None:
+    """The regime's whole point: successive rounds fit successively more rows.
+
+    The subsetting selectors would return the same count both times.
+    """
+    selector = FullArchiveSubsetSelector()
+    encoder = _UnusedEncoder()
+
+    first = selector.select(_archive([0.01] * 25000), encoder=encoder)
+    second = selector.select(_archive([0.01] * 29700), encoder=encoder)
+
+    assert len(first.indices) == 25000
+    assert len(second.indices) == 29700
+
+
+def test_full_archive_counts_the_top_tier_without_selecting_on_it() -> None:
+    """top_threshold only reports, so the subset is unchanged by it."""
+    archive = _archive([0.9 if i % 10 == 0 else 0.01 for i in range(200)])
+    selector = FullArchiveSubsetSelector(top_threshold=0.5)
+
+    subset = selector.select(archive, encoder=_UnusedEncoder())
+
+    assert subset.top_count == 20
+    assert subset.indices == list(range(200))
+
+
+def test_full_archive_reports_no_top_tier_without_a_threshold() -> None:
+    """Unset, top_count is 0 rather than the archive size."""
+    archive = _archive([0.9] * 10)
+
+    subset = FullArchiveSubsetSelector().select(archive, encoder=_UnusedEncoder())
+
+    assert subset.top_count == 0
+
+
+def test_full_archive_handles_an_empty_archive() -> None:
+    """An empty archive gives an empty subset, not a numpy error."""
+    subset = FullArchiveSubsetSelector(top_threshold=0.5).select(
+        [], encoder=_UnusedEncoder()
+    )
+
+    assert subset.indices == []
+    assert subset.top_count == 0
+
+
+def test_full_archive_stops_once_the_archive_passes_max_size() -> None:
+    """The cap turns a CUDA OOM into a message naming the sizes involved."""
+    selector = FullArchiveSubsetSelector(max_size=46000)
+
+    with pytest.raises(ValueError, match="past the configured max_size") as raised:
+        selector.select(_archive([0.01] * 46001), encoder=_UnusedEncoder())
+
+    message = str(raised.value)
+    assert "46001" in message
+    assert "46000" in message
+    # The predicted peak is in the message, so the error says how far over the
+    # device the fit would have been rather than only that a limit was crossed.
+    assert f"{predicted_fit_peak_gib(46001):.1f}" in message
+
+
+def test_full_archive_allows_exactly_max_size() -> None:
+    """The cap is the largest permitted size, not the first refused one."""
+    selector = FullArchiveSubsetSelector(max_size=100)
+
+    subset = selector.select(_archive([0.01] * 100), encoder=_UnusedEncoder())
+
+    assert len(subset.indices) == 100
+
+
+def test_full_archive_without_a_cap_fits_whatever_it_is_given() -> None:
+    """Unset, nothing but the device limits the size."""
+    selector = FullArchiveSubsetSelector()
+
+    subset = selector.select(_archive([0.01] * 60000), encoder=_UnusedEncoder())
+
+    assert len(subset.indices) == 60000
+
+
+def test_full_archive_rejects_a_non_positive_cap() -> None:
+    """A cap below one could never admit a fit."""
+    with pytest.raises(ValueError, match="max_size must be positive"):
+        FullArchiveSubsetSelector(max_size=0)
+
+
+def test_full_archive_exposes_no_band_diagnostics() -> None:
+    """There are no bands, and the surrogate reads the attribute with getattr."""
+    selector = FullArchiveSubsetSelector()
+
+    assert getattr(selector, "last_diagnostics", {}) == {}
+
+
+def test_predicted_fit_peak_matches_the_measured_probes() -> None:
+    """The model behind the cap's message reproduces what the probes measured.
+
+    Round 1 of job 26162761 peaked at 48.58 GiB at n=40,000 and round 1 of job
+    26162757 at 61.29 GiB at n=45,000, both on an otherwise empty device.
+    """
+    assert predicted_fit_peak_gib(40000) == pytest.approx(48.58, abs=0.15)
+    assert predicted_fit_peak_gib(45000) == pytest.approx(61.29, abs=0.15)
+
+
+def test_full_archive_config_builds_the_selector() -> None:
+    """The union discriminates on type and passes every setting through."""
+    data = {"type": "FullArchive", "top_threshold": 0.5, "max_size": 46000}
+
+    parsed = TypeAdapter(TrainingSubsetSelectorConfig).validate_python(data)
+    selector = parsed.build()
+
+    assert isinstance(parsed, FullArchiveSubsetSelectorConfig)
+    assert isinstance(selector, FullArchiveSubsetSelector)
+    assert selector.top_threshold == 0.5
+    assert selector.max_size == 46000
+
+
+def test_full_archive_config_defaults_to_no_threshold_and_no_cap() -> None:
+    """The type alone is a valid config; it needs no size."""
+    parsed = TypeAdapter(TrainingSubsetSelectorConfig).validate_python(
+        {"type": "FullArchive"}
+    )
+    selector = parsed.build()
+
+    assert isinstance(selector, FullArchiveSubsetSelector)
+    assert selector.top_threshold is None
+    assert selector.max_size is None
+
+
+def test_full_archive_config_rejects_a_leftover_subset_size() -> None:
+    """A merged-not-replaced switch must fail rather than pick a regime.
+
+    `surrogate.training_subset.type=FullArchive` deep-merges onto the
+    StratifiedFPS block and leaves its keys behind; the config carrying both is
+    ambiguous about which regime was meant, so it is refused.
+    """
+    with pytest.raises(ValueError):
+        TypeAdapter(TrainingSubsetSelectorConfig).validate_python(
+            {"type": "FullArchive", "size": 25000, "keep_above": 0.5}
+        )

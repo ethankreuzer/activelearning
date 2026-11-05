@@ -151,7 +151,9 @@ def test_evaluation_chunking_does_not_change_the_metrics() -> None:
         surrogate, held_out, include_figure=False, chunk_size=1000
     )
 
-    assert few == pytest.approx(many)
+    # 40 points is below MIN_CALIBRATION_POINTS, so the calibration readouts are
+    # nan in both; nan_ok makes nan compare equal to nan.
+    assert few == pytest.approx(many, nan_ok=True)
 
 
 def test_evaluation_without_a_figure_still_reports_metrics() -> None:

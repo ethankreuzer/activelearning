@@ -1,0 +1,30 @@
+# Clear the training-subset node so a FullArchive block can take its place.
+#
+# This file is HALF of the switch and does nothing useful alone. Pass it after
+# the base config, together with the dotlist override that supplies the new
+# node -- which is what `jobs/single_fidelity_al_nibi.sh <...> full` does:
+#
+#   scripts/run_with_sigterm_flush.py \
+#     config/ampc/subset_fixed_gp.yaml \
+#     config/ampc/overrides/full_archive.yaml \
+#     "surrogate.training_subset={type: FullArchive, top_threshold: 0.5, max_size: 46000}"
+#
+# WHY A FILE RATHER THAN ONE OVERRIDE. The two regimes do not share a schema:
+# FullArchive has no `size`, `keep_above` or `band_edges`, and its config sets
+# extra="forbid". OmegaConf merges mappings recursively, so the override alone
+# would leave the StratifiedFPS keys sitting beside the new `type` and the
+# config would be refused. Setting the node to null first means the override
+# merges onto nothing and REPLACES it, which is the semantics wanted.
+#
+# Neither half can misfire quietly. This file alone leaves training_subset null,
+# which no member of the union validates; the override alone leaves the stale
+# keys, which extra="forbid" rejects. A partial switch fails at config load, not
+# thirty hours into a run.
+#
+# Note the contrast with jobs/single_fidelity_al_memcheck.sh, which swaps the
+# oracle with a bare override and needs no such file. That works only because
+# ConstantOracleConfig leaves pydantic's extra="ignore" default in place and so
+# discards the Dock3Oracle keys the merge leaves behind. It is not a pattern to
+# copy here.
+surrogate:
+  training_subset: null

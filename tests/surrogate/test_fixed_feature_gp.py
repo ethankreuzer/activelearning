@@ -33,7 +33,10 @@ from activelearning.surrogate.fixed_feature_gp import (
     accept_abnormal_lbfgsb_warnings,
 )
 from activelearning.surrogate.subset_gp import SubsetFixedFeatureGPSurrogate
-from activelearning.surrogate.training_subset import ThresholdRandomSubsetSelector
+from activelearning.surrogate.training_subset import (
+    FullArchiveSubsetSelector,
+    ThresholdRandomSubsetSelector,
+)
 from activelearning.utils.types import Candidate, Observation
 
 SMILES = ("C", "CC", "CCO", "CCN", "CCCO", "OCCO", "NCCN", "CCCCC")
@@ -918,3 +921,45 @@ def test_subset_surrogate_records_fit_timings_without_cuda(tmp_path: Path) -> No
         assert profiling["profiling/surrogate/cuda_released_before_fit_gib"] >= 0.0
     else:
         assert cuda_keys == []
+
+
+def test_subset_surrogate_fits_the_whole_archive_as_it_grows(tmp_path: Path) -> None:
+    """The FullArchive regime: the training set IS the archive, every round.
+
+    The behaviour the regime exists for, and the one a subsetting selector
+    cannot produce: the second fit is strictly larger than the first because the
+    archive grew, rather than being pinned at a configured size. The composition
+    metrics must say so too -- an archive fraction of 1.0 is how a run reports
+    that nothing mediated between what was docked and what the GP saw.
+    """
+    archive = _observations()
+    surrogate = SubsetFixedFeatureGPSurrogate(
+        _SmilesFeatureEncoder(),
+        selector=FullArchiveSubsetSelector(top_threshold=0.5),
+        subset_dir=tmp_path,
+    )
+
+    surrogate.fit(archive[:5])
+    first, _ = surrogate.drain_round_diagnostics(include_figures=False, max_points=0)
+    first_profiling = surrogate.get_fit_profiling()
+
+    surrogate.fit(archive)
+    second, _ = surrogate.drain_round_diagnostics(include_figures=False, max_points=0)
+    second_profiling = surrogate.get_fit_profiling()
+
+    assert first_profiling["profiling/surrogate/subset_size"] == 5.0
+    assert second_profiling["profiling/surrogate/subset_size"] == float(len(archive))
+    assert first_profiling["profiling/surrogate/archive_size"] == 5.0
+    assert second_profiling["profiling/surrogate/archive_size"] == float(len(archive))
+
+    assert first["surrogate/subset_gp/train/archive_fraction"] == 1.0
+    assert second["surrogate/subset_gp/train/archive_fraction"] == 1.0
+    assert second["surrogate/subset_gp/train/size"] == len(archive)
+
+    # No selection happened, so there is nothing to report per band. The
+    # surrogate reads last_diagnostics with getattr, so a selector that never
+    # sets it must simply contribute no band keys.
+    assert not [key for key in second if "/band_" in key]
+
+    train_X, _ = surrogate.get_train_data()
+    assert train_X.shape == (len(archive), 4)

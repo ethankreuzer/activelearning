@@ -31,6 +31,7 @@ import shlex
 import subprocess
 import sys
 from collections.abc import Iterator, Sequence
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -49,6 +50,8 @@ _LOG_LEVEL_VARIABLE = "ACTIVELEARNING_LOG_LEVEL"
 
 #: Marks the handler this module installed, so configuring twice is harmless.
 _HANDLER_NAME = "activelearning-stdout"
+
+_module_logger = logging.getLogger(__name__)
 
 
 def configure_logging(level: int | str | None = None) -> None:
@@ -161,6 +164,26 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     from activelearning.active_learning import active_learning
     from activelearning.runtime import bind_runtime_context
+    from activelearning.utils.seeding import set_global_seed
+
+    # Seed before anything is built. runtime.seed was reaching only the
+    # components that read it explicitly -- the S3-GFN sampler reseeds per round
+    # and the subset selectors carry their own generators -- while NumPy's
+    # global RNG and the cuDNN determinism flags were never set at all, so a
+    # config advertising seed 42 did not actually govern the whole run.
+    set_global_seed(cfg.runtime.seed)
+
+    # Built once and shared: the run writer persists it to disk and the logger
+    # sends it to the tracking backend, so the two cannot disagree about what
+    # produced the run.
+    run_metadata = _build_run_metadata(
+        config_paths=config_paths,
+        overrides=overrides,
+        raw_cfg=raw_cfg,
+        cfg=cfg,
+    )
+    _warn_on_dirty_working_tree(run_metadata)
+    _save_uncommitted_diff(run_metadata, cfg=cfg)
 
     # Build instances of active learning components from pydantic config models
     dataset = cfg.dataset.build()
@@ -172,14 +195,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     budget = cfg.budget.build()
     logger = cfg.logger.build() if cfg.logger is not None else None
     run_writer = (
-        cfg.run_writer.build(
-            metadata=_build_run_metadata(
-                config_paths=config_paths,
-                overrides=overrides,
-                raw_cfg=raw_cfg,
-                cfg=cfg,
-            )
-        )
+        cfg.run_writer.build(metadata=run_metadata)
         if cfg.run_writer is not None
         else None
     )
@@ -199,6 +215,18 @@ def main(argv: Sequence[str] | None = None) -> None:
         # invisible unless written out. This dump carries every field, default
         # or not, so a run in the table always says exactly what it ran.
         logger.log_config({"effective": cfg.model_dump(mode="json")})
+        # Provenance too, which until now reached only run_manifest.json on
+        # disk. A tracking-backend run that cannot say which commit, which
+        # archive file and which encoder checkpoint produced it is not a record
+        # of an experiment, and the on-disk manifest is no help once the output
+        # directory is moved or deleted. `config` and `effective_config` are
+        # omitted here because the two calls above already carry them.
+        logger.log_config(
+            {
+                "cli": run_metadata["cli"],
+                "provenance": run_metadata["provenance"],
+            }
+        )
 
     # Run active learning campaign
     dataset, total_cost, num_rounds = active_learning(
@@ -240,10 +268,67 @@ def _build_run_metadata(
         },
         "provenance": {
             "git_commit_sha": _git_commit_sha(),
+            # A SHA describes the code only if the tree matched it.
+            **_git_working_tree_state(),
             "resolved_config_md5": _stable_md5(resolved_config),
             "input_files": _collect_input_files(config_paths, resolved_config),
         },
     }
+
+
+#: Filename of the saved working-tree patch, inside the run's output directory.
+_UNCOMMITTED_PATCH_NAME = "uncommitted.patch"
+
+
+def _warn_on_dirty_working_tree(run_metadata: dict[str, Any]) -> None:
+    """Say loudly, at startup, that the recorded commit is not what is running."""
+    provenance = run_metadata.get("provenance", {})
+    if not provenance.get("dirty"):
+        return
+    paths = provenance.get("dirty_paths") or []
+    _module_logger.warning(
+        "Working tree differs from HEAD (%s): %d tracked file(s) modified -- %s. "
+        "The recorded commit %s does NOT describe the code being run. The diff "
+        "is saved beside the run outputs as %s and its md5 is in the run's "
+        "provenance, but committing before a long run is the only way to make "
+        "the run reproducible from the commit alone.",
+        provenance.get("git_commit_sha"),
+        len(paths),
+        ", ".join(paths[:10]) + (", ..." if len(paths) > 10 else ""),
+        provenance.get("git_commit_sha"),
+        _UNCOMMITTED_PATCH_NAME,
+    )
+
+
+def _save_uncommitted_diff(run_metadata: dict[str, Any], *, cfg: Any) -> None:
+    """Write the working-tree patch beside the run's outputs, when it is dirty.
+
+    The digest in the provenance distinguishes two dirty runs; the patch itself
+    is what lets one be reconstructed. Nothing here is allowed to fail a run:
+    a run that cannot record its diff is worse off, not broken.
+    """
+    provenance = run_metadata.get("provenance", {})
+    if not provenance.get("dirty"):
+        return
+    output_dir = getattr(getattr(cfg, "run_writer", None), "output_dir", None)
+    if output_dir is None:
+        _module_logger.warning(
+            "No run_writer output directory, so the working-tree patch cannot be "
+            "saved. Only its md5 is recorded."
+        )
+        return
+    diff = _git_uncommitted_diff()
+    if not diff:
+        return
+    try:
+        destination = Path(output_dir)
+        destination.mkdir(parents=True, exist_ok=True)
+        patch_path = destination / _UNCOMMITTED_PATCH_NAME
+        patch_path.write_text(diff, encoding="utf-8")
+    except OSError as error:
+        _module_logger.warning("Could not save the working-tree patch: %s", error)
+        return
+    run_metadata["provenance"]["uncommitted_diff_path"] = _display_path(patch_path)
 
 
 def _format_activelearning_command(
@@ -269,6 +354,78 @@ def _git_commit_sha() -> str | None:
     return sha or None
 
 
+def _git_working_tree_state() -> dict[str, Any]:
+    """Return how the working tree differs from HEAD, if at all.
+
+    A commit SHA alone does not identify the code that ran: a run launched from
+    a modified tree records a SHA describing something else, and nothing in the
+    run says so. This reports the difference so a run can be trusted or
+    distrusted on its own evidence.
+
+    Tracked modifications and untracked files are reported separately and only
+    the former set ``dirty``. An untracked file does not change what the
+    recorded commit means -- this repository habitually carries a few unfinished
+    job scripts -- so counting them as dirty would make the flag meaningless.
+
+    Returns
+    -------
+    dict
+        ``dirty`` (None when git is unavailable), ``dirty_paths``,
+        ``untracked_paths`` and ``uncommitted_diff_md5``, the digest of
+        ``git diff HEAD`` that distinguishes two runs from differently modified
+        trees.
+    """
+    unknown: dict[str, Any] = {
+        "dirty": None,
+        "dirty_paths": [],
+        "untracked_paths": [],
+        "uncommitted_diff_md5": None,
+    }
+    status = subprocess.run(
+        ["git", "status", "--porcelain"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if status.returncode != 0:
+        return unknown
+
+    dirty_paths: list[str] = []
+    untracked_paths: list[str] = []
+    for line in status.stdout.splitlines():
+        if not line.strip():
+            continue
+        # Porcelain v1: two status characters, a space, then the path.
+        entry = line[3:].strip()
+        if line.startswith("??"):
+            untracked_paths.append(entry)
+        else:
+            dirty_paths.append(entry)
+
+    state: dict[str, Any] = {
+        "dirty": bool(dirty_paths),
+        "dirty_paths": sorted(dirty_paths),
+        "untracked_paths": sorted(untracked_paths),
+        "uncommitted_diff_md5": None,
+    }
+    if dirty_paths:
+        state["uncommitted_diff_md5"] = _stable_text_md5(_git_uncommitted_diff() or "")
+    return state
+
+
+def _git_uncommitted_diff() -> str | None:
+    """Return the full diff of the working tree against HEAD, staged included."""
+    result = subprocess.run(
+        ["git", "diff", "HEAD"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return None
+    return result.stdout
+
+
 def _collect_input_files(
     config_paths: Sequence[Path],
     resolved_config: Any,
@@ -282,8 +439,8 @@ def _collect_input_files(
             recorded_files.append(_file_record(path))
             seen_paths.add(path)
 
-    for candidate in _iter_config_file_candidates(resolved_config):
-        resolved_candidate = _resolve_existing_file(candidate)
+    for candidate, is_directory in _iter_config_file_candidates(resolved_config):
+        resolved_candidate = _resolve_existing_path(candidate, directory=is_directory)
         if resolved_candidate is None or resolved_candidate in seen_paths:
             continue
         recorded_files.append(_file_record(resolved_candidate))
@@ -292,11 +449,53 @@ def _collect_input_files(
     return recorded_files
 
 
-def _iter_config_file_candidates(value: Any, key: str | None = None) -> Iterator[str]:
-    """Yield file-like config values while skipping known output paths."""
+#: Config keys whose string values name an input FILE worth recording.
+#: Matched on the key, not the value, because a config is full of strings and
+#: only these are inputs. Extended past the original four generic names after
+#: an audit of sf-10round-5000dock-5000steps-seed42, whose manifest recorded
+#: three files and silently omitted the rest: the MiniMol checkpoint that
+#: defines the GP's entire feature space, the fixed-feature store and the SMILES
+#: list that fixes its row order, the GFN prior, and the DOCK3 installation.
+#: A value that is not an existing file -- a Hugging Face hub id under
+#: ``model_name_or_path``, say -- resolves to nothing and is skipped.
+_INPUT_FILE_KEYS = frozenset(
+    {
+        "path",
+        "config_path",
+        "file",
+        "file_path",
+        "checkpoint_path",
+        "state_path",
+        "store_path",
+        "smiles_path",
+        "model_name_or_path",
+        "tokenizer_name_or_path",
+        "indock_template",
+        "dock64_exe",
+        "dockenv_sh",
+    }
+)
+
+#: Config keys naming an input DIRECTORY. Recorded by path alone: hashing a tree
+#: means walking it, and the DOCK3 dockfiles directory is shared, large and not
+#: ours. Naming it still tells a reader which installation was used.
+_INPUT_DIR_KEYS = frozenset({"package_path", "dockfiles_dir"})
+
+#: Keys that name where a run WRITES. Never recorded as inputs.
+_OUTPUT_KEYS = frozenset({"output_dir", "log_dir", "cache_dir", "subset_dir"})
+
+
+def _iter_config_file_candidates(
+    value: Any, key: str | None = None
+) -> Iterator[tuple[str, bool]]:
+    """Yield ``(path, is_directory_key)`` for input-like config values.
+
+    Output destinations are skipped: recording them as inputs would hash this
+    run's own artifacts and change the provenance from one run to the next.
+    """
     if isinstance(value, dict):
         for child_key, child_value in value.items():
-            if child_key in {"output_dir", "log_dir"}:
+            if child_key in _OUTPUT_KEYS:
                 continue
             yield from _iter_config_file_candidates(child_value, child_key)
         return
@@ -306,23 +505,83 @@ def _iter_config_file_candidates(value: Any, key: str | None = None) -> Iterator
             yield from _iter_config_file_candidates(child_value, key)
         return
 
-    if isinstance(value, str) and key in {"path", "config_path", "file", "file_path"}:
-        yield value
+    if not isinstance(value, str):
+        return
+    if key in _INPUT_FILE_KEYS:
+        yield value, False
+    elif key in _INPUT_DIR_KEYS:
+        yield value, True
+
+
+def _resolve_existing_path(path_like: str, *, directory: bool = False) -> Path | None:
+    """Resolve a config path against the working directory if it exists.
+
+    Symlinks are followed, because the fixed-feature store is a link into
+    project space and the target is the input that matters.
+    """
+    candidate = Path(path_like).expanduser()
+    if not candidate.is_absolute():
+        candidate = Path.cwd() / candidate
+    try:
+        candidate = candidate.resolve()
+    except OSError:
+        return None
+    if directory:
+        return candidate if candidate.is_dir() else None
+    return candidate if candidate.is_file() else None
 
 
 def _resolve_existing_file(path_like: str) -> Path | None:
-    """Resolve a config path against the current working directory if it exists."""
-    candidate = Path(path_like).expanduser()
-    if not candidate.is_absolute():
-        candidate = (Path.cwd() / candidate).resolve()
-    if candidate.is_file():
-        return candidate
-    return None
+    """Resolve a config path to an existing file, or ``None``."""
+    return _resolve_existing_path(path_like, directory=False)
 
 
-def _file_record(path: Path) -> dict[str, str]:
-    """Return a stable path/hash record for one file."""
-    return {"path": _display_path(path), "md5": _file_md5(path)}
+#: Files above this size are identified by size and mtime rather than a digest.
+#: The fixed-feature store is 20.5 GB on a networked filesystem; hashing it at
+#: every run start would read all of it for no gain, since nothing rewrites it
+#: in place. The threshold is above every other input the AmpC configs name --
+#: the largest are the 33 MB MiniMol checkpoint and the 23 MB held-out set --
+#: so those are still hashed.
+_MAX_HASHED_BYTES = 256 * 1024 * 1024
+
+
+def _file_record(path: Path) -> dict[str, Any]:
+    """Return a path, size and digest record for one input.
+
+    ``md5`` is ``None`` for a directory or an oversized file, and
+    ``md5_skipped`` then says why. A null digest must never read as "this input
+    was unchanged".
+    """
+    record: dict[str, Any] = {"path": _display_path(path)}
+    try:
+        stat = path.stat()
+    except OSError as error:
+        record["md5"] = None
+        record["md5_skipped"] = f"could not stat: {error.strerror or error}"
+        return record
+
+    if path.is_dir():
+        record["kind"] = "directory"
+        record["md5"] = None
+        record["md5_skipped"] = "directory; recorded by path only"
+        return record
+
+    record["bytes"] = stat.st_size
+    record["mtime"] = datetime.fromtimestamp(
+        stat.st_mtime, tz=timezone.utc
+    ).isoformat()
+    if stat.st_size > _MAX_HASHED_BYTES:
+        record["md5"] = None
+        record["md5_skipped"] = (
+            f"larger than {_MAX_HASHED_BYTES} bytes; identified by size and mtime"
+        )
+        return record
+    try:
+        record["md5"] = _file_md5(path)
+    except OSError as error:
+        record["md5"] = None
+        record["md5_skipped"] = f"could not read: {error.strerror or error}"
+    return record
 
 
 def _display_path(path: Path) -> str:
@@ -348,6 +607,11 @@ def _stable_md5(payload: Any) -> str:
         "utf-8"
     )
     return hashlib.md5(encoded_payload).hexdigest()
+
+
+def _stable_text_md5(text: str) -> str:
+    """Compute the MD5 digest of a string."""
+    return hashlib.md5(text.encode("utf-8")).hexdigest()
 
 
 if __name__ == "__main__":
