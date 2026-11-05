@@ -687,3 +687,130 @@ def test_run_writer_skips_scored_samples_with_mismatched_scores(tmp_path) -> Non
     run_writer.record_round(_scored_round_record(short_scores))
 
     assert not (tmp_path / _SCORED_SAMPLES_PATH).exists()
+
+
+def test_scored_samples_carry_the_reward_scale_the_policy_trained_on(
+    tmp_path,
+) -> None:
+    """The floored log beside the raw value, matching reward/trajectory.
+
+    acquisition_score is unreadable on the scale the policy sees: the floor at
+    -150 nats is a score of 7.2e-66, so a pool row at 1.4e-69 is already below
+    it. The new column is the quantity the reward is built from, bounded by the
+    floor and 0, which is what the trajectory chart plots.
+    """
+    run_writer = JSONLinesRunWriter(
+        output_dir=tmp_path, reward_transform="power", log_score_floor=-150.0
+    )
+    run_writer.start_run({})
+    scores = SelectionScores(
+        # A readable score, a zero that underflowed, and one whose log is
+        # already past the floor.
+        acquisition_scores=(0.2, 0.0, 0.9, 1.4e-69),
+        ranking_scores=(0.2, 0.0, 0.9, 1.4e-69),
+        selected_indices=(2, 0),
+    )
+
+    run_writer.record_round(_scored_round_record(scores))
+
+    with (tmp_path / _SCORED_SAMPLES_PATH).open(newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    reward_inputs = [float(row["reward_input_score"]) for row in rows]
+    assert reward_inputs[0] == pytest.approx(math.log(0.2))
+    assert reward_inputs[2] == pytest.approx(math.log(0.9))
+    # The underflowed zero and the row below the floor are both AT the floor,
+    # and so are reward-identical: the column has to show that rather than
+    # imply a distinction the policy never saw.
+    assert reward_inputs[1] == pytest.approx(-150.0)
+    assert reward_inputs[3] == pytest.approx(-150.0)
+    # The raw value is kept, so ranking_score still matches what the selector
+    # ranked on and earlier runs stay comparable.
+    assert [float(row["acquisition_score"]) for row in rows] == [
+        0.2,
+        0.0,
+        0.9,
+        1.4e-69,
+    ]
+    # The scale the chart draws: bounded by the floor below and 0 above.
+    assert all(-150.0 <= value <= 0.0 for value in reward_inputs)
+
+
+def test_scored_samples_omit_the_reward_scale_without_a_reward_shape(
+    tmp_path,
+) -> None:
+    """No configured transform, no column -- rather than a guessed scale."""
+    run_writer = JSONLinesRunWriter(output_dir=tmp_path)
+    run_writer.start_run({})
+
+    run_writer.record_round(_scored_round_record(_SCORES))
+
+    with (tmp_path / _SCORED_SAMPLES_PATH).open(newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    assert "reward_input_score" not in rows[0]
+
+
+def test_scored_samples_omit_the_reward_scale_for_a_per_batch_floor(
+    tmp_path,
+) -> None:
+    """Under `power` with no fixed floor the scale is not defined for a pool.
+
+    The floor then sits a fixed spread below each BATCH's own maximum, and a
+    100k pool is not one of the sampler's batches, so computing it here would
+    invent a number the policy never used.
+    """
+    run_writer = JSONLinesRunWriter(
+        output_dir=tmp_path, reward_transform="power", log_score_floor=None
+    )
+    run_writer.start_run({})
+
+    run_writer.record_round(_scored_round_record(_SCORES))
+
+    with (tmp_path / _SCORED_SAMPLES_PATH).open(newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    assert "reward_input_score" not in rows[0]
+
+
+def test_scored_samples_keep_the_pool_when_the_reward_scale_cannot_be_built(
+    tmp_path,
+) -> None:
+    """A negative score has no logarithm, so the column goes, not the round."""
+    run_writer = JSONLinesRunWriter(
+        output_dir=tmp_path, reward_transform="power", log_score_floor=-150.0
+    )
+    run_writer.start_run({})
+    scores = SelectionScores(
+        acquisition_scores=(0.2, -1.0, 0.9, 0.1),
+        ranking_scores=(0.2, -1.0, 0.9, 0.1),
+        selected_indices=(2, 0),
+    )
+
+    run_writer.record_round(_scored_round_record(scores))
+
+    with (tmp_path / _SCORED_SAMPLES_PATH).open(newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    assert "reward_input_score" not in rows[0]
+    assert [float(row["acquisition_score"]) for row in rows] == [0.2, -1.0, 0.9, 0.1]
+
+
+def test_selected_samples_carry_the_reward_scale_too(tmp_path) -> None:
+    """The small file worth uploading has the same columns as the pool.
+
+    Both files are written in POOL order -- one pass over the pool mirrors the
+    selected rows into the second file -- so indices 0 and 2 appear in that
+    order even though index 2 was selected first. ``selection_rank`` is what
+    carries the selection order.
+    """
+    run_writer = JSONLinesRunWriter(
+        output_dir=tmp_path, reward_transform="power", log_score_floor=-150.0
+    )
+    run_writer.start_run({})
+
+    run_writer.record_round(_scored_round_record(_SCORES))
+
+    with (tmp_path / _SELECTED_SAMPLES_PATH).open(newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    assert [row["sample_index"] for row in rows] == ["0", "2"]
+    assert [row["selection_rank"] for row in rows] == ["1", "0"]
+    assert [float(row["reward_input_score"]) for row in rows] == pytest.approx(
+        [math.log(0.2), math.log(0.9)]
+    )

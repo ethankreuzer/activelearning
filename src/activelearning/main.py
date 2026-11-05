@@ -195,7 +195,17 @@ def main(argv: Sequence[str] | None = None) -> None:
     budget = cfg.budget.build()
     logger = cfg.logger.build() if cfg.logger is not None else None
     run_writer = (
-        cfg.run_writer.build(metadata=run_metadata)
+        cfg.run_writer.build(
+            metadata=run_metadata,
+            # The sampler's reward shape, so each round's scored-samples CSV
+            # can carry the acquisition on the scale the policy was trained
+            # against beside the raw value. Read off the sampler config here
+            # rather than configured on the writer: one source of truth, so
+            # the saved column cannot describe a reward the run did not use.
+            # A sampler without these attributes simply omits the column.
+            reward_transform=getattr(cfg.sampler, "reward_transform", None),
+            log_score_floor=getattr(cfg.sampler, "log_score_floor", None),
+        )
         if cfg.run_writer is not None
         else None
     )

@@ -15,6 +15,10 @@ from matplotlib.figure import Figure
 from pydantic import BaseModel, Field
 
 from activelearning.monitoring.keys import validate_log_key
+from activelearning.sampler.reward_transform import (
+    RewardTransform,
+    apply_reward_transform,
+)
 from activelearning.selector.selector import SelectionScores
 from activelearning.utils.types import Candidate, Observation
 
@@ -160,6 +164,12 @@ class JSONLinesRunWriter(RunWriter):
     its acquisition scores to
     ``artifacts/acquisition/general/round_NNNN/scored_samples.csv``, next to that
     round's score-distribution figure.
+
+    Given the sampler's reward shape, that CSV also carries
+    ``reward_input_score``: the acquisition on the scale the policy was
+    actually trained against, which is what
+    ``sampler/s3gfn/reward/trajectory`` charts. See
+    :meth:`_reward_input_scores`.
     """
 
     def __init__(
@@ -169,10 +179,14 @@ class JSONLinesRunWriter(RunWriter):
         write_config: bool = True,
         metadata: dict[str, Any] | None = None,
         write_sample_scores: bool = True,
+        reward_transform: RewardTransform | None = None,
+        log_score_floor: float | None = None,
     ) -> None:
         self.output_dir = output_dir
         self.write_samples = write_samples
         self.write_sample_scores = write_sample_scores
+        self.reward_transform = reward_transform
+        self.log_score_floor = log_score_floor
         self.write_config = write_config
         self.metadata = metadata or {}
         self._manifest: dict[str, Any] | None = None
@@ -386,6 +400,56 @@ class JSONLinesRunWriter(RunWriter):
             return None
         return self.output_dir / self._last_selected_samples_path
 
+    def _reward_input_scores(
+        self, acquisition_scores: Sequence[float]
+    ) -> list[float] | None:
+        """Return the acquisition on the scale the policy was trained against.
+
+        ``acquisition_score`` is the raw value GIBBON returned, and under the
+        ``power`` transform the policy never sees it: it sees
+        ``max(log(acq), log_score_floor)``, which is bounded above by 0 and
+        below by the floor, and which ``sampler/s3gfn/reward/trajectory``
+        charts. On the value scale that quantity is unreadable -- the floor at
+        -150 nats is a score of 7.2e-66, and a pool row at 1.4e-69 is already
+        below it -- so a reader comparing the saved column against the chart
+        would be comparing two different things.
+
+        Computed with the sampler's own
+        :func:`~activelearning.sampler.reward_transform.apply_reward_transform`
+        rather than reimplemented here, so the column cannot drift from the
+        reward the run actually trained on.
+
+        Returns
+        -------
+        list[float] | None
+            One value per acquisition score, or ``None`` when the scale is not
+            well defined for a pool: with no configured transform, or under
+            ``power`` with no fixed floor, where the floor sits a fixed spread
+            below each BATCH's own maximum and a 100k pool is not one of the
+            sampler's batches.
+        """
+        if self.reward_transform is None:
+            return None
+        if self.reward_transform == "power" and self.log_score_floor is None:
+            return None
+        try:
+            return apply_reward_transform(
+                self.reward_transform,
+                list(acquisition_scores),
+                self.log_score_floor,
+            )
+        except ValueError:
+            # A negative score under `power` has no logarithm. The pool and
+            # every other column are still worth writing, so this is a missing
+            # column rather than a failed round.
+            _logger.warning(
+                "Not writing reward_input_score: the %r transform rejected the "
+                "round's acquisition scores.",
+                self.reward_transform,
+                exc_info=True,
+            )
+            return None
+
     def _write_scored_samples(self, record: RoundRecord) -> str | None:
         """Write the sampled pool with its selector scores as one CSV per round.
 
@@ -482,11 +546,13 @@ class JSONLinesRunWriter(RunWriter):
         selected_path = self.output_dir / selected_relative_path
         path.parent.mkdir(parents=True, exist_ok=True)
         selected_path.parent.mkdir(parents=True, exist_ok=True)
+        reward_input_scores = self._reward_input_scores(scores.acquisition_scores)
         header = [
             "sample_index",
             "x",
             "fidelity",
             "acquisition_score",
+            *(["reward_input_score"] if reward_input_scores is not None else []),
             "ranking_score",
             "selected",
             "selection_rank",
@@ -515,6 +581,11 @@ class JSONLinesRunWriter(RunWriter):
                     _csv_value(candidate.x),
                     "" if candidate.fidelity is None else candidate.fidelity,
                     scores.acquisition_scores[index],
+                    *(
+                        []
+                        if reward_input_scores is None
+                        else [reward_input_scores[index]]
+                    ),
                     scores.ranking_scores[index],
                     rank is not None,
                     "" if rank is None else rank,
@@ -602,7 +673,12 @@ class JSONLinesRunWriterConfig(BaseModel):
     write_sample_scores: bool = True
     metadata: dict[str, Any] = Field(default_factory=dict)
 
-    def build(self, metadata: dict[str, Any] | None = None) -> RunWriter:
+    def build(
+        self,
+        metadata: dict[str, Any] | None = None,
+        reward_transform: RewardTransform | None = None,
+        log_score_floor: float | None = None,
+    ) -> RunWriter:
         """Build the configured run writer.
 
         Parameters
@@ -610,6 +686,12 @@ class JSONLinesRunWriterConfig(BaseModel):
         metadata : dict[str, Any] | None, optional
             Additional metadata merged into the configured static metadata
             before the writer is constructed.
+        reward_transform, log_score_floor : optional
+            The sampler's reward shape, which adds ``reward_input_score`` to
+            each round's scored-samples CSV. Passed by the caller from the
+            sampler config rather than configured here: the reward belongs to
+            the sampler, and a second place to set it would let the saved
+            column describe a reward the run did not train on.
 
         Returns
         -------
@@ -622,6 +704,8 @@ class JSONLinesRunWriterConfig(BaseModel):
             write_config=self.write_config,
             metadata=_deep_merge(self.metadata, metadata or {}),
             write_sample_scores=self.write_sample_scores,
+            reward_transform=reward_transform,
+            log_score_floor=log_score_floor,
         )
 
 
