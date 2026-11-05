@@ -27,6 +27,8 @@ outputs/ampc/single_fidelity_al/<run_name>/
 ├── run_description.txt            the W&B notes the job script generated
 ├── generated_pool_round_NNNN.csv  the 100k pool, SMILES only
 ├── rejects_round_NNNN.csv         reservoir sample of rejected generations
+├── training_samples_round_NNNN.csv.gz  every molecule generated WHILE training
+├── training_steps_round_NNNN.csv       the per-step training series, as data
 ├── training_subsets/
 │   ├── training_subset_fit_KKKK.csv   the rows fit K trained on
 │   └── gp_state_fit_KKKK.pt           fit K's GP state dict
@@ -38,13 +40,34 @@ outputs/ampc/single_fidelity_al/<run_name>/
 │   ├── oracle/general/round_NNNN/
 │   │   └── oracle_query_observations.csv
 │   ├── surrogate/general/round_NNNN/predicted_vs_observed.png
-│   ├── surrogate/general/round_NNNN/calibration/reliability.png
+│   ├── surrogate/general/calibration/round_NNNN/reliability.png
 │   ├── surrogate/eval_set/ampc_331k/round_NNNN/...
-│   └── sampler/s3gfn/round_NNNN/{training_losses,log_z}.png
+│   ├── sampler/s3gfn/round_NNNN/{log_z,training_losses}.png
+│   ├── sampler/s3gfn/reward/round_NNNN/{trajectory,concentration,
+│   │                                    effective_support,
+│   │                                    above_floor_fraction}.png
+│   ├── sampler/s3gfn/acq/round_NNNN/trajectory.png
+│   └── sampler/s3gfn/train/round_NNNN/{batch_health,residual,
+│                                       prior_divergence,gradient_norm}.png
 └── wandb/offline-run-*/            the offline W&B run
 ```
 
-The whole thing is ~366 MB for ten rounds, of which ~24 MB is `wandb/`.
+**Figures nest by namespace.** A figure logged as
+`sampler/s3gfn/reward/trajectory` lands at
+`artifacts/sampler/s3gfn/reward/round_0003/trajectory.png` — the namespace
+becomes directories and only the last segment is the filename. Listing
+`artifacts/sampler/s3gfn/round_0003/` therefore shows only two of the eleven
+per-step figures. `round_history.jsonl`'s `artifacts` map is the authoritative
+index of what a round wrote.
+
+**The reference run predates some of this.** `sf-10round-5000dock-5000steps-seed42`
+has no `gp_state_fit_*.pt`, no `training_samples_*`/`training_steps_*`, no
+`reward_input_score`, no `gp_total_std`, and only 3 `input_files`. Everything
+below describes what a run launched from the current tree writes.
+
+A ten-round run is ~375 MB: ~366 MB of pool CSVs and figures, ~24 MB of
+that `wandb/`, plus ~6 MB a round of gzipped training molecules and a few
+hundred KB a round of per-step series.
 
 Every job runs `WANDB_MODE=offline`. Nothing reaches W&B until, from a
 **login node**:
@@ -130,7 +153,62 @@ later dies in docking still leaves its pool. For analysis it is **redundant** �
 A reservoir sample of generations thrown away (disconnected, parse error,
 unterminated). Rates are in `sampler/s3gfn/generation/reject_rate/*`.
 
-### 2.4 `training_subsets/training_subset_fit_KKKK.csv`
+### 2.4 `training_samples_round_NNNN.csv.gz`
+
+**Every molecule the policy generated while TRAINING**, which is not the same
+set as the 100k pool: the pool is one snapshot taken *after* a round's
+training, from that round's final policy, while this is what the policy
+explored *while learning*. The policy is never checkpointed, so nothing can
+reproduce this after the run ends.
+
+| Column | Meaning |
+|---|---|
+| `step` | Training step that generated it, 1-based |
+| `smiles` | The molecule, as the sampler canonicalized it |
+| `reward_input_score` | The post-transform score the loss multiplied by beta — same scale as `reward_input_score` in `scored_samples.csv` and as `sampler/s3gfn/reward/trajectory` |
+| `acquisition_score` | Raw acquisition value, empty where the step reported none |
+
+320,000 rows a round (5,000 steps × batch 64), ~21.5 MB plain and **~6 MB
+gzipped**, which is why it is compressed. `pandas.read_csv` reads `.csv.gz`
+with no change at the call site; from the shell use `zcat`. Unique rate runs
+0.86–0.95, so ~93% of rows are distinct molecules.
+
+Written once at the end of the round, not per step — one write to a networked
+filesystem instead of five thousand.
+
+A batch whose SMILES count disagrees with its reward count is **dropped
+entirely** rather than recorded: a misaligned row would attribute one
+molecule's reward to another and nothing downstream could detect it.
+
+### 2.5 `training_steps_round_NNNN.csv`
+
+The per-step series the eleven per-step figures are drawn from, **as numbers**.
+Without it a round's within-round dynamics could be looked at but not
+re-binned, overlaid across rounds, or computed on — and since the policy is not
+checkpointed they could not be regenerated either.
+
+One row per training step, 1-based. Columns: `generated`, `valid`,
+`synthesizable`, `unique`, `online_loss`, `replay_loss`, `auxiliary_loss`,
+`log_z`, `step_duration_s`, `reward_mean/max/min/median`,
+`reward_ratio_max/median/min`, `reward_effective_support`,
+`acq_max/median/min`, `above_floor_fraction`, `residual_mean/std`,
+`prior_log_ratio_mean`, `online_gradient_norm`, `replay_gradient_norm`.
+
+~5,000 rows and 26 columns a round — a few hundred KB, so this one stays
+uncompressed and greppable.
+
+Two behaviours to know:
+
+- **Conditionally recorded series are placed by their own step numbers**, not
+  by position, so a step that produced no valid molecules leaves an **empty
+  cell** rather than shifting every later point one step to the left. That
+  shift would be worst exactly when validity is collapsing, which is when these
+  curves get read.
+- A series that never recorded in a round **gains no column**, rather than an
+  empty one. With no fixed `log_score_floor`, for instance, there is no
+  `above_floor_fraction` column.
+
+### 2.6 `training_subsets/training_subset_fit_KKKK.csv`
 
 The exact rows fit *K* trained on, **in the order it trained on them**, which
 is the order the state dict assumes.
@@ -149,7 +227,7 @@ is the order the state dict assumes.
 archive does not index the same way, which is why `read_training_subset`
 drops it.
 
-### 2.5 `training_subsets/gp_state_fit_KKKK.pt`
+### 2.7 `training_subsets/gp_state_fit_KKKK.pt`
 
 Fit *K*'s `model.state_dict()`: fitted hyperparameters plus the input and
 outcome transform buffers, on CPU. Kilobytes.
@@ -158,13 +236,13 @@ outcome transform buffers, on CPU. Kilobytes.
 training set, so this file alone is useless — it is half of a pair, and
 `training_subset_fit_KKKK.csv` of the *same index* is the other half.
 
-### 2.6 `artifacts/oracle/general/round_NNNN/oracle_query_observations.csv`
+### 2.8 `artifacts/oracle/general/round_NNNN/oracle_query_observations.csv`
 
 `x, fidelity, y, dock3_failure_reason, dock3_pprop, dock3_raw_score` — the
 docking results for the round, failures included. Replaying these over the
 initial archive reconstructs the archive at any round.
 
-### 2.7 `stage_history.jsonl` and `round_history.jsonl`
+### 2.9 `stage_history.jsonl` and `round_history.jsonl`
 
 `stage_history.jsonl` gets a record as each **stage** completes (surrogate fit,
 policy training, docking), so a crash does not lose finished stages. This is
@@ -178,7 +256,7 @@ where the CUDA memory readings live:
 `round_history.jsonl` gets one object per completed **round**, with that
 round's metrics, diagnostics and artifact paths.
 
-### 2.8 `run_manifest.json`
+### 2.10 `run_manifest.json`
 
 - `cli.command` — the reproduction command
 - `provenance.git_commit_sha`, dirty flag, dirty paths, diff digest
@@ -186,7 +264,21 @@ round's metrics, diagnostics and artifact paths.
 - `provenance.input_files` — path, bytes, mtime, md5 for every input: the
   archive CSV, the MiniMol checkpoint, the feature store, the GFN prior, the
   DOCK3 binary, the 331k eval set
+- `provenance.environment` — Python version, platform, hostname, interpreter
+  path, `torch.version.cuda`, CUDA availability, GPU model names, and the
+  versions of torch, gpytorch, botorch, numpy, scipy, pandas, rdkit,
+  transformers, wandb and matplotlib. A commit identifies the code; it does not
+  identify what ran it, and across a multi-month study the cluster's modules
+  move underneath a fixed SHA
+- `provenance.slurm` — `SLURM_JOB_ID`, array job/task ids, job name, account,
+  partition, nodelist, CPUs per task, memory, GPUs, submit dir. This is what
+  links the run directory to `slurm_logs/single_fidelity_al_<jobid>.{out,err}`,
+  where the OOM traces, warnings and timings live. `null` outside Slurm
 - `config`, `effective_config`
+
+Both new blocks are best-effort: a package that is not installed records
+`None`, and a failed probe records `None` rather than raising. Provenance must
+never be the reason a run does not start.
 
 A dirty tree also leaves `uncommitted.patch` in the run directory.
 
@@ -334,6 +426,16 @@ molecules from round 6's policy, inspect its weights, or branch a run off it.
 
 This is a deliberate choice — GP-MoLFormer weights are hundreds of MB a round.
 
+What stands in for it: `training_samples_round_NNNN.csv.gz` (every molecule the
+policy explored, with its reward, by step), `training_steps_round_NNNN.csv`
+(every per-step series), and `generated_pool_round_NNNN.csv` /
+`scored_samples.csv` (the post-training snapshot). Between them, questions
+*about* the policy's behaviour are answerable; only re-running the policy
+itself is not.
+
+Still unrecoverable: the replay buffer's contents, the optimizer state, and the
+policy weights.
+
 ### 6.5 Re-running does not reproduce the run
 
 There is no global `manual_seed` and no `use_deterministic_algorithms` in the
@@ -366,13 +468,28 @@ No file holds "the archive at round N". Replay the initial CSV
 (`dataset.initial_data.path`, md5 in `provenance.input_files`) plus each
 round's `oracle_query_observations.csv`.
 
-### 6.9 The 331k eval set must still exist
+### 6.9 The 20 GB feature store is recorded but not hashed
+
+`_MAX_HASHED_BYTES` is 256 MB, so
+`cache/ampc/s3gfn_minimol_ampc_fingerprints.npy` — a symlink to a 20 GB file in
+`/project/6077746/ethankrz/ampc_store/` — is recorded with `md5: None` and an
+`md5_skipped` reason. Path, size and mtime only.
+
+It defines the GP's entire feature space. If it is ever regenerated, no run can
+*prove* which version it used; size and mtime are weak evidence. Either treat
+the store as immutable, or hash it once by hand and record the digest as a
+config constant.
+
+The 331k eval set (23 MB) and the initial archive (1.7 MB) are both under the
+limit and **are** hashed.
+
+### 6.10 The 331k eval set must still exist
 
 `cache/ampc/exact_dkl_top_n/ampc_331k.csv` is referenced by path, not copied
 into the run. Its md5 is in `provenance.input_files` — check it before
 comparing calibration across runs.
 
-### 6.10 The GP training set cannot exceed 40,000 rows
+### 6.11 The GP training set cannot exceed 40,000 rows
 
 Measured in the real loop, two rounds each with the policy and encoder
 resident: 40,000 passed (job 26162761), 45,000 did not (jobs 26162757 and
@@ -394,6 +511,10 @@ to itself and is **not** the ceiling.
 | Recompute the acquisition for any molecule | **Yes** — from the restored GP |
 | Reconstruct the archive at any round | **Yes** — by replay |
 | Inspect what the policy generated and what was docked | **Yes** |
+| Redraw or recompute any per-step training curve | **Yes** — `training_steps_round_NNNN.csv` holds the series as data |
+| Analyse what the policy explored while learning | **Yes** — `training_samples_round_NNNN.csv.gz`, 320k molecules a round |
+| Say which torch, CUDA and GPU produced a number | **Yes** — `provenance.environment` |
+| Find the scheduler log for a run | **Yes** — `provenance.slurm.SLURM_JOB_ID` |
 | Generate new molecules from a past round's policy | **No** — not checkpointed |
 | Resume or branch a run from round *N* | **No** — no policy, no optimizer state |
 | Re-execute the run and get the same numbers | **No** — no determinism guarantees |
