@@ -182,7 +182,7 @@ if [[ "${DATASET_MODE}" == "full" ]]; then
   # rather than merged into. See config/ampc/overrides/full_archive.yaml.
   CONFIGS+=("config/ampc/overrides/full_archive.yaml")
   SUBSET_OVERRIDES=(
-    "surrogate.training_subset={type: FullArchive, top_threshold: 0.5, max_size: 46000}"
+    "surrogate.training_subset={type: FullArchive, top_threshold: 0.5, max_size: 40000}"
   )
 fi
 

@@ -28,20 +28,38 @@
 #                      that replaces the training_subset node; read that file
 #                      for why the switch takes two pieces.
 #
-# THE CEILING ON `full`, which decides the round count rather than the budget.
-# An exact GP's kernel matrix is O(n^2). Measured, the fit peaks at
-# 3.0068e-08 * n^2 + 0.325 GiB, so on this 79.18 GiB card the fit alone cannot
-# exceed ~51,000 rows even with nothing else resident, and the policy and
-# encoder share the device. The archive gains ~4,700 rows a round, not the full
-# docking budget, because ~8% of docks fail and add no row. From a 25,000-row
-# start:
+# THE CEILING ON THE TRAINING SET, which for `full` decides the round count
+# rather than the budget. An exact GP's kernel matrix is O(n^2) and the fit
+# peaks at 3.0068e-08 * n^2 + 0.325 GiB, which reproduces every isolated
+# benchmark to within 0.15 GiB. That model is NOT the ceiling: it describes a
+# fit with the card to itself, and the loop never has that. The ceiling was
+# settled by probing the real loop instead, two rounds each, with the policy
+# and encoder resident:
 #
-#   fit 1  25,000    fit 3  34,400    fit 5  43,800
-#   fit 2  29,700    fit 4  39,100    fit 6  48,500   <- at/over the cap
+#   n=40,000  job 26162761  PASSED  round-2 peak 72.48 GiB, 6.70 GiB spare
+#   n=45,000  job 26162757  OOM in round 2
+#   n=45,000  job 26215104  OOM in round 2, after the cached-block release
+#   n=50,000  job 26159147  OOM in round 2
 #
-# So `full` gets about SIX rounds from 25,000, not ten, and about three from the
-# 39,999-row set. `max_size: 46000` below stops it with a named error rather
+# So 40,000 ROWS IS THE CAP, measured, and 45,000 is not reachable on this card.
+# Round 2 at 45,000 died with 68.94 GiB allocated and 2.27 GiB free, needing one
+# more contiguous 7.54 GiB matrix: the live policy, prior, encoder and
+# acquisition state come to ~7.6 GiB, and the fit needs room for another full
+# kernel matrix at its peak rather than just its own peak. An earlier reading of
+# this as stale allocator cache was wrong -- job 26215104 released the cache and
+# failed the same way.
+#
+# For `full`, the archive gains ~4,700 rows a round, not the full docking
+# budget, because ~8% of docks fail and add no row. From a 25,000-row start:
+#
+#   fit 1  25,000    fit 3  34,400
+#   fit 2  29,700    fit 4  39,100    fit 5  43,800  <- over the cap
+#
+# So `full` gets about FOUR rounds from 25,000, not ten, and one from the
+# 39,999-row set. `max_size: 40000` below stops it with a named error rather
 # than a CUDA out-of-memory inside the Cholesky; size the rounds for it.
+#
+# `subset` is unaffected: it fits a pinned 25,000 rows, well under the cap.
 #
 # EVERY setting lives in config/ampc/subset_fixed_gp.yaml. This script passes
 # no `sampler.*` overrides: the reward-shape arms took their real reward, beta,
@@ -163,15 +181,16 @@ fi
 #
 # top_threshold mirrors the subset arm's keep_above so train/top_count means the
 # same thing in both; it selects nothing, since every row is fitted anyway.
-# max_size is the measured ceiling, less margin: see the header.
+# max_size is the measured ceiling itself -- 40,000 passed the two-round probe
+# and 45,000 did not -- so there is no margin below it: see the header.
 CONFIGS=("${CONFIG}")
 DATASET_NOTE="reselect the GP's training set from the archive (stratified FPS, every row at y >= 0.5 kept outright, band edges pinned to the round-0 balanced quantiles)"
 if [[ "${DATASET_MODE}" == "full" ]]; then
   CONFIGS+=("config/ampc/overrides/full_archive.yaml")
   OVERRIDES+=(
-    "surrogate.training_subset={type: FullArchive, top_threshold: 0.5, max_size: 46000}"
+    "surrogate.training_subset={type: FullArchive, top_threshold: 0.5, max_size: 40000}"
   )
-  DATASET_NOTE="refit the GP on the WHOLE archive, which grows every round (no subsetting; dataset_mode=full, capped at 46,000 rows by VRAM, so expect ~6 rounds from a 25,000-row start)"
+  DATASET_NOTE="refit the GP on the WHOLE archive, which grows every round (no subsetting; dataset_mode=full, capped at 40,000 rows by VRAM -- the measured ceiling, see the header -- so expect ~4 rounds from a 25,000-row start)"
 fi
 
 export WANDB_NOTES="Single-fidelity active learning, run ${RUN_NAME}: the full loop over rounds, which the reward-shape arms only ever ran one of.
@@ -182,7 +201,7 @@ Caveat for a short test run: 1,000 docks per round gives ~70 molecules above the
 Round 0's selection is the identity, because the archive equals the training budget, so that round has no band metrics. Expected, not a fault."
 if [[ "${DATASET_MODE}" == "full" ]]; then
   WANDB_NOTES="${WANDB_NOTES}
-DATASET MODE IS 'full': there is no subset selection, so NO round has band metrics and surrogate/subset_gp/train/archive_fraction reads 1.000 throughout -- that is the regime working, not a fault. The reading to watch instead is profiling/surrogate/cuda_headroom_at_peak_gib, which falls every round as the kernel matrix grows; the run stops with a named ValueError at 46,000 rows rather than a CUDA OOM."
+DATASET MODE IS 'full': there is no subset selection, so NO round has band metrics and surrogate/subset_gp/train/archive_fraction reads 1.000 throughout -- that is the regime working, not a fault. The reading to watch instead is profiling/surrogate/cuda_headroom_at_peak_gib, which falls every round as the kernel matrix grows; the run stops with a named ValueError at 40,000 rows rather than a CUDA OOM."
 fi
 printf '%s\n' "${WANDB_NOTES}" > "${OUTPUT_DIR}/run_description.txt"
 echo "dataset_mode=${DATASET_MODE}"

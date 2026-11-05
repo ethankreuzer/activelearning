@@ -257,8 +257,8 @@ budget:
   # `10 5000`; see MULTI_ROUND_AL_PLAN.md.
   #
   # With `dataset_mode=full` the round count is NOT free: the GP fits the whole
-  # archive, which gains ~4,700 rows a round and hits its 46,000-row VRAM cap
-  # after about six. Asking for more ends the run with a ValueError mid-flight.
+  # archive, which gains ~4,700 rows a round and hits its 40,000-row VRAM cap
+  # after about four. Asking for more ends the run with a ValueError mid-flight.
   #
   # The pool stays at 100,000 generated molecules per round (sampler.n_samples
   # above): what is shortened is the docking, not the generation or the

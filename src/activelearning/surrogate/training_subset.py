@@ -351,12 +351,18 @@ class FullArchiveSubsetSelector(TrainingSubsetSelector):
     failed docks return no row.
 
     There is no ``size``, which is the point. The cost is that an exact GP's
-    kernel matrix is O(n^2), so this regime has a ceiling: on an 80 GB card the
-    fit alone cannot exceed ~51,000 rows even with nothing else resident, and
-    the policy and encoder share the device. The run's round count is therefore
-    bounded by memory rather than by the budget, which the operator is expected
-    to have sized for -- ``max_size`` is here to make the stop legible rather
-    than to defend against it.
+    kernel matrix is O(n^2), so this regime has a ceiling. The ceiling is not
+    the one :func:`predicted_fit_peak_gib` implies: that model describes a fit
+    with the card to itself, and the loop never has that. Probed in the real
+    loop on an 80 GB card, two rounds each with the policy and encoder
+    resident, 40,000 rows passed (job 26162761) and 45,000 did not (jobs
+    26162757 and 26215104), the latter needing one more contiguous 7.54 GiB
+    matrix beside ~7.6 GiB of live policy, prior, encoder and acquisition
+    state. So the measured cap is 40,000.
+
+    The run's round count is therefore bounded by memory rather than by the
+    budget, which the operator is expected to have sized for -- ``max_size`` is
+    here to make the stop legible rather than to defend against it.
     """
 
     def __init__(

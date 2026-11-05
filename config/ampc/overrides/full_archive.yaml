@@ -7,7 +7,7 @@
 #   scripts/run_with_sigterm_flush.py \
 #     config/ampc/subset_fixed_gp.yaml \
 #     config/ampc/overrides/full_archive.yaml \
-#     "surrogate.training_subset={type: FullArchive, top_threshold: 0.5, max_size: 46000}"
+#     "surrogate.training_subset={type: FullArchive, top_threshold: 0.5, max_size: 40000}"
 #
 # WHY A FILE RATHER THAN ONE OVERRIDE. The two regimes do not share a schema:
 # FullArchive has no `size`, `keep_above` or `band_edges`, and its config sets

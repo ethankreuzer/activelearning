@@ -38,7 +38,7 @@ BASE_CONFIG = Path("config/ampc/subset_fixed_gp.yaml")
 CLEAR_OVERLAY = Path("config/ampc/overrides/full_archive.yaml")
 #: Exactly the override jobs/single_fidelity_al_nibi.sh passes for `full`.
 FULL_ARCHIVE_OVERRIDE = (
-    "surrogate.training_subset={type: FullArchive, top_threshold: 0.5, max_size: 46000}"
+    "surrogate.training_subset={type: FullArchive, top_threshold: 0.5, max_size: 40000}"
 )
 
 _ADAPTER = TypeAdapter(TrainingSubsetSelectorConfig)
@@ -73,14 +73,14 @@ def test_the_two_piece_switch_replaces_the_node() -> None:
         [BASE_CONFIG, CLEAR_OVERLAY], overrides=[FULL_ARCHIVE_OVERRIDE]
     )
 
-    assert node == {"type": "FullArchive", "top_threshold": 0.5, "max_size": 46000}
+    assert node == {"type": "FullArchive", "top_threshold": 0.5, "max_size": 40000}
 
     parsed = _ADAPTER.validate_python(node)
     selector = parsed.build()
     assert isinstance(parsed, FullArchiveSubsetSelectorConfig)
     assert isinstance(selector, FullArchiveSubsetSelector)
     assert selector.top_threshold == 0.5
-    assert selector.max_size == 46000
+    assert selector.max_size == 40000
 
 
 def test_the_override_alone_is_refused() -> None:

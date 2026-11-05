@@ -277,14 +277,14 @@ def test_full_archive_handles_an_empty_archive() -> None:
 
 def test_full_archive_stops_once_the_archive_passes_max_size() -> None:
     """The cap turns a CUDA OOM into a message naming the sizes involved."""
-    selector = FullArchiveSubsetSelector(max_size=46000)
+    selector = FullArchiveSubsetSelector(max_size=40000)
 
     with pytest.raises(ValueError, match="past the configured max_size") as raised:
         selector.select(_archive([0.01] * 46001), encoder=_UnusedEncoder())
 
     message = str(raised.value)
     assert "46001" in message
-    assert "46000" in message
+    assert "40000" in message
     # The predicted peak is in the message, so the error says how far over the
     # device the fit would have been rather than only that a limit was crossed.
     assert f"{predicted_fit_peak_gib(46001):.1f}" in message
@@ -333,7 +333,7 @@ def test_predicted_fit_peak_matches_the_measured_probes() -> None:
 
 def test_full_archive_config_builds_the_selector() -> None:
     """The union discriminates on type and passes every setting through."""
-    data = {"type": "FullArchive", "top_threshold": 0.5, "max_size": 46000}
+    data = {"type": "FullArchive", "top_threshold": 0.5, "max_size": 40000}
 
     parsed = TypeAdapter(TrainingSubsetSelectorConfig).validate_python(data)
     selector = parsed.build()
@@ -341,7 +341,7 @@ def test_full_archive_config_builds_the_selector() -> None:
     assert isinstance(parsed, FullArchiveSubsetSelectorConfig)
     assert isinstance(selector, FullArchiveSubsetSelector)
     assert selector.top_threshold == 0.5
-    assert selector.max_size == 46000
+    assert selector.max_size == 40000
 
 
 def test_full_archive_config_defaults_to_no_threshold_and_no_cap() -> None:
