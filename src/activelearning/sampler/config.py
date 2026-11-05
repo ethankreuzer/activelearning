@@ -378,6 +378,18 @@ class S3GFNSamplerConfig(BaseModel):
     pool_log_path : str, optional
     CSV of the generated pool, written as soon as generation finishes so it
     survives a round that later fails. None disables it.
+    training_sample_log_path : str, optional
+    Gzipped CSV of every molecule generated WHILE TRAINING, with the step and
+    the two scores it was judged by. The pool above is a snapshot taken after
+    training; this is the round's exploration, which nothing can reproduce
+    afterwards because the policy is not checkpointed. 320,000 rows a round at
+    5,000 steps and a batch of 64, ~6 MB compressed. None disables it.
+    training_step_log_path : str, optional
+    CSV of the per-step training series -- losses, log Z, gradient norms,
+    reward and acquisition summaries, concentration, above-floor fraction. The
+    same numbers the per-step figures are drawn from, as data, so they can be
+    re-binned or overlaid rather than only looked at. One row per step. None
+    disables it.
     step_bin_size : int, default=100
     Training steps reduced to one median point on the per-step figures, so the
     curves show a trend rather than batch-to-batch noise. The median resists
@@ -435,6 +447,8 @@ class S3GFNSamplerConfig(BaseModel):
     reject_sample_size: int = Field(default=2000, ge=0)
     reject_log_path: str | None = None
     pool_log_path: str | None = None
+    training_sample_log_path: str | None = None
+    training_step_log_path: str | None = None
     step_bin_size: int = Field(default=100, ge=1)
     seed: int = Field(default=42, ge=0)
 
@@ -521,6 +535,8 @@ class S3GFNSamplerConfig(BaseModel):
             reject_sample_size=self.reject_sample_size,
             reject_log_path=self.reject_log_path,
             pool_log_path=self.pool_log_path,
+            training_sample_log_path=self.training_sample_log_path,
+            training_step_log_path=self.training_step_log_path,
             step_bin_size=self.step_bin_size,
             seed=self.seed,
         )

@@ -198,6 +198,15 @@ sampler:
   # until 2026-10-23.
   pool_log_path: outputs/ampc/single_fidelity_al/${run_name}/generated_pool_round_{round}.csv
   reject_log_path: outputs/ampc/single_fidelity_al/${run_name}/rejects_round_{round}.csv
+  # Every molecule generated WHILE TRAINING, and the per-step series the
+  # eleven per-step figures are drawn from. Both exist because the policy is
+  # never checkpointed: the pool above is one snapshot taken after a round's
+  # training, the figures are PNGs, and neither can be regenerated once the
+  # run ends. 320,000 rows a round at 5,000 steps and a batch of 64 -- ~6 MB
+  # gzipped, against the ~366 MB a ten-round run already writes -- and ~5,000
+  # rows of per-step series, a few hundred KB, left uncompressed.
+  training_sample_log_path: outputs/ampc/single_fidelity_al/${run_name}/training_samples_round_{round}.csv.gz
+  training_step_log_path: outputs/ampc/single_fidelity_al/${run_name}/training_steps_round_{round}.csv
 
 selector:
   type: CostAwareSelector

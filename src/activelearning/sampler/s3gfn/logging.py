@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import csv
+import gzip
 import logging
 import math
 import random
 import statistics
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Sequence
 
 from matplotlib.axes import Axes
 from matplotlib.figure import Figure
@@ -86,6 +87,16 @@ class _RoundMetrics:
     negative_buffer_size: int = 0
     training_duration_s: float | None = None
     generation_duration_s: float | None = None
+    # Every molecule the policy generated while TRAINING, with the step that
+    # produced it and the two scores it was judged by. The 100k pool is one
+    # snapshot taken AFTER a round's training; this is what the policy explored
+    # while learning, and the policy itself is not checkpointed, so nothing can
+    # reproduce it afterwards. 320,000 rows a round at 5,000 steps and a batch
+    # of 64, written once per round as gzipped CSV.
+    training_sample_steps: list[int] = field(default_factory=list)
+    training_sample_smiles: list[str] = field(default_factory=list)
+    training_sample_rewards: list[float] = field(default_factory=list)
+    training_sample_acqs: list[float] = field(default_factory=list)
 
     def record_training_step(
         self,
@@ -99,6 +110,7 @@ class _RoundMetrics:
         log_z: float,
         raw_reward_scores: Sequence[float],
         acq_scores: Sequence[float] = (),
+        smiles: Sequence[str] = (),
         unique_count: int | None = None,
         beta: float = 1.0,
         on_policy_diagnostics: tuple[float, float, float] | None = None,
@@ -156,6 +168,18 @@ class _RoundMetrics:
         step_number = len(self.generated_counts)
         reward_values = [float(value) for value in raw_reward_scores]
         self.raw_reward_scores.extend(reward_values)
+        # Aligned with reward_values by construction: both come from the same
+        # prepared batch. Recorded only when all three line up, because a
+        # misaligned row would attribute one molecule's reward to another and
+        # nothing downstream could detect it.
+        if smiles and len(smiles) == len(reward_values):
+            acq_values = [float(value) for value in acq_scores]
+            if len(acq_values) != len(reward_values):
+                acq_values = [float("nan")] * len(reward_values)
+            self.training_sample_steps.extend([step_number] * len(reward_values))
+            self.training_sample_smiles.extend(str(value) for value in smiles)
+            self.training_sample_rewards.extend(reward_values)
+            self.training_sample_acqs.extend(acq_values)
         if reward_values:
             self.reward_steps.append(step_number)
             self.raw_reward_means.append(_mean(reward_values))
@@ -1217,3 +1241,193 @@ def _bounded(
         index * (len(values) - 1) // (max_points - 1) for index in range(max_points)
     ]
     return [values[index] for index in indices]
+
+
+def write_training_samples_log(
+    metrics: _RoundMetrics,
+    path: str,
+    *,
+    round_index: int,
+) -> str | None:
+    """Write every molecule the policy generated while training, gzipped.
+
+    The 100k pool in ``generated_pool_round_*.csv`` is a single snapshot taken
+    AFTER a round's training, from that round's final policy. This is what the
+    policy explored WHILE learning -- and since the policy is never
+    checkpointed, nothing can reproduce it after the run ends.
+
+    Gzipped because it is 320,000 rows a round at 5,000 steps and a batch of
+    64: ~21.5 MB plain against ~6 MB compressed, and ``pandas.read_csv`` reads
+    ``.csv.gz`` with no change at the call site. Written once at the end of the
+    round rather than per step, which is one write to a networked filesystem
+    instead of five thousand.
+
+    Columns
+    -------
+    ``step``
+        Training step that generated the molecule, 1-based.
+    ``smiles``
+        The molecule, as the sampler canonicalized it.
+    ``reward_input_score``
+        The post-transform score the loss multiplied by beta -- under ``power``
+        that is ``max(log(acq), log_score_floor)``, the same scale as
+        ``reward_input_score`` in ``scored_samples.csv`` and as
+        ``sampler/s3gfn/reward/trajectory``.
+    ``acquisition_score``
+        The raw acquisition value, or empty where the step reported none.
+
+    Parameters
+    ----------
+    metrics : _RoundMetrics
+        Accumulator holding the round's per-molecule records.
+    path : str
+        Destination path, with ``{round}`` replaced by the zero-padded round
+        index. ``.gz`` is appended when absent, so the name never claims to be
+        plain CSV.
+    round_index : int
+        Round the molecules came from.
+
+    Returns
+    -------
+    str or None
+        The path written, or None when the round recorded none.
+    """
+    if not metrics.training_sample_smiles:
+        return None
+    resolved = Path(path.replace("{round}", f"{round_index:04d}"))
+    if resolved.suffix != ".gz":
+        resolved = resolved.with_name(resolved.name + ".gz")
+    resolved.parent.mkdir(parents=True, exist_ok=True)
+    with gzip.open(resolved, "wt", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(("step", "smiles", "reward_input_score", "acquisition_score"))
+        writer.writerows(
+            zip(
+                metrics.training_sample_steps,
+                metrics.training_sample_smiles,
+                metrics.training_sample_rewards,
+                (
+                    "" if math.isnan(value) else value
+                    for value in metrics.training_sample_acqs
+                ),
+            )
+        )
+    _logger.info(
+        "Wrote %d training molecule(s) to %s.",
+        len(metrics.training_sample_smiles),
+        resolved,
+    )
+    return str(resolved)
+
+
+#: Per-step series written by :func:`write_training_steps_log`, as
+#: ``(column, series attribute, step-index attribute)``. A ``None`` step index
+#: means the series is appended on EVERY step, so its position is the step.
+#: The others are recorded conditionally and carry their own step numbers --
+#: without them a step that yielded nothing would shift every later point one
+#: to the left, worst exactly when validity is collapsing.
+_TRAINING_STEP_SERIES: tuple[tuple[str, str, str | None], ...] = (
+    ("generated", "generated_counts", None),
+    ("valid", "valid_counts", None),
+    ("synthesizable", "synthesizable_counts", None),
+    ("unique", "unique_counts", None),
+    ("online_loss", "online_rtb_losses", None),
+    ("replay_loss", "replay_losses", None),
+    ("auxiliary_loss", "auxiliary_losses", None),
+    ("log_z", "log_z_values", None),
+    ("step_duration_s", "training_step_durations_s", None),
+    ("reward_mean", "raw_reward_means", "reward_steps"),
+    ("reward_max", "raw_reward_maxes", "reward_steps"),
+    ("reward_min", "raw_reward_mins", "reward_steps"),
+    ("reward_median", "raw_reward_medians", "reward_steps"),
+    ("reward_ratio_max", "reward_ratio_maxes", "reward_steps"),
+    ("reward_ratio_median", "reward_ratio_medians", "reward_steps"),
+    ("reward_ratio_min", "reward_ratio_mins", "reward_steps"),
+    ("reward_effective_support", "reward_effective_supports", "reward_steps"),
+    ("acq_max", "acq_maxes", "acq_steps"),
+    ("acq_median", "acq_medians", "acq_steps"),
+    ("acq_min", "acq_mins", "acq_steps"),
+    ("above_floor_fraction", "above_floor_fractions", "above_floor_steps"),
+    ("residual_mean", "residual_means", "residual_steps"),
+    ("residual_std", "residual_stds", "residual_steps"),
+    ("prior_log_ratio_mean", "prior_log_ratio_means", "residual_steps"),
+    ("online_gradient_norm", "online_gradient_norms", "online_gradient_norm_steps"),
+    ("replay_gradient_norm", "replay_gradient_norms", "replay_gradient_norm_steps"),
+)
+
+
+def write_training_steps_log(
+    metrics: _RoundMetrics,
+    path: str,
+    *,
+    round_index: int,
+) -> str | None:
+    """Write the round's per-step training series as one CSV.
+
+    The same numbers the eleven per-step figures are drawn from. Those figures
+    are PNGs: without this file a round's within-round dynamics could be looked
+    at but not re-binned, overlaid across rounds, or computed on -- and the
+    policy is not checkpointed, so they could not be regenerated either.
+
+    One row per training step, 1-based, with an empty cell where a series did
+    not record that step. Conditionally recorded series are placed by their own
+    step numbers rather than by position, so a step that produced no valid
+    molecules leaves a gap instead of shifting the rest of the curve.
+
+    About 5,000 rows and 26 columns a round -- a few hundred kilobytes, so this
+    one is left uncompressed and stays greppable.
+
+    Parameters
+    ----------
+    metrics : _RoundMetrics
+        Accumulator holding the round's series.
+    path : str
+        Destination path, with ``{round}`` replaced by the zero-padded round
+        index.
+    round_index : int
+        Round the series came from.
+
+    Returns
+    -------
+    str or None
+        The path written, or None when the round recorded no steps.
+    """
+    total_steps = len(metrics.generated_counts)
+    if total_steps < 1:
+        return None
+    columns: list[str] = []
+    by_step: list[dict[int, Any]] = []
+    for column, series_attr, step_attr in _TRAINING_STEP_SERIES:
+        series = getattr(metrics, series_attr, None)
+        if not series:
+            continue
+        if step_attr is None:
+            placed = {index + 1: value for index, value in enumerate(series)}
+        else:
+            steps = getattr(metrics, step_attr, None) or []
+            placed = dict(zip(steps, series))
+        columns.append(column)
+        by_step.append(placed)
+
+    resolved = Path(path.replace("{round}", f"{round_index:04d}"))
+    resolved.parent.mkdir(parents=True, exist_ok=True)
+    with resolved.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(("step", *columns))
+        for step in range(1, total_steps + 1):
+            writer.writerow(
+                (
+                    step,
+                    *(
+                        "" if (value := placed.get(step)) is None else value
+                        for placed in by_step
+                    ),
+                )
+            )
+    _logger.info(
+        "Wrote %d training step(s) across %d series to %s.",
+        total_steps,
+        len(columns),
+        resolved,
+    )
+    return str(resolved)
