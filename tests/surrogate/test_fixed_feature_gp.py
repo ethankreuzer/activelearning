@@ -32,12 +32,16 @@ from activelearning.surrogate.fixed_feature_gp import (
     FixedFeatureGPSurrogate,
     accept_abnormal_lbfgsb_warnings,
 )
-from activelearning.surrogate.subset_gp import SubsetFixedFeatureGPSurrogate
+from activelearning.surrogate.subset_gp import (
+    SubsetFixedFeatureGPSurrogate,
+    load_fit,
+    read_training_subset,
+)
 from activelearning.surrogate.training_subset import (
     FullArchiveSubsetSelector,
     ThresholdRandomSubsetSelector,
 )
-from activelearning.utils.types import Candidate, Observation
+from activelearning.utils.types import DEFAULT_FIDELITY, Candidate, Observation
 
 SMILES = ("C", "CC", "CCO", "CCN", "CCCO", "OCCO", "NCCN", "CCCCC")
 
@@ -963,3 +967,140 @@ def test_subset_surrogate_fits_the_whole_archive_as_it_grows(tmp_path: Path) -> 
 
     train_X, _ = surrogate.get_train_data()
     assert train_X.shape == (len(archive), 4)
+
+
+def test_subset_surrogate_records_a_state_beside_each_training_set(
+    tmp_path: Path,
+) -> None:
+    """Each fit leaves the pair a round is recovered from, keyed by fit index."""
+    archive = _observations()
+    surrogate = _subset_surrogate(tmp_path, size=5)
+
+    surrogate.fit(archive)
+    surrogate.fit(archive)
+
+    for fit_index in (0, 1):
+        assert (tmp_path / f"training_subset_fit_{fit_index:04d}.csv").is_file()
+        assert (tmp_path / f"gp_state_fit_{fit_index:04d}.pt").is_file()
+    # The state is the fitted hyperparameters and the transforms, not the
+    # training data: kilobytes, so saving one per round costs nothing against
+    # the artifacts a round already writes.
+    assert (tmp_path / "gp_state_fit_0000.pt").stat().st_size < 100_000
+
+
+def test_subset_surrogate_writes_no_state_without_a_subset_dir() -> None:
+    """No recording directory, no files -- and the fit still happens."""
+    surrogate = SubsetFixedFeatureGPSurrogate(
+        _SmilesFeatureEncoder(),
+        selector=ThresholdRandomSubsetSelector(size=5, threshold=1.0),
+    )
+
+    surrogate.fit(_observations())
+
+    assert surrogate.last_subset is not None
+
+
+def test_load_fit_restores_a_rounds_predictions_exactly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A recovered round predicts what that round predicted, without refitting.
+
+    The point of saving the state at all: a round whose surrogate cannot be
+    reconstructed can only be read through the numbers it happened to log at
+    the time. A wrong restore would not crash -- it would answer with a
+    different GP -- so the predictions are compared, not the file's existence.
+    """
+    archive = _observations()
+    surrogate = _subset_surrogate(tmp_path, size=5)
+    surrogate.fit(archive)
+    candidates = [Candidate(x="CCO"), Candidate(x="NCCCN")]
+    expected = surrogate.predict(candidates)
+
+    def no_fit(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("A restore must not fit.")
+
+    monkeypatch.setattr(botorch_surrogate, "fit_gpytorch_mll", no_fit)
+    restored = load_fit(tmp_path, 0, FixedFeatureGPSurrogate(_SmilesFeatureEncoder()))
+    actual = restored.predict(candidates)
+
+    assert actual["mean"] == pytest.approx(expected["mean"])
+    assert actual["std"] == pytest.approx(expected["std"])
+
+
+def test_load_fit_restores_each_round_separately(tmp_path: Path) -> None:
+    """Fit 1 is recovered as fit 1, not as whatever was written last.
+
+    Two fits on different archives learn different hyperparameters, so reading
+    the wrong index is visible in the predictions. The indices have to address
+    the rounds independently or a ten-round run has one recoverable surrogate.
+    """
+    archive = _observations()
+    surrogate = _subset_surrogate(tmp_path, size=5)
+    surrogate.fit(archive)
+    candidates = [Candidate(x="CCO"), Candidate(x="NCCCN")]
+    first = surrogate.predict(candidates)
+    surrogate.fit([Observation(x=o.x, y=2.0 * o.y) for o in archive])
+    second = surrogate.predict(candidates)
+
+    restored_first = load_fit(
+        tmp_path, 0, FixedFeatureGPSurrogate(_SmilesFeatureEncoder())
+    )
+    restored_second = load_fit(
+        tmp_path, 1, FixedFeatureGPSurrogate(_SmilesFeatureEncoder())
+    )
+
+    assert restored_first.predict(candidates)["mean"] == pytest.approx(first["mean"])
+    assert restored_second.predict(candidates)["mean"] == pytest.approx(second["mean"])
+
+
+def test_read_training_subset_round_trips_the_recorded_rows(tmp_path: Path) -> None:
+    """The CSV reads back as the observations the fit trained on, in order."""
+    archive = _observations()
+    surrogate = _subset_surrogate(tmp_path, size=5)
+    surrogate.fit(archive)
+    subset = surrogate.last_subset
+    assert subset is not None
+
+    rows = read_training_subset(tmp_path / "training_subset_fit_0000.csv")
+
+    assert [row.x for row in rows] == [archive[i].x for i in subset.indices]
+    assert [row.y for row in rows] == pytest.approx(
+        [archive[i].y for i in subset.indices]
+    )
+    assert [row.fidelity for row in rows] == [
+        archive[i].fidelity for i in subset.indices
+    ]
+
+
+def test_load_fit_names_the_missing_half(tmp_path: Path) -> None:
+    """A fit that was never recorded says which file is absent."""
+    with pytest.raises(FileNotFoundError, match="No fit 3"):
+        load_fit(tmp_path, 3, FixedFeatureGPSurrogate(_SmilesFeatureEncoder()))
+
+
+def test_read_training_subset_rejects_an_empty_file(tmp_path: Path) -> None:
+    """An exact GP cannot be restored without the data it conditions on."""
+    path = tmp_path / "training_subset_fit_0000.csv"
+    path.write_text("archive_index,x,fidelity,y\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="no training rows"):
+        read_training_subset(path)
+
+
+def test_read_training_subset_reads_a_blank_fidelity_as_the_default(
+    tmp_path: Path,
+) -> None:
+    """A None fidelity is recorded blank, and must not read back as a guess.
+
+    _write_subset writes an empty field for a None fidelity. Substituting any
+    particular number here would restore the fit at a fidelity it was not
+    fitted at, and nothing downstream checks.
+    """
+    path = tmp_path / "training_subset_fit_0000.csv"
+    path.write_text(
+        "archive_index,x,fidelity,y\n0,CCO,,0.5\n", encoding="utf-8"
+    )
+
+    rows = read_training_subset(path)
+
+    assert [row.fidelity for row in rows] == [DEFAULT_FIDELITY]
