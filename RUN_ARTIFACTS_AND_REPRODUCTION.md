@@ -27,7 +27,7 @@ outputs/ampc/single_fidelity_al/<run_name>/
 ├── run_description.txt            the W&B notes the job script generated
 ├── generated_pool_round_NNNN.csv  the 100k pool, SMILES only
 ├── rejects_round_NNNN.csv         reservoir sample of rejected generations
-├── training_samples_round_NNNN.csv.gz  every molecule generated WHILE training
+├── training_samples_round_NNNN.csv.gz  every molecule TRAINED on (see 6.12)
 ├── training_steps_round_NNNN.csv       the per-step training series, as data
 ├── training_subsets/
 │   ├── training_subset_fit_KKKK.csv   the rows fit K trained on
@@ -168,10 +168,12 @@ reproduce this after the run ends.
 | `reward_input_score` | The post-transform score the loss multiplied by beta — same scale as `reward_input_score` in `scored_samples.csv` and as `sampler/s3gfn/reward/trajectory` |
 | `acquisition_score` | Raw acquisition value, empty where the step reported none |
 
-320,000 rows a round (5,000 steps × batch 64), ~21.5 MB plain and **~6 MB
+Roughly 296,000 rows a round — **not** 320,000. The file holds the molecules
+the policy was actually trained on, which is the post-filter batch, so the row
+count is `sum(valid)` from `training_steps_round_NNNN.csv`, not
+`n_train_steps × batch_size`. See caveat 6.12. About 20 MB plain and **~10 MB
 gzipped**, which is why it is compressed. `pandas.read_csv` reads `.csv.gz`
-with no change at the call site; from the shell use `zcat`. Unique rate runs
-0.86–0.95, so ~93% of rows are distinct molecules.
+with no change at the call site; from the shell use `zcat`.
 
 Written once at the end of the round, not per step — one write to a networked
 filesystem instead of five thousand.
@@ -400,6 +402,11 @@ Ten rounds produce `training_subset_fit_0000`…`0009` but
 
 **Fit `K` corresponds to round `K+1`.**
 
+The reason is that the two counters start from different places: the fit
+counter starts at 0 and the round number starts at 1, and the GP is fitted at
+the *start* of a round. So the first fit of the run, `fit_0000`, is the GP that
+round 1 then sampled and selected with.
+
 Pairing `fit_0003` with `round_0003` evaluates the wrong round's GP against the
 wrong round's molecules and produces entirely plausible numbers. Nothing
 detects it.
@@ -500,6 +507,24 @@ it about four rounds from a 25,000-row start.
 The memory model `3.0068e-08 * n^2 + 0.325` GiB describes a fit with the card
 to itself and is **not** the ceiling.
 
+### 6.12 `training_samples` rows are fewer than steps × batch size
+
+The file records `prepared.smiles`, the batch the loss was actually computed
+on, so generations the sampler rejected as invalid never get a row. The row
+count is therefore `sum(valid)` from `training_steps_round_NNNN.csv`, not
+`n_train_steps × batch_size`.
+
+Measured on the 500-step smoke run (job 26223616): `sum(generated)` was exactly
+32,000 and the file held 29,589 rows, 92.5%. Reconcile against the `valid`
+column before concluding that rows are missing — a short file is the expected
+shape, not a truncated write. The discarded generations are still counted, in
+`valid` and in `sampler/s3gfn/generation/reject_rate/*`, and a reservoir sample
+of them is in `rejects_round_NNNN.csv`.
+
+A whole batch is also dropped, deliberately, when its SMILES count disagrees
+with its reward count (§2.4), but that is a guard against misalignment and
+should never fire.
+
 ---
 
 ## 7. What is and is not reproducible
@@ -512,7 +537,7 @@ to itself and is **not** the ceiling.
 | Reconstruct the archive at any round | **Yes** — by replay |
 | Inspect what the policy generated and what was docked | **Yes** |
 | Redraw or recompute any per-step training curve | **Yes** — `training_steps_round_NNNN.csv` holds the series as data |
-| Analyse what the policy explored while learning | **Yes** — `training_samples_round_NNNN.csv.gz`, 320k molecules a round |
+| Analyse what the policy explored while learning | **Yes** — `training_samples_round_NNNN.csv.gz`, ~296k molecules a round |
 | Say which torch, CUDA and GPU produced a number | **Yes** — `provenance.environment` |
 | Find the scheduler log for a run | **Yes** — `provenance.slurm.SLURM_JOB_ID` |
 | Generate new molecules from a past round's policy | **No** — not checkpointed |
