@@ -7,6 +7,36 @@
 #   sbatch jobs/single_fidelity_al_nibi.sh              (the 2-round test)
 #   sbatch jobs/single_fidelity_al_nibi.sh <run_name> <rounds> <docks_per_round>
 #   sbatch jobs/single_fidelity_al_nibi.sh <run_name> <rounds> <docks_per_round> <dataset_mode>
+#   sbatch jobs/single_fidelity_al_nibi.sh <run_name> <rounds> <docks_per_round> <dataset_mode> key=value ...
+#
+# ANYTHING AFTER <dataset_mode> is passed through verbatim as an OmegaConf
+# override, appended last so it beats the overrides this script sets itself.
+# The override names its own config key, so the submit command states what it
+# changed and `cli.*` records it exactly as typed. For example, the 40,000-row
+# training-set arm:
+#
+#   sbatch jobs/single_fidelity_al_nibi.sh sf-10round-40ktrain-seed42 10 5000 subset \
+#     surrogate.training_subset.size=40000 \
+#     dataset.path=data/ampc_balanced_n40000_39999.csv
+#
+# A FEW OVERRIDES ARE GUARDED, because the training-set size is the one knob
+# whose mistakes cost a dead 48-hour job rather than an error:
+#
+#   - The size field differs BY MODE and the two are not interchangeable.
+#     `subset` takes `training_subset.size`, the number of rows fitted every
+#     round, so memory is flat. `full` takes `training_subset.max_size`, the
+#     size past which the run STOPS, because there the archive grows and
+#     nothing bounds the fit. StratifiedFPS has no max_size, FullArchive has no
+#     size, and both forbid extra keys, so passing the wrong one is refused
+#     here rather than 90 seconds in at config load.
+#   - Neither may exceed 40,000, the measured ceiling (see THE CEILING below).
+#     The config itself would accept 50,000 and the fit would die in a CUDA
+#     out-of-memory partway through a round.
+#   - `dataset.path` must exist, since a missing archive is only discovered
+#     after the venv, the imports and the feature store have loaded.
+#   - The whole `training_subset` node cannot be replaced this way: in `full`
+#     mode this script sets that node itself, and a second whole-node override
+#     would silently drop the half it did not write. Override the leaf instead.
 #
 # DATASET_MODE picks how the labeled data is managed over rounds. The two
 # regimes differ in one thing -- what the GP is fitted on -- and that one thing
@@ -103,14 +133,14 @@
 # and the docking each write their metrics, figures and results to disk as they
 # complete (stage_history.jsonl in the run directory). Re-check the fair share
 # before every submit:
-#   sshare -l -A def-bengioy_gpu,def-mailhoto_gpu,def-yvesbrun_gpu
+#   sshare -l -A def-alexhg_gpu,def-bengioy_gpu,def-mailhoto_gpu,def-yvesbrun_gpu
 
 #SBATCH --gpus=h100:1
 #SBATCH --cpus-per-task=24
 #SBATCH --mem=80G
 #SBATCH --time=48:00:00
 #SBATCH --job-name=single_fidelity_al
-#SBATCH --account=def-yvesbrun_gpu
+#SBATCH --account=def-alexhg_gpu
 #SBATCH --output=slurm_logs/single_fidelity_al_%j.out
 #SBATCH --error=slurm_logs/single_fidelity_al_%j.err
 
@@ -141,7 +171,72 @@ if [[ "${DATASET_MODE}" != "subset" && "${DATASET_MODE}" != "full" ]]; then
   exit 2
 fi
 
+# Before the override checks, because dataset.path is relative to the repo and
+# sbatch starts the script in whatever directory it was submitted from.
 cd /home/ethankrz/activelearning
+
+# Everything past <dataset_mode> is a config override, checked here only where
+# a mistake would survive config validation and die hours later on the GPU.
+# See the header for why each of these is worth a guard.
+EXTRA_OVERRIDES=("${@:5}")
+TRAINING_SET_CEILING=40000
+for override in ${EXTRA_OVERRIDES[@]+"${EXTRA_OVERRIDES[@]}"}; do
+  if [[ "${override}" != *=* ]]; then
+    echo "extra arguments must be config overrides of the form key=value; got '${override}'." >&2
+    echo "usage: sbatch jobs/single_fidelity_al_nibi.sh <run_name> [<rounds> <docks_per_round>] [<dataset_mode>] [key=value ...]" >&2
+    exit 2
+  fi
+  override_key="${override%%=*}"
+  override_value="${override#*=}"
+  case "${override_key}" in
+    surrogate.training_subset)
+      echo "Do not replace the whole training_subset node from the command line." >&2
+      echo "In dataset_mode=full this script sets that node itself, and a second" >&2
+      echo "whole-node override drops the half it did not write. Override the" >&2
+      echo "leaf instead, e.g. surrogate.training_subset.size=25000." >&2
+      exit 2
+      ;;
+    surrogate.training_subset.size|surrogate.training_subset.max_size)
+      # The two fields are per-mode and mean different things: `size` is the
+      # rows fitted every round, `max_size` is where a growing fit must stop.
+      if [[ "${override_key}" == *.size && "${DATASET_MODE}" == "full" ]]; then
+        echo "surrogate.training_subset.size does not exist in dataset_mode=full." >&2
+        echo "FullArchive fits the whole archive and has no fixed size; what it" >&2
+        echo "takes is max_size, the size past which the run stops. Use" >&2
+        echo "surrogate.training_subset.max_size=${override_value}, or dataset_mode=subset." >&2
+        exit 2
+      fi
+      if [[ "${override_key}" == *.max_size && "${DATASET_MODE}" == "subset" ]]; then
+        echo "surrogate.training_subset.max_size does not exist in dataset_mode=subset." >&2
+        echo "StratifiedFPS fits a fixed number of rows every round, so the size" >&2
+        echo "is not a ceiling to stop at. Use" >&2
+        echo "surrogate.training_subset.size=${override_value}, or dataset_mode=full." >&2
+        exit 2
+      fi
+      if [[ ! "${override_value}" =~ ^[0-9]+$ || "${override_value}" -lt 1 ]]; then
+        echo "${override_key} must be a positive integer; got '${override_value}'." >&2
+        exit 2
+      fi
+      if [[ "${override_value}" -gt "${TRAINING_SET_CEILING}" ]]; then
+        echo "${override_key}=${override_value} is over the measured ${TRAINING_SET_CEILING}-row ceiling." >&2
+        echo "40,000 passed the two-round probe in the real loop (job 26162761," >&2
+        echo "72.48 GiB peak, 6.70 GiB spare); 45,000 did not (26162757, 26215104)." >&2
+        echo "The config would accept this and the fit would die in a CUDA" >&2
+        echo "out-of-memory partway through a round. See the header." >&2
+        exit 2
+      fi
+      ;;
+    dataset.path)
+      if [[ ! -f "${override_value}" ]]; then
+        echo "dataset.path '${override_value}' is not a file, relative to $(pwd)." >&2
+        echo "A missing archive is otherwise only found after the venv, the" >&2
+        echo "imports and the feature store have loaded." >&2
+        exit 2
+      fi
+      ;;
+  esac
+done
+
 source .venv/bin/activate
 
 export PYTHONUNBUFFERED=1
@@ -205,6 +300,14 @@ DATASET MODE IS 'full': there is no subset selection, so NO round has band metri
 fi
 printf '%s\n' "${WANDB_NOTES}" > "${OUTPUT_DIR}/run_description.txt"
 echo "dataset_mode=${DATASET_MODE}"
+
+# LAST, so a passed-through override beats the ones above. In dataset_mode=full
+# that is what lets `surrogate.training_subset.max_size=N` merge onto the
+# FullArchive node this script just set, instead of being overwritten by it.
+OVERRIDES+=(${EXTRA_OVERRIDES[@]+"${EXTRA_OVERRIDES[@]}"})
+if [[ ${#EXTRA_OVERRIDES[@]} -gt 0 ]]; then
+  printf 'passed-through override: %s\n' "${EXTRA_OVERRIDES[@]}"
+fi
 
 # run_with_sigterm_flush turns Slurm's SIGTERM into a KeyboardInterrupt, so the
 # loop's handler commits the dying round's telemetry instead of losing it.
