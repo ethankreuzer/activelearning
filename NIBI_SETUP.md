@@ -222,7 +222,7 @@ None of these are in git. Copy them to the same paths relative to the repo root:
 | `minimol_ampc_encoder/` | 34 MB | AmpC MiniMol encoder package and `model/final.pt`. Run its `verify_install.py` inside `salloc`. |
 | `~/.cache/huggingface/hub/models--ibm-research--GP-MoLFormer-Uniq` and `models--ibm-research--MoLFormer-XL-both-10pct` | ~360 MB | Either rsync them, or pre-fetch them on the Nibi login node. |
 
-`ampc_hitrate_fits/` **is** tracked (`fitted_params.json`, `data/full_scores.df`), so it arrives
+`ampc_hitrate_fits/` **is** tracked (`fitted_params.json`, `data/ampc_full_scores_1p7b.df`), so it arrives
 with the clone. Globus or `rsync` between login nodes are both fine for the 20 GB cache.
 
 ---

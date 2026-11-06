@@ -77,7 +77,7 @@ oracle:
   # The observed value is P(binding), not the docking score. Paths are relative
   # to the repository root, like config/data/molecules.txt elsewhere.
   hitrate_params: ampc_hitrate_fits/fitted_params.json
-  score_pprop_table: ampc_hitrate_fits/data/full_scores.df
+  score_pprop_table: ampc_hitrate_fits/data/ampc_full_scores_1p7b.df
   hitrate_target: ampc
   pki_threshold: 6.5
 

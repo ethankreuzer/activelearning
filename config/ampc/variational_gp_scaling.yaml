@@ -160,7 +160,7 @@ oracle:
   num_workers: null
   ligbuild_timeout: 150
   hitrate_params: ampc_hitrate_fits/fitted_params.json
-  score_pprop_table: ampc_hitrate_fits/data/full_scores.df
+  score_pprop_table: ampc_hitrate_fits/data/ampc_full_scores_1p7b.df
   hitrate_target: ampc
   pki_threshold: 6.5
 

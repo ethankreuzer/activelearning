@@ -38,7 +38,7 @@ def main() -> int:
         fidelity_costs={1: 32.0},
         fidelity_confidences={1: 1.0},
         hitrate_params=str(REPO_ROOT / "ampc_hitrate_fits/fitted_params.json"),
-        score_pprop_table=str(REPO_ROOT / "ampc_hitrate_fits/data/full_scores.df"),
+        score_pprop_table=str(REPO_ROOT / "ampc_hitrate_fits/data/ampc_full_scores_1p7b.df"),
         hitrate_target="ampc",
         pki_threshold=6.5,
         shared_work_dir="/scratch/ethankrz/activelearning/dock3_queries",
