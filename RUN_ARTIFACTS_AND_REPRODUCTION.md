@@ -525,6 +525,77 @@ A whole batch is also dropped, deliberately, when its SMILES count disagrees
 with its reward count (§2.4), but that is a guard against misalignment and
 should never fire.
 
+### 6.13 A misspelled dataset override is silently ignored — OPEN, fix due 2026-11-07
+
+**`dataset.path=` does nothing.** The loader reads
+`dataset.initial_data.path`. An override on the wrong key is absorbed without
+a warning, the run starts on whatever the YAML named, and the dead key is
+still echoed into the logged config and `run_manifest.json` — so the run
+*looks* correct on inspection. This is the one provenance failure the manifest
+does not protect you from: everything recorded is accurate, but it records a
+key nobody read.
+
+Cost, measured: **job 26236119** was submitted as the 40,000-row training arm
+with `dataset.path=data/ampc_balanced_n40000_39999.csv` and ran 6 h 59 m on the
+25,000-row set before being cancelled. `profiling/surrogate/archive_size` read
+25000 at round 1. Worse, the paired `surrogate.training_subset.size=40000` then
+exceeded the archive, so StratifiedFPS selected everything
+(`archive_fraction=1.000`, `subset_size=29888`) and the arm was a full-archive
+duplicate of job 26236107, not a 40k-subset arm at all. Corrected resubmit:
+**job 26276912**.
+
+**Detection.** Check `profiling/surrogate/archive_size` on round 1 against the
+dataset you meant to start from. It is the cheapest signal that an override
+landed, and the only one that would have caught this within minutes.
+
+Three things are wrong, in increasing order of leverage:
+
+1. `jobs/single_fidelity_al_nibi.sh:20` — the header's worked example, the one
+   written to be copied, uses `dataset.path=`. Line 35 repeats it in the
+   guard's rationale, and line 174 in a comment.
+2. `jobs/single_fidelity_al_nibi.sh:229` — the guard's `case` arm matches the
+   literal `dataset.path`, so it is backwards both ways. It fires on the dead
+   key, confirming a file exists that will then be ignored; and it does **not**
+   fire on `dataset.initial_data.path`, so the correct spelling has no
+   existence check at all. A typo'd filename on the working key still dies
+   late, after the venv, the imports and the feature store have loaded —
+   exactly what the guard was written to prevent.
+3. `src/activelearning/dataset/config.py:173` — `ListDatasetConfig(BaseModel)`
+   sets no `model_config`, so pydantic's default `extra="ignore"` swallows the
+   unknown key. **This is the root cause.** `extra="forbid"` appears in 10
+   other places in `src/` (`oracle/config.py` ×3, `surrogate/encoder_config.py`
+   ×2, `surrogate/training_subset.py` ×2, `monitoring/held_out.py`) — the
+   dataset config is the inconsistency, not the rule. The same treatment is
+   worth extending to `CSVInitialDataConfig`, which would catch typos *inside*
+   `initial_data`.
+
+Adding `extra="forbid"` would have failed the submit in seconds with a named
+error. The two script fixes only patch the one key people happen to typo; this
+one closes the class.
+
+**Why it is not fixed yet.** Deferred deliberately on 2026-11-06 with three
+arms running (jobs 26236107, 26236114, 26236117) and one queued (26276912).
+Notes for whoever picks it up:
+
+- The running jobs are **not** at risk from a `src/` edit. The install is
+  editable, so source is read live, but all three imported their modules at
+  startup and nothing re-imports: docking is `ThreadPoolExecutor` (threads,
+  same process, `dock3_oracle.py:859`) plus external DOCK3/`ligbuild`
+  subprocesses that do not import the package. The hazard to respect is a
+  module imported *lazily* in a late stage, such as end-of-run plotting.
+- A **queued** job does pick up `src/` changes, because it loads source when it
+  starts. It does **not** pick up script changes: Slurm snapshots the batch
+  script at submission (`scontrol write batch_script <id> -` reads that copy,
+  not the file on disk).
+- So the script fixes are safe at any time; the `extra="forbid"` change should
+  land either before 26276912 starts or after, not during, and wants the full
+  config chain validated first — the risk is a dormant extra key elsewhere
+  turning a silent drop into a startup failure. The chain checked so far
+  (`config/ampc/subset_fixed_gp.yaml`, `config/ampc/overrides/full_archive.yaml`)
+  sets only declared fields.
+- Committing before a queued job starts keeps its `provenance.dirty` false,
+  matching the arms it is compared against (all `8a48ddb`, clean).
+
 ---
 
 ## 7. What is and is not reproducible
