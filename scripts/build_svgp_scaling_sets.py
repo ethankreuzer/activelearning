@@ -92,6 +92,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from activelearning.applications.molecules.hit_rate import DEFAULT_ENRICHED_THRESHOLD
+
 _logger = logging.getLogger("build_svgp_scaling_sets")
 
 #: Band edges, as targets. These are ``HitRateModel.hit_rate_from_pprop(p, 6.5)``
@@ -104,7 +106,9 @@ DEFAULT_BAND_EDGES: tuple[float, ...] = (
 )
 
 #: Targets at or above this are kept outright: ``hit_rate_from_pprop(3.5, 6.5)``.
-DEFAULT_KEEP_ABOVE = 0.2617481563014626
+#: Aliased from the canonical definition so the tail is cut at the same place here,
+#: in the policy pretraining and in the surrogate evaluation's hit / non-hit split.
+DEFAULT_KEEP_ABOVE = DEFAULT_ENRICHED_THRESHOLD
 
 #: Share of each arm given to the 3.0-3.5 band. See the module docstring.
 DEFAULT_TOP_FRACTION = 0.169

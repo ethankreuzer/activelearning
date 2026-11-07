@@ -470,8 +470,12 @@ def prediction_outputs(
     Returns
     -------
     tuple[dict[str, float], dict[str, Any]]
-        Metrics keyed ``<set>/final/<metric>`` and ``<set>/std_latent/<stat>``,
-        and figures keyed ``<set>/figures/<name>``.
+        Metrics keyed ``<set>/final/<metric>``,
+        ``<set>/calibration/<metric>`` (the
+        :func:`~activelearning.surrogate.eval_metrics.variance_calibration_metrics`
+        block, the only one that measures the latent variance the acquisition
+        consumes against the residuals rather than against the total) and
+        ``<set>/std_latent/<stat>``, and figures keyed ``<set>/figures/<name>``.
     """
     from activelearning.surrogate.eval_metrics import (
         error_by_std_figure,
@@ -481,6 +485,7 @@ def prediction_outputs(
         top_fraction_overlap,
         top_fraction_split_means,
         two_panel_histogram,
+        variance_calibration_metrics,
         weighted_prediction_metrics,
     )
 
@@ -493,6 +498,13 @@ def prediction_outputs(
         latent_std=predictions["std_latent"],
     ).items():
         metrics[f"{name}/final/{key}"] = value
+    for key, value in variance_calibration_metrics(
+        eval_set.targets,
+        predictions["mean"],
+        predictions["std_latent"],
+        predictions["std_total"],
+    ).items():
+        metrics[f"{name}/calibration/{key}"] = value
     metrics[f"{name}/final/top1pct_overlap"] = top_fraction_overlap(
         eval_set.targets, predictions["mean"]
     )
