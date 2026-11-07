@@ -4,8 +4,71 @@ Written 2026-11-07 on Mila, as a handoff. This file is the entry point for
 resuming the work; it supersedes nothing but assumes
 `SURROGATE_THEN_PRIOR_RESTART.md` has been read for the pre-2026-11-07 history.
 
-**Nothing has been launched. Nothing has been committed.** Branch
-`exact-dkl-top-n`, last commit `76cd121`.
+**No experiment has been launched.** Only code and this document were written.
+
+---
+
+## 0. Repo state, and the first thing to do
+
+As of the end of the 2026-11-07 session, on branch `exact-dkl-top-n`:
+
+- **`origin/exact-dkl-top-n` is correct and current.** It ends at `420538e`,
+  "split the surrogate eval by hit and enriched, and score calibration offline",
+  which is the session's work in its final form. Pushed and verified.
+- **The local checkout at `~/activelearning` is NOT current.** It sits at
+  `9d0d644`, **ahead 1, behind 17**. That commit is **orphaned and superseded**:
+  it was this session's first attempt, written before the branch had been
+  fetched, and it contained a duplicate calibration metric (see section 3). Its
+  surviving content is in `420538e` in corrected form. **Do not merge, rebase or
+  push `9d0d644`.** Discard it.
+- The push was made from a throwaway worktree precisely so that the local
+  checkout's uncommitted work was never at risk. Nothing there was modified,
+  staged or stashed. The worktree has been removed.
+
+### Reconciling the local checkout
+
+`9d0d644` should be dropped and the branch pointed at the remote. The working
+tree is dirty, so the uncommitted work has to be dealt with first, and **three of
+those files were also changed on the remote**, which is why this was left for a
+human rather than guessed at:
+
+| locally modified, uncommitted | also changed on the remote? |
+|---|---|
+| `config/ampc/variational_gp_scaling.yaml` | **YES** -- `ba1048a` touched it, and the local edit is the `prior_mean` fix |
+| `config/ampc/reward_shape_svgp300k.yaml` | **YES** |
+| `src/activelearning/sampler/s3gfn/sampler.py` | **YES** |
+| `src/activelearning/surrogate/config.py` | no |
+| `src/activelearning/surrogate/variational_gp.py` | no -- the `noise_floor` work |
+| `tests/surrogate/test_variational_gp.py` | no |
+| `tests/test_example_configs.py` | no |
+| `jobs/exact_dkl_balanced_n40000_prepare_mila.sh` | no |
+| `jobs/reward_shape_mila.sh` | no |
+| `jobs/variational_gp_scaling_mila.sh` | no |
+
+The three overlapping files need a real decision: the remote's `ba1048a` points
+the oracle at the corrected score/pProp table and may already supersede the local
+`prior_mean` edit, or may need it reapplied on top. Check before discarding
+either side.
+
+Shape of it, once that is decided:
+
+    cd ~/activelearning
+    git stash push -m "pre-pull wip"      # or commit the local work first
+    git reset --hard origin/exact-dkl-top-n   # drops the orphaned 9d0d644
+    git stash pop                          # expect conflicts in the three files
+
+The untracked files (`PRIOR_RTB_*.md`, `SURROGATE_THEN_PRIOR_RESTART.md`,
+`config/ampc/prior_rtb_*.yaml`, several `jobs/*.sh`,
+`scripts/pretrain_prior_rtb.py`, `scripts/analyze_prior_rtb_tail.py`,
+`tests/scripts/test_pretrain_prior_rtb.py`) all predate this session, collide
+with nothing on the remote, and are untouched by a reset. They are still
+uncommitted and should probably be committed.
+
+One small thing rides along: `scripts/pretrain_prior_rtb.py` is untracked but was
+edited this session -- one import, and `TAIL_THRESHOLD` now aliasing
+`DEFAULT_ENRICHED_THRESHOLD` (value unchanged at `0.2617481563014626`, pinned by
+a test). If that file is committed later it will carry that change. It is
+consistent with `420538e`, which is already on the remote.
 
 ---
 
