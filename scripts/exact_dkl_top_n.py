@@ -76,6 +76,10 @@ from scripts.surrogate_eval_io import (  # noqa: E402
     write_per_molecule_csv,
 )
 
+from activelearning.applications.molecules.hit_rate import (  # noqa: E402
+    DEFAULT_ENRICHED_THRESHOLD,
+    DEFAULT_HIT_THRESHOLD,
+)
 from activelearning.surrogate.gp_hyperparameters import (  # noqa: E402
     gp_hyperparameters,
 )
@@ -114,6 +118,23 @@ SURROGATE_ENCODERS = {
 #: Appended to a set's name for the metrics computed on only the molecules the
 #: surrogate was not trained on.
 UNSEEN_SUFFIX = "_unseen"
+
+#: Appended to a set's name for the metrics computed on only its HITS, the
+#: molecules at or above ``DEFAULT_HIT_THRESHOLD`` (pProp 5). Recovering these is
+#: the objective of the project, so they are reported on their own even though
+#: there are few of them: 100 of ampc_331k, 1 of gp_molformer_set.
+HIT_SUFFIX = "_hit"
+
+#: Appended for the ENRICHED region, at or above ``DEFAULT_ENRICHED_THRESHOLD``
+#: (pProp 3.5), and for its complement. The enriched region is a superset of the
+#: hits and is where the mean and the variance can actually be measured: 3,153
+#: molecules of ampc_331k against 100 hits. The mean and the latent variance
+#: behave very differently across the two -- on the 300k ELBO arm the latent
+#: variance is 30x too small on ampc_331k's bulk and 488x too small on its
+#: enriched region -- which the whole-set number hides because the enriched region
+#: is 1% of the set.
+ENRICHED_SUFFIX = "_enriched"
+BULK_SUFFIX = "_bulk"
 
 
 @dataclass(frozen=True)
@@ -530,24 +551,53 @@ def prediction_outputs_with_unseen(
     metrics, built = prediction_outputs(eval_set, predictions, figures=figures)
     in_train = np.asarray(in_train, dtype=bool)
     metrics[f"{eval_set.name}/final/n_in_train"] = float(in_train.sum())
-    unseen = ~in_train
-    if unseen.any():
-        subset = EvalSet(
-            name=f"{eval_set.name}{UNSEEN_SUFFIX}",
-            smiles=tuple(
-                molecule for molecule, keep in zip(eval_set.smiles, unseen) if keep
-            ),
-            targets=eval_set.targets[unseen],
-            features=None,
-            weights=None if eval_set.weights is None else eval_set.weights[unseen],
-        )
-        unseen_metrics, _ = prediction_outputs(
-            subset,
-            {key: np.asarray(values)[unseen] for key, values in predictions.items()},
-            figures=False,
-        )
-        metrics.update(unseen_metrics)
+
+    targets = np.asarray(eval_set.targets, dtype=float)
+    labelled = np.isfinite(targets)
+    is_hit = targets >= DEFAULT_HIT_THRESHOLD
+    is_enriched = targets >= DEFAULT_ENRICHED_THRESHOLD
+    for suffix, mask in (
+        (UNSEEN_SUFFIX, ~in_train),
+        (HIT_SUFFIX, is_hit),
+        (ENRICHED_SUFFIX, is_enriched),
+        (BULK_SUFFIX, ~is_enriched & labelled),
+    ):
+        subset_metrics = _subset_prediction_outputs(eval_set, predictions, mask, suffix)
+        metrics.update(subset_metrics)
+    metrics[f"{eval_set.name}/final/n_hit"] = float(is_hit.sum())
+    metrics[f"{eval_set.name}/final/n_enriched"] = float(is_enriched.sum())
     return metrics, built
+
+
+def _subset_prediction_outputs(
+    eval_set: EvalSet,
+    predictions: Mapping[str, np.ndarray],
+    mask: np.ndarray,
+    suffix: str,
+) -> dict[str, float]:
+    """Prediction metrics for the molecules a mask selects, under ``<set><suffix>/``.
+
+    Returns an empty dict when the mask selects nothing, so an evaluation set with
+    no hits simply has no ``<set>_hit/`` block rather than a block of NaNs.
+    """
+    keep = np.asarray(mask, dtype=bool)
+    if not keep.any():
+        return {}
+    subset = EvalSet(
+        name=f"{eval_set.name}{suffix}",
+        smiles=tuple(
+            molecule for molecule, taken in zip(eval_set.smiles, keep) if taken
+        ),
+        targets=eval_set.targets[keep],
+        features=None,
+        weights=None if eval_set.weights is None else eval_set.weights[keep],
+    )
+    subset_metrics, _ = prediction_outputs(
+        subset,
+        {key: np.asarray(values)[keep] for key, values in predictions.items()},
+        figures=False,
+    )
+    return subset_metrics
 
 
 def load_resolved_set(

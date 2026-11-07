@@ -470,11 +470,15 @@ def prediction_outputs(
     Returns
     -------
     tuple[dict[str, float], dict[str, Any]]
-        Metrics keyed ``<set>/final/<metric>`` and ``<set>/std_latent/<stat>``,
-        and figures keyed ``<set>/figures/<name>``.
+        Metrics keyed ``<set>/final/<metric>`` (including the
+        :func:`~activelearning.surrogate.eval_metrics.latent_calibration` block,
+        which is the only one that measures the latent standard deviation against
+        the residuals rather than the total) and ``<set>/std_latent/<stat>``, and
+        figures keyed ``<set>/figures/<name>``.
     """
     from activelearning.surrogate.eval_metrics import (
         error_by_std_figure,
+        latent_calibration,
         predicted_vs_observed_figure,
         prediction_metrics,
         summary_stats,
@@ -491,6 +495,10 @@ def prediction_outputs(
         predictions["mean"],
         predictions["std_total"],
         latent_std=predictions["std_latent"],
+    ).items():
+        metrics[f"{name}/final/{key}"] = value
+    for key, value in latent_calibration(
+        eval_set.targets, predictions["mean"], predictions["std_latent"]
     ).items():
         metrics[f"{name}/final/{key}"] = value
     metrics[f"{name}/final/top1pct_overlap"] = top_fraction_overlap(

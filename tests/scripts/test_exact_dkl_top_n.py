@@ -10,6 +10,7 @@ from identical max-value samples.
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -17,7 +18,12 @@ import numpy as np
 import pytest
 import torch
 
+from activelearning.applications.molecules.hit_rate import (
+    DEFAULT_ENRICHED_THRESHOLD,
+    DEFAULT_HIT_THRESHOLD,
+)
 from activelearning.monitoring.keys import validate_log_key
+from activelearning.surrogate.eval_metrics import LATENT_CALIBRATION_KEYS
 from scripts import exact_dkl_top_n as arm
 from scripts.surrogate_eval_io import EvalSet, prediction_outputs, score_outputs
 
@@ -930,3 +936,114 @@ def test_variational_gp_balanced_config_parses() -> None:
     assert config.surrogate.prior_mean == pytest.approx(0.03956042999405787)
     assert config.surrogate.training_params.batch_size is None
     assert config.runtime.precision == 32
+
+
+def test_enriched_and_bulk_blocks_partition_the_set_at_pprop_3_5() -> None:
+    """Every labelled molecule lands in exactly one of the two blocks."""
+    eval_set = _eval_set("ampc_331k", 40)
+    expected = int((eval_set.targets >= DEFAULT_ENRICHED_THRESHOLD).sum())
+
+    metrics, _ = arm.prediction_outputs_with_unseen(
+        eval_set, _predictions(40), np.zeros(40, dtype=bool), figures=False
+    )
+
+    assert 0 < expected < 40
+    assert metrics["ampc_331k/final/n_enriched"] == float(expected)
+    assert math.isfinite(metrics["ampc_331k_enriched/final/rmse"])
+    assert math.isfinite(metrics["ampc_331k_bulk/final/rmse"])
+    for key in metrics:
+        validate_log_key(key)
+
+
+def test_the_hit_block_is_cut_at_pprop_5_not_at_the_enriched_edge() -> None:
+    """Hits are pProp 5+, the molecules the sampling has to recover.
+
+    The two thresholds must not be confused: on ampc_331k the enriched region
+    holds 3,153 molecules and the hits 100.
+    """
+    targets = np.array([0.1, 0.3, 0.4, 0.6, 0.65])
+    eval_set = EvalSet(
+        name="ampc_331k",
+        smiles=tuple(f"C{index}" for index in range(5)),
+        targets=targets,
+        features=torch.zeros((5, 3)),
+    )
+
+    metrics, _ = arm.prediction_outputs_with_unseen(
+        eval_set, _predictions(5), np.zeros(5, dtype=bool), figures=False
+    )
+
+    assert DEFAULT_HIT_THRESHOLD > DEFAULT_ENRICHED_THRESHOLD
+    # 0.3, 0.4, 0.6 and 0.65 clear pProp 3.5; only 0.6 and 0.65 clear pProp 5.
+    assert metrics["ampc_331k/final/n_enriched"] == 4.0
+    assert metrics["ampc_331k/final/n_hit"] == 2.0
+
+
+def test_a_set_with_no_hits_has_no_hit_block() -> None:
+    """gp_molformer_set holds one hit in 83,811; an empty block is omitted."""
+    eval_set = EvalSet(
+        name="gp_molformer_set",
+        smiles=("C0", "C1", "C2"),
+        targets=np.array([0.01, 0.02, 0.03]),
+        features=torch.zeros((3, 3)),
+    )
+
+    metrics, _ = arm.prediction_outputs_with_unseen(
+        eval_set, _predictions(3), np.zeros(3, dtype=bool), figures=False
+    )
+
+    assert metrics["gp_molformer_set/final/n_hit"] == 0.0
+    assert not [key for key in metrics if key.startswith("gp_molformer_set_hit/")]
+    assert not [key for key in metrics if key.startswith("gp_molformer_set_enriched/")]
+    assert "gp_molformer_set_bulk/final/rmse" in metrics
+
+
+def test_the_enriched_block_exposes_overconfidence_the_whole_set_hides() -> None:
+    """Why the split exists: a 1% enriched region cannot move a whole-set average.
+
+    The latent std is honest on the bulk and ten times too small on the enriched
+    molecules, which is the measured shape of these fits. The whole-set reading
+    stays close to calibrated while the enriched block shows the real
+    overconfidence.
+    """
+    count = 1000
+    targets = np.full(count, 0.05)
+    targets[:10] = 0.40  # a 1% enriched region, above pProp 3.5 but below pProp 5
+    mean = targets.copy()
+    mean[:10] = 0.05  # predicted as if they were bulk
+    latent = np.full(count, 0.035)
+    predictions = {
+        "mean": mean,
+        "std_total": latent.copy(),
+        "std_latent": latent.copy(),
+    }
+    eval_set = EvalSet(
+        name="ampc_331k",
+        smiles=tuple(f"C{index}" for index in range(count)),
+        targets=targets,
+        features=torch.zeros((count, 3)),
+    )
+
+    metrics, _ = arm.prediction_outputs_with_unseen(
+        eval_set, predictions, np.zeros(count, dtype=bool), figures=False
+    )
+
+    assert metrics["ampc_331k/final/latent_z_rms"] == pytest.approx(1.0, abs=0.01)
+    assert metrics["ampc_331k_enriched/final/latent_z_rms"] == pytest.approx(
+        10.0, abs=0.01
+    )
+    assert metrics["ampc_331k_bulk/final/latent_z_rms"] == pytest.approx(0.0)
+    assert metrics["ampc_331k/final/n_hit"] == 0.0
+
+
+def test_latent_calibration_keys_reach_the_final_block() -> None:
+    """The new metrics are logged alongside the existing prediction metrics."""
+    metrics, _ = arm.prediction_outputs_with_unseen(
+        _eval_set("val_set", 40),
+        _predictions(40),
+        np.zeros(40, dtype=bool),
+        figures=False,
+    )
+
+    for key in LATENT_CALIBRATION_KEYS:
+        assert f"val_set/final/{key}" in metrics

@@ -13,6 +13,11 @@ import numpy as np
 import pytest
 
 from activelearning.applications.molecules.hit_rate import (
+    DEFAULT_ENRICHED_PPROP,
+    DEFAULT_ENRICHED_THRESHOLD,
+    DEFAULT_HIT_PPROP,
+    DEFAULT_HIT_THRESHOLD,
+    DEFAULT_PKI_THRESHOLD,
     HitRateModel,
     load_score_pprop_table,
 )
@@ -194,3 +199,45 @@ class TestThreadSafety:
             got = list(executor.map(lambda job: model.hit_rate(*job), jobs))
 
         assert got == expected
+
+
+def test_default_thresholds_match_the_ampc_fit() -> None:
+    """Both constants are their pProp expressed on the y scale for the AmpC fit.
+
+    They are hardcoded so nothing has to load the score table to use them, so they
+    are pinned here against the real fit. Skipped where ``ampc_hitrate_fits/`` is
+    absent, since it is untracked.
+    """
+    params_path = Path("ampc_hitrate_fits/fitted_params.json")
+    table = Path("ampc_hitrate_fits/data/full_scores.df")
+    if not (params_path.is_file() and table.is_file()):
+        pytest.skip("ampc_hitrate_fits/ is not present")
+
+    model = HitRateModel(json.loads(params_path.read_text())["ampc"], table)
+
+    assert model.hit_rate_from_pprop(
+        DEFAULT_HIT_PPROP, DEFAULT_PKI_THRESHOLD
+    ) == pytest.approx(DEFAULT_HIT_THRESHOLD, rel=0, abs=0)
+    assert model.hit_rate_from_pprop(
+        DEFAULT_ENRICHED_PPROP, DEFAULT_PKI_THRESHOLD
+    ) == pytest.approx(DEFAULT_ENRICHED_THRESHOLD, rel=0, abs=0)
+
+
+def test_a_hit_is_stricter_than_the_enriched_region() -> None:
+    """The two thresholds are easy to confuse, so the ordering is pinned.
+
+    pProp 5 is the objective -- the molecules the sampling has to recover. pProp
+    3.5 is the enriched region the surrogate has to predict well to find them, and
+    it holds ~30x more molecules, which is why both exist.
+    """
+    assert DEFAULT_HIT_PPROP > DEFAULT_ENRICHED_PPROP
+    assert DEFAULT_HIT_THRESHOLD > DEFAULT_ENRICHED_THRESHOLD
+
+
+def test_y_is_increasing_in_pprop_below_the_artifact_peak(model: HitRateModel) -> None:
+    """The hit threshold is only a faithful re-expression of pProp while y rises."""
+    values = [
+        model.hit_rate_from_pprop(pprop, 6.5) for pprop in np.arange(0.0, 6.0, 0.25)
+    ]
+
+    assert all(later > earlier for earlier, later in zip(values, values[1:]))

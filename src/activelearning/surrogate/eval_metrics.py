@@ -268,6 +268,146 @@ def prediction_metrics(
     return metrics
 
 
+def _ols_slope_intercept(x: np.ndarray, y: np.ndarray) -> tuple[float, float] | None:
+    """Least-squares ``y ~ intercept + slope * x``, or ``None`` if ``x`` is constant.
+
+    Written out rather than taken from ``np.polyfit``, which solves an unscaled
+    Vandermonde system and warns about conditioning on inputs this one handles
+    exactly.
+    """
+    if x.size < 2:
+        return None
+    x_mean = float(np.mean(x))
+    centered = x - x_mean
+    denominator = float(np.dot(centered, centered))
+    if denominator <= 0.0:
+        return None
+    slope = float(np.dot(centered, y - np.mean(y)) / denominator)
+    return slope, float(np.mean(y) - slope * x_mean)
+
+
+#: Keys :func:`latent_calibration` always returns, so a caller gets the same shape
+#: whether or not the de-biased reading could be computed.
+LATENT_CALIBRATION_KEYS = (
+    "latent_coverage_1std",
+    "latent_coverage_2std",
+    "latent_z_rms",
+    "latent_variance_ratio",
+    "latent_debias_gain",
+    "latent_debias_intercept",
+    "latent_coverage_1std_debiased",
+    "latent_coverage_2std_debiased",
+    "latent_z_rms_debiased",
+    "latent_variance_ratio_debiased",
+    "latent_slope_debiased",
+)
+
+
+def latent_calibration(
+    targets: Sequence[float] | np.ndarray,
+    mean: Sequence[float] | np.ndarray,
+    latent_std: Sequence[float] | np.ndarray,
+) -> dict[str, float]:
+    """Is the LATENT variance -- the only part the acquisition consumes -- calibrated?
+
+    :func:`prediction_metrics` measures coverage against the TOTAL standard
+    deviation, which on these fits is dominated by the observation noise: the 300k
+    ELBO arm's mean latent std on ``gentail`` is 0.0069 against a total of 0.0363,
+    so its coverage says almost nothing about the quantity that drives GIBBON.
+    This function measures the latent standard deviation on its own.
+
+    Two readings are returned and they answer different questions.
+
+    *Raw* compares the latent standard deviation with the error the surrogate
+    actually makes. This is what the acquisition experiences, bias included.
+
+    *De-biased* first removes the mean's systematic error by regressing the targets
+    on the predicted means (``y ~ intercept + gain * mu``) and rescaling the latent
+    standard deviation by the fitted ``gain``, which isolates the variance question
+    from the mean question. The step is not optional: on raw residuals the mean's
+    systematic error swamps the variance signal and the slope comes out negative,
+    -11.7 on ``ampc_331k`` as recorded in
+    ``jobs/variational_gp_calibration_grid_mila.sh``.
+
+    Parameters
+    ----------
+    targets : Sequence[float] or np.ndarray
+        Observed values.
+    mean : Sequence[float] or np.ndarray
+        Predicted means.
+    latent_std : Sequence[float] or np.ndarray
+        Predicted standard deviations WITHOUT observation noise.
+
+    Returns
+    -------
+    dict[str, float]
+        The keys in :data:`LATENT_CALIBRATION_KEYS`. ``latent_coverage_1std`` and
+        ``latent_coverage_2std`` are the fractions of targets within one and two
+        latent standard deviations; a calibrated Gaussian gives about 0.68 and 0.95.
+        ``latent_z_rms`` is the root mean square of ``(y - mu) / latent_std`` and is
+        1.0 when calibrated, above it when overconfident. ``latent_variance_ratio``
+        is ``mean(residual^2) / mean(latent_std^2)``, the factor by which the latent
+        variance is too small. ``latent_slope_debiased`` regresses the squared
+        de-biased residual on the rescaled latent variance and is also 1.0 when
+        calibrated. ``latent_debias_gain`` and ``latent_debias_intercept`` are the
+        fitted de-bias line, reported so the correction is auditable. Every value is
+        NaN when there is nothing finite to compute it from, and the de-biased
+        values are NaN when the de-bias line cannot be fitted (fewer than two
+        points, a constant predicted mean, or a non-positive gain).
+
+    Notes
+    -----
+    ``latent_z_rms`` and ``latent_variance_ratio`` are the readings to trust on a
+    NARROW subset, such as the hits alone. Within a subset the target range is
+    compressed, the fitted gain falls and the squared residual decorrelates from
+    the predicted variance, so ``latent_slope_debiased`` becomes an unstable
+    estimate and can even go negative -- it is meaningful on a whole evaluation
+    set, not on a slice of one.
+    """
+    y, mu, sigma = _finite_triple(targets, mean, latent_std)
+    nan = float("nan")
+    metrics = {key: nan for key in LATENT_CALIBRATION_KEYS}
+    if y.size == 0:
+        return metrics
+
+    clipped = np.clip(sigma, MIN_STD, None)
+    residual = y - mu
+    error = np.abs(residual)
+    metrics["latent_coverage_1std"] = float(np.mean(error <= clipped))
+    metrics["latent_coverage_2std"] = float(np.mean(error <= 2.0 * clipped))
+    metrics["latent_z_rms"] = float(np.sqrt(np.mean((residual / clipped) ** 2)))
+    metrics["latent_variance_ratio"] = float(np.mean(residual**2) / np.mean(clipped**2))
+
+    fitted = _ols_slope_intercept(mu, y)
+    if fitted is None:
+        return metrics
+    gain, intercept = fitted
+    metrics["latent_debias_gain"] = gain
+    metrics["latent_debias_intercept"] = intercept
+    if not (gain > 0.0):
+        # A non-positive gain means the mean is anti-correlated with the truth, and
+        # rescaling by it would flip the variance. Report the gain and stop.
+        return metrics
+
+    debiased = y - (intercept + gain * mu)
+    scaled = gain * clipped
+    variance = scaled**2
+    metrics["latent_coverage_1std_debiased"] = float(
+        np.mean(np.abs(debiased) <= scaled)
+    )
+    metrics["latent_coverage_2std_debiased"] = float(
+        np.mean(np.abs(debiased) <= 2.0 * scaled)
+    )
+    metrics["latent_z_rms_debiased"] = float(np.sqrt(np.mean((debiased / scaled) ** 2)))
+    metrics["latent_variance_ratio_debiased"] = float(
+        np.mean(debiased**2) / np.mean(variance)
+    )
+    slope = _ols_slope_intercept(variance, debiased**2)
+    if slope is not None:
+        metrics["latent_slope_debiased"] = slope[0]
+    return metrics
+
+
 def weighted_prediction_metrics(
     targets: Sequence[float] | np.ndarray,
     mean: Sequence[float] | np.ndarray,

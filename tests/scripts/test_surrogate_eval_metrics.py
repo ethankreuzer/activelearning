@@ -567,3 +567,106 @@ class TestCrossSetTopKShares:
         )
 
         assert result["top2/b_share"] == pytest.approx(1.0)
+
+
+def test_latent_calibration_is_one_for_a_calibrated_latent_std() -> None:
+    """Residuals drawn at exactly the predicted latent std give every reading 1.0."""
+    rng = np.random.default_rng(0)
+    latent_std = rng.uniform(0.05, 0.2, 200_000)
+    mean = rng.normal(0.0, 1.0, 200_000)
+    targets = mean + rng.normal(0.0, 1.0, 200_000) * latent_std
+
+    values = metrics.latent_calibration(targets, mean, latent_std)
+
+    assert values["latent_z_rms"] == pytest.approx(1.0, abs=0.01)
+    assert values["latent_variance_ratio"] == pytest.approx(1.0, abs=0.02)
+    assert values["latent_slope_debiased"] == pytest.approx(1.0, abs=0.05)
+    assert values["latent_coverage_1std"] == pytest.approx(0.683, abs=0.01)
+    assert values["latent_coverage_2std"] == pytest.approx(0.954, abs=0.01)
+
+
+def test_latent_calibration_detects_a_halved_latent_std() -> None:
+    """Halving the std quadruples the variance ratio and doubles the z-score.
+
+    This is the overconfidence the acquisition is blind to, so the scaling is
+    worth pinning exactly.
+    """
+    rng = np.random.default_rng(1)
+    latent_std = rng.uniform(0.05, 0.2, 200_000)
+    mean = rng.normal(0.0, 1.0, 200_000)
+    targets = mean + rng.normal(0.0, 1.0, 200_000) * latent_std
+
+    values = metrics.latent_calibration(targets, mean, latent_std / 2.0)
+
+    assert values["latent_z_rms"] == pytest.approx(2.0, abs=0.02)
+    assert values["latent_variance_ratio"] == pytest.approx(4.0, abs=0.08)
+    assert values["latent_slope_debiased"] == pytest.approx(4.0, abs=0.2)
+
+
+def test_latent_calibration_removes_a_biased_mean_before_the_slope() -> None:
+    """A mean that is off by a constant leaves the de-biased readings calibrated.
+
+    The raw readings must still show the bias, since that is what the acquisition
+    experiences.
+    """
+    rng = np.random.default_rng(2)
+    latent_std = np.full(100_000, 0.1)
+    mean = rng.normal(0.0, 1.0, 100_000)
+    targets = mean + 0.5 + rng.normal(0.0, 1.0, 100_000) * latent_std
+
+    values = metrics.latent_calibration(targets, mean, latent_std)
+
+    assert values["latent_z_rms"] > 4.0
+    assert values["latent_debias_intercept"] == pytest.approx(0.5, abs=0.01)
+    assert values["latent_debias_gain"] == pytest.approx(1.0, abs=0.01)
+    assert values["latent_z_rms_debiased"] == pytest.approx(1.0, abs=0.02)
+    assert values["latent_variance_ratio_debiased"] == pytest.approx(1.0, abs=0.02)
+
+
+def test_latent_calibration_returns_every_key_for_an_empty_input() -> None:
+    """Callers get the same dict shape whether or not anything was computable."""
+    values = metrics.latent_calibration([], [], [])
+
+    assert set(values) == set(metrics.LATENT_CALIBRATION_KEYS)
+    assert all(math.isnan(value) for value in values.values())
+
+
+def test_latent_calibration_drops_rows_that_are_not_finite_everywhere() -> None:
+    """A NaN in any of the three columns drops that molecule, as elsewhere."""
+    targets = [0.0, 1.0, float("nan"), 3.0]
+    mean = [0.0, 1.0, 2.0, 3.0]
+    latent_std = [1.0, 1.0, 1.0, float("nan")]
+
+    values = metrics.latent_calibration(targets, mean, latent_std)
+
+    assert values["latent_coverage_1std"] == pytest.approx(1.0)
+    assert values["latent_z_rms"] == pytest.approx(0.0)
+
+
+def test_latent_calibration_skips_the_debias_for_a_constant_mean() -> None:
+    """With no spread in the predicted mean the de-bias line cannot be fitted."""
+    values = metrics.latent_calibration([0.0, 1.0, 2.0], [1.0, 1.0, 1.0], [1.0] * 3)
+
+    assert math.isfinite(values["latent_z_rms"])
+    assert math.isnan(values["latent_debias_gain"])
+    assert math.isnan(values["latent_slope_debiased"])
+
+
+def test_latent_calibration_reports_a_negative_gain_without_using_it() -> None:
+    """An anti-correlated mean is recorded, but rescaling by it is refused."""
+    mean = [0.0, 1.0, 2.0, 3.0]
+    targets = [3.0, 2.0, 1.0, 0.0]
+
+    values = metrics.latent_calibration(targets, mean, [1.0] * 4)
+
+    assert values["latent_debias_gain"] < 0.0
+    assert math.isnan(values["latent_z_rms_debiased"])
+    assert math.isnan(values["latent_slope_debiased"])
+
+
+def test_latent_calibration_is_finite_for_a_collapsed_latent_std() -> None:
+    """A zero latent std is clamped, as in the Gaussian NLL."""
+    values = metrics.latent_calibration([1.0, 2.0], [0.0, 0.0], [0.0, 0.0])
+
+    assert math.isfinite(values["latent_z_rms"])
+    assert values["latent_coverage_1std"] == pytest.approx(0.0)

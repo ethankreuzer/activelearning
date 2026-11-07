@@ -49,6 +49,36 @@ from scipy.stats import norm
 
 logger = logging.getLogger(__name__)
 
+#: The experimental pKi at or above which a molecule counts as a hit.
+DEFAULT_PKI_THRESHOLD = 6.5
+
+#: pProp at or above which a molecule IS a hit: the top 10^-5 of the library by
+#: docking score. Recovering these by sampling is the objective of the whole
+#: project, so this is what "hit" means everywhere. They are rare -- 116 of the
+#: 300,000-molecule training set, 100 of ampc_331k, 1 of the 83,811 docked
+#: GP-MoLFormer prior samples -- which is why the enriched region below exists as
+#: a separate, better-powered read.
+DEFAULT_HIT_PPROP = 5.0
+
+#: ``hit_rate_from_pprop(DEFAULT_HIT_PPROP, DEFAULT_PKI_THRESHOLD)`` for the AmpC
+#: fit, i.e. :data:`DEFAULT_HIT_PPROP` on the y scale.
+DEFAULT_HIT_THRESHOLD = 0.5247394203416823
+
+#: pProp at or above which a molecule is in the ENRICHED region: the top 10^-3.5.
+#: Not a hit -- it is the region the surrogate has to predict well in order to
+#: find hits, and it holds enough molecules (3,653 of the training set, 3,153 of
+#: ampc_331k) to measure a mean and a variance on. This is the threshold the
+#: training sets are carved with and the tail the policy is trained against.
+DEFAULT_ENRICHED_PPROP = 3.5
+
+#: :data:`DEFAULT_ENRICHED_PPROP` on the y scale, for the AmpC fit.
+DEFAULT_ENRICHED_THRESHOLD = 0.2617481563014626
+
+#: Both thresholds are hardcoded rather than computed so nothing has to load the
+#: score table to use them; ``tests`` pin both against the model. y is strictly
+#: increasing in pProp up to the mixture peak at pProp ~6.25, so each is a faithful
+#: re-expression of its pProp for every molecule below that peak.
+
 # Grid used to invert the mixture CDF. Matches the upstream implementation.
 _PPF_GRID_SIZE = 10000
 _PPF_X_MIN = -10.0
