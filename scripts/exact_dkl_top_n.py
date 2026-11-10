@@ -715,6 +715,14 @@ def block_labels(targets: np.ndarray) -> np.ndarray:
     return codes
 
 
+#: Target blocks whose acquisition distribution gets its own FIGURES, not just
+#: scalars. The hits are the objective and the enriched region is where the
+#: surrogate has to be right to find them, so both are plotted. ``_bulk`` is
+#: omitted: it sits entirely at the acquisition floor on every arm measured, so
+#: its histogram is a single bar.
+_FIGURE_BLOCKS = frozenset({HIT_SUFFIX, ENRICHED_SUFFIX})
+
+
 def score_outputs_with_blocks(
     eval_set: EvalSet,
     scores: np.ndarray,
@@ -730,7 +738,17 @@ def score_outputs_with_blocks(
     that has gone flat exactly where it matters -- on the molecules the project
     is trying to recover -- does not show in it. This reports the same
     statistics on the hit and enriched blocks, which is where "is the reward
-    flat" is actually answered. Figures are built for the whole set only.
+    flat" is actually answered.
+
+    **Figures are built for the whole set and for the HIT and ENRICHED blocks**
+    (user's requirement, 2026-11-10: the reward distribution on the hits has to
+    be readable by eye on the dashboard, not only as summary scalars). The BULK
+    block gets no figure: measured on all six exact arms it is entirely at the
+    acquisition floor -- ``fraction_at_floor`` 1.000, ``n_mass90`` 1, entropy
+    ~1e-12 -- so its histogram is one bar and carries no information. That is
+    also the desired behaviour, the acquisition putting its mass on the enriched
+    region, and it is why the WHOLE-SET ``fraction_at_floor`` of ~0.79 looks bad
+    and is not.
 
     The per-budget enrichments are DROPPED on a block smaller than the budget:
     ``acquisition_enrichment`` clamps ``k`` to the usable count, so ``top1000``
@@ -784,14 +802,14 @@ def score_outputs_with_blocks(
             features=None,
             weights=None if eval_set.weights is None else eval_set.weights[keep],
         )
-        block_metrics, _ = score_outputs(
+        block_metrics, block_figures = score_outputs(
             subset,
             values[keep],
             scoring=scoring,
             label=label,
             log_floor=log_floor,
             rank_metrics=rank_metrics,
-            figures=False,
+            figures=suffix in _FIGURE_BLOCKS,
         )
         count = int(keep.sum())
         metrics.update(
@@ -801,6 +819,7 @@ def score_outputs_with_blocks(
                 if not _is_degenerate_budget_key(key, count)
             }
         )
+        figures.update(block_figures)
     return metrics, figures
 
 

@@ -4,12 +4,22 @@ Written 2026-11-07 on Mila, as a handoff. This file is the entry point for
 resuming the work; it supersedes nothing but assumes
 `SURROGATE_THEN_PRIOR_RESTART.md` has been read for the pre-2026-11-07 history.
 
-**State as of 2026-11-10, end of session.** Branch `exact-dkl-top-n`, last commit
-`1d0cdb8`. The exact-GP sweep RAN and is decided (section 5a: `on_pinned`). The
-variational-GP sweep is designed, written and validated but **not launched**
-(section 5): twelve arms, `config/ampc/variational_gp_sweep.yaml` and
-`jobs/variational_gp_sweep_mila.sh`. Section 1 of this file is still the objective;
-sections 4 and 7 are still the label state and the open asks.
+**State as of 2026-11-10, end of session.** Branch `exact-dkl-top-n`.
+
+- **Read section 2.0 first.** It changes how every reward number in this file is to be
+  read: `gp_molformer_set` is the untrained prior's samples and cannot measure whether
+  the acquisition discriminates. Sections 2a and 2c carry corrections because of it.
+- **The exact-GP sweep RAN TWICE.** The second run (jobs 11633184-89, W&B
+  `ExactGP_thesis`, group `exact-gp-n20000`) adds the scored `ampc_val_screen_232k_acq`
+  slice, acquisition metrics on the hit/enriched blocks and their figures. `on_pinned`
+  stands, on better evidence than before -- section 5a RESULT, and 2.0 for what was
+  wrong with the first run's stated argument. The first six runs are tagged
+  `superseded` and grouped `exact-gp-n20000-superseded`.
+- **The variational-GP sweep is designed, written and validated, and a FOUR-ARM PILOT
+  has run** (W&B `VariationalGP_thesis`). The grid is **48 arms** and is NOT launched:
+  section 5, with the pilot's verdict under "THE PILOT".
+- Section 1 is still the objective; sections 4 and 7 are still the label state and the
+  open asks.
 
 ---
 
@@ -1215,13 +1225,17 @@ Eight tests in `tests/scripts/test_exact_dkl_top_n.py`.
 
 ## 5. The variational-GP sweep: SETTLED design (2026-11-10)
 
-**TWELVE ARMS, nothing launched yet.** `config/ampc/variational_gp_sweep.yaml` and
-`jobs/variational_gp_sweep_mila.sh`, both written 2026-11-10 and validated (all twelve
-arms parse, both axis-2 levels build a surrogate, every guard fires).
+**FORTY-EIGHT ARMS, nothing launched yet beyond the four-arm pilot below.**
+`config/ampc/variational_gp_sweep.yaml` and `jobs/variational_gp_sweep_mila.sh`, both
+written 2026-11-10 and validated: all 48 arms parse, both lengthscale-prior levels
+build a surrogate, every guard fires.
 
-    sbatch jobs/variational_gp_sweep_mila.sh <pll|elbo> <on|off>      # SIZE=20000 default
-    SIZE=100000 sbatch jobs/variational_gp_sweep_mila.sh pll on
-    SIZE=300000 sbatch jobs/variational_gp_sweep_mila.sh pll on
+    sbatch jobs/variational_gp_sweep_mila.sh <pll|elbo> <on|off> <steps>   # SIZE=20000 default
+
+    for n in 20000 100000 300000; do for o in pll elbo; do
+      for p in on off; do for s in 625 1250 2500 5000; do
+        SIZE=$n sbatch jobs/variational_gp_sweep_mila.sh $o $p $s
+    done; done; done; done
 
 **This is a COMPARISON, not a second sweep.** The thesis compares the exact and the
 variational GP, so the design is the exact sweep's design with only the differences the
@@ -1260,26 +1274,25 @@ arms; the old script stays for the 104 historical arms' provenance.
 | 1. variational objective | `pll` / `elbo` | `surrogate.training_params.variational_objective=` | **no** |
 | 2. lengthscale prior | `on` / `off` | `surrogate.lengthscale_prior=false` | **yes, and it decided that sweep** |
 | 3. training size | `20000` / `100000` / `300000` | `SIZE=` | only 20,000 is reachable |
+| 4. training budget, Adam steps | `625` / `1250` / `2500` / `5000` | third positional argument | no -- L-BFGS-B runs to convergence |
 
-**2 x 2 x 3 = 12 arms, fully crossed.**
+**2 x 2 x 3 x 4 = 48 arms, fully crossed.** Axes 2 and 4 are both here BECAUSE of the
+pilot below: axis 2 was nearly dropped and the pilot said keep it, axis 4 was excluded
+and the pilot said add it.
 
 **Axis 1 is the one the exact GP cannot have**, and it is the largest effect measured
 anywhere in this project (section 2c): under the ELBO the variational variance is a
 pure penalty and the optimum drives it to zero; under PLL it enters the predictive
-distribution and has an interior optimum. On old y at 300k it moved the
-`gp_molformer_set` log-GIBBON median -2,688 -> -376 and the de-biased latent
-calibration slope 28.3 -> 1.28, for 0.008 of Pearson. So the exact GP's
+distribution and has an interior optimum. So the exact GP's
 `ExactMarginalLogLikelihood` is not a neutral default to compare against -- it is a
-third point on this axis, and that is a thesis result rather than a nuisance.
+third point on this axis, and that is a thesis result rather than a nuisance. **Note
+the pilot ran PLL only** (reason in the pilot section), so axis 1 is still entirely
+unmeasured on the current labels and the current eval sets.
 
-**Axis 2 is crossed again on purpose.** It decided the exact sweep: `off` predicted
-BETTER pointwise (pearson 0.842 vs 0.825) and was unusable, with `n_mass90 = 1` and
-0.000 nats of entropy -- one molecule of 83,811 holding 90% of the acquisition mass.
-The open question that only both sweeps answer is whether that degeneracy belongs to
-the exact GP's marginal likelihood or to this kernel on these features. Same asymmetry
-as there: the axis changes the GRADIENT and the STARTING POINT together (4.63, the
-prior's mode, against `sqrt(512)` = 22.63 -- `variational_gp._matern_kernel:79-81`),
-and a difference cannot be split between them.
+**Axis 2 survived the pilot and would have been wrongly dropped.** It decided the exact
+sweep, where prior-off predicted BETTER pointwise and was unusable for AL. The pilot
+tested whether that transfers. **It does not** -- prior-off is equal or better on every
+variational endpoint. See the pilot section.
 
 **Axis 3 is why the variational GP is in the thesis at all.** n=20,000 is the MATCHED
 cell -- the exact sweep's training set molecule for molecule, and the only size the
@@ -1289,6 +1302,23 @@ so tail supervision is CONSTANT and only the bulk grows: the three sizes measure
 much bulk this surrogate absorbs at fixed tail supervision, which is what decides
 whether the AL loop can drop the archive/train split the exact GP's memory forced on
 it.
+
+**Axis 4 is the user's hypothesis, confirmed and then complicated.** The ladder points
+DOWN -- 10,000 is deliberately NOT a level, because the pilot measured it as dominated
+on both primary endpoints and its only wins were accuracy, which the endpoint list
+reports as a cost. The job derives `epochs` from the step count, so a level means the
+same optimization at every size; at n=300,000 the whole-epoch rounding makes the four
+levels 666 / 1258 / 2516 / 5032, so the 625 level is 6.6% over there.
+
+A level is a training BUDGET, not early stopping: `lr_schedule` is cosine over the
+whole fit, so a 625-step arm is a complete schedule annealed to `lr_min`, not a
+truncated 5,000-step one. The levels therefore cannot be read off one long run's
+checkpoints, which is why the axis costs 4x the arms rather than nothing.
+
+**KNOWN GAP at the short end.** Calibration improved monotonically as steps fell and
+nothing on disk says where that stops, so if the 625 cells are still improving the
+frontier is left open. They are the cheapest arms; read them first and add a 312 level
+if the trend has not turned.
 
 Measured on the files 2026-11-10, because any later floor levels are fractions of
 these:
@@ -1315,23 +1345,137 @@ the 100k/300k variances in step 5 of section 6, which were the OLD y-banded sets
 - **`ard`**, **`num_inducing`**, **`inducing_init`**, **`runtime.seed`**: all measured
   near-inert (sections 5a and 5's earlier draft). The winning arm is re-run at seeds 43
   and 44 afterwards.
-- **steps**, fixed at 10,000. Section 2e already measured the DIRECTION -- 5,032 ->
-  20,128 steps bought 0.005 of pearson and cost the prior-set GIBBON median -551 ->
-  -652 and effective support 6.1 -> 5.0. Sweeping it would pay 5x the arms to confirm a
-  known sign. The job derives `epochs` from `STEPS`, so the sizes are step-matched:
-  **10,000 / 10,000 / 10,064** (the 300k figure is also the incumbent's count).
-- **`noise_floor`: UNSET in all twelve arms. This REVERSES the parked design below.**
+- ~~**steps**, fixed at 10,000, because section 2e had already measured the
+  DIRECTION.~~ **MOVED TO AXIS 4, 2026-11-10.** The direction was never the question --
+  where the knee is, and what it costs, was. See "THE PILOT" below.
+- **`noise_floor`: UNSET in all 48 arms. This REVERSES the parked design below, and the
+  pilot now justifies it on evidence rather than on symmetry with the exact sweep.**
   Same reasoning the user applied to the exact sweep's `noise_std_floor`: flooring the
   noise pins the outputscale-to-noise ratio by fiat, and that ratio -- the latent
   variance GIBBON consumes -- is the quantity the objective exists to estimate. If PLL
   collapses the noise onto the 1e-4 floor here as it did on old y, that is a reported
-  RESULT. The floor frontier of section 2d becomes a separate, later sweep on the arm
+  RESULT -- and the pilot measured exactly that, at 10,000 steps, while total coverage
+  stayed at 0.685: the variance moved into the per-molecule LATENT term, which is what
+  GIBBON consumes, so flooring the noise would push it back into a per-molecule
+  CONSTANT. The floor frontier of section 2d becomes a separate, later sweep on the arm
   this one picks, and it has no exact-GP counterpart -- which is precisely why it does
   not belong in a comparison. `jobs/variational_gp_sweep_mila.sh` **refuses** a
   `surrogate.noise_floor=` override so this cannot be done by accident.
   **Scale, if it is ever set:** `VariationalGPSurrogate.noise_floor` is on the
   VARIANCE scale; `FixedFeatureGPSurrogate.noise_std_floor` is a standard deviation.
   Opposite conventions.
+
+### THE PILOT, and what it decided (2026-11-10)
+
+**Four arms, run before the grid was sized, to settle whether the lengthscale prior was
+worth doubling the sweep.** `n20000_pll_{on,off}_s{2500,10000}` -- same training set as
+all six exact arms, PLL, W&B project `VariationalGP_thesis`, group
+`variational-gp-n20000`: `4ctgk70v` (off s2500), `rbbtw3zb` (on s2500), `q7aqfb2a`
+(off s10000), `g1id72na` (on s10000).
+
+**PLL and not ELBO, and the reason is not preference.** Under the ELBO the variational
+variance enters only as a cost, so training shrinks it toward zero on its own (measured:
+learned noise 0.4218 under ELBO against 0.000107 under PLL). Had the prior been tested
+there and prior-off come back flat, there would be no way to tell whether the prior or
+the objective flattened it. PLL leaves the latent variance free to respond. The cost of
+that choice, stated plainly: **the pilot's verdict on axis 2 is a verdict for PLL**, and
+if ELBO wins the grid the prior question needs rechecking there.
+
+#### 1. Axis 2 KEPT -- the exact GP's result does not transfer
+
+On `ampc_val_screen_232k_acq_hit` (15,767 hits), `gibbon_value`:
+
+| | off s2500 | on s2500 | off s10000 | on s10000 |
+|---|---|---|---|---|
+| `effective_support` | **7207** | 4689 | 4304 | 4193 |
+| `n_mass90` | **6056** | 4108 | 3789 | 3694 |
+| `fraction_at_floor` | **0.022** | 0.044 | 0.042 | 0.053 |
+| val `latent_variance_ratio` | **1.40** | 1.673 | 1.72 | 1.84 |
+
+Prior-off is equal or BETTER on every endpoint, where in the exact GP it lost by 4x.
+Its hyperparameters drift exactly as they did there -- lengthscale 19.47 (s2500) and
+13.90 (s10000) against ~6.2 with the prior, outputscale 1.74 / 3.23 against ~0.36,
+`signal_to_noise` up to 26,300 -- and **that drift produces no mass collapse here.**
+So the exact GP's failure was not "long lengthscale implies dead acquisition"; it
+needed the exact marginal likelihood fitted to convergence. Fixing
+`lengthscale_prior=true` on the exact sweep's authority would have been wrong.
+
+#### 2. Axis 4 ADDED -- over-training is real, and it is a trade-off
+
+The user's hypothesis, and it holds. 2,500 steps against 10,000 (prior-off):
+
+| | s2500 | s10000 |
+|---|---|---|
+| val `latent_variance_ratio` (1.0 ideal) | **1.40** | 1.72 |
+| val `latent_coverage_1std` (0.68 ideal) | **0.751** | 0.685 |
+| enriched `latent_variance_ratio` | **4.04** | 5.85 |
+| hit `effective_support` | **7207** | 4304 |
+| val `pearson` | **0.8705** | 0.8632 |
+| learned `noise` (floor 1e-4) | 5.31e-4 | **1.23e-4** |
+| enriched `rmse` | 0.1863 | **0.1687** |
+| enriched `bias` | -0.1572 | **-0.1278** |
+
+**The last two rows are why this is an axis and not a fixed choice.** Short training
+wins calibration and reward spread and LOSES accuracy on exactly the enriched and hit
+molecules that matter. An earlier draft of this section said 2,500 "wins on every
+axis"; on the blocks that is false.
+
+#### 3. The noise collapse is intrinsic to PLL, and is not the defect it was taken for
+
+At 10,000 steps the learned noise sits on its 1e-4 floor (1.23e-4); at 2,500 it is
+5.31e-4, genuinely fitted. So training length decides whether it hits the bound. But
+BOTH are ~900x below the Gamma test's irreducible-variance estimate of 0.489 of
+`var(y)` (old-y, step 4 of section 6, still un-redone), so shorter training does not
+rescue it.
+
+**It does not need rescuing.** `mean std_total` and `mean std_latent` agree to four
+digits in all four arms (0.06950 vs 0.06943 at s2500), i.e. the noise contributes
+~0.1% of the predictive uncertainty -- and total `coverage_1std` is 0.752 / 0.687, at
+or above the correct 0.68. The variance did not vanish; it moved into the per-molecule
+latent term, which is what PLL exists to do and what GIBBON consumes. The old concern
+was legitimate only because under ELBO the noise was 0.42, ~85% of predictive variance,
+AND the latent term was flat. **This is also the evidence-based reason `noise_floor`
+stays unset**: flooring the noise would force variance back into a per-molecule
+CONSTANT, the one term the acquisition cannot rank on.
+
+#### 4. The variational GP beats the exact GP at the same n, and the blocks temper it
+
+Same 20,000 molecules, same features, same acquisition:
+
+| | exact `on_pinned` | variational best |
+|---|---|---|
+| val `latent_variance_ratio` (1.0 ideal) | 10.79 | **1.40** |
+| val `latent_coverage_1std` (0.68 ideal) | 0.215 | **0.751** |
+| val `pearson` | 0.825 | **0.8705** |
+| hit `effective_support` | 1114 | **7207** |
+
+**But the whole-set calibration is flattered by the bulk**, which is 87% of the set and
+reads `latent_variance_ratio` 0.68-1.08. Per block:
+
+| | hit | enriched | bulk |
+|---|---|---|---|
+| `latent_variance_ratio` | **4.78 - 8.06** | 4.04 - 6.37 | 0.68 - 1.08 |
+| `coverage_1std` | 0.158 - 0.250 | 0.264 - 0.295 | 0.725 - 0.827 |
+| `bias` | -0.147 to -0.189 | -0.126 to -0.157 | +0.027 to +0.036 |
+| `pearson` (within block) | **0.212 - 0.224** | 0.626 - 0.628 | 0.744 - 0.757 |
+
+Three readings to carry forward:
+
+- **Still 4-8x over-confident on the molecules that matter**, against 1.0. Far better
+  than the old 300k ELBO arm (488x enriched, 1206x hits) and than the exact GP, but not
+  the "nearly honest" picture the whole-set 1.40 suggests.
+- **Systematic UNDER-prediction of enriched and hits by 0.13-0.19 in `y`**, against a
+  hit threshold of 0.525 -- a 25-36% shortfall. `bias` is positive on the bulk and
+  negative on the enriched region, which is shrinkage toward the pinned library mean.
+- **`pearson` WITHIN the hits is 0.21-0.22.** The model separates hits from non-hits
+  well (whole-set 0.87) and can barely order them among themselves. This is almost
+  certainly the same failure as `olivier_invitro`'s `top1pct_overlap` = **0.000**, which
+  is 0.000 in all four pilot arms and all six exact arms.
+
+**The last point is an open question this grid will probably not answer.** No
+hyperparameter here looks likely to move a within-hit `pearson` of 0.22; it reads as a
+property of the target or the frozen features. It should be named as its own
+investigation rather than hoped for from an arm.
 
 ### Endpoints, declared before launch
 
@@ -1390,7 +1534,8 @@ the trade-off has been seen. Every cell runs and every cell is recorded.
 
 `jobs/variational_gp_sweep_mila.sh` asks `unkillable`, one **l40s**, 4 CPU, 32G, 3 h.
 The fit is a 4096 x 1024 cross-covariance per step at every size, so fit cost scales
-with the step count alone and is identical in all twelve arms; wall time and memory are
+with the step count alone, so an arm's cost is set by its AXIS-4 level (625 to 5,000
+steps) and nothing else; wall time and memory are
 dominated by GIBBON on the 83,811-molecule prior set. Comparable arms ran 7-25 min.
 `unkillable`'s per-user cap (6 CPU / 32G / 1 GPU) runs the arms **one at a time**;
 `PARTITION=main` would give two at once at 24G, at the risk of preemption -- and a

@@ -20,8 +20,13 @@
 # seed 42, and GIBBON with num_mv_samples=10 scored on both the value and the
 # log scale.
 #
-# TWO SWEPT AXES plus the training size, FULLY CROSSED: 2 x 2 x 3 = TWELVE
-# ARMS. jobs/variational_gp_sweep_mila.sh takes all three as arguments.
+# FOUR AXES, FULLY CROSSED: 2 x 2 x 3 x 4 = FORTY-EIGHT ARMS.
+# jobs/variational_gp_sweep_mila.sh takes all four as arguments.
+#
+# The fourth axis, STEPS, was added 2026-11-10 after a four-arm pilot
+# (n20000_pll_{on,off}_s{2500,10000}, W&B VariationalGP_thesis). It was first
+# excluded on the grounds that section 2e had already measured the DIRECTION;
+# the pilot showed that was the wrong reason to exclude it. See "AXIS 4" below.
 #
 #   AXIS 1, the variational objective, 2 levels -- VARIATIONAL ONLY:
 #     pll      surrogate.training_params.variational_objective=PredictiveLogLikelihood
@@ -74,6 +79,38 @@
 #     surrogate absorbs at fixed tail supervision. See THESIS_ACTIVELEARNING.md
 #     "The svgpscale ladder".
 #
+#   AXIS 4, the training budget in Adam STEPS, 4 levels:
+#     625 / 1250 / 2500 / 5000
+#
+#     ADDED 2026-11-10 on the pilot's evidence, and the LADDER POINTS DOWN on
+#     purpose. Going 2,500 -> 10,000 steps at n=20,000 made every primary
+#     endpoint worse: whole-set latent_variance_ratio 1.40 -> 1.72, enriched
+#     4.04 -> 5.85, latent_coverage_1std 0.751 -> 0.685, and hit-block
+#     effective_support 7207 -> 4304. The learned noise also fell 5.3e-4 ->
+#     1.2e-4, i.e. onto the 1e-4 floor.
+#
+#     10,000 IS NOT A LEVEL, deliberately. Its only wins were enriched rmse
+#     (0.169 vs 0.186) and bias (-0.128 vs -0.157) -- accuracy, which the
+#     endpoint list reports as a COST and does not optimise -- plus continuity
+#     with the incumbent's 10,064 steps, which is worth two follow-up arms
+#     rather than twelve cells of this grid.
+#
+#     625 is the bottom because calibration was still improving monotonically
+#     as steps fell and nothing on disk says where that stops. KNOWN GAP: if
+#     the 625 cells are still improving, the frontier is open at the short end;
+#     read them first (they are the cheapest arms) and add 312 if the trend has
+#     not turned.
+#
+#     The axis is a genuine TRADE-OFF, not a free win -- short training buys
+#     calibration and reward spread and costs accuracy on exactly the enriched
+#     and hit molecules that matter. That is a better reason to sweep it than
+#     the "known sign" argument first used to exclude it.
+#
+#     Note what a level means here: lr_schedule is cosine over the WHOLE fit, so
+#     a 625-step arm is a complete schedule annealed to lr_min, not a truncated
+#     5,000-step one. The axis is a training BUDGET, not early stopping, and the
+#     levels cannot be read off one long run's checkpoints.
+#
 # NOT SWEPT, each with the measurement behind it:
 #   - prior_mean (pinned / learned / constant). The exact sweep crossed this as
 #     its axis 2 and measured it INERT: the whole spread was 16-89x smaller
@@ -94,12 +131,9 @@
 #     42/43/44, a 4e-4 spread against a 0.33 between-arm sd. The winning arm is
 #     re-run at 43 and 44 afterwards instead -- the variance statement at 2
 #     arms' cost rather than 3x the sweep.
-#   - steps. Fixed at 10,000 (see training_params.epochs). Section 2e of
-#     THESIS_ACTIVELEARNING.md already measured the DIRECTION: 5,032 ->
-#     20,128 steps moved pearson 0.791 -> 0.796 while the prior-set GIBBON
-#     median went -551 -> -652 and effective support 6.1 -> 5.0, so more
-#     training buys accuracy and costs reward quality. Sweeping it would pay 5x
-#     the arms to re-confirm a known sign.
+#     (steps WAS listed here as fixed at 10,000, on the argument that section 2e
+#     had already measured the direction. The pilot showed the direction was not
+#     the question -- where the knee is, and what it costs, was. It is AXIS 4.)
 #   - noise_floor. NOT USED, and deliberately so, which REVERSES the parked
 #     design in THESIS_ACTIVELEARNING.md section 5. It is the knob that
 #     produces the (reward, calibration) frontier of section 2d, and it is left
@@ -183,16 +217,17 @@ surrogate:
     # The job sets this per arm, to match the training set above.
     feature_cache_path: cache/ampc/exact_dkl_top_n/svgpscale_20000.npy
   training_params:
-    # 10,000 Adam STEPS, not 300 epochs. The job computes `epochs` from
-    # STEPS=10000 and ceil(SIZE / 4096) steps per epoch, so the three sizes get
-    # the SAME optimization: 2,000 epochs x 5 steps = 10,000 at n=20,000, 400 x
-    # 25 = 10,000 at 100,000, and 136 x 74 = 10,064 at 300,000. EPOCHS ARE NOT
-    # COMPARABLE ACROSS ARMS; steps are, and 10,064 is also the incumbent's
-    # count, so this sweep's 300k cells are step-matched to it.
+    # AXIS 4 reaches the model through here. The job sets `epochs` from STEPS
+    # and ceil(SIZE / 4096) steps per epoch, so a step level means the same
+    # optimization at every size: STEPS=2500 is 500 epochs x 5 steps at
+    # n=20,000, 100 x 25 at 100,000 and 34 x 74 = 2,516 at 300,000.
     #
-    # The value below is only the default for a run launched without the job
-    # script, and it is the n=20,000 figure.
-    epochs: 2000
+    # EPOCHS ARE NOT COMPARABLE ACROSS SIZES; steps are. Read train/epoch/*
+    # against the step count, which is in the arm name and the tags.
+    #
+    # The value below is only the default for a run launched WITHOUT the job
+    # script: 500 epochs = 2,500 steps at n=20,000, the pilot's better level.
+    epochs: 500
     # 3e-3, not the 1e-2 of the scaling arms: the incumbent and the whole
     # calibration grid ran at 3e-3 cosine to 1e-4, so this keeps the sweep
     # comparable with the 104 arms already on disk.

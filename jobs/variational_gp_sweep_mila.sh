@@ -2,15 +2,23 @@
 # One arm of the variational-GP sweep on Mila. Twelve arms: two axes crossed
 # with the three sizes of the svgpscale ladder.
 #
-#   sbatch jobs/variational_gp_sweep_mila.sh pll  on     # the config as written
-#   sbatch jobs/variational_gp_sweep_mila.sh pll  off
-#   sbatch jobs/variational_gp_sweep_mila.sh elbo on
-#   sbatch jobs/variational_gp_sweep_mila.sh elbo off
+#   sbatch jobs/variational_gp_sweep_mila.sh <pll|elbo> <on|off> <steps>
 #
-# and the same four at each size:
+# FORTY-EIGHT ARMS: objective(2) x lengthscale_prior(2) x size(3) x steps(4),
+# fully crossed. Steps are 625 / 1250 / 2500 / 5000 -- a ladder that points
+# DOWN, on the 2026-11-10 pilot's evidence; 10,000 is deliberately not a level.
+# config/ampc/variational_gp_sweep.yaml "AXIS 4" has the numbers.
 #
-#   SIZE=100000 sbatch jobs/variational_gp_sweep_mila.sh pll on
-#   SIZE=300000 sbatch jobs/variational_gp_sweep_mila.sh pll on
+#   sbatch jobs/variational_gp_sweep_mila.sh pll  on  2500
+#   sbatch jobs/variational_gp_sweep_mila.sh elbo off 625
+#   SIZE=300000 sbatch jobs/variational_gp_sweep_mila.sh pll on 1250
+#
+# The whole grid:
+#
+#   for n in 20000 100000 300000; do for o in pll elbo; do
+#     for p in on off; do for s in 625 1250 2500 5000; do
+#       SIZE=$n sbatch jobs/variational_gp_sweep_mila.sh $o $p $s
+#   done; done; done; done
 #
 # THE COMPANION OF jobs/exact_gp_sweep_mila.sh, deliberately: same runner, same
 # three held-out sets, same metrics, same per-arm artifacts, same W&B
@@ -32,12 +40,15 @@
 # ladder is NESTED, so a smaller arm is a subset of every larger one; see
 # THESIS_ACTIVELEARNING.md "The svgpscale ladder".
 #
-# STEPS, not epochs. STEPS=10000 by default, and EPOCHS is derived as
-# ceil(STEPS / ceil(SIZE / 4096)), so every size gets the same optimization:
-# 10,000 steps at 20,000 and 100,000 rows, 10,064 at 300,000 (136 epochs of 74
-# steps). EPOCHS ARE NOT COMPARABLE ACROSS SIZES; read train/epoch/* against
-# the step count, which is in the arm name and the tags. 10,064 is also the
-# incumbent arm's count, so the 300k cells here are step-matched to it.
+# STEPS, not epochs. EPOCHS is derived as ceil(STEPS / ceil(SIZE / 4096)), so a
+# step level means the same optimization at every size: STEPS=2500 is 2,500
+# steps at n=20,000 and 100,000, and 2,516 at 300,000 (34 epochs of 74 steps).
+# EPOCHS ARE NOT COMPARABLE ACROSS SIZES; read train/epoch/* against the step
+# count, which is in the arm name and the tags.
+#
+# The step count is an AXIS, and a short one is not a truncated long one:
+# lr_schedule is cosine over the whole fit, so each level is a complete
+# schedule annealed to lr_min. The levels cannot be read off one long run.
 #
 # EVALUATION, after the fit: predictions on all three held-out sets, and GIBBON
 # scores (value and log scale) on gp_molformer_set and olivier_invitro. The
@@ -107,11 +118,14 @@
 
 set -euo pipefail
 
-USAGE="usage: sbatch jobs/variational_gp_sweep_mila.sh <pll|elbo> <on|off>  [SIZE=20000|100000|300000]"
+USAGE="usage: sbatch jobs/variational_gp_sweep_mila.sh <pll|elbo> <on|off> <steps>  [SIZE=20000|100000|300000]"
 OBJECTIVE_ARG="${1:?${USAGE}}"
 PRIOR="${2:?${USAGE}}"
+# AXIS 4, positional and REQUIRED rather than an env default: it is a swept axis
+# as of 2026-11-10, and a default would let an arm of the grid be launched
+# without stating which level it is.
+STEPS="${3:?${USAGE}}"
 SIZE="${SIZE:-20000}"
-STEPS="${STEPS:-10000}"
 M="${M:-1024}"
 
 case "${OBJECTIVE_ARG}" in
@@ -159,7 +173,7 @@ done
 
 # Reject the overrides that would make the arm name a lie, the way the older
 # scaling job does. Everything the name encodes has to come from an argument.
-for argument in "${@:3}"; do
+for argument in "${@:4}"; do
   case "${argument}" in
     dataset.initial_data.path=*|surrogate.encoder.feature_cache_path=*)
       echo "Set the training set with SIZE=<n>, not ${argument}, so the arm" \
@@ -171,8 +185,8 @@ for argument in "${@:3}"; do
       echo "Set the lengthscale prior with the second argument (on|off), not ${argument}." >&2
       exit 2 ;;
     surrogate.training_params.epochs=*|surrogate.num_inducing=*|--score-chunk-size*)
-      echo "Set these with STEPS=<count> and M=<count>, not ${argument}, so the" \
-        "arm name and tags follow them." >&2; exit 2 ;;
+      echo "Set these with the third argument (steps) and M=<count>, not" \
+        "${argument}, so the arm name and tags follow them." >&2; exit 2 ;;
     surrogate.noise_floor=*)
       echo "noise_floor is UNSET in all twelve arms by design; the floor frontier" \
         "is a separate sweep. See the config header." >&2; exit 2 ;;
@@ -249,7 +263,7 @@ uv run --no-sync python -m scripts.exact_dkl_top_n \
   --wandb-group "variational-gp-n${SIZE}" \
   --wandb-tags "variational-gp-sweep,svgp,n${SIZE},trainset-svgpscale${SIZE},${OBJECTIVE_ARG},${OBJECTIVE},prior-${PRIOR},M${M},steps${TOTAL_STEPS},isotropic,matern,outputscale,pinned-mean,noise-prior,scale-inputs,no-noise-floor,adam,minibatch4096,lr-cosine,lr3e-3,fp32,nested,keep-pprop3.5,support-cap100k,chunk${SCORE_CHUNK}" \
   --run-name "${ARM}-${SLURM_JOB_ID}" \
-  "${@:3}"
+  "${@:4}"
 
 echo
 echo "Fitted and scored into ${OUTPUT_DIR}. Summary:"
