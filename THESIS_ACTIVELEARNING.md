@@ -1052,6 +1052,131 @@ before the trade-off has been seen. Every cell runs and every cell is recorded.
 
 ---
 
+## 5b. The calibration metrics the AL framework must track (decided 2026-11-10)
+
+**DECISION: the active-learning framework tracks `latent_calibration` (this repo's
+version), NOT `variance_calibration_metrics` (the Nibi version). `diagnostics.py` is to
+be ported over to it.** User's call, and the reasoning is below because it is not
+merely a preference.
+
+The two implementations measure DIFFERENT QUANTITIES and are not comparable:
+
+| | denominator | estimator | `on_pinned` on the 232k |
+|---|---|---|---|
+| `latent_calibration` (this repo) | latent variance ONLY | pooled ratio + OLS mean-debiasing | `latent_variance_ratio` **10.79** |
+| `variance_calibration_metrics` (Nibi) | TOTAL variance (latent + noise) | quantile-binned regression | `z_var_mean` **2.79** |
+
+A **3.9x gap on the same run**, because total variance is dominated by the single
+learned noise constant: std_total 0.0611 against std_latent 0.0307. Logging the Nibi
+metric per round would make round 5 incomparable with this sweep's baseline, which is
+the user's reason and it is sufficient on its own.
+
+The stronger reason is that the latent variance is the quantity GIBBON actually
+consumes, and the noise term is CONSTANT per molecule, so folding it into the
+denominator dilutes exactly the per-candidate variation the acquisition ranks on. The
+sweep demonstrated this: the `off` arms had BETTER pointwise accuracy (pearson 0.842 vs
+0.825) and were unusable because their latent variance stopped discriminating
+(`n_mass90` 1, entropy 0.000). A total-variance metric would have partly masked that.
+Over 10 rounds, an acquisition quietly collapsing mid-run is the most likely failure
+mode, and the Nibi metric is the one that would not show it.
+
+**AMENDMENT -- keep one idea from the Nibi version.** It computes `worst_bin_ratio`,
+"the largest per-bin mean squared residual / mean total variance", which catches nine
+healthy bins hiding one catastrophic one. The pooled ratio cannot see that, and over 10
+rounds it matters: AL draws from the HIGH-latent-variance tail, so miscalibration
+concentrated there is both the likeliest and the most consequential. Port the binning,
+but compute it on LATENT variance so it complements `latent_variance_ratio` on one
+scale instead of reintroducing the incomparable denominator.
+
+**What the port actually involves.** `variance_calibration_metrics` is called from
+`src/activelearning/monitoring/diagnostics.py` and `scripts/surrogate_eval_io.py`, and
+`tests/surrogate/test_variance_calibration.py` (290 lines) pins its behaviour. Both call
+sites need rewriting. That test file tests an implementation being retired, so most of
+it goes -- but read it first for edge cases (empty bins, degenerate variance, all-equal
+predictions) worth keeping as tests of the replacement.
+
+## 5c. HANDOFF TO NIBI: what the 10-round AL run needs (2026-11-10)
+
+**READ THIS BEFORE PULLING ON NIBI. Neither branch on the remote can run the AL job
+as it stands, and pulling the obvious one gives you a tree that cannot see the config
+this sweep just chose.**
+
+### The repo is split across two branches, and each is missing the other's half
+
+This Mila checkout forked from `origin/exact-dkl-top-n` at `76cd121` and never pulled
+the Nibi work of 2026-11-04..07. Both sides then advanced. As of 2026-11-10:
+
+| branch | has | MISSING |
+|---|---|---|
+| `origin/exact-dkl-top-n` | the AL round infrastructure: `full_archive.yaml`, `RUN_ARTIFACTS_AND_REPRODUCTION.md`, the newer `subset_gp.py` / `training_subset.py` / `diagnostics.py` / `active_learning.py`, the Nibi job scripts, `ampc_full_scores_1p7b.df` | **`config/ampc/exact_gp_sweep.yaml`** -- the config the sweep chose. Also the W&B trim, the `weight` column, the flat config keys, the 20k ladder |
+| `origin/exact-gp-sweep-n20000` | everything this sweep produced, including the chosen config | `full_archive.yaml`, `RUN_ARTIFACTS_AND_REPRODUCTION.md`, and the Nov-04..07 versions of the four files below |
+
+The four AL-critical files differ by a LOT between the branches -- the sweep branch
+carries their 2026-11-04 state, not Nibi's:
+
+    subset_gp.py        +152/-4     training_subset.py  +181/-8
+    diagnostics.py      +327/-7     active_learning.py   +34/-2
+
+**So: `git pull` on `exact-dkl-top-n` gives a tree with no `exact_gp_sweep.yaml`, and
+checking out `exact-gp-sweep-n20000` gives a tree whose AL round machinery is a week
+old.** The merge in section 5b is not optional before the 10-round run; it is the
+prerequisite. Do the merge on Mila (where both sides can be inspected), push, then pull
+on Nibi.
+
+### The surrogate block the AL run must use
+
+From `config/ampc/exact_gp_sweep.yaml`, the `on_pinned` arm, unchanged:
+
+    surrogate:
+      type: FixedFeatureGPSurrogate
+      lengthscale_prior: true            # AXIS 1 -- the arm that won
+      prior_mean: 0.0042864189360438442  # AXIS 2 -- PINNED at the 10M library mean
+      constant_kernel: false
+      ard: false
+      kernel: matern
+      outputscale: true
+      scale_inputs: true
+      standardize_outputs: true
+      max_cholesky_size: 30000
+      accept_abnormal_lbfgsb: true
+
+`noise_std_floor` stays UNSET. `prior_mean` is the LIBRARY mean and must not be
+recomputed per round from the round's training set -- that is the whole point of the
+pinned arm, and re-deriving it each round reintroduces exactly the drift that
+disqualified the `learned` arm. See "RESULT" in section 5a.
+
+### Data to transfer -- `data/` and `cache/` are gitignored, so git carries NONE of it
+
+**682 MB**, and the run fails without it (`cache_only: true` makes a cache miss a hard
+error rather than silent re-encoding, which is deliberate):
+
+| file | size | why |
+|---|---|---|
+| `data/ampc_svgpscale_20000.csv` | 1.4M | the training set |
+| `cache/ampc/exact_dkl_top_n/svgpscale_20000.npy` + `.npy.json` | 40M | its feature cache; the `.json` hashes the ordered SMILES and is checked |
+| `cache/ampc/exact_dkl_top_n/ampc_val_screen_232k.csv` + `.npy` | 469M | THE validation set, ipw-weighted. The `.csv` carries the `weight` column |
+| `cache/ampc/exact_dkl_top_n/gp_molformer_set.npy` | 164M | scored set |
+| `cache/ampc/exact_dkl_top_n/olivier_invitro.npy` | 3.0M | scored set |
+
+The 20k set is the innermost arm of a NESTED five-arm ladder, so it is a subset of the
+25k/50k/100k/300k sets; do not rebuild it on Nibi, because a build whose largest arm
+differs draws different pools and yields a different 20k. See "The svgpscale ladder".
+
+### Traps that have already cost a job on this project
+
+- **`/tmp` is node-local.** Stage under `/network/scratch` (Mila) or the Nibi
+  equivalent, or an sbatch job "completes" with no output at all.
+- **Partition QOS caps.** On Mila `main` is cpu=8 / mem=48G / gpu=2 per user, which is
+  why `jobs/exact_gp_sweep_mila.sh` asks 24G -- 48/24 = 2 is the GPU cap, so two arms
+  run at once. Nibi's caps are different; check before copying the directives.
+- **Compute-node internet is inconsistent and the repo's own comments disagree.**
+  `exact_gp_sweep_mila.sh` says compute nodes have no internet; `reward_shape_mila.sh`
+  says they do. On 2026-11-10 `cn-f002` reached `api.wandb.ai`. Runs are written
+  OFFLINE either way and synced afterwards, so this costs nothing -- but do not trust
+  either comment.
+- **`git_dirty` is recorded in `resolved_config.json`.** For a thesis run, commit first:
+  a dirty tree means the code that produced the run is not recoverable from the SHA.
+
 ## 6. Where we are, and the remaining steps
 
 **Done:** step 2 below. Everything else is open.
