@@ -7,6 +7,7 @@ which is untracked and may move.
 import json
 import math
 from concurrent.futures import ThreadPoolExecutor
+from itertools import pairwise
 from pathlib import Path
 
 import numpy as np
@@ -18,6 +19,8 @@ from activelearning.applications.molecules.hit_rate import (
     DEFAULT_HIT_PPROP,
     DEFAULT_HIT_THRESHOLD,
     DEFAULT_PKI_THRESHOLD,
+    DOCKED_RANK_FRACTION,
+    PPROP_DOCKED_TO_FULL_SCREEN,
     HitRateModel,
     load_score_pprop_table,
 )
@@ -241,3 +244,238 @@ def test_y_is_increasing_in_pprop_below_the_artifact_peak(model: HitRateModel) -
     ]
 
     assert all(later > earlier for earlier, later in zip(values, values[1:]))
+
+
+class TestPeakPprop:
+    """The peak is what makes the hit rate non-injective in pProp."""
+
+    def test_peak_is_interior_and_the_branch_below_it_rises(
+        self, model: HitRateModel
+    ) -> None:
+        peak_pprop, peak_rate = model.peak_pprop(DEFAULT_PKI_THRESHOLD)
+
+        assert 0.0 < peak_pprop < 20.0
+        assert peak_rate == pytest.approx(
+            model.hit_rate_from_pprop(peak_pprop, DEFAULT_PKI_THRESHOLD)
+        )
+        below = [
+            model.hit_rate_from_pprop(p, DEFAULT_PKI_THRESHOLD)
+            for p in np.linspace(0.0, peak_pprop, 40)
+        ]
+        assert all(b > a for a, b in pairwise(below))
+
+    def test_the_hit_rate_falls_above_the_peak(self, model: HitRateModel) -> None:
+        peak_pprop, peak_rate = model.peak_pprop(DEFAULT_PKI_THRESHOLD)
+
+        above = [
+            model.hit_rate_from_pprop(peak_pprop + step, DEFAULT_PKI_THRESHOLD)
+            for step in (0.5, 1.0, 2.0, 4.0)
+        ]
+        assert all(value < peak_rate for value in above)
+        assert all(b < a for a, b in pairwise(above))
+
+    def test_a_monotone_fit_has_no_interior_peak(self, tmp_path: Path) -> None:
+        """Without an artifact component the hit rate never turns over.
+
+        ``peak_pprop`` must refuse rather than hand back a search bound and let
+        the inversion silently operate on a half-open branch. The bounded
+        optimizer returns a point just inside the bound (19.9999997, not 20), so
+        the refusal compares the peak against both endpoints instead of
+        measuring its distance to them.
+        """
+        path = tmp_path / "t.df"
+        path.write_text("score pprop\n-10.0 5.0\n0.0 1.0\n")
+        monotone = HitRateModel({**_PARAMS, "artifact_freq": 0.0}, path)
+
+        with pytest.raises(ValueError, match="does not exceed"):
+            monotone.peak_pprop(DEFAULT_PKI_THRESHOLD)
+
+    def test_a_falling_fit_has_no_rising_branch(self, tmp_path: Path) -> None:
+        """A positive score/potency correlation makes the hit rate fall throughout.
+
+        This also trips the endpoint comparison, since pProp 0 is then the
+        maximum. The strict-monotonicity sweep behind it stays as a second line
+        of defence for a fit that beats both endpoints yet is not monotone below
+        its peak -- which no fixture here produces, but a different fit could.
+        """
+        path = tmp_path / "t.df"
+        path.write_text("score pprop\n-10.0 5.0\n0.0 1.0\n")
+        falling = HitRateModel({**_PARAMS, "rho": 0.75}, path)
+
+        with pytest.raises(ValueError, match="does not exceed"):
+            falling.peak_pprop(DEFAULT_PKI_THRESHOLD)
+
+    def test_the_real_ampc_peak_is_above_the_library_maximum(self) -> None:
+        """Every corrected library label is therefore on the rising branch.
+
+        The library's best molecule reads y 0.66552300556127664. If that sat above
+        the peak its pProp would be ambiguous and the whole set of labels would be
+        un-invertible, so this is the fact the inversion rests on. Skipped where
+        ``ampc_hitrate_fits/`` is absent, since it is untracked.
+        """
+        params_path = Path("ampc_hitrate_fits/fitted_params.json")
+        table = Path("ampc_hitrate_fits/data/full_scores.df")
+        if not (params_path.is_file() and table.is_file()):
+            pytest.skip("ampc_hitrate_fits/ is not present")
+
+        real = HitRateModel(json.loads(params_path.read_text())["ampc"], table)
+        peak_pprop, peak_rate = real.peak_pprop(DEFAULT_PKI_THRESHOLD)
+
+        assert peak_pprop == pytest.approx(6.32137, abs=1e-4)
+        assert peak_rate == pytest.approx(0.6663101434897, abs=1e-12)
+        assert 0.66552300556127664 < peak_rate
+
+
+class TestPpropFromHitRate:
+    """Inverting stage 2, on the rising branch only."""
+
+    @pytest.mark.parametrize("pprop", [0.1, 0.5, 1.0, 2.0, 3.0, 3.5, 4.0, 5.0])
+    def test_round_trips_below_the_peak(
+        self, model: HitRateModel, pprop: float
+    ) -> None:
+        rate = model.hit_rate_from_pprop(pprop, DEFAULT_PKI_THRESHOLD)
+
+        assert model.pprop_from_hit_rate(rate, DEFAULT_PKI_THRESHOLD) == pytest.approx(
+            pprop, abs=1e-9
+        )
+
+    def test_a_falling_branch_value_comes_back_as_its_rising_twin(
+        self, model: HitRateModel
+    ) -> None:
+        """The documented, deliberate limitation -- tested so it is not a surprise.
+
+        Nothing in a bare hit rate says which branch it came from, so a caller
+        holding a falling-branch value has to rule that out itself.
+        """
+        peak = model.peak_pprop(DEFAULT_PKI_THRESHOLD)
+        far_above = peak[0] + 3.0
+        rate = model.hit_rate_from_pprop(far_above, DEFAULT_PKI_THRESHOLD)
+
+        recovered = model.pprop_from_hit_rate(rate, DEFAULT_PKI_THRESHOLD, peak=peak)
+
+        assert recovered < peak[0]
+        assert recovered != pytest.approx(far_above, abs=1e-3)
+
+    def test_nan_propagates(self, model: HitRateModel) -> None:
+        assert math.isnan(
+            model.pprop_from_hit_rate(float("nan"), DEFAULT_PKI_THRESHOLD)
+        )
+
+    def test_above_the_peak_raises(self, model: HitRateModel) -> None:
+        peak = model.peak_pprop(DEFAULT_PKI_THRESHOLD)
+
+        with pytest.raises(ValueError, match="largest attainable"):
+            model.pprop_from_hit_rate(peak[1] * 1.001, DEFAULT_PKI_THRESHOLD, peak=peak)
+
+    def test_above_the_peak_clamps(self, model: HitRateModel) -> None:
+        peak = model.peak_pprop(DEFAULT_PKI_THRESHOLD)
+
+        assert (
+            model.pprop_from_hit_rate(
+                peak[1] * 1.001,
+                DEFAULT_PKI_THRESHOLD,
+                peak=peak,
+                out_of_range="clamp",
+            )
+            == peak[0]
+        )
+
+    def test_at_or_below_the_floor_raises(self, model: HitRateModel) -> None:
+        with pytest.raises(ValueError, match="at or below"):
+            model.pprop_from_hit_rate(0.0, DEFAULT_PKI_THRESHOLD)
+
+    def test_at_or_below_the_floor_clamps(self, model: HitRateModel) -> None:
+        assert (
+            model.pprop_from_hit_rate(0.0, DEFAULT_PKI_THRESHOLD, out_of_range="clamp")
+            == 0.0
+        )
+
+    def test_an_unknown_out_of_range_mode_raises(self, model: HitRateModel) -> None:
+        with pytest.raises(ValueError, match="out_of_range must be"):
+            model.pprop_from_hit_rate(
+                0.3, DEFAULT_PKI_THRESHOLD, out_of_range="whatever"
+            )
+
+    def test_passing_the_peak_changes_nothing(self, model: HitRateModel) -> None:
+        """The peak argument is a performance hint, so it must not alter results."""
+        peak = model.peak_pprop(DEFAULT_PKI_THRESHOLD)
+        rate = model.hit_rate_from_pprop(2.5, DEFAULT_PKI_THRESHOLD)
+
+        assert model.pprop_from_hit_rate(
+            rate, DEFAULT_PKI_THRESHOLD, peak=peak
+        ) == model.pprop_from_hit_rate(rate, DEFAULT_PKI_THRESHOLD)
+
+    def test_inverting_is_worse_conditioned_near_the_peak(self) -> None:
+        """Why a pProp recovered from a label is not good enough in the tail.
+
+        The hit rate flattens towards the peak, so the same perturbation in y
+        buys a much larger move in pProp there. This is the measurement behind
+        the decision to take ampc_331k's pProp from the screen rather than invert
+        its stored labels. Pinned against the real fit, since the claim is about
+        that fit's geometry and not a property of any mixture.
+        """
+        params_path = Path("ampc_hitrate_fits/fitted_params.json")
+        table = Path("ampc_hitrate_fits/data/full_scores.df")
+        if not (params_path.is_file() and table.is_file()):
+            pytest.skip("ampc_hitrate_fits/ is not present")
+
+        real = HitRateModel(json.loads(params_path.read_text())["ampc"], table)
+        peak = real.peak_pprop(DEFAULT_PKI_THRESHOLD)
+
+        def sensitivity(pprop: float) -> float:
+            rate = real.hit_rate_from_pprop(pprop, DEFAULT_PKI_THRESHOLD)
+            moved = real.pprop_from_hit_rate(
+                rate + 1e-9, DEFAULT_PKI_THRESHOLD, peak=peak
+            )
+            return abs(moved - pprop)
+
+        # Measured: 5.9e-09 at pProp 3.5 against 3.5e-06 just below the peak.
+        assert sensitivity(3.5) < 1e-08
+        assert sensitivity(peak[0] - 0.001) > 1e-06
+        assert sensitivity(peak[0] - 0.001) > 100.0 * sensitivity(3.5)
+
+    def test_the_real_fit_inverts_both_thresholds(self) -> None:
+        """The two hardcoded constants are evaluations of this map, so invert them."""
+        params_path = Path("ampc_hitrate_fits/fitted_params.json")
+        table = Path("ampc_hitrate_fits/data/full_scores.df")
+        if not (params_path.is_file() and table.is_file()):
+            pytest.skip("ampc_hitrate_fits/ is not present")
+
+        real = HitRateModel(json.loads(params_path.read_text())["ampc"], table)
+        peak = real.peak_pprop(DEFAULT_PKI_THRESHOLD)
+
+        assert real.pprop_from_hit_rate(
+            DEFAULT_HIT_THRESHOLD, DEFAULT_PKI_THRESHOLD, peak=peak
+        ) == pytest.approx(DEFAULT_HIT_PPROP, abs=1e-9)
+        assert real.pprop_from_hit_rate(
+            DEFAULT_ENRICHED_THRESHOLD, DEFAULT_PKI_THRESHOLD, peak=peak
+        ) == pytest.approx(DEFAULT_ENRICHED_PPROP, abs=1e-9)
+
+
+class TestConventionConstants:
+    """The docked-only to full-screen conversion."""
+
+    def test_the_offset_is_minus_log10_of_the_docked_fraction(self) -> None:
+        assert PPROP_DOCKED_TO_FULL_SCREEN == pytest.approx(
+            -math.log10(DOCKED_RANK_FRACTION), abs=1e-15
+        )
+
+    def test_the_offset_matches_the_librarys_worst_molecule(self) -> None:
+        """The library's minimum pProp IS this constant, which is how it was found.
+
+        A docked-only denominator puts the worst docked molecule at rank fraction
+        1.0, i.e. pProp 0. The library puts it at ``N_docked/N_screened``, so its
+        floor is ``-log10(0.864)``. That difference is the entire disagreement
+        between the library and ampc_331k.
+        """
+        params_path = Path("ampc_hitrate_fits/fitted_params.json")
+        table = Path("ampc_hitrate_fits/data/full_scores.df")
+        if not (params_path.is_file() and table.is_file()):
+            pytest.skip("ampc_hitrate_fits/ is not present")
+
+        real = HitRateModel(json.loads(params_path.read_text())["ampc"], table)
+        library_min_y = 5.4223377755103196e-06
+
+        implied = real.pprop_from_hit_rate(library_min_y, DEFAULT_PKI_THRESHOLD)
+
+        assert implied == pytest.approx(PPROP_DOCKED_TO_FULL_SCREEN, abs=1e-4)

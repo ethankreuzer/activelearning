@@ -98,7 +98,7 @@ surrogate:
   lengthscale_prior: true
   scale_inputs: true
   noise_prior: true
-  prior_mean: 0.03956042999405787  # Mean y of data/10M_unif_random_subset.csv.
+  prior_mean: 0.0042864189360438442  # Mean y of data/10M_unif_random_subset.csv, recomputed 2026-11-07 after the y relabel (was 0.03956042999405787 from the OLD_WRONG_Y file).
   standardize_outputs: true
 
 acquisition:

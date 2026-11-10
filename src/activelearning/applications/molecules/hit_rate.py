@@ -20,6 +20,13 @@ because the artifact component increasingly dominates: a score that good is more
 likely to be an artifact than a real binder. That is intended behaviour, and it
 means the best achievable objective value sits at an interior score rather than
 at the most negative score available.
+:meth:`HitRateModel.peak_pprop` locates that maximum on the pProp scale, and
+:meth:`HitRateModel.pprop_from_hit_rate` inverts stage 2 on the rising branch
+below it — the only branch an observed label can be assumed to lie on.
+
+Note that only stage 1 depends on the reference screen. Stage 2 reads nothing but
+the fitted parameters, so a wrong score->pProp table corrupts :meth:`pprop` and
+:meth:`hit_rate` while leaving :meth:`hit_rate_from_pprop` exact.
 
 Deviation from upstream
 -----------------------
@@ -45,6 +52,7 @@ from typing import Any, Mapping
 
 import numpy as np
 from scipy.interpolate import interp1d
+from scipy.optimize import brentq, minimize_scalar
 from scipy.stats import norm
 
 logger = logging.getLogger(__name__)
@@ -55,9 +63,9 @@ DEFAULT_PKI_THRESHOLD = 6.5
 #: pProp at or above which a molecule IS a hit: the top 10^-5 of the library by
 #: docking score. Recovering these by sampling is the objective of the whole
 #: project, so this is what "hit" means everywhere. They are rare -- 116 of the
-#: 300,000-molecule training set, 100 of ampc_331k, 1 of the 83,811 docked
-#: GP-MoLFormer prior samples -- which is why the enriched region below exists as
-#: a separate, better-powered read.
+#: 10,000,000-molecule library, and the same 116 of the 300,000-molecule training
+#: set, since the training carve keeps the whole tail -- which is why the enriched
+#: region below exists as a separate, better-powered read.
 DEFAULT_HIT_PPROP = 5.0
 
 #: ``hit_rate_from_pprop(DEFAULT_HIT_PPROP, DEFAULT_PKI_THRESHOLD)`` for the AmpC
@@ -66,9 +74,10 @@ DEFAULT_HIT_THRESHOLD = 0.5247394203416823
 
 #: pProp at or above which a molecule is in the ENRICHED region: the top 10^-3.5.
 #: Not a hit -- it is the region the surrogate has to predict well in order to
-#: find hits, and it holds enough molecules (3,653 of the training set, 3,153 of
-#: ampc_331k) to measure a mean and a variance on. This is the threshold the
-#: training sets are carved with and the tail the policy is trained against.
+#: find hits, and it holds enough molecules (3,653 of the library, and the same
+#: 3,653 of the training set) to measure a mean and a variance on. This is the
+#: threshold the training sets are carved with and the tail the policy is trained
+#: against.
 DEFAULT_ENRICHED_PPROP = 3.5
 
 #: :data:`DEFAULT_ENRICHED_PPROP` on the y scale, for the AmpC fit.
@@ -76,13 +85,43 @@ DEFAULT_ENRICHED_THRESHOLD = 0.2617481563014626
 
 #: Both thresholds are hardcoded rather than computed so nothing has to load the
 #: score table to use them; ``tests`` pin both against the model. y is strictly
-#: increasing in pProp up to the mixture peak at pProp ~6.25, so each is a faithful
+#: increasing in pProp up to the mixture peak, which :meth:`HitRateModel.peak_pprop`
+#: locates at pProp 6.3214 for the shipped AmpC fit, so each is a faithful
 #: re-expression of its pProp for every molecule below that peak.
+
+#: Fraction of the virtual screen that docked successfully, ``N_docked /
+#: N_screened``. pProp is ``-log10(rank / N_screened)``, i.e. the denominator is
+#: the WHOLE screen including the molecules that failed to dock, which rank below
+#: every docked one. A rank fraction measured among docked molecules only must
+#: therefore be multiplied by this factor to become a pProp.
+#:
+#: The 10M library's labels were built with this value: its worst molecule sits at
+#: pProp 0.06347, which is ``-log10(0.864)``, and ``10^-pProp = 0.864 * rank/N``
+#: reproduces its labels to 3-4 digits at every rank from 20 to 10,000,000. By
+#: contrast ``ampc_331k`` and ``val_set`` carry pProps whose worst molecule is at
+#: pProp 0.0, i.e. they rank among DOCKED MOLECULES ONLY and are missing this
+#: factor; :data:`PPROP_DOCKED_TO_FULL_SCREEN` is what converts them.
+#:
+#: The exact screen counts behind the factor are not recorded in this repo. 0.864
+#: implies roughly 1.47e9 docked of 1.7e9 screened, or 1.4e9 of 1.62e9.
+DOCKED_RANK_FRACTION = 0.864
+
+#: ``-log10(DOCKED_RANK_FRACTION)``: add this to a pProp that was computed against
+#: the docked molecules only to express it against the whole screen.
+PPROP_DOCKED_TO_FULL_SCREEN = 0.06348625752110672
 
 # Grid used to invert the mixture CDF. Matches the upstream implementation.
 _PPF_GRID_SIZE = 10000
 _PPF_X_MIN = -10.0
 _PPF_X_MAX = 10.0
+
+# Bounds and tolerances for locating the mixture peak and inverting the hit rate
+# below it. 10^-20 of a ~1.4e9-molecule screen is far less than one molecule, so
+# no attainable pProp lies above the search bound.
+_PPROP_SEARCH_MAX = 20.0
+_PPROP_PEAK_XATOL = 1e-10
+_PPROP_INVERSION_XTOL = 1e-13
+_PPROP_MONOTONICITY_GRID = 64
 
 
 def load_score_pprop_table(table_path: str | Path) -> tuple[np.ndarray, np.ndarray]:
@@ -333,6 +372,157 @@ class HitRateModel:
 
         weight = self._regular_weight(standardized_score)
         return weight * base_hit_rate + (1.0 - weight) * indiscriminate_hit_rate
+
+    def peak_pprop(self, pki_threshold: float) -> tuple[float, float]:
+        """Locate the interior maximum of :meth:`hit_rate_from_pprop`.
+
+        The hit rate is not monotone in pProp: it rises, peaks, and falls again
+        as the artifact component takes over (see :meth:`_regular_weight`). This
+        reports where. For the shipped AmpC fit at ``pki_threshold=6.5`` the peak
+        is at pProp 6.32137 with a hit rate of 0.66631, and the 10M library's
+        best molecule sits just below it at pProp 6.2463, so every library label
+        is on the rising branch and therefore invertible.
+
+        Parameters
+        ----------
+        pki_threshold : float
+            Experimental pKi at or above which a molecule counts as a hit.
+
+        Returns
+        -------
+        pprop : float
+            pProp at which the hit rate is maximal.
+        hit_rate : float
+            The hit rate there, i.e. the largest attainable objective value.
+
+        Raises
+        ------
+        ValueError
+            If the maximum lies at a search bound, or the hit rate is not
+            strictly increasing below it. The mixture is then not unimodal over
+            ``[0, 20]`` and :meth:`pprop_from_hit_rate` has no single rising
+            branch to invert.
+        """
+        result = minimize_scalar(
+            lambda value: -self.hit_rate_from_pprop(float(value), pki_threshold),
+            bounds=(0.0, _PPROP_SEARCH_MAX),
+            method="bounded",
+            options={"xatol": _PPROP_PEAK_XATOL},
+        )
+        peak = float(result.x)
+        peak_rate = float(-result.fun)
+        # An interior maximum has to beat BOTH endpoints. Testing the distance to
+        # the bounds instead would never fire: the bounded method returns a point
+        # just inside them, so a monotone fit yields 19.9999997 rather than 20.
+        at_bounds = (
+            self.hit_rate_from_pprop(0.0, pki_threshold),
+            self.hit_rate_from_pprop(_PPROP_SEARCH_MAX, pki_threshold),
+        )
+        if not all(peak_rate > value for value in at_bounds):
+            raise ValueError(
+                f"Hit rate at pProp {peak!r} ({peak_rate!r}) does not exceed "
+                f"both ends of the search range [0, {_PPROP_SEARCH_MAX}] "
+                f"({at_bounds[0]!r}, {at_bounds[1]!r}); the mixture is not "
+                "unimodal there, so the rising branch is not well defined."
+            )
+
+        grid = np.linspace(0.0, peak, _PPROP_MONOTONICITY_GRID)
+        values = np.array(
+            [self.hit_rate_from_pprop(float(value), pki_threshold) for value in grid]
+        )
+        if not np.all(np.diff(values) > 0.0):
+            raise ValueError(
+                f"Hit rate is not strictly increasing on [0, {peak!r}], so the "
+                "rising branch cannot be inverted."
+            )
+        return peak, peak_rate
+
+    def pprop_from_hit_rate(
+        self,
+        hit_rate: float,
+        pki_threshold: float,
+        *,
+        peak: tuple[float, float] | None = None,
+        out_of_range: str = "raise",
+    ) -> float:
+        """Invert :meth:`hit_rate_from_pprop` on its RISING branch only.
+
+        The hit rate is **not injective** in pProp — it peaks at
+        :meth:`peak_pprop` and falls above — so this returns the unique pProp in
+        ``[0, peak]`` with that hit rate. A hit rate taken from the falling
+        branch therefore comes back as its rising twin: with the AmpC fit,
+        ``pprop_from_hit_rate(hit_rate_from_pprop(8.0, 6.5), 6.5)`` is 2.58, not
+        8.0. Callers that might hold falling-branch values have to rule that out
+        themselves; nothing here can tell the two apart.
+
+        Inverting is also badly conditioned near the peak, where the hit rate is
+        flat: with the AmpC fit a change of 1e-9 in the hit rate moves pProp by
+        6e-09 at pProp 3.5 but by 2.5e-06 at pProp 6.32, a factor of 430. Prefer
+        a pProp carried alongside the label over one recovered from it.
+
+        Parameters
+        ----------
+        hit_rate : float
+            A hit rate on the rising branch. ``NaN`` propagates unchanged.
+        pki_threshold : float
+            Experimental pKi at or above which a molecule counts as a hit.
+        peak : tuple of (float, float), optional
+            A precomputed :meth:`peak_pprop` result, so a caller inverting many
+            values locates the peak once. The answer is identical either way.
+        out_of_range : {"raise", "clamp"}, default="raise"
+            What to do with a hit rate the rising branch cannot attain: above
+            the peak, or at or below ``hit_rate_from_pprop(0)`` (1.66e-32 for
+            the AmpC fit). ``"clamp"`` returns the branch endpoint instead.
+
+        Returns
+        -------
+        float
+            pProp in ``[0, peak]``, or ``NaN`` if ``hit_rate`` is not finite.
+
+        Raises
+        ------
+        ValueError
+            If ``out_of_range`` is not recognised, or it is ``"raise"`` and the
+            hit rate is off the branch.
+        """
+        if out_of_range not in ("raise", "clamp"):
+            raise ValueError(
+                f"out_of_range must be 'raise' or 'clamp', got {out_of_range!r}"
+            )
+        if not math.isfinite(hit_rate):
+            return float("nan")
+
+        peak_at, peak_rate = (
+            peak if peak is not None else self.peak_pprop(pki_threshold)
+        )
+        floor_rate = self.hit_rate_from_pprop(0.0, pki_threshold)
+
+        if hit_rate > peak_rate:
+            if out_of_range == "clamp":
+                return peak_at
+            raise ValueError(
+                f"Hit rate {hit_rate!r} exceeds the largest attainable value "
+                f"{peak_rate!r} (at pProp {peak_at!r}), so it is not on the "
+                "rising branch."
+            )
+        if hit_rate <= floor_rate:
+            if out_of_range == "clamp":
+                return 0.0
+            raise ValueError(
+                f"Hit rate {hit_rate!r} is at or below the value at pProp 0 "
+                f"({floor_rate!r}), so the rising branch does not reach it."
+            )
+
+        return float(
+            brentq(
+                lambda value: (
+                    self.hit_rate_from_pprop(float(value), pki_threshold) - hit_rate
+                ),
+                0.0,
+                peak_at,
+                xtol=_PPROP_INVERSION_XTOL,
+            )
+        )
 
     # ------------------------------------------------------------------
     # Internal helpers

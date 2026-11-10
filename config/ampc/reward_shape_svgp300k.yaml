@@ -1,7 +1,7 @@
 # Reward-shape arm on the sparse variational GP chosen by the training-set
 # scaling study: the 300k nested set, ELBO, 1024 inducing points, cosine from
 # 3e-3 over 10,064 steps (svgpscale_300000_svgp_M1024_iso_matern_scaled_
-# pm0.03956_elbo_cosine_lr3e-3_steps10064_fp32, fitted on Mila).
+# pm0.0042864_elbo_cosine_lr3e-3_steps10064_fp32, fitted on Mila).
 #
 #   SURROGATE=svgp300k LOG_SCORE_FLOOR=-500 sbatch --cpus-per-task=24 \
 #     jobs/reward_shape_nibi.sh power 0.1 1000 5000
@@ -40,7 +40,7 @@ surrogate:
   type: VariationalGPSurrogate
   # Restored in place of training; the settings below must match the fit, or
   # load_state_dict raises.
-  state_path: outputs/ampc/variational_gp/svgpscale_300000_svgp_M1024_iso_matern_scaled_pm0.03956_elbo_cosine_lr3e-3_steps10064_fp32/surrogate_state.pt
+  state_path: outputs/ampc/variational_gp/svgpscale_300000_svgp_M1024_iso_matern_scaled_pm0.0042864_elbo_cosine_lr3e-3_steps10064_fp32/surrogate_state.pt
   encoder:
     # The encoder the training cache was written by. cache_only false, since
     # generated SMILES are in no cache; the 300,000 training molecules are an
@@ -67,7 +67,7 @@ surrogate:
   lengthscale_prior: true
   scale_inputs: true
   noise_prior: true
-  prior_mean: 0.03956042999405787  # Mean y of data/10M_unif_random_subset.csv.
+  prior_mean: 0.0042864189360438442  # Mean y of data/10M_unif_random_subset.csv, recomputed 2026-11-07 after the y relabel (was 0.03956042999405787 from the OLD_WRONG_Y file).
   standardize_outputs: true
 
 acquisition:
