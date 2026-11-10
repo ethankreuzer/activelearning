@@ -75,6 +75,22 @@ class _PreparedMoleculeBatch:
         Optional terminal fidelity-action indices aligned with ``smiles``.
     synthesizable : tuple[bool, ...]
         Synthetic accessibility score (SA-score) threshold results aligned with ``smiles``.
+    invalid_input_ids : Tensor or None
+        The policy's OWN generated token ids for the rows canonicalization
+        rejected, so they are absent from every other field here. These are the
+        trajectories the policy actually sampled, not a re-encoding of the
+        unparseable string: ``encode_smiles`` neither canonicalizes nor
+        validates, so re-encoding would score a different trajectory than the
+        one that was taken. They carry no SMILES, no acquisition score and no
+        reward, because an unparseable molecule cannot be scored -- which is
+        why they can only ever be used where reward scores are not needed.
+        ``None`` when nothing was rejected.
+    invalid_smiles : tuple[str, ...]
+        The raw generated strings for those same rejected rows, in the same
+        order. They are unparseable by construction, so they are stored only as
+        identity: ``ReplayBuffer`` deduplicates on the string, and the FIFO
+        policy the negative buffer uses never calls RDKit on it, unlike the
+        reward policy.
     """
 
     smiles: tuple[str, ...]
@@ -83,6 +99,8 @@ class _PreparedMoleculeBatch:
     acq_scores: tuple[float, ...]
     synthesizable: tuple[bool, ...]
     fidelity_indices: Tensor | None = None
+    invalid_input_ids: Tensor | None = None
+    invalid_smiles: tuple[str, ...] = ()
 
 
 # Warn above this beta when the acquisition reports log-scale scores.
@@ -769,6 +787,10 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
             molecule_chem=molecule_chem,
             acquisition=acquisition,
             cost_fn=cost_fn,
+            # Only the training path supplies these, so only here do invalid
+            # generations reach the negative buffer. See
+            # _update_generated_batch for why they belong there.
+            generated_input_ids=generated.input_ids,
         )
         self._last_gradient_norm = None
         online_loss = self._update_generated_batch(
@@ -907,6 +929,55 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
                     else prepared.fidelity_indices[negative_mask]
                 ),
             )
+
+        # INVALID generations go in too, not only the SA failures above.
+        #
+        # Until this existed, a molecule RDKit could not parse was dropped in
+        # _canonicalize_batch and entered neither buffer nor any loss term, so
+        # the objective applied NO cost to producing one -- the policy paid only
+        # in fewer usable trajectories per step. On the floor -1000 arm with the
+        # fine-tuned prior that meant roughly 50 of 64 generations per step
+        # carrying no corrective gradient while validity fell from 0.83 to 0.14.
+        #
+        # They can only be negatives: an unparseable string has no acquisition
+        # score, so it has no reward and could never sit on the positive side.
+        # That is exactly what the auxiliary contrastive loss needs -- its
+        # docstring states negative sequences do not need reward scores, since
+        # it only evaluates their trajectory log-probability -- so a reward of
+        # 0.0 is a placeholder the loss never reads, and add_batch requires
+        # merely that it be finite.
+        #
+        # Two properties of ReplayBuffer make this safe. The negative buffer is
+        # FIFO, and only the "reward" policy calls Chem.MolFromSmiles and
+        # rejects what will not parse; FIFO stores the row as given. And
+        # deduplication is on the string, so the raw generated text is what
+        # distinguishes these entries -- an empty or whitespace string is
+        # silently refused by _add, which is the desired outcome for an
+        # unterminated generation.
+        #
+        # NOTE ON SCALE: this raises the negative set from ~2 per batch to ~50
+        # on a collapsing arm, so the aux term's magnitude changes by more than
+        # an order of magnitude at a FIXED aux_coefficient, and the 6400-entry
+        # FIFO now turns over every ~128 steps rather than effectively never.
+        # aux_coefficient was tuned when only SA failures landed here and very
+        # likely needs rescanning; a run with this change is not directly
+        # comparable to one without at the same coefficient.
+        if (
+            negative_buffer is not None
+            and prepared.invalid_input_ids is not None
+            and prepared.invalid_smiles
+        ):
+            negative_buffer.add_batch(
+                prepared.invalid_input_ids,
+                prepared.invalid_smiles,
+                # Placeholder: never read, because the contrastive loss uses
+                # only the trajectory log-probabilities of its negatives.
+                torch.zeros(
+                    len(prepared.invalid_smiles),
+                    dtype=torch.float32,
+                    device=prepared.invalid_input_ids.device,
+                ),
+            )
         return online_loss
 
     def _update_replay_batch(
@@ -968,13 +1039,34 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
         molecule_chem: Any,
         acquisition: Any,
         cost_fn: Callable[[Sequence[Candidate]], list[float]] | None,
+        generated_input_ids: Tensor | None = None,
     ) -> _PreparedMoleculeBatch:
         """Canonicalize, score, encode, and classify one generated batch."""
-        canonical_smiles, canonical_fidelity_indices = self._canonicalize_batch(
+        (
+            canonical_smiles,
+            canonical_fidelity_indices,
+            rejected_positions,
+        ) = self._canonicalize_batch(
             smiles,
             fidelity_indices=fidelity_indices,
             molecule_chem=molecule_chem,
         )
+
+        # The policy's own token ids for the rows RDKit rejected. Sliced from
+        # what generate() returned rather than re-encoded, and only when the
+        # caller supplied them, so every other call site keeps its old
+        # behaviour and gets None.
+        invalid_input_ids: Tensor | None = None
+        invalid_smiles: tuple[str, ...] = ()
+        if generated_input_ids is not None and rejected_positions:
+            invalid_input_ids = generated_input_ids[
+                torch.tensor(
+                    rejected_positions,
+                    dtype=torch.long,
+                    device=generated_input_ids.device,
+                )
+            ]
+            invalid_smiles = tuple(smiles[index] for index in rejected_positions)
 
         if not canonical_smiles:
             empty_ids = model.encode_smiles([])
@@ -989,6 +1081,8 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
                 acq_scores=(),
                 synthesizable=(),
                 fidelity_indices=canonical_fidelity_indices,
+                invalid_input_ids=invalid_input_ids,
+                invalid_smiles=invalid_smiles,
             )
 
         candidates = [
@@ -1023,6 +1117,8 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
             acq_scores=tuple(acq_scores),
             synthesizable=tuple(labels),
             fidelity_indices=canonical_fidelity_indices,
+            invalid_input_ids=invalid_input_ids,
+            invalid_smiles=invalid_smiles,
         )
 
     def _canonicalize_batch(
@@ -1031,13 +1127,20 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
         *,
         fidelity_indices: Tensor | None,
         molecule_chem: Any,
-    ) -> tuple[tuple[str, ...], Tensor | None]:
-        """Return valid canonical SMILES and aligned action indices."""
+    ) -> tuple[tuple[str, ...], Tensor | None, tuple[int, ...]]:
+        """Return valid canonical SMILES, aligned action indices, and rejects.
+
+        The third element holds the positions in ``smiles`` that failed to
+        parse. Callers need them to recover the policy's own token ids for the
+        rejected rows, which are otherwise discarded here and so reach no
+        buffer and no loss term.
+        """
         # Validate alignment before filtering; retained indices are remapped below.
         self._resolve_fidelity_values(fidelity_indices, count=len(smiles))
         canonical_smiles: list[str] = []
         retained_fidelity_indices: list[int] = []
         rejects: list[tuple[str, str]] = []
+        rejected_positions: list[int] = []
         for index, generated_smiles in enumerate(smiles):
             canonical, reason = _canonicalize_with_reason(
                 generated_smiles,
@@ -1045,6 +1148,7 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
             )
             if canonical is None:
                 rejects.append((reason or "parse_error", generated_smiles))
+                rejected_positions.append(index)
             else:
                 canonical_smiles.append(canonical)
                 if fidelity_indices is not None:
@@ -1063,6 +1167,7 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
                     device=fidelity_indices.device,
                 )
             ),
+            tuple(rejected_positions),
         )
 
     def _resolve_fidelity_values(
