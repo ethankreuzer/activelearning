@@ -1720,6 +1720,43 @@ This project runs on two clusters and the repo needs attention PER SESSION, not 
 milestone. The 2026-11-07 session recorded that the checkout had diverged; nobody acted,
 and the divergence grew to 19 commits against 18 before being merged.
 
+### BLOCKER: the AL config's training-subset band edges are STALE (2026-11-10)
+
+**`config/ampc/subset_fixed_gp.yaml` must not be launched as it stands.** Its
+`band_edges: [0.03482, 0.03909, 0.05816, 0.23182, 0.32965, 0.40834]` were derived under
+the OLD, broken labels. Inverted through the corrected curve the first three map to pProp
+**1.65 / 1.72 / 1.97** -- they were slicing the narrow range just above the old floor
+(pProp 1.5988, y 0.0318), which is all the old route could emit.
+
+Corrected `y` reaches 5.4e-06, so measured on a 500,000-row sample of the library those
+edges leave **97.46% of molecules in band 0**. `StratifiedFPS` is then not stratifying:
+the per-round training subset collapses onto one band.
+
+Proposed replacement, uniform 0.5-wide pProp steps, mirroring how the `svgpscale` ladder
+was recut, and the same 6 edges / 7 bands so `pool_multiple` is unchanged:
+
+    band_edges: [0.0609540589, 0.1131050091, 0.1812916313,
+                 0.2617481563, 0.3494612715, 0.4389967547]
+    # pProp 2.0 / 2.5 / 3.0 / 3.5 / 4.0 / 4.5
+
+Library shares with those edges: 98.855 / 0.794 / 0.241 / 0.078 / 0.022 / 0.007 / 0.003 %.
+
+**Band 0 still holds 98.9%, and that is inherent to the library rather than a fixable
+property of the edges.** What changes is that bands 1-6 become meaningful, non-empty
+strata at interpretable pProp cuts instead of three near-duplicate edges between pProp
+1.65 and 1.97. `band_fill: proportional` and `pool_multiple` are what handle the
+imbalance. Note also that these shares describe the ROUND-1 archive only; later rounds
+are policy-enriched and the distribution shifts.
+
+**Also undecided: `keep_above: 0.5`.** That is y 0.5, about pProp 4.84, just under the
+hit threshold 0.5247394203416823, while the `svgpscale` sets keep everything above the
+ENRICHED threshold 0.2617481563014626. The three candidates are the hit threshold, the
+enriched threshold, or leaving 0.5 as is.
+
+**STATUS: deferred by the user 2026-11-10 ("I will come back and revisit these edges
+later"). NOT a decision to skip -- a 10-round run launched before it is settled spends
+48 h on an unstratified subset.**
+
 ### The surrogate block the AL run must use
 
 From `config/ampc/exact_gp_sweep.yaml`, the `on_pinned` arm, unchanged:
