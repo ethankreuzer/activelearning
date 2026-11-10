@@ -1690,31 +1690,35 @@ now obsolete and would have destroyed the sweep had it been run on 2026-11-10.
 
 ## 5c. HANDOFF TO NIBI: what the 10-round AL run needs (2026-11-10)
 
-**READ THIS BEFORE PULLING ON NIBI. Neither branch on the remote can run the AL job
-as it stands, and pulling the obvious one gives you a tree that cannot see the config
-this sweep just chose.**
+**`git pull` on `exact-dkl-top-n` is now the right thing to do.** Pull it, transfer the
+775 MB below, and use the surrogate block below unchanged.
 
-### The repo is split across two branches, and each is missing the other's half
+### The branch split is RESOLVED -- ignore the earlier warning
 
-This Mila checkout forked from `origin/exact-dkl-top-n` at `76cd121` and never pulled
-the Nibi work of 2026-11-04..07. Both sides then advanced. As of 2026-11-10:
+An earlier draft of this section opened "READ THIS BEFORE PULLING ON NIBI. Neither
+branch on the remote can run the AL job as it stands." **That is no longer true.** The
+merge it demanded happened on Mila in `16529f8` ("merge the Nibi branch: AL
+infrastructure in, this sweep's eval kept"), so `origin/exact-dkl-top-n` now carries
+BOTH halves: the Nov-04..07 AL round infrastructure (`full_archive.yaml`,
+`RUN_ARTIFACTS_AND_REPRODUCTION.md`, the newer `subset_gp.py` / `training_subset.py` /
+`diagnostics.py` / `active_learning.py`, the Nibi job scripts,
+`ampc_full_scores_1p7b.df`) and everything the sweep produced, including
+`config/ampc/exact_gp_sweep.yaml`. Verified 2026-11-10 by reading that path out of
+`origin/exact-dkl-top-n`.
 
-| branch | has | MISSING |
-|---|---|---|
-| `origin/exact-dkl-top-n` | the AL round infrastructure: `full_archive.yaml`, `RUN_ARTIFACTS_AND_REPRODUCTION.md`, the newer `subset_gp.py` / `training_subset.py` / `diagnostics.py` / `active_learning.py`, the Nibi job scripts, `ampc_full_scores_1p7b.df` | **`config/ampc/exact_gp_sweep.yaml`** -- the config the sweep chose. Also the W&B trim, the `weight` column, the flat config keys, the 20k ladder |
-| `origin/exact-gp-sweep-n20000` | everything this sweep produced, including the chosen config | `full_archive.yaml`, `RUN_ARTIFACTS_AND_REPRODUCTION.md`, and the Nov-04..07 versions of the four files below |
+`origin/exact-gp-sweep-n20000` still exists and is still missing the AL machinery. Do
+not check it out; it is history.
 
-The four AL-critical files differ by a LOT between the branches -- the sweep branch
-carries their 2026-11-04 state, not Nibi's:
+**What you must still check before pulling: that Mila has PUSHED.** This file and the
+code it describes are only useful on Nibi once `exact-dkl-top-n` is pushed, and this
+project has already lost a week to a divergence nobody looked at. `git log --oneline -1`
+on both sides should agree.
 
-    subset_gp.py        +152/-4     training_subset.py  +181/-8
-    diagnostics.py      +327/-7     active_learning.py   +34/-2
+### The lesson that survives from the earlier draft
 
-**So: `git pull` on `exact-dkl-top-n` gives a tree with no `exact_gp_sweep.yaml`, and
-checking out `exact-gp-sweep-n20000` gives a tree whose AL round machinery is a week
-old.** The merge in section 5b is not optional before the 10-round run; it is the
-prerequisite. Do the merge on Mila (where both sides can be inspected), push, then pull
-on Nibi.
+This project runs on two clusters and the repo needs attention PER SESSION, not per
+milestone. The 2026-11-07 session recorded that the checkout had diverged; nobody acted,
+and the divergence grew to 19 commits against 18 before being merged.
 
 ### The surrogate block the AL run must use
 
@@ -1740,17 +1744,33 @@ disqualified the `learned` arm. See "RESULT" in section 5a.
 
 ### Data to transfer -- `data/` and `cache/` are gitignored, so git carries NONE of it
 
-**682 MB**, and the run fails without it (`cache_only: true` makes a cache miss a hard
-error rather than silent re-encoding, which is deliberate):
+**775 MB**, measured 2026-11-10, and the run fails without it (`cache_only: true` makes
+a cache miss a hard error rather than silent re-encoding, which is deliberate). **Every
+`.npy` needs its `.npy.json` beside it**: the manifest hashes the ordered SMILES and the
+loader refuses the store if it disagrees.
 
 | file | size | why |
 |---|---|---|
 | `data/ampc_svgpscale_20000.csv` | 1.4M | the training set |
-| `cache/ampc/exact_dkl_top_n/svgpscale_20000.npy` + `.npy.json` | 40M | its feature cache; the `.json` hashes the ordered SMILES and is checked |
-| `cache/ampc/exact_dkl_top_n/ampc_val_screen_232k.csv` + `.npy` | 469M | THE validation set, ipw-weighted. The `.csv` carries the `weight` column |
-| `cache/ampc/exact_dkl_top_n/gp_molformer_set.npy` | 164M | scored set |
-| `cache/ampc/exact_dkl_top_n/olivier_invitro.npy` | 3.0M | scored set |
+| `cache/.../svgpscale_20000.npy` + `.npy.json` | 40M | its feature cache |
+| `cache/.../ampc_val_screen_232k.csv` + `.npy` + `.npy.json` | 469M | THE validation set, ipw-weighted, PREDICT-ONLY. The `.csv` carries the `weight` column |
+| `cache/.../ampc_val_screen_232k_acq.csv` + `.npy` + `.npy.json` | **93M** | **ADDED 2026-11-10.** The SCORED 45,850-row slice: every statistic that answers "is the reward flat on the molecules we want" comes from this set. See 5a-bis |
+| `cache/.../gp_molformer_set.csv` + `.npy` + `.npy.json` | 169M | scored set. Labels still stale, so read only its underflow statistics (section 2.0) |
+| `cache/.../olivier_invitro.csv` + `.npy` + `.npy.json` | 3.1M | scored set, 1,521 in-vitro molecules |
 
+**The `_acq` slice must be COPIED, not rebuilt on Nibi.** `scripts/build_val_screen_acq_set.py`
+subsamples the bulk with `seed=42`, so a rebuild from the same 232k gives the same rows --
+but only if the source `ampc_val_screen_232k.csv` has the same row ORDER, since the
+selection indexes into it. Copying removes the question. Rebuilding is the fallback:
+
+    python -m scripts.build_val_screen_acq_set   # 30,850 enriched + 15,000 bulk, seed 42
+
+**One trap in its weights, repeated here because it is easy to miss:** `weight` is
+`1/P(selected)` for the rule that built the 232k and is carried unchanged, but the bulk
+is a subsample, so a surviving bulk row stands for **13.3358x** as many screen molecules
+(`selection.bulk_weight_scale` in the manifest). The scale is NOT applied to the column.
+Population-level means from this set must apply it; the hit/enriched block statistics the
+AL run tracks do not need it.
 The 20k set is the innermost arm of a NESTED five-arm ladder, so it is a subset of the
 25k/50k/100k/300k sets; do not rebuild it on Nibi, because a build whose largest arm
 differs draws different pools and yields a different 20k. See "The svgpscale ladder".
