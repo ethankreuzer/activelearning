@@ -903,3 +903,45 @@ def test_ampc_prior_rtb_pretrain_config_parses() -> None:
     ).relative_to(REPOSITORY_ROOT)
     assert config.runtime.precision == 32
     assert config.budget.max_rounds == 1
+
+
+def test_al_surrogate_is_the_sweeps_on_pinned_arm() -> None:
+    """The 10-round AL config must carry the arm the exact-GP sweep chose.
+
+    Both of these were WRONG here until 2026-11-10 and neither failed loudly:
+
+    ``prior_mean`` still held 0.03956042999405787, the mean of the OLD_WRONG_Y
+    file, which the relabel corrected everywhere except this config -- 9x off.
+
+    ``lengthscale_prior`` was ABSENT, and its default is ``False``, which is the
+    arm the sweep REJECTED: with the prior off, 90% of the GIBBON mass lands on
+    one molecule of 83,811 and the acquisition goes anti-correlated with the
+    labels. A 10-round run would have docked against it.
+
+    `SubsetFixedFeatureGPSurrogate` subclasses the `FixedFeatureGPSurrogate` the
+    sweep fitted and changes only which rows each round trains on, so every
+    field below is the same knob the sweep turned.
+    """
+    config_path = REPOSITORY_ROOT / "config" / "ampc" / "subset_fixed_gp.yaml"
+
+    config = load_and_parse(config_path, ActiveLearningConfig)
+    surrogate = config.surrogate
+
+    assert surrogate.type == "SubsetFixedFeatureGPSurrogate"
+    # AXIS 1, the axis that decided the sweep.
+    assert surrogate.lengthscale_prior is True
+    # AXIS 2 = pinned: the LIBRARY mean, a fixed constant across rounds, not the
+    # round's own training mean.
+    assert surrogate.prior_mean == pytest.approx(0.0042864189360438442)
+    assert surrogate.constant_kernel is False
+    # Pinned across all six arms.
+    assert surrogate.ard is False
+    assert surrogate.kernel == "matern"
+    assert surrogate.outputscale is True
+    assert surrogate.scale_inputs is True
+    assert surrogate.standardize_outputs is True
+    assert surrogate.max_cholesky_size == 30000
+    assert surrogate.accept_abnormal_lbfgsb is True
+    # Deliberately unset: a noise floor pins the outputscale-to-noise ratio by
+    # fiat, and that ratio is what the marginal likelihood is there to estimate.
+    assert getattr(surrogate, "noise_std_floor", None) is None

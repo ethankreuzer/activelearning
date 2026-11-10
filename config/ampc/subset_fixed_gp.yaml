@@ -112,17 +112,56 @@ surrogate:
     pool_multiple: [40, 40, 40, 15, 15, 15, 15]
     seed: ${runtime.seed}
   subset_dir: outputs/ampc/single_fidelity_al/${run_name}/training_subsets
-  # The surrogate chosen for the active-learning experiments (see
-  # scripts/gp_scaling_benchmark.py and the fitted arm
-  # outputs/ampc/exact_dkl_top_n/balanced_25000_fixedgp_iso_matern_scaled_pm0.03956_fp32):
-  # one lengthscale shared by all 512 features, Matern-5/2 in a learned
-  # ScaleKernel, and the constant mean pinned at the 10M library mean.
-  ard: false
+  # THE SURROGATE IS THE `on_pinned` ARM OF THE EXACT-GP SWEEP (2026-11-10, jobs
+  # 11628247-11628252, W&B project ExactGP_thesis, group exact-gp-n20000).
+  # THESIS_ACTIVELEARNING.md section 5a "RESULT" is the decision record.
+  #
+  # The sweep fitted `FixedFeatureGPSurrogate`; this is
+  # `SubsetFixedFeatureGPSurrogate`, which SUBCLASSES it and changes only which
+  # rows each round fits on. So every setting below is the same knob the sweep
+  # turned, and the result carries over directly rather than by analogy.
+  #
+  # One lengthscale shared by all 512 features, Matern-5/2 in a learned
+  # ScaleKernel, constant mean pinned at the 10M library mean.
+  ard: false  # Measured inert and mildly harmful on both ranking endpoints.
   kernel: matern
   outputscale: true
-  prior_mean: 0.03956042999405787  # Mean y of data/10M_unif_random_subset.csv.
-  scale_inputs: true
+  # AXIS 1 OF THE SWEEP, AND THE ONE THAT DECIDED IT. Was ABSENT here, which
+  # defaults to false -- the arm the sweep REJECTED. With the prior off the fit
+  # runs into a degenerate corner (lengthscale 19.2 against 2.75, outputscale
+  # 18.2 against 0.18, signal-to-noise 84 against 1.07): a near-constant kernel
+  # with enormous amplitude, which predicts BETTER pointwise (val pearson 0.842
+  # against 0.825) and leaves the acquisition unable to rank. On
+  # gp_molformer_set the prior-off arms put 90% of the GIBBON mass on ONE
+  # molecule of 83,811, at zero entropy, with the acquisition ANTI-correlated
+  # with the labels (spearman_y -0.057 against +0.134). A 64-molecule batch
+  # would be one informative pick and 63 arbitrary ones.
+  lengthscale_prior: true
+  # AXIS 2, and it measured as a tie: pinned / learned / constant differ by less
+  # than the seed noise on every endpoint (16-89x smaller than the axis-1 gap).
+  # `pinned` is chosen for ROUND-TO-ROUND STABILITY, which a single-round sweep
+  # cannot see and which this run turns on: the library mean is a FIXED
+  # constant, so round 7's scores are comparable with round 1's, whereas a
+  # learned mean climbs every round as the archive gains hits and inflates
+  # predictions for unseen molecules exactly as the pool is exhausted.
+  #
+  # DO NOT recompute this per round from the round's training subset. That is
+  # the drift the `learned` arm was rejected for.
+  #
+  # CORRECTED 2026-11-10: was 0.03956042999405787, which came from the
+  # OLD_WRONG_Y file -- the score->pProp table that collapsed every docked
+  # molecule to one y. 9x wrong. See section 4.0.
+  prior_mean: 0.0042864189360438442  # Mean y of data/10M_unif_random_subset.csv.
+  constant_kernel: false  # AXIS 2 = `pinned`; true would be the `constant` arm.
+  scale_inputs: true  # Pinned true in every arm so it cannot confound axis 1.
   standardize_outputs: true
+  # An ABNORMAL L-BFGS-B exit is accepted as a fit rather than raised, as in all
+  # six arms. Without it a round that ends abnormal kills the whole run.
+  accept_abnormal_lbfgsb: true
+  # noise_std_floor is deliberately UNSET: flooring the noise pins the
+  # outputscale-to-noise ratio by fiat, and that ratio is what the marginal
+  # likelihood is there to estimate.
+  #
   # Exact Cholesky for the whole subset; see fixed_feature_gp_balanced.yaml.
   max_cholesky_size: 30000
 
