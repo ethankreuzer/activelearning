@@ -1,0 +1,257 @@
+# The exact GP sweep: BoTorch's exact GP on the frozen MiniMol AmpC
+# fingerprints, fitted to the 25,000-molecule svgpscale set, with ONE axis --
+# whether the lengthscale carries BoTorch's dimension-scaled LogNormal prior.
+#
+# TWO AXES, FULLY CROSSED: 2 x 3 = SIX ARMS. Everything not named here is
+# pinned across every arm, so a contrast is attributable to the axes and
+# nothing else. The cross is full rather than partial because the question is
+# whether the prior's effect DEPENDS on how the level is represented; a partial
+# grid would assume that interaction away.
+#
+#   AXIS 1, lengthscale prior, 2 levels:
+#     on       this file as written
+#     off      surrogate.lengthscale_prior=false
+#
+#   AXIS 2, how the function's LEVEL is represented, 3 levels:
+#     pinned   this file as written (prior_mean at the library mean)
+#     learned  surrogate.prior_mean=null
+#     constant surrogate.constant_kernel=true  (prior_mean stays pinned)
+#
+# The `learned` and `constant` levels exist because the pinned mean is doing
+# more work than it looks like it is; the reasoning is on `prior_mean` below.
+# `surrogate.prior_mean=null` with `constant_kernel=true` is REJECTED by the
+# surrogate: both represent the level of the function, so the cell is not
+# interpretable.
+#
+# What the axis actually changes, which is two things, not one:
+#   1. the GRADIENT. With the prior, the MLL carries a LogNormal(sqrt2 + 0.5*log
+#      512, sqrt3) term on the lengthscale, mode 4.63, pulling it down; without
+#      it the lengthscale is fitted from the data term alone.
+#   2. the STARTING POINT. 4.63 (the prior's mode) with it, sqrt(512) = 22.63
+#      without -- the start this package's other prior-free kernels use
+#      (variational_gp._matern_kernel), and the DKL incumbent's. This is a
+#      deliberate choice over starting both arms at 4.63:
+#      FIXED_FEATURE_GP_STATUS.md recorded lengthscales drifting 4.6 -> 22 and
+#      still rising, so the prior-free arm starts near where the fit was heading.
+#      The cost is that "prior off" means prior-free-and-far-start; a difference
+#      between arms cannot be split between the two mechanisms.
+#
+# Not swept, with the evidence:
+#   - ard. Measured INERT on the 24 local calibration-grid arms (pearson 0.7949
+#     ard vs 0.7927 iso, delta 0.002 against a 0.005 sd) and mildly HARMFUL on
+#     both endpoints that matter (top1000_enrichment 2.02 vs 2.07, spearman_y
+#     0.131 vs 0.155). Fixed off: sweeping it would pay a doubling to confirm a
+#     null. It is also what makes lengthscale_prior=false expressible at all --
+#     BoTorch's ARD kernel comes from get_covar_module_with_dim_scaled_prior,
+#     which has no way to omit the prior.
+#   - runtime.seed. Measured NOISE on the same arms: 0.79373 / 0.79368 / 0.79406
+#     across seeds 42/43/44, a 4e-4 spread against a 0.33 between-arm sd. Rather
+#     than an axis, the winning arm is re-run at 43 and 44 afterwards: the
+#     variance statement at 2 arms' cost instead of 3x the sweep.
+#   - noise_std_floor. NOT USED, and deliberately so. It is the knob that would
+#     play the variational sweep's ELBO-vs-PLL role, but flooring the noise pins
+#     the outputscale-to-noise ratio by fiat, and that ratio -- the latent
+#     variance the acquisition consumes -- is the quantity the marginal
+#     likelihood exists to estimate here. If noise collapses, that is a finding
+#     about this model on this data, not something to floor away before looking.
+#
+# Like exact_dkl_top_n.yaml, which this mirrors outside the surrogate block, the
+# sampler, oracle, selector and budget sections are never built but must stay
+# valid, because ActiveLearningConfig validates the whole file.
+
+runtime:
+  device: cuda
+  # float32, matching the variational sweep and the DKL incumbent. User
+  # decision, 2026-11-09, against an earlier reading of the fp32 evidence.
+  #
+  # WHY, and what the risk is. The fp64 full fit (Nibi job 24352820) was
+  # cancelled at 1 h 55 min after ~4,400 objective evaluations, ~1.5 s each, and
+  # was STILL far from converging; it peaked at 38.8 GB. fp64 does not converge
+  # in feasible wall-clock at n=25,000. The fp32 full fit (job 24352829) did
+  # report convergence after 94 steps / 164 evaluations, which is a FALSE
+  # convergence -- but that run was ard=true, and its degeneracy was 512
+  # lengthscales collapsing with the minimum pinned at the 0.025 bound and ~32
+  # effective dims. That failure mode needs the 512-lengthscale valley, and
+  # ard=false here has one lengthscale.
+  #
+  # So the risk that CARRIES OVER is narrower: scipy's convergence status is not
+  # trustworthy at this precision. JUDGE EACH FIT ON ITS LOSS TRACE, not on the
+  # status flag -- and note this is what makes accept_abnormal_lbfgsb below
+  # load-bearing rather than precautionary. Watch also for psd_safe_cholesky
+  # jitter escalation: one 25,000 x 25,000 Cholesky is ~2.5 GB in fp32, cheap,
+  # but a Matern over 512-d fingerprints is where fp32 jitter starts to bite.
+  #
+  # A reward-shape arm restoring this state must also run at 32.
+  precision: 32
+  seed: 42
+
+dataset:
+  type: ListDataset
+  initial_data:
+    # Built 2026-11-09 by jobs/build_svgp_scaling_sets_mila.sh (job 11616447)
+    # from the CORRECTED 10M library, with bands cut on pProp in uniform
+    # 0.5-wide steps. n=25,000: mean(y) 0.10886673, var(y) 0.014415757.
+    #
+    # NOT data/ampc_balanced_25000.csv, which stratifies on quantiles of the
+    # OLD, wrong y -- a biased SELECTION, not just stale labels, recorded as
+    # skip_selection_biased in the relabel manifest and unfixable by
+    # relabelling.
+    path: data/ampc_svgpscale_25000.csv
+    x_columns: SMILE
+    y_column: y
+    fidelity_column: fidelity
+
+surrogate:
+  type: FixedFeatureGPSurrogate
+  encoder:
+    # The FIXED encoder the training cache was written by: no trainable layer,
+    # so the fingerprints enter the kernel as they are.
+    type: MiniMolAmpcSmilesFixedEncoder
+    checkpoint_path: minimol_ampc_encoder/model/final.pt
+    package_path: minimol_ampc_encoder
+    device: cpu  # Never used: inference is disabled by cache_only.
+    batch_size: 64  # Never used: inference is disabled by cache_only below.
+    cache_size: 0  # The persistent per-set cache is the only cache needed.
+    # A cache miss is a loud error rather than hours of silent MiniMol
+    # inference, which would destroy the timing measurement.
+    cache_only: true
+    feature_cache_path: cache/ampc/exact_dkl_top_n/svgpscale_25000.npy
+  # THE AXIS. true here; the PRIOR=off arm overrides it to false. See the
+  # header for what the two arms differ in, and the module docstring of
+  # surrogate/fixed_feature_gp.py for the two asymmetries that follow -- the
+  # 0.025 floor is kept either way, and a retry never resamples a prior-free
+  # lengthscale, so only the noise is redrawn in the prior-off arm.
+  lengthscale_prior: true
+  # One lengthscale shared by all 512 features. Required by
+  # lengthscale_prior=false, and measured inert; see the header.
+  ard: false
+  # Matern-5/2, matching the single-fidelity AL config that worked and the DKL
+  # incumbent, rather than BoTorch's default RBF.
+  kernel: matern
+  # A LEARNED, prior-free output scale. The config default is false, which
+  # would FIX the signal variance at the training targets' variance -- here 1 on
+  # the standardized scale. Learning it is what lets the fit separate signal
+  # from noise, which is the thing the prior axis acts on.
+  outputscale: true
+  # SECOND AXIS, three levels. This file is level 1; the other two are one
+  # override each (see the header).
+  #
+  # The CORRECTED 10M library mean, pinned and excluded from the fit. The
+  # working AL runs used 0.03956, which came from the broken score -> pProp
+  # table. This is the prediction far from the data, and the training set is
+  # tail-enriched (its mean y is 0.109, 25x the library's), so learning it
+  # would put the prior mean 25x too high.
+  #
+  # WHY THIS IS AN AXIS AND NOT A FIXED CHOICE. What the kernel fits is the
+  # residual y - m(X), so a mean pinned 25x below the training targets' own mean
+  # leaves every one of the 25,000 residuals shifted the same way: on the
+  # standardized scale the pinned mean sits at (0.0042864 - 0.1088667) /
+  # 0.1200656 = -0.871, so the kernel must explain a constant +0.871 sigma
+  # offset across every training point. A stationary zero-mean kernel can only
+  # do that by lengthening its lengthscale (so the function is near-constant
+  # across the domain) and raising its output scale -- which is the same
+  # signature as the 4.6 -> 22 lengthscale drift recorded in
+  # FIXED_FEATURE_GP_STATUS.md, and it spends latent variance on a KNOWN
+  # constant instead of on variation between molecules. That variance is what
+  # GIBBON consumes. So the pinned mean may be competing with the lengthscale
+  # prior for the degree of freedom the first axis is trying to isolate, and
+  # the three levels turn that argument into a measurement.
+  prior_mean: 0.0042864189360438442
+  # Level 3 sets this true (keeping prior_mean pinned): a ConstantKernel ADDED
+  # to the covariance, outside the output scale. It is the prior VARIANCE of an
+  # unknown constant, which GPyTorch integrates out analytically rather than
+  # fitting as a free parameter, so the offset above has somewhere to live that
+  # is not the lengthscale. Rejected alongside prior_mean=null, which would
+  # represent the same constant twice.
+  constant_kernel: false
+  # Per-dimension min-max to [0, 1] on the training rows, which the
+  # dimension-scaled lengthscale prior assumes. Held true in BOTH arms even
+  # though the prior-off arm no longer needs it: changing it with the prior
+  # would confound the axis.
+  scale_inputs: true
+  # Makes the hyperparameters dimensionless; prior_mean and any noise bound are
+  # converted through the same transform automatically.
+  standardize_outputs: true
+  # Must exceed n = 25,000. Above GPyTorch's 800-row default the marginal
+  # likelihood becomes a conjugate-gradient/Lanczos STOCHASTIC estimate, and
+  # L-BFGS-B's line search assumes a deterministic objective. At precision 32
+  # this matters MORE, not less: a stochastic objective and a precision-limited
+  # one are two independent ways to fake a convergence, and this setting removes
+  # the first. Fitting only; prediction keeps GPyTorch's defaults.
+  max_cholesky_size: 30000
+  # Required once a fit is capped or sits at its optimum: a capped or
+  # line-search-exhausted L-BFGS-B attempt ends ABNORMAL and would otherwise be
+  # discarded and retried from resampled hyperparameters.
+  accept_abnormal_lbfgsb: true
+
+acquisition:
+  # GIBBON. The script scores it twice, once on the value scale and once on the
+  # log scale, so log_output is set per scoring pass rather than here.
+  #
+  # NOTE on cost at this n, before anything is scored: GIBBON's posterior
+  # carries a copy of all n training inputs per batch element, chunk x (n+1) x
+  # 512 x 4 bytes at precision 32. At n=25,000 ONE candidate row is 51 MB (it
+  # would be 102 MB in float64), so the 128 that was right for n=2000 would be
+  # ~6.5 TB. score_chunk_size must be set from a measurement, not inherited.
+  type: QLowerBoundMaxValueEntropy
+  candidate_set_spec:
+    # The support for max-value sampling. At n=25,000 the training set is the
+    # support and the fallback never triggers.
+    type: TrainDataCandidateSetSpec
+    fallback_size: 100000
+    seed: 42
+  num_mv_samples: 10
+  score_chunk_size: 5000
+  maximize: true
+  log_space: true
+  log_output: false
+
+sampler:
+  type: S3GFNSampler
+  n_samples: 100000
+  fidelities: [1]
+  model_name_or_path: ibm-research/GP-MoLFormer-Uniq
+  tokenizer_name_or_path: ibm-research/MoLFormer-XL-both-10pct
+  trust_remote_code: true
+  performance_mode: optimized
+  max_length: 80
+  batch_size: 64
+  replay_batch_size: 64
+  generation_batch_size: 128
+  n_train_steps: 2500
+  num_warmup_steps: 10
+  beta: 1.0
+  aux_coefficient: 0.001
+  sa_threshold: 4.0
+
+selector:
+  type: CostAwareSelector
+
+oracle:
+  type: Dock3Oracle
+  mol_repr: smiles
+  indock_template: /home/ethankrz/dock_smiles/ampc_dockfiles/INDOCK
+  dockfiles_dir: /home/ethankrz/dock_smiles/ampc_dockfiles
+  fidelity_costs:
+    1: 1.0
+  fidelity_confidences:
+    1: 1.0
+  num_workers: null
+  ligbuild_timeout: 150
+  hitrate_params: ampc_hitrate_fits/fitted_params.json
+  score_pprop_table: ampc_hitrate_fits/data/full_scores.df
+  hitrate_target: ampc
+  pki_threshold: 6.5
+
+budget:
+  available_budget: 100000.0
+  schedule:
+    type: constant
+    value: 10000.0
+
+logger:
+  # Stripped by the script, which builds its own run logger from the
+  # --wandb-* flags.
+  type: ConsoleLogger
+  project_name: ampc-exact-gp-25k
+  run_name: exact-gp-25k
