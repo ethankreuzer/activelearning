@@ -1260,3 +1260,177 @@ def test_latent_calibration_keys_reach_the_final_block() -> None:
 
     for key in LATENT_CALIBRATION_KEYS:
         assert f"val_set/final/{key}" in metrics
+
+
+def _acq_eval_set(targets: np.ndarray, name: str = "ampc_val_screen_232k") -> EvalSet:
+    """An eval set with the given targets and no features, for scoring metrics."""
+    return EvalSet(
+        name=name,
+        smiles=tuple(f"C{index}" for index in range(targets.size)),
+        targets=targets,
+        features=None,
+    )
+
+
+def test_acquisition_metrics_are_reported_on_the_hit_and_enriched_blocks() -> None:
+    """The whole-set acquisition distribution is dominated by the bulk.
+
+    The project's objective is to recover the hits, so "is the reward flat"
+    has to be answerable on the hit block specifically -- which the whole-set
+    number cannot do when hits are a fraction of a percent of the set.
+    """
+    targets = np.array([0.9, 0.6, 0.3, 0.3, 0.01, 0.01])
+    scores = np.array([5.0, 4.0, 3.0, 2.0, 1.0, 0.0])
+
+    metrics, _ = arm.score_outputs_with_blocks(
+        _acq_eval_set(targets),
+        scores,
+        scoring="gibbon_value",
+        label="GIBBON",
+        log_floor=1e-300,
+        rank_metrics=True,
+    )
+
+    base = "ampc_val_screen_232k"
+    for suffix, expected_count in (("_hit", 2.0), ("_enriched", 4.0), ("_bulk", 2.0)):
+        key = f"{base}{suffix}/acquisition/gibbon_value/count"
+        assert metrics[key] == expected_count
+    # The whole-set block is still reported alongside them.
+    assert metrics[f"{base}/acquisition/gibbon_value/count"] == 6.0
+
+
+def test_the_hit_block_acquisition_sees_a_flat_reward_the_whole_set_hides() -> None:
+    """The motivating case, and the reason this block exists.
+
+    Two hits share one acquisition value while the bulk spreads over a wide
+    range. The whole-set effective support looks healthy; on the hits the
+    reward is perfectly flat, which is the failure that matters.
+    """
+    targets = np.concatenate([np.full(2, 0.9), np.linspace(0.0, 0.1, 50)])
+    scores = np.concatenate([np.full(2, 1.0), np.linspace(1.0, 1000.0, 50)])
+
+    metrics, _ = arm.score_outputs_with_blocks(
+        _acq_eval_set(targets),
+        scores,
+        scoring="gibbon_value",
+        label="GIBBON",
+        log_floor=1e-300,
+        rank_metrics=True,
+    )
+
+    base = "ampc_val_screen_232k"
+    whole = metrics[f"{base}/acquisition/gibbon_value/effective_support"]
+    hits = metrics[f"{base}_hit/acquisition/gibbon_value/effective_support"]
+    # Two molecules sharing one value: the support is both of them, and the
+    # entropy is the maximum for two candidates rather than anything useful.
+    assert hits == pytest.approx(2.0)
+    assert metrics[f"{base}_hit/acquisition/gibbon_value/n_mass90"] == 2.0
+    # The whole set spreads over three orders of magnitude, so it reads
+    # healthier than the block the project actually cares about.
+    assert whole > hits
+
+
+def test_a_block_smaller_than_a_selection_budget_reports_no_enrichment() -> None:
+    """top1000 on a 3-molecule block would select all of it and report 1.0.
+
+    acquisition_enrichment clamps k to the usable count, so the number would
+    look like a measurement while being true by construction.
+    """
+    targets = np.array([0.9, 0.8, 0.7, 0.01, 0.01])
+    scores = np.array([4.0, 3.0, 2.0, 1.0, 0.0])
+
+    metrics, _ = arm.score_outputs_with_blocks(
+        _acq_eval_set(targets),
+        scores,
+        scoring="gibbon_value",
+        label="GIBBON",
+        log_floor=1e-300,
+        rank_metrics=True,
+    )
+
+    base = "ampc_val_screen_232k"
+    assert f"{base}_hit/acquisition/gibbon_value/top100_enrichment" not in metrics
+    assert f"{base}_hit/acquisition/gibbon_value/top1000_enrichment" not in metrics
+    # The order-only statistics that do not depend on a budget are kept.
+    assert f"{base}_hit/acquisition/gibbon_value/spearman_y" in metrics
+
+
+def test_acquisition_blocks_use_the_same_cut_as_the_prediction_blocks() -> None:
+    """One definition, so the two paths cannot drift onto different molecules."""
+    targets = np.array([0.9, 0.6, 0.3, 0.01])
+    scores = np.array([3.0, 2.0, 1.0, 0.0])
+    eval_set = EvalSet(
+        name="val_set",
+        smiles=tuple(f"C{index}" for index in range(4)),
+        targets=targets,
+        features=torch.zeros((4, 3)),
+    )
+
+    predicted, _ = arm.prediction_outputs_with_unseen(
+        eval_set, _predictions(4), np.zeros(4, dtype=bool), figures=False
+    )
+    scored, _ = arm.score_outputs_with_blocks(
+        _acq_eval_set(targets, name="val_set"),
+        scores,
+        scoring="gibbon_value",
+        label="GIBBON",
+        log_floor=1e-300,
+        rank_metrics=True,
+    )
+
+    for suffix, mask, _narrow in arm.target_blocks(targets):
+        # Both paths emit the block, and the acquisition block holds exactly the
+        # molecules the shared cut selected.
+        assert any(key.startswith(f"val_set{suffix}/final/") for key in predicted)
+        assert scored[f"val_set{suffix}/acquisition/gibbon_value/count"] == float(
+            mask.sum()
+        )
+
+
+def test_an_unlabelled_set_gets_no_acquisition_blocks() -> None:
+    """olivier_invitro was unlabelled by design before 2026-11-09."""
+    scores = np.array([3.0, 2.0, 1.0])
+    eval_set = EvalSet(
+        name="olivier_invitro",
+        smiles=("C0", "C1", "C2"),
+        targets=np.full(3, np.nan),
+        features=None,
+    )
+
+    metrics, _ = arm.score_outputs_with_blocks(
+        eval_set,
+        scores,
+        scoring="gibbon_value",
+        label="GIBBON",
+        log_floor=1e-300,
+        rank_metrics=True,
+    )
+
+    assert not [key for key in metrics if "_hit/" in key or "_enriched/" in key]
+
+
+def test_block_labels_code_every_molecule_and_the_keys_are_valid() -> None:
+    """The CSV's block column, so a recomputed block needs no source constant."""
+    codes = arm.block_labels(np.array([0.9, 0.3, 0.01, np.nan]))
+
+    assert list(codes) == [2.0, 1.0, 0.0, -1.0]
+    assert codes[0] == 2.0 and DEFAULT_HIT_THRESHOLD < 0.9
+    assert codes[1] == 1.0 and DEFAULT_ENRICHED_THRESHOLD < 0.3
+
+
+def test_every_block_acquisition_key_is_a_valid_log_key() -> None:
+    """A key W&B would reject costs the whole run's logging."""
+    targets = np.array([0.9, 0.6, 0.3, 0.3, 0.01, 0.01])
+    scores = np.array([5.0, 4.0, 3.0, 2.0, 1.0, 0.0])
+
+    metrics, _ = arm.score_outputs_with_blocks(
+        _acq_eval_set(targets),
+        scores,
+        scoring="gibbon_value",
+        label="GIBBON",
+        log_floor=1e-300,
+        rank_metrics=True,
+    )
+
+    for key in metrics:
+        validate_log_key(key)

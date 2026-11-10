@@ -624,17 +624,9 @@ def prediction_outputs_with_unseen(
     metrics[f"{eval_set.name}/final/n_in_train"] = float(in_train.sum())
 
     targets = np.asarray(eval_set.targets, dtype=float)
-    labelled = np.isfinite(targets)
     is_hit = targets >= DEFAULT_HIT_THRESHOLD
     is_enriched = targets >= DEFAULT_ENRICHED_THRESHOLD
-    # ``narrow`` marks a block cut on the TARGET, where the de-biased statistics
-    # are invalid; see _DEBIASED_SUFFIX. ``_unseen`` is the whole set minus the
-    # training molecules, which is wide, so it keeps them.
-    blocks = [
-        (HIT_SUFFIX, is_hit, True),
-        (ENRICHED_SUFFIX, is_enriched, True),
-        (BULK_SUFFIX, ~is_enriched & labelled, True),
-    ]
+    blocks = list(target_blocks(targets))
     if in_train.any():
         # Only emitted when the set and the training data actually overlap. With
         # no overlap ``~in_train`` selects the whole set, so every key in the
@@ -649,6 +641,178 @@ def prediction_outputs_with_unseen(
     metrics[f"{eval_set.name}/final/n_hit"] = float(is_hit.sum())
     metrics[f"{eval_set.name}/final/n_enriched"] = float(is_enriched.sum())
     return metrics, built
+
+
+def target_blocks(
+    targets: np.ndarray,
+) -> tuple[tuple[str, np.ndarray, bool], ...]:
+    """Return the ``(suffix, mask, narrow)`` blocks cut on the TARGET.
+
+    ONE definition of the three target blocks, shared by the prediction path
+    (:func:`prediction_outputs_with_unseen`) and the acquisition path
+    (:func:`score_outputs_with_blocks`), so the two can never drift into
+    reporting ``<set>_hit/final/*`` and ``<set>_hit/acquisition/*`` over
+    different molecules.
+
+    **The cut is on ``y``, deliberately, and this is NOT the "band bug" an
+    earlier draft of THESIS_ACTIVELEARNING.md called it.** A hit is
+    ``y >= DEFAULT_HIT_THRESHOLD``, the ``y`` at exactly pProp 5, and enriched
+    is the ``y`` at exactly pProp 3.5. Because ``y`` peaks at pProp 6.32 and
+    falls away above it, this excludes the molecules above pProp ~7.12 -- on
+    ``ampc_val_screen_232k`` that is 120 of 15,887 -- and excluding them is
+    CORRECT: their fitted hit probability really has dropped below a pProp-5
+    molecule's, because at that rarity docking artifacts dominate the mixture.
+    Confirmed with the user 2026-11-10: the decay above pProp 6.32 is a
+    FEATURE, so "too high" pProp molecules are not hits.
+
+    ``narrow`` marks a block cut on the target, where the de-biased statistics
+    are invalid; see :data:`_DEBIASED_SUFFIX`.
+
+    Parameters
+    ----------
+    targets : np.ndarray
+        The set's ``y``. Non-finite entries fall in no block.
+
+    Returns
+    -------
+    tuple[tuple[str, np.ndarray, bool], ...]
+        ``(suffix, mask, narrow)`` for the hit, enriched and bulk blocks.
+    """
+    values = np.asarray(targets, dtype=float)
+    labelled = np.isfinite(values)
+    is_enriched = values >= DEFAULT_ENRICHED_THRESHOLD
+    return (
+        (HIT_SUFFIX, values >= DEFAULT_HIT_THRESHOLD, True),
+        (ENRICHED_SUFFIX, is_enriched, True),
+        (BULK_SUFFIX, ~is_enriched & labelled, True),
+    )
+
+
+def block_labels(targets: np.ndarray) -> np.ndarray:
+    """Return a per-molecule block code, for the run's per-molecule CSV.
+
+    ``2`` hit, ``1`` enriched but not a hit, ``0`` bulk, ``-1`` unlabelled. The
+    codes are redundant with ``y`` and the two pinned thresholds, and are
+    written anyway so that recomputing a block statistic from ``eval/<set>.csv``
+    never depends on re-deriving a constant that lives in the source tree.
+
+    Parameters
+    ----------
+    targets : np.ndarray
+        The set's ``y``.
+
+    Returns
+    -------
+    np.ndarray
+        Float codes aligned with ``targets``.
+    """
+    values = np.asarray(targets, dtype=float)
+    codes = np.full(values.shape, -1.0, dtype=float)
+    labelled = np.isfinite(values)
+    codes[labelled & (values >= DEFAULT_ENRICHED_THRESHOLD)] = 1.0
+    codes[labelled & (values >= DEFAULT_HIT_THRESHOLD)] = 2.0
+    codes[labelled & (values < DEFAULT_ENRICHED_THRESHOLD)] = 0.0
+    return codes
+
+
+def score_outputs_with_blocks(
+    eval_set: EvalSet,
+    scores: np.ndarray,
+    *,
+    scoring: str,
+    label: str,
+    log_floor: float | None,
+    rank_metrics: bool,
+) -> tuple[dict[str, float], dict[str, Any]]:
+    """Acquisition metrics for the whole set AND for each target block.
+
+    The whole-set acquisition distribution is dominated by the bulk, so a reward
+    that has gone flat exactly where it matters -- on the molecules the project
+    is trying to recover -- does not show in it. This reports the same
+    statistics on the hit and enriched blocks, which is where "is the reward
+    flat" is actually answered. Figures are built for the whole set only.
+
+    The per-budget enrichments are DROPPED on a block smaller than the budget:
+    ``acquisition_enrichment`` clamps ``k`` to the usable count, so ``top1000``
+    on a 650-molecule block would select the whole block and report an
+    enrichment of exactly 1.0, which looks like a measurement and is not.
+
+    Parameters
+    ----------
+    eval_set : EvalSet
+        The set, supplying targets and optional weights.
+    scores : np.ndarray
+        One acquisition score per molecule.
+    scoring : str
+        Key segment naming the scoring pass, such as ``gibbon_value``.
+    label : str
+        Human-readable axis label for the figures.
+    log_floor : float or None
+        Clamp for the figures and for ``score_degeneracy``; ``None`` for scores
+        that are already logarithms.
+    rank_metrics : bool
+        Whether to report the order-only metrics.
+
+    Returns
+    -------
+    tuple[dict[str, float], dict[str, Any]]
+        Metrics keyed ``<set>[<block>]/acquisition/<scoring>/<stat>``, and the
+        whole-set figures.
+    """
+    metrics, figures = score_outputs(
+        eval_set,
+        scores,
+        scoring=scoring,
+        label=label,
+        log_floor=log_floor,
+        rank_metrics=rank_metrics,
+    )
+    if not eval_set.has_targets:
+        return metrics, figures
+    values = np.asarray(scores, dtype=np.float64)
+    for suffix, mask, _narrow in target_blocks(eval_set.targets):
+        keep = np.asarray(mask, dtype=bool)
+        if not keep.any():
+            # No block rather than a block of NaNs, matching the prediction path.
+            continue
+        subset = EvalSet(
+            name=f"{eval_set.name}{suffix}",
+            smiles=tuple(
+                molecule for molecule, taken in zip(eval_set.smiles, keep) if taken
+            ),
+            targets=np.asarray(eval_set.targets, dtype=float)[keep],
+            features=None,
+            weights=None if eval_set.weights is None else eval_set.weights[keep],
+        )
+        block_metrics, _ = score_outputs(
+            subset,
+            values[keep],
+            scoring=scoring,
+            label=label,
+            log_floor=log_floor,
+            rank_metrics=rank_metrics,
+            figures=False,
+        )
+        count = int(keep.sum())
+        metrics.update(
+            {
+                key: value
+                for key, value in block_metrics.items()
+                if not _is_degenerate_budget_key(key, count)
+            }
+        )
+    return metrics, figures
+
+
+def _is_degenerate_budget_key(key: str, count: int) -> bool:
+    """Return whether ``key`` is a per-budget metric whose budget exceeds ``count``."""
+    stat = key.rpartition("/")[2]
+    if not stat.startswith("top"):
+        return False
+    budget_text = stat[3:].partition("_")[0]
+    if not budget_text.isdigit():
+        return False
+    return int(budget_text) >= count
 
 
 def _subset_prediction_outputs(
@@ -1563,7 +1727,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                             pooled_scores.setdefault(scoring.name, {})[
                                 study_set.name
                             ] = scores
-                        metrics, figures = score_outputs(
+                        metrics, figures = score_outputs_with_blocks(
                             eval_set,
                             scores,
                             scoring=scoring.name,
@@ -1573,6 +1737,10 @@ def main(argv: Sequence[str] | None = None) -> None:
                         )
                         final_metrics.update(metrics)
                         final_figures.update(figures)
+                if eval_set.has_targets:
+                    # Written so a block statistic recomputed from this file does
+                    # not depend on re-deriving the two pinned thresholds.
+                    columns["block"] = block_labels(eval_set.targets)
                 write_per_molecule_csv(
                     out_dir / "eval" / f"{study_set.name}.csv", eval_set, columns
                 )

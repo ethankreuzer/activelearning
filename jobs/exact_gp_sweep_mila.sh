@@ -44,6 +44,19 @@
 #                                     GIBBON DISTRIBUTION is label-free and is
 #                                     the point of scoring it.
 #   - olivier_invitro          1,521  labelled 2026-11-09 from its DOCK scores.
+#   - ampc_val_screen_232k_acq 45,850 scored, via --extra-set. THE set that
+#                                     answers "is the reward flat on the
+#                                     molecules we are trying to recover": all
+#                                     30,850 enriched (15,767 of them hits) plus
+#                                     a seed-42 15,000-row bulk subsample, sliced
+#                                     from the 232k's own feature store by
+#                                     scripts/build_val_screen_acq_set.py. Added
+#                                     2026-11-10 because every reward number to
+#                                     that point was on gp_molformer_set, which
+#                                     is the UNTRAINED prior's samples and cannot
+#                                     answer it (THESIS section 2.0). ~43 s per
+#                                     GIBBON pass at 0.94 ms/candidate. It also
+#                                     makes CROSS_SET_POOL non-degenerate again.
 #
 # --score-chunk-size 128, MEASURED. The cost is chunk x (n+1) x 512 x 4 bytes at
 # fp32: 48.83 MiB per candidate row at n=25,001.
@@ -187,6 +200,7 @@ uv run --no-sync python -m scripts.exact_dkl_top_n \
   --eval-chunk-size 5000 \
   --score-chunk-size "${SCORE_CHUNK_SIZE}" \
   --acquisition-seed 42 \
+  --extra-set ampc_val_screen_232k_acq \
   --wandb-project "${WANDB_PROJECT}" \
   --wandb-entity "${WANDB_ENTITY}" \
   --wandb-group "exact-gp-n${SIZE}" \

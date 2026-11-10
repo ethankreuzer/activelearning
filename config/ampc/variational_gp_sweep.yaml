@@ -1,0 +1,341 @@
+# The variational GP sweep: a sparse variational GP (1024 inducing points) on
+# the frozen MiniMol AmpC fingerprints, fitted by Adam to one arm of the
+# svgpscale ladder.
+#
+# THIS IS THE COMPANION OF config/ampc/exact_gp_sweep.yaml. The thesis compares
+# the two surrogates, so everything the two models share is pinned to the SAME
+# value here as there, and the differences are only the ones the model forces:
+# an inducing-point posterior, Adam instead of L-BFGS-B, and an objective
+# (ELBO or PLL) where the exact GP has only the exact marginal likelihood. The
+# eval sets, the metrics, the acquisition and the per-arm artifacts come from
+# the same runner, scripts/exact_dkl_top_n.py, which dispatches on
+# surrogate.type -- so a variational arm and an exact arm at the same n are
+# directly comparable with nothing else moving.
+#
+# What is shared with the exact sweep, value for value: the training set (an
+# arm of the nested svgpscale ladder), the frozen MiniMol encoder and its
+# cache, Matern-5/2, ard=false (ONE lengthscale over all 512 features),
+# scale_inputs=true, standardize_outputs=true, the constant mean PINNED at the
+# 10M library mean 0.0042864189360438442, a learned output scale, float32,
+# seed 42, and GIBBON with num_mv_samples=10 scored on both the value and the
+# log scale.
+#
+# TWO SWEPT AXES plus the training size, FULLY CROSSED: 2 x 2 x 3 = TWELVE
+# ARMS. jobs/variational_gp_sweep_mila.sh takes all three as arguments.
+#
+#   AXIS 1, the variational objective, 2 levels -- VARIATIONAL ONLY:
+#     pll      surrogate.training_params.variational_objective=PredictiveLogLikelihood
+#     elbo     surrogate.training_params.variational_objective=VariationalELBO
+#
+#     This axis does not exist for an exact GP and is the largest effect
+#     measured anywhere in this project. Under the ELBO the variational
+#     variance is a PURE PENALTY, so the optimum drives it to zero; under the
+#     PLL it enters the predictive distribution and has an interior optimum
+#     (src/activelearning/surrogate/objectives.py). Measured on old y at 300k,
+#     10,064 steps: learned noise 0.4218 -> 0.000107, gp_molformer_set
+#     log-GIBBON median -2,688 -> -376, top1000 enrichment 0.133 -> 0.282, the
+#     de-biased latent calibration slope 28.3 -> 1.28, for 0.008 of Pearson.
+#     That is ~2,300 nats of acquisition headroom, and the whole reason the
+#     incumbent ELBO arm's reward was a constant with ~2 molecules carrying
+#     all the mass.
+#
+#   AXIS 2, the lengthscale prior, 2 levels -- SHARED WITH THE EXACT SWEEP:
+#     on       this file as written
+#     off      surrogate.lengthscale_prior=false
+#
+#     This is the axis that DECIDED the exact-GP sweep (2026-11-10): `off`
+#     predicted better pointwise (pearson 0.842 vs 0.825) and was unusable for
+#     AL, because the fit landed in a degenerate corner -- lengthscale 19.2,
+#     outputscale 18.2, signal-to-noise 84 -- where ONE molecule of 83,811 held
+#     90% of the acquisition mass (n_mass90 = 1, entropy 0.000 nats). It is
+#     crossed again here because the question the comparison has to answer is
+#     whether that is a property of the EXACT GP's marginal likelihood or of
+#     this kernel on these features; only running both tells them apart.
+#
+#     As in the exact sweep the axis changes TWO things at once and a
+#     difference cannot be split between them: the GRADIENT (with the prior the
+#     objective carries LogNormal(sqrt2 + 0.5*log 512, sqrt3) on the
+#     lengthscale, mode 4.63) and the STARTING POINT (4.63 with it, sqrt(512) =
+#     22.63 without -- see variational_gp._matern_kernel:79-81).
+#
+#   AXIS 3, the training size, 3 levels -- the svgpscale ladder:
+#     20000    the MATCHED cell: the exact sweep's training set, molecule for
+#              molecule. This is the only n at which the two surrogates can be
+#              compared, because 20,000 is where the exact GP's O(n^2) memory
+#              stopped (38.8 GB measured at 25,000 against an L40S's 48 GB).
+#     100000   the middle rung, so scaling is a trend and not two points.
+#     300000   where the incumbent lived, and the variational GP's reason to
+#              exist: the exact GP cannot reach it at all.
+#
+#     The ladder is NESTED -- the 20k set is a subset of the 100k set, which is
+#     a subset of the 300k set, and every arm holds the whole pProp >= 3.5 tail
+#     (3,654 rows) -- so tail supervision is CONSTANT across the three sizes and
+#     only the bulk grows. The arms therefore measure how much bulk this
+#     surrogate absorbs at fixed tail supervision. See THESIS_ACTIVELEARNING.md
+#     "The svgpscale ladder".
+#
+# NOT SWEPT, each with the measurement behind it:
+#   - prior_mean (pinned / learned / constant). The exact sweep crossed this as
+#     its axis 2 and measured it INERT: the whole spread was 16-89x smaller
+#     than the lengthscale-prior gap on every endpoint, and the three final
+#     losses differed by an order of magnitude LESS than the seed noise. It is
+#     pinned here on the exact sweep's reasoning -- the pinned mean is a FIXED
+#     physical constant, so round 7 of an AL run stays comparable with round 1,
+#     while a learned mean climbs as hits accumulate. VariationalGPSurrogate
+#     has no constant_kernel, so the third level is not expressible anyway.
+#   - ard. Measured inert on pearson (0.7949 ard vs 0.7927 iso, delta 0.002
+#     against a 0.005 sd) and mildly HARMFUL on both ranking endpoints
+#     (top1000_enrichment 2.02 vs 2.07, spearman_y 0.131 vs 0.155) across the
+#     24 local calibration-grid arms. Fixed off, as in the exact sweep, and it
+#     is what makes lengthscale_prior=false expressible at all.
+#   - num_inducing and inducing_init. Measured near-inert on old y: the M2048
+#     arm changed nothing. M stays 1024.
+#   - runtime.seed. Measured NOISE: 0.79373 / 0.79368 / 0.79406 across seeds
+#     42/43/44, a 4e-4 spread against a 0.33 between-arm sd. The winning arm is
+#     re-run at 43 and 44 afterwards instead -- the variance statement at 2
+#     arms' cost rather than 3x the sweep.
+#   - steps. Fixed at 10,000 (see training_params.epochs). Section 2e of
+#     THESIS_ACTIVELEARNING.md already measured the DIRECTION: 5,032 ->
+#     20,128 steps moved pearson 0.791 -> 0.796 while the prior-set GIBBON
+#     median went -551 -> -652 and effective support 6.1 -> 5.0, so more
+#     training buys accuracy and costs reward quality. Sweeping it would pay 5x
+#     the arms to re-confirm a known sign.
+#   - noise_floor. NOT USED, and deliberately so, which REVERSES the parked
+#     design in THESIS_ACTIVELEARNING.md section 5. It is the knob that
+#     produces the (reward, calibration) frontier of section 2d, and it is left
+#     unset for the same reason the exact sweep left noise_std_floor unset:
+#     flooring the noise pins the outputscale-to-noise ratio by fiat, and that
+#     ratio -- the latent variance GIBBON consumes -- is the quantity the
+#     objective exists to estimate. If PLL collapses the noise onto the 1e-4
+#     floor here as it did on old y, that is a RESULT about this objective on
+#     this data, reported rather than assumed away. The floor frontier is a
+#     separate, later sweep on the arm this one picks, and it has no exact-GP
+#     counterpart, which is exactly why it does not belong in the comparison.
+#     NOTE the scale if it is ever set: VariationalGPSurrogate.noise_floor is on
+#     the VARIANCE scale, the OPPOSITE convention from
+#     FixedFeatureGPSurrogate.noise_std_floor, which is a standard deviation.
+#
+# Like exact_dkl_top_n.yaml, which this mirrors outside the surrogate block,
+# the sampler, oracle, selector and budget sections are never built but must
+# stay valid, because ActiveLearningConfig validates the whole file.
+
+runtime:
+  device: cuda
+  # float32, as in the exact sweep and every variational arm on disk. The
+  # exact GP's fp32 caveat -- scipy's convergence status is untrustworthy at
+  # this precision -- does NOT carry over: Adam runs a fixed number of steps
+  # and reports no convergence status, so there is no status to mistrust. What
+  # replaces it is the loss trace, logged per epoch, and the hyperparameter
+  # trace beside it.
+  precision: 32
+  seed: 42
+
+dataset:
+  type: ListDataset
+  initial_data:
+    # AXIS 3. The job overrides this and the feature cache below from SIZE;
+    # 20000 is the default and the cell matched to the exact sweep.
+    #
+    # Built 2026-11-10 by jobs/build_svgp_scaling_sets_mila.sh (job 11627959)
+    # from the CORRECTED 10M library, with bands cut on pProp in uniform
+    # 0.5-wide steps. n=20,000: mean(y) 0.11866336, var(y) 0.016138535,
+    # sd 0.12703753. Measured 2026-11-10 on the files themselves, since the
+    # floor levels of any later noise-floor sweep are fractions of these:
+    #
+    #   n          mean(y)      var(y)       tail rows   tail share
+    #   20,000     0.11866336   0.016138535      3,653       18.26%
+    #   100,000    0.07009585   0.007215347      3,653        3.65%
+    #   300,000    0.04550720   0.003730295      3,653        1.22%
+    #
+    # var(y) spans 4.3x across the ladder, so an ABSOLUTE noise floor is not
+    # comparable across sizes -- it must be a fraction of each arm's own
+    # var(y). The tail share falls by construction: every arm keeps the same
+    # pProp >= 3.5 molecules whole and only the bulk grows. (3,653 rather than
+    # 3,654 because the band is cut on pProp and y is not monotone above its
+    # peak at pProp 6.32, so one very-high-pProp molecule sits below the
+    # y-equivalent threshold.)
+    #
+    # NOT data/ampc_balanced_*.csv, which stratify on quantiles of the OLD,
+    # wrong y -- a biased SELECTION, not just stale labels, recorded as
+    # skip_selection_biased in the relabel manifest and unfixable by
+    # relabelling.
+    path: data/ampc_svgpscale_20000.csv
+    x_columns: SMILE
+    y_column: y
+    fidelity_column: fidelity
+
+surrogate:
+  type: VariationalGPSurrogate
+  encoder:
+    # The FIXED encoder the training cache was written by: no trainable layer,
+    # so the fingerprints enter the kernel as they are. Identical to the exact
+    # sweep's encoder block, down to the cache path, which is what makes the
+    # matched cell matched.
+    type: MiniMolAmpcSmilesFixedEncoder
+    checkpoint_path: minimol_ampc_encoder/model/final.pt
+    package_path: minimol_ampc_encoder
+    device: cpu  # Never used: inference is disabled by cache_only.
+    batch_size: 64  # Never used: inference is disabled by cache_only below.
+    cache_size: 0  # The persistent per-set cache is the only cache needed.
+    # A cache miss is a loud error rather than hours of silent MiniMol
+    # inference, which would destroy the timing measurement.
+    cache_only: true
+    # The job sets this per arm, to match the training set above.
+    feature_cache_path: cache/ampc/exact_dkl_top_n/svgpscale_20000.npy
+  training_params:
+    # 10,000 Adam STEPS, not 300 epochs. The job computes `epochs` from
+    # STEPS=10000 and ceil(SIZE / 4096) steps per epoch, so the three sizes get
+    # the SAME optimization: 2,000 epochs x 5 steps = 10,000 at n=20,000, 400 x
+    # 25 = 10,000 at 100,000, and 136 x 74 = 10,064 at 300,000. EPOCHS ARE NOT
+    # COMPARABLE ACROSS ARMS; steps are, and 10,064 is also the incumbent's
+    # count, so this sweep's 300k cells are step-matched to it.
+    #
+    # The value below is only the default for a run launched without the job
+    # script, and it is the n=20,000 figure.
+    epochs: 2000
+    # 3e-3, not the 1e-2 of the scaling arms: the incumbent and the whole
+    # calibration grid ran at 3e-3 cosine to 1e-4, so this keeps the sweep
+    # comparable with the 104 arms already on disk.
+    lr: 3.0e-3
+    # Minibatched, so a step costs the same at every size: a full-batch step at
+    # 300,000 rows would build a 300,000 x 1024 cross-covariance, and a sparse
+    # variational GP exists precisely so it need not.
+    batch_size: 4096
+    # Annealed to lr_min over every step of the fit. Held constant, the
+    # balanced arms ended on a flat loss with the lengthscale and output scale
+    # still drifting, so where training stopped was deciding the
+    # hyperparameters.
+    lr_schedule: cosine
+    lr_min: 1.0e-4
+    # AXIS 1. PLL is this file's level; the elbo arm overrides it to
+    # VariationalELBO. See the header for the measurement.
+    variational_objective: PredictiveLogLikelihood
+  # 1024 learned inducing points. Measured near-inert against 2048 on old y.
+  num_inducing: 1024
+  # Uniform training rows. The stratified and k-means starts cannot be used at
+  # these sizes: their top stratum (top 0.1%) holds 20-25 rows and would be
+  # allotted 192 points.
+  inducing_init: random
+  inducing_init_seed: 0
+  # One lengthscale shared by all 512 features, as in the exact sweep.
+  # Required by lengthscale_prior=false, and measured inert; see the header.
+  ard: false
+  # AXIS 2. true here; the off arm overrides it to false. Note the asymmetry
+  # this shares with the exact sweep: with the prior the lengthscale starts at
+  # the prior mode 4.63, without it at sqrt(512) = 22.63.
+  lengthscale_prior: true
+  # BoTorch's LogNormal(-4, 1) on the noise, mode 0.0067, with gpytorch's
+  # softplus 1e-4 floor rather than BoTorch's untransformed bound, because Adam
+  # cannot enforce a bound. Kept ON, matching the exact sweep's untouched
+  # default noise prior, so the only objective-dependent thing about the noise
+  # is the objective itself.
+  noise_prior: true
+  # Per-dimension min-max to [0, 1] on the TRAINING rows, which the
+  # dimension-scaled lengthscale prior assumes. Held true in BOTH levels of
+  # axis 2 even though the off level no longer needs it: changing it with the
+  # prior would confound the axis. Caveat, unchanged from the exact sweep: the
+  # svgpscale arms are tail-enriched FPS selections, so eval molecules fall
+  # outside [0, 1] on some dimensions.
+  scale_inputs: true
+  # The CORRECTED 10M library mean, pinned and excluded from the fit. NOT an
+  # axis here -- the exact sweep measured the three levels inert; see the
+  # header. The working AL runs used 0.03956, which came from the broken
+  # score -> pProp table.
+  prior_mean: 0.0042864189360438442
+  # Makes the hyperparameters dimensionless and is what converts prior_mean and
+  # any noise bound into model space. It does NOT fix the deeper mismatch: y is
+  # a bounded, right-skewed hit probability under a Gaussian likelihood.
+  standardize_outputs: true
+
+acquisition:
+  # GIBBON. The script scores it twice, once on the value scale and once on the
+  # log scale, so log_output is set per scoring pass rather than here.
+  #
+  # Identical to the exact sweep's block except for the support cap below. The
+  # cost structure is completely different, though, and this is the one place
+  # the comparison is NOT like for like: the exact GP's posterior carries a copy
+  # of all n training inputs per batch element (39 MB per candidate row at
+  # n=20,000, which is why its chunk is 128), while the variational posterior
+  # carries only the (M + 1)^2 covariance, so a chunk's memory grows with M^2
+  # and not with n at all. The job scales the chunk by (1024 / M)^2.
+  type: QLowerBoundMaxValueEntropy
+  candidate_set_spec:
+    # The support for max-value sampling, CAPPED at 100,000 as it would be in
+    # an AL round. max_support_size is a ceiling, not a target, so the 20k and
+    # 100k arms use their whole training set and only the 300k arm is drawn
+    # down, by the deterministic fidelity/target stratified reservoir, which
+    # keeps the arm's best molecule. run/acquisition/*/acqf_support_size
+    # records the size used.
+    #
+    # At n=20,000 this makes the support the 20,000 training rows -- exactly
+    # what the exact sweep's uncapped TrainDataCandidateSetSpec gives at the
+    # same n, so the matched cell is matched on the acquisition too.
+    #
+    # fallback_size stays the smaller size the out-of-memory retry drops to; if
+    # that retry ever fires, exact_dkl_top_n.py fails the run rather than
+    # quietly changing the support.
+    type: TrainDataCandidateSetSpec
+    max_support_size: 100000
+    fallback_size: 50000
+    seed: 42
+  num_mv_samples: 10
+  # Overridden by --score-chunk-size, which the job computes from M.
+  score_chunk_size: 256
+  maximize: true
+  log_space: true
+  log_output: false
+
+sampler:
+  type: S3GFNSampler
+  n_samples: 100000
+  fidelities: [1]
+  model_name_or_path: ibm-research/GP-MoLFormer-Uniq
+  tokenizer_name_or_path: ibm-research/MoLFormer-XL-both-10pct
+  trust_remote_code: true
+  performance_mode: optimized
+  max_length: 80
+  batch_size: 64
+  replay_batch_size: 64
+  generation_batch_size: 128
+  n_train_steps: 2500
+  num_warmup_steps: 10
+  beta: 1.0
+  aux_coefficient: 0.001
+  sa_threshold: 4.0
+
+selector:
+  type: CostAwareSelector
+
+oracle:
+  type: Dock3Oracle
+  mol_repr: smiles
+  indock_template: /home/ethankrz/dock_smiles/ampc_dockfiles/INDOCK
+  dockfiles_dir: /home/ethankrz/dock_smiles/ampc_dockfiles
+  fidelity_costs:
+    1: 1.0
+  fidelity_confidences:
+    1: 1.0
+  num_workers: null
+  ligbuild_timeout: 150
+  hitrate_params: ampc_hitrate_fits/fitted_params.json
+  # The GROUND-TRUTH score -> pProp table (1.7e9 screen, 28,759 rows), NOT the
+  # shipped full_scores.df, which puts 97.48% of its rows in a sentinel pile at
+  # score 100.005 and is what miscalibrated every label before 2026-11-07. The
+  # oracle is never built by this script, so this is inert here -- it is correct
+  # so that a copy of this config cannot reintroduce the wrong labels.
+  score_pprop_table: ampc_hitrate_fits/data/ampc_full_scores_1p7b.df
+  hitrate_target: ampc
+  pki_threshold: 6.5
+
+budget:
+  available_budget: 100000.0
+  schedule:
+    type: constant
+    value: 10000.0
+
+logger:
+  # Stripped by the script, which builds its own run logger from the
+  # --wandb-* flags.
+  type: ConsoleLogger
+  project_name: ampc-variational-gp-sweep
+  run_name: variational-gp-sweep

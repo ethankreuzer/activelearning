@@ -4,8 +4,12 @@ Written 2026-11-07 on Mila, as a handoff. This file is the entry point for
 resuming the work; it supersedes nothing but assumes
 `SURROGATE_THEN_PRIOR_RESTART.md` has been read for the pre-2026-11-07 history.
 
-**Nothing has been launched. Nothing has been committed.** Branch
-`exact-dkl-top-n`, last commit `76cd121`.
+**State as of 2026-11-10, end of session.** Branch `exact-dkl-top-n`, last commit
+`1d0cdb8`. The exact-GP sweep RAN and is decided (section 5a: `on_pinned`). The
+variational-GP sweep is designed, written and validated but **not launched**
+(section 5): twelve arms, `config/ampc/variational_gp_sweep.yaml` and
+`jobs/variational_gp_sweep_mila.sh`. Section 1 of this file is still the objective;
+sections 4 and 7 are still the label state and the open asks.
 
 ---
 
@@ -86,32 +90,41 @@ sampling, and above all the GIBBON reward -- has to be re-established.
 | `DEFAULT_HIT_THRESHOLD` | 5.0 | 0.5247394203416823 | a **HIT**. What the sampling must recover. The objective. |
 | `DEFAULT_ENRICHED_THRESHOLD` | 3.5 | 0.2617481563014626 | the **ENRICHED** region. Not hits; the region the surrogate must predict well in order to find hits, and large enough to measure a mean and a variance on. |
 
-#### These thresholds applied to `y` are BANDS, not tails -- a live bug
+#### These thresholds applied to `y` are BANDS, not tails -- and that is the DEFINITION, not a bug
 
-Because `y` is non-monotone (see above), thresholding on `y` closes on the upper
-side as well as the lower:
+**REVERSED 2026-11-10, with the user. An earlier draft of this subsection called it a
+"live bug" and said the blocks should be recut on pProp. That was wrong and the plan is
+cancelled.**
+
+A **HIT is `y >= DEFAULT_HIT_THRESHOLD`** -- the `y` at exactly pProp 5 -- and
+**ENRICHED is `y >= DEFAULT_ENRICHED_THRESHOLD`**, the `y` at exactly pProp 3.5. That
+is what `scripts/exact_dkl_top_n.py` already does (`target_blocks`), and it is correct.
+
+Because `y` is non-monotone (see above), such a cut closes on the upper side too:
 
 | threshold | as a `y` cut, holds for pProp in |
 |---|---|
 | `DEFAULT_HIT_THRESHOLD` (`y` >= 0.5247) | **[5.00, 7.12]** |
 | `DEFAULT_ENRICHED_THRESHOLD` (`y` >= 0.2617) | **[3.50, 7.65]** |
 
-`scripts/exact_dkl_top_n.py:557-558` builds the `_hit` / `_enriched` / `_bulk`
-blocks as `targets >= threshold`, where `targets` is `y`. So those blocks are bands.
-Measured on `ampc_val_screen_232k`: the `_hit` block **excludes 120 of the 15,887
-true hits -- the best 120 molecules in the set** -- and `_enriched` excludes 37 of
-30,887.
+Measured on `ampc_val_screen_232k`, the cut excludes **120 of the 15,887** molecules
+at pProp 5+, and those exclusions are the highest-pProp molecules in the set.
+**Excluding them is right.** `y` is a hit PROBABILITY and it peaks at pProp 6.32; above
+that a molecule is rarer than the 1.2e-6 `artifact_freq` prior, so docking artifacts
+dominate the fitted mixture and the model stops believing the score. A pProp-9 molecule
+has the same `y` as a pProp-1 molecule by design (section 1's table). So a molecule
+whose `y` has fallen below a pProp-5 molecule's is, on the objective this project
+optimises, not a hit. Calling those 120 "the best 120 molecules in the set" -- as the
+earlier draft did -- silently substituted DOCK3 score for the objective.
 
-On the 10M library and the training sets the effect is ~0-1 molecules
-(`10M * 1e-7.1 < 1`), which is why it was never seen. It bites on tail-enriched
-evaluation sets, on the Olivier in-vitro panel (pProp up to 7.65), and above all on
-GENERATED molecules, whose distribution is not the library's.
+This is the same artifact down-weighting that section 1 declares a FEATURE, applied
+consistently to the block definitions. Treating it as a bug in one place and a feature
+in another was the actual error.
 
-**Decided with the user (2026-11-09): redefine the blocks on pProp, carrying pProp
-in the eval CSVs.** Not yet implemented. Note it CANNOT be done by inverting `y`:
-above the peak at pProp 6.32 the inverse is two-valued, so pProp must be carried
-explicitly. `ampc_331k` and `gp_molformer_set` are cached as `SMILES,y` only and
-their top molecules therefore cannot be recovered without their source files.
+The counts in this document therefore mean two different things and both are used:
+pProp-cut populations (the table below) describe the library, while the `_hit` /
+`_enriched` blocks a run reports are `y`-cut. On `ampc_val_screen_232k` that is 15,887
+against **15,767**, and the 120-molecule difference is the whole of it.
 
 Populations:
 
@@ -132,7 +145,117 @@ of `DEFAULT_ENRICHED_THRESHOLD`; a test asserts the value is unchanged.
 
 All of the following was measured in this session from files already on disk.
 
+### 2.0. WHICH SET MEASURES THE REWARD -- read this before any number below (2026-11-10)
+
+**User's correction, 2026-11-10, and it invalidates the FRAMING of much of section 2
+and of section 5a's RESULT. `gp_molformer_set` MUST NOT be used to judge whether the
+surrogate's reward discriminates.**
+
+The reason is the project's own design. `gp_molformer_set` is 83,811 samples from the
+UNTRAINED GP-MoLFormer prior, and **the prior is not supposed to sample binders.** It
+is there to jump-start learning by producing drug-like molecules; teaching it to find
+binders is the entire job of the S3-GFN training against the GIBBON reward. So a low,
+tightly-clustered reward on prior samples is the EXPECTED starting condition, not a
+symptom of a broken surrogate. If 83,811 prior molecules are genuinely homogeneous and
+genuinely mediocre, a CORRECT surrogate gives them all similar acquisition values.
+Degeneracy on that set therefore cannot distinguish "the acquisition is broken" from
+"the prior's samples really are alike", and reading it as the former is what went
+wrong.
+
+**What each set is for, which is the rule to follow from here:**
+
+| set | n | what it can answer | what it CANNOT answer |
+|---|---|---|---|
+| `olivier_invitro` | 1,521 | **IS THE REWARD FLAT.** Experimentally measured, 42.8% hits, real variation in `y` to discriminate on | population-level anything: it is a hand-picked top-docking panel |
+| `ampc_val_screen_232k` | 230,887 | **IS THE REWARD FLAT**, at population scale with ipw. Spans pProp 0.06 to 9 with 15,887 hits | nothing yet -- **it has never been GIBBON-scored**; see the gap below |
+| `gp_molformer_set` | 83,811 | ONE thing: whether RTB gets a usable GRADIENT at step 0, i.e. the UNDERFLOW question -- if nearly every sample lands at -744.44 the fine-tuning has nothing to descend on, however expected the low level is | whether the acquisition DISCRIMINATES. The prior's samples are not meant to span `y` |
+
+So the question "is the reward flat" is answered on molecules that actually span `y`,
+and above all **on the high-`y` molecules** in the 232k and the in-vitro panel. The
+prior set keeps exactly one job, the underflow check, and it must be labelled as that
+job wherever it appears.
+
+#### What this changes in the numbers already recorded
+
+**It does NOT overturn the exact-GP decision.** `on_pinned` still wins, and on
+`olivier_invitro` alone -- it never needed the prior set. Measured across all six arms
+(`outputs/ampc/exact_gp_sweep/*/eval_summary.json`):
+
+| `olivier_invitro` | `off_pinned` | `on_pinned` |
+|---|---|---|
+| `gibbon_value/effective_support` | 3.58 | **16.21** |
+| `n_mass90` | 3 | **13** |
+| `entropy_nats` | 1.276 | **2.785** |
+| `fraction_at_floor` | 0.9645 | **0.8343** |
+| median log GIBBON | -240.5 | **-79.68** |
+
+plus the calibration readings, which are on the right sets already: val
+`latent_variance_ratio` 10.8 vs 26.4, val `latent_coverage_1std` 0.215 vs 0.133,
+olivier `latent_variance_ratio` 49 vs 134. Every one favours `on`.
+
+**But section 5a's headline ARGUMENT was an artifact of the wrong set, and it was the
+most alarming claim in this document.** It read prior-off's `gp_molformer_set`
+acquisition `spearman_y` of **-0.057** as "the acquisition is anti-correlated with the
+target, so the prior-off arms are unusable for AL whatever their pointwise accuracy."
+On molecules with real measured hits that is simply false:
+
+| `olivier_invitro` `gibbon_value/spearman_y` | off_c | off_l | off_p | on_c | on_l | on_p |
+|---|---|---|---|---|---|---|
+| | 0.6914 | 0.6915 | 0.6914 | 0.7086 | 0.7085 | 0.7084 |
+
+**All six arms rank in-vitro molecules by `y` at Spearman 0.69-0.71.** Axis 1 was never
+about ranking ability on real binders. What it actually moves is how CONCENTRATED the
+acquisition mass is -- support, entropy, floor fraction. Same decision, different
+mechanism, and the mechanism that was written down was the wrong one.
+
+#### The finding the prior-set framing HID, and it is the open problem
+
+Because `gp_molformer_set`'s numbers were worse, they absorbed the attention, and
+nobody recorded what the chosen arm does on real molecules:
+
+- **`on_pinned` puts 83.4% of the in-vitro panel AT THE ACQUISITION FLOOR**
+  (`fraction_at_floor` 0.8343).
+- Its `effective_support` is 16.2 of 1,521 molecules -- **1.07%**.
+- `top1000_enrichment` is **1.25** against a null of 1.0.
+- `top1pct_overlap` is **0.000 in all six arms**: none finds the top 15 of 1,521.
+
+So on the set that matters, **the reward IS still largely flat in the arm that was
+chosen.** `on_pinned` is the best of six and the exact-GP sweep did not solve the
+problem; caveat 2 of section 5a said as much about CALIBRATION, but the acquisition
+statement was missing. This is the thing the variational sweep has to move, and it is
+the thesis's open problem rather than a settled one.
+
+#### The gap: the 232k has NEVER been GIBBON-scored
+
+Verified 2026-11-10: `ampc_val_screen_232k` has **zero** `acquisition/*` keys in all
+six arms' `eval_summary.json`. It is predict-only in `STUDY_SETS` because GIBBON's
+exact-GP posterior carries all n training inputs per batch element -- 39 MB per
+candidate row at n=20,000 -- so scoring 230,887 candidates was unaffordable. The
+consequence is that **"reward on the high-`y` molecules of the validation set" has
+never been measured for any arm, exact or variational.** Two facts make it fixable:
+
+1. **The variational GP can afford it.** Its posterior carries only the (M+1)^2
+   covariance, so chunk memory grows with M^2 and **not with n at all**. Scoring the
+   232k, or an ipw-stratified subsample of it, is within reach of the variational arms
+   in a way it never was for the exact ones.
+2. **The exact arms can be re-scored without refitting.** Each kept
+   `surrogate_state.pt` precisely so "predictions on a NEW set need no refit", and
+   `--load-state` exists for this. An ipw-stratified subsample sized to
+   `--score-chunk-size 128` gives the exact sweep the same endpoint, so the
+   exact-vs-variational comparison can be made on the right set.
+
+Until that is done, the honest statement is that the reward has been judged on a
+1,521-molecule hand-picked panel and on a set that was never meant to answer the
+question.
+
 ### 2a. The current surrogate's reward is unusable
+
+**RE-READ UNDER 2.0.** Every number in this subsection is on the untrained prior's
+samples, which cannot answer whether the acquisition discriminates. What it DOES
+establish is the underflow problem -- 17 of 65,536 above -744.44 means RTB has
+almost no gradient at step 0 -- and that claim stands. "Unusable as a reward" was
+over-stated on this evidence alone; the in-vitro and 232k readings in 2.0 are where
+flatness is judged.
 
 Everything downstream has been using
 `outputs/ampc/variational_gp/svgpscale_300000_svgp_M1024_iso_matern_scaled_pm0.0042864_elbo_cosine_lr3e-3_steps10064_fp32`
@@ -178,6 +301,19 @@ is very nearly constant, which is why effective support collapses to ~2.
 values will shift slightly. `gentail` is final.)
 
 ### 2c. It is largely an ELBO artefact, and PLL fixes most of it
+
+**PARTLY AFFECTED BY 2.0, and this is the same class of error.** Two of the five rows
+below -- the `gp_molformer_set` GIBBON median and its `top1000` enrichment -- are on
+the untrained prior's samples, and the enrichment row also uses that set's wrong
+labels. So the MAGNITUDE claim ("~2,300 nats of headroom") is not evidence about
+discrimination. What survives independently is the de-biased latent calibration slope
+on `ampc_331k` (28.3 -> 1.28), the learned-noise collapse (0.4218 -> 0.000107), and
+the mechanism in `objectives.py`, which is an argument about the objective rather than
+a measurement on any set: under the ELBO the variational variance is a pure penalty
+whose optimum is zero, under PLL it enters the predictive distribution and has an
+interior optimum. PLL remains the better-evidenced choice, but the in-vitro and 232k
+acquisition endpoints of 2.0 have never been measured for the ELBO/PLL contrast, and
+the variational sweep is what will measure them.
 
 From `outputs/ampc/variational_gp/calibration_grid_summary.csv` (24 arms, OLD y,
 300k, seed 42, isotropic):
@@ -561,6 +697,21 @@ acquisition consumes:
 mass. A 64-molecule batch would be one informative pick and 63 arbitrary ones, so the
 prior-off arms are unusable for AL whatever their pointwise accuracy.
 
+**CORRECTED 2026-11-10 -- see 2.0. The conclusion stands; this argument does not.**
+Five of the nine rows above, including the `spearman_y` row, are on
+`gp_molformer_set`, which is the untrained prior's samples and cannot measure whether
+the acquisition discriminates. The `-0.057` reading in particular must NOT be read as
+"anti-correlated with the target": on `olivier_invitro`, which has experimentally
+measured hits, **all six arms rank by `y` at Spearman 0.69-0.71** and prior-off is
+0.6914 against prior-on's 0.7084. Axis 1 does not change ranking ability on real
+binders; it changes how CONCENTRATED the acquisition mass is. The decision for `on` is
+carried by the in-vitro acquisition rows (`effective_support` 3.58 -> 16.21,
+`n_mass90` 3 -> 13, `entropy_nats` 1.276 -> 2.785, `fraction_at_floor` 0.9645 ->
+0.8343) and by the val/olivier calibration rows, all of which are on sets that can
+answer the question. And note what 2.0 adds: `on_pinned` still leaves **83.4% of the
+in-vitro panel at the acquisition floor**, so this sweep concentrated the reward
+without making it usable.
+
 **The mechanism is in the hyperparameters.** Without the prior the fit lands in a
 degenerate corner: lengthscale **19.2** against 2.75, outputscale **18.2** against 0.18,
 signal-to-noise **84** against 1.07. A near-constant kernel with enormous amplitude is a
@@ -878,54 +1029,6 @@ features -- which is exactly what the `learned` and `constant` arms separate.
    `gibbon_value`'s `effective_support` / `n_mass90` / `fraction_at_floor` -- are
    unaffected. Unresolved.
 
-### Where each arm's data is saved locally (2026-11-10)
-
-Every arm writes to `outputs/ampc/exact_gp_25k/<arm>/`, where `<arm>` is
-`<on|off>_<pinned|learned|constant>` -- the same string as the W&B run name minus the
-job id. **48 MB per arm**, so ~290 MB for the six. Nothing here is a copy of W&B:
-W&B is the dashboard, these files are the record.
-
-| path | what it holds |
-|---|---|
-| `eval/<set>.csv` | **one row per molecule**: `SMILES, y, [weight,] in_train, mean, std_total, std_latent` and, on the scored sets, `score_gibbon_value, score_gibbon_log`. 44 MB over the three sets |
-| `eval_summary.json` | every logged scalar, including the ones no longer sent to W&B |
-| `fit_summary.json` | fitted hyperparameters, L-BFGS-B attempts/status/evaluations, set sizes |
-| `loss_curve.csv` | per-evaluation loss, noise, outputscale, lengthscale, signal-to-noise |
-| `stage_profile.csv` | all nine profile columns per stage, rewritten after every stage so a killed run keeps what it measured |
-| `resolved_config.json` | the fully resolved config plus `provenance.git_commit` / `git_dirty` |
-| `surrogate_state.pt` | the fitted model, so predictions on a NEW set need no refit |
-
-**The guarantee, tested on job 11620200 rather than assumed: every statistic and
-figure an arm reports is recomputable from `eval/<set>.csv` alone.** Checked key by
-key -- `rmse`, `bias`, `pearson`, `coverage_1std`, `std_latent/mean`,
-`latent_variance_ratio` and the `_unseen` block all reproduce to ten decimals from the
-three prediction columns. So a figure nobody thought to make, or a block cut at a
-different threshold, costs a CSV read and no GPU.
-
-That guarantee had one hole, found and closed on 2026-11-10. `ampc_val_screen_232k`'s
-**ipw weights are an input, not a function of the saved columns**, so while
-`weighted_rmse / weighted_bias / weighted_pearson / weighted_r2` were logged, nothing
-under the run could reproduce them. `write_per_molecule_csv` now writes `weight` after
-`y` for any weighted set, and job 11620200's CSV was backfilled from
-`cache/ampc/exact_dkl_top_n/ampc_val_screen_232k.csv` -- the join verified on all
-230,887 rows by SMILES and `y` before the write, and confirmed after by recomputing
-`weighted_rmse` 0.0804760188 and `weighted_bias` 0.0699949904 from the file alone,
-matching the logged values. Note `relabel_eval_sets.py` records that `weight` is
-`1/P(selected)` **for the rule actually applied and must never be recomputed** -- which
-is why it is saved rather than derived.
-
-Two things are deliberately NOT under the run directory, both reproducible without it:
-the MiniMol features, shared in `cache/ampc/exact_dkl_top_n/<set>.npy` and
-deterministic given the encoder identity (~650 MB per arm if duplicated); and GIBBON's
-50,000-row max-value support, fixed by `--acquisition-seed 42`.
-
-W&B carries 449 scalars per arm after the 2026-11-10 trim, down from 647, having
-dropped only keys that repeat a key that remains (`<set>_unseen/*` where
-`n_in_train = 0`; `gibbon_log`'s rank metrics, identical to `gibbon_value`'s by
-monotonicity), are constant by construction (`gibbon_log/fraction_zero` = 1.0), or
-live in `stage_profile.csv` (six of eight `run/stage/*` fields). **Job 11620200
-predates the trim and carries the wider key set.**
-
 ### The svgpscale ladder, and why a 20k could be added without disturbing it (2026-11-10)
 
 The ladder is now **five nested arms**, `data/ampc_svgpscale_{20000,25000,50000,100000,300000}.csv`,
@@ -992,63 +1095,351 @@ needs **no MiniMol inference**.
 
 ---
 
-## 5. The VariationalGP sweep design (runs AFTER the exact GP)
+## 5a-bis. Where every run's data is saved locally -- BOTH sweeps (2026-11-10)
 
-Decided with the user before the exact-GP sweep was separated out. **Parked** until the
-exact GP is done; the two-job ELBO/PLL split below is the VARIATIONAL design and does
-not transfer. ELBO and PLL do not exist for an exact GP --
-`VariationalDKLTrainingConfig` carries `variational_objective` specifically "so the
-setting does not appear on `ExactDKLSurrogateConfig`, whose objective is an exact
-marginal log likelihood" (`src/activelearning/surrogate/dkl/config.py:40-54`).
+**Promoted out of 5a 2026-11-10.** It was written there and read as
+exact-GP-specific; the layout is identical for the variational arms, and the standard
+it states applies to every run this project reports.
 
-**Fixed:** Matern-5/2 in `ScaleKernel`; `ard: false`; constant mean PINNED at
-**0.0042864189360438442** (the relabelled 10M library mean); `noise_prior: true`;
-`num_inducing: 1024`; `inducing_init: random`; `scale_inputs: true`;
-`standardize_outputs: true`; fp32; batch 4096; lr 3e-3 cosine to 1e-4.
-`num_inducing`, `inducing_init` and `ard` were all measured near-inert on old y
-(the M2048 arm changed nothing; ARD moved Pearson <0.001).
+**THE STANDARD, which is the user's requirement and is not negotiable: every scalar
+and every figure in a run is reproducible from files saved under that run's own
+directory.** W&B is the dashboard; these files are the record. A number that exists
+only in W&B, or only in a notebook, does not count as measured.
 
-**Datasets: 100k and 300k only. 50k dropped** at the user's instruction.
+Every arm writes to `outputs/ampc/<sweep>/<arm>/`:
 
-**Validation:** `ampc_331k`, predict-only (`SCORE_AMPC=0`); its GIBBON pass was
-73% of run time and calibration needs only mean/std/y.
+| sweep | directory | arm name |
+|---|---|---|
+| exact GP (section 5a) | `outputs/ampc/exact_gp_sweep/` | `n<SIZE>_<on\|off>_<pinned\|learned\|constant>` |
+| variational GP (section 5) | `outputs/ampc/variational_gp_sweep/` | `n<SIZE>_<pll\|elbo>_<on\|off>_s<STEPS>` |
 
-**Two array jobs, split by objective.** ELBO's learned noise is 0.42 standardized
-in every arm measured, so floors below that are inert and floors above it would be
-forcing noise above what ELBO chose -- a different experiment.
+the same string as the W&B run name minus the job id. **48 MB per arm** for the exact
+sweep, so ~290 MB for the six.
 
-- **Job A, PLL.** dataset(2) x steps(5) x lengthscale_prior(2) x noise_floor(5) x
-  seed(2) = **200 arms**.
-- **Job B, ELBO.** No floor axis. dataset(2) x steps(5) x lengthscale_prior(2) x
-  seed(2) = **40 arms**.
 
-~240 arms at ~10 min each, ~40 GPU-hours as two Slurm arrays on L40S.
+Every arm writes to `outputs/ampc/<sweep>/<arm>/`, where `<arm>` is
+`<on|off>_<pinned|learned|constant>` -- the same string as the W&B run name minus the
+job id. **48 MB per arm**, so ~290 MB for the six. Nothing here is a copy of W&B:
+W&B is the dashboard, these files are the record.
 
-- **steps**: 1250, 2500, 5000, 10000, 20000 (log2 ladder). The job rounds each to
-  whole epochs -- 25 steps/epoch at 100k, 74 at 300k -- so STEPS are comparable
-  across datasets and epochs are not.
-- **noise_floor**: as a FRACTION of each dataset's own `var(y)`:
-  `{0.10, 0.25, ELBO's measured new-y noise, re-derived Gamma intercept, 0.67}`.
-  One level must equal ELBO's learned noise so there is a matched-noise cell where
-  the PLL/ELBO contrast is not confounded.
-- **lengthscale_prior**: `{true, false}`. With it off the lengthscale starts at
-  `sqrt(512) = 22.6` under only a positivity constraint; cells that fail to settle
-  are a reportable result, not a bug.
+| path | what it holds |
+|---|---|
+| `eval/<set>.csv` | **one row per molecule**: `SMILES, y, [weight,] in_train, mean, std_total, std_latent` and, on the scored sets, `score_gibbon_value, score_gibbon_log`. 44 MB over the three sets |
+| `eval_summary.json` | every logged scalar, including the ones no longer sent to W&B |
+| `fit_summary.json` | fitted hyperparameters, L-BFGS-B attempts/status/evaluations, set sizes |
+| `loss_curve.csv` | per-evaluation loss, noise, outputscale, lengthscale, signal-to-noise |
+| `stage_profile.csv` | all nine profile columns per stage, rewritten after every stage so a killed run keeps what it measured |
+| `resolved_config.json` | the fully resolved config plus `provenance.git_commit` / `git_dirty` |
+| `surrogate_state.pt` | the fitted model, so predictions on a NEW set need no refit |
 
-**Ungated.** A grid has no optimizer to steer, so gates can only discard cells
-before the trade-off has been seen. Every cell runs and every cell is recorded.
+**The guarantee, tested on job 11620200 rather than assumed: every statistic and
+figure an arm reports is recomputable from `eval/<set>.csv` alone.** Checked key by
+key -- `rmse`, `bias`, `pearson`, `coverage_1std`, `std_latent/mean`,
+`latent_variance_ratio` and the `_unseen` block all reproduce to ten decimals from the
+three prediction columns. So a figure nobody thought to make, or a block cut at a
+different threshold, costs a CSV read and no GPU.
+
+That guarantee had one hole, found and closed on 2026-11-10. `ampc_val_screen_232k`'s
+**ipw weights are an input, not a function of the saved columns**, so while
+`weighted_rmse / weighted_bias / weighted_pearson / weighted_r2` were logged, nothing
+under the run could reproduce them. `write_per_molecule_csv` now writes `weight` after
+`y` for any weighted set, and job 11620200's CSV was backfilled from
+`cache/ampc/exact_dkl_top_n/ampc_val_screen_232k.csv` -- the join verified on all
+230,887 rows by SMILES and `y` before the write, and confirmed after by recomputing
+`weighted_rmse` 0.0804760188 and `weighted_bias` 0.0699949904 from the file alone,
+matching the logged values. Note `relabel_eval_sets.py` records that `weight` is
+`1/P(selected)` **for the rule actually applied and must never be recomputed** -- which
+is why it is saved rather than derived.
+
+Two things are deliberately NOT under the run directory, both reproducible without it:
+the MiniMol features, shared in `cache/ampc/exact_dkl_top_n/<set>.npy` and
+deterministic given the encoder identity (~650 MB per arm if duplicated); and GIBBON's
+50,000-row max-value support, fixed by `--acquisition-seed 42`.
+
+W&B carries 449 scalars per arm after the 2026-11-10 trim, down from 647, having
+dropped only keys that repeat a key that remains (`<set>_unseen/*` where
+`n_in_train = 0`; `gibbon_log`'s rank metrics, identical to `gibbon_value`'s by
+monotonicity), are constant by construction (`gibbon_log/fraction_zero` = 1.0), or
+live in `stage_profile.csv` (six of eight `run/stage/*` fields). **Job 11620200
+predates the trim and carries the wider key set.**
+
+### The scored validation slice, added 2026-11-10
+
+`ampc_val_screen_232k_acq` (45,850 rows) is scored by every arm of both sweeps and
+gets the same per-molecule CSV as any other set. It exists because of section 2.0:
+until 2026-11-10 every reward number in this project was on `gp_molformer_set`, the
+untrained prior's samples, which cannot answer whether the acquisition
+discriminates. Built by `scripts/build_val_screen_acq_set.py` from the 232k's own
+feature store -- no MiniMol inference, fingerprints bit-identical, the manifest's
+`input_sha256` rewritten over the sliced SMILES so the loader's order check still
+binds (verified).
+
+| | |
+|---|---|
+| enriched (`y >= 0.2617481563014626`) | **30,850, kept whole** |
+| of which hits (`y >= 0.5247394203416823`) | **15,767** |
+| bulk subsample | **15,000** of 200,037, `seed=42`, FIXED across all arms |
+| cost | ~43 s per GIBBON pass, 0.94 ms/candidate |
+
+**The blocks are cut on `y`, deliberately** -- the `y` at exactly pProp 5 and at
+exactly pProp 3.5. That excludes the 120 molecules above pProp ~7.12, and excluding
+them is CORRECT: `y` peaks at pProp 6.32 and decays above it because docking
+artifacts dominate the mixture at that rarity, so their fitted hit probability
+really is below a pProp-5 molecule's. Confirmed with the user 2026-11-10; earlier
+drafts of section 1 called this a "live bug" and that was wrong.
+
+**One trap in its weights.** `weight` is carried, never recomputed -- it is
+`1/P(selected)` for the rule that built the 232k. But the bulk is a subsample, so a
+surviving bulk row stands for **13.3358x** as many screen molecules
+(`selection.bulk_weight_scale` in the manifest). The scale is NOT applied to the
+column: the right scale depends on what is being estimated, and silently rescaling
+a column the thesis treats as an input would be worse than making the consumer
+apply it deliberately. **Population-level means from this set must apply it; the
+block statistics it exists for do not need it.**
+
+### Acquisition metrics on the target blocks, added 2026-11-10
+
+Until 2026-11-10 the `_hit` / `_enriched` / `_bulk` blocks carried PREDICTION metrics
+only, so "is the reward flat on the molecules we are trying to recover" could not be
+read from any run. `score_outputs_with_blocks` now reports every acquisition statistic
+per block, and `exact_dkl_top_n.target_blocks` is the ONE definition both paths use so
+they cannot drift onto different molecules. The per-molecule CSV also carries a
+`block` column (2 hit, 1 enriched, 0 bulk, -1 unlabelled), redundant with `y` and the
+two thresholds, so recomputing a block statistic never depends on re-deriving a
+constant from the source tree. The per-budget enrichments are dropped on a block
+smaller than the budget, since `acquisition_enrichment` clamps `k` to the usable count
+and would otherwise report an enrichment of exactly 1.0 that looks like a measurement.
+Eight tests in `tests/scripts/test_exact_dkl_top_n.py`.
+
+---
+
+## 5. The variational-GP sweep: SETTLED design (2026-11-10)
+
+**TWELVE ARMS, nothing launched yet.** `config/ampc/variational_gp_sweep.yaml` and
+`jobs/variational_gp_sweep_mila.sh`, both written 2026-11-10 and validated (all twelve
+arms parse, both axis-2 levels build a surrogate, every guard fires).
+
+    sbatch jobs/variational_gp_sweep_mila.sh <pll|elbo> <on|off>      # SIZE=20000 default
+    SIZE=100000 sbatch jobs/variational_gp_sweep_mila.sh pll on
+    SIZE=300000 sbatch jobs/variational_gp_sweep_mila.sh pll on
+
+**This is a COMPARISON, not a second sweep.** The thesis compares the exact and the
+variational GP, so the design is the exact sweep's design with only the differences the
+model forces. Shared value for value: the training set (an arm of the nested
+`svgpscale` ladder), the frozen MiniMol encoder **and its cache file**, Matern-5/2,
+`ard=false`, `scale_inputs=true`, `standardize_outputs=true`, the constant mean PINNED
+at 0.0042864189360438442, a learned output scale, fp32, seed 42, and GIBBON with
+`num_mv_samples=10` scored on both the value and the log scale.
+
+### What made this cheap: the runner already carries the exact sweep's apparatus
+
+Three things that did NOT need building, checked rather than assumed:
+
+- `scripts/exact_dkl_top_n.py:119` dispatches on `VariationalGPSurrogate`, so the
+  variational arms run through the SAME runner, writing the same `eval/<set>.csv`,
+  `eval_summary.json`, `fit_summary.json`, `loss_curve.csv`, `stage_profile.csv`,
+  `resolved_config.json` and `surrogate_state.pt` as the six exact arms.
+- `STUDY_SETS` (`:202`) is now globally the three thesis sets --
+  `ampc_val_screen_232k` (predict-only, ipw), `gp_molformer_set`, `olivier_invitro` --
+  so a variational run gets them with **no flag at all**, and the `latent_calibration`
+  metrics of section 5b come with them.
+- `config/ampc/variational_gp_scaling.yaml` already held the matched fixed block and
+  already pointed `score_pprop_table` at the ground-truth 1p7b table.
+
+**A consequence worth knowing before reaching for the old script:
+`jobs/variational_gp_scaling_mila.sh` CANNOT RUN as written.** It passes
+`--predict-only ampc_331k`, and `ampc_331k` was retired from `STUDY_SETS`, so
+`resolve_study_sets` (`:281-286`) raises -- `--predict-only` only accepts a set that
+would otherwise be scored. `jobs/variational_gp_sweep_mila.sh` replaces it for thesis
+arms; the old script stays for the 104 historical arms' provenance.
+
+### The axes
+
+| axis | levels | override | exists for the exact GP? |
+|---|---|---|---|
+| 1. variational objective | `pll` / `elbo` | `surrogate.training_params.variational_objective=` | **no** |
+| 2. lengthscale prior | `on` / `off` | `surrogate.lengthscale_prior=false` | **yes, and it decided that sweep** |
+| 3. training size | `20000` / `100000` / `300000` | `SIZE=` | only 20,000 is reachable |
+
+**2 x 2 x 3 = 12 arms, fully crossed.**
+
+**Axis 1 is the one the exact GP cannot have**, and it is the largest effect measured
+anywhere in this project (section 2c): under the ELBO the variational variance is a
+pure penalty and the optimum drives it to zero; under PLL it enters the predictive
+distribution and has an interior optimum. On old y at 300k it moved the
+`gp_molformer_set` log-GIBBON median -2,688 -> -376 and the de-biased latent
+calibration slope 28.3 -> 1.28, for 0.008 of Pearson. So the exact GP's
+`ExactMarginalLogLikelihood` is not a neutral default to compare against -- it is a
+third point on this axis, and that is a thesis result rather than a nuisance.
+
+**Axis 2 is crossed again on purpose.** It decided the exact sweep: `off` predicted
+BETTER pointwise (pearson 0.842 vs 0.825) and was unusable, with `n_mass90 = 1` and
+0.000 nats of entropy -- one molecule of 83,811 holding 90% of the acquisition mass.
+The open question that only both sweeps answer is whether that degeneracy belongs to
+the exact GP's marginal likelihood or to this kernel on these features. Same asymmetry
+as there: the axis changes the GRADIENT and the STARTING POINT together (4.63, the
+prior's mode, against `sqrt(512)` = 22.63 -- `variational_gp._matern_kernel:79-81`),
+and a difference cannot be split between them.
+
+**Axis 3 is why the variational GP is in the thesis at all.** n=20,000 is the MATCHED
+cell -- the exact sweep's training set molecule for molecule, and the only size the
+exact GP could fit (38.8 GB measured at n=25,000). 100,000 and 300,000 are out of its
+reach entirely. The ladder is NESTED and every arm keeps the whole pProp >= 3.5 tail,
+so tail supervision is CONSTANT and only the bulk grows: the three sizes measure how
+much bulk this surrogate absorbs at fixed tail supervision, which is what decides
+whether the AL loop can drop the archive/train split the exact GP's memory forced on
+it.
+
+Measured on the files 2026-11-10, because any later floor levels are fractions of
+these:
+
+| n | mean(y) | var(y) | tail rows | tail share |
+|---|---|---|---|---|
+| 20,000 | 0.11866336 | 0.016138535 | 3,653 | 18.26% |
+| 100,000 | 0.07009585 | 0.007215347 | 3,653 | 3.65% |
+| 300,000 | 0.04550720 | 0.003730295 | 3,653 | 1.22% |
+
+`var(y)` spans **4.3x** across the ladder, so an absolute noise floor is not comparable
+across sizes -- it has to be a fraction of each arm's own `var(y)`. (This supersedes
+the 100k/300k variances in step 5 of section 6, which were the OLD y-banded sets'.)
+
+### What is NOT swept, and the measurement behind each
+
+- **`prior_mean`.** The exact sweep crossed `pinned` / `learned` / `constant` as its
+  axis 2 and measured it **inert**: the whole spread was 16-89x smaller than the
+  lengthscale-prior gap on every endpoint, and the three final losses differed by an
+  order of magnitude LESS than seed noise. Pinned here on that sweep's reasoning -- a
+  fixed physical constant keeps round 7 of an AL run comparable with round 1.
+  `VariationalGPSurrogate` has no `constant_kernel`, so the third level is not
+  expressible anyway.
+- **`ard`**, **`num_inducing`**, **`inducing_init`**, **`runtime.seed`**: all measured
+  near-inert (sections 5a and 5's earlier draft). The winning arm is re-run at seeds 43
+  and 44 afterwards.
+- **steps**, fixed at 10,000. Section 2e already measured the DIRECTION -- 5,032 ->
+  20,128 steps bought 0.005 of pearson and cost the prior-set GIBBON median -551 ->
+  -652 and effective support 6.1 -> 5.0. Sweeping it would pay 5x the arms to confirm a
+  known sign. The job derives `epochs` from `STEPS`, so the sizes are step-matched:
+  **10,000 / 10,000 / 10,064** (the 300k figure is also the incumbent's count).
+- **`noise_floor`: UNSET in all twelve arms. This REVERSES the parked design below.**
+  Same reasoning the user applied to the exact sweep's `noise_std_floor`: flooring the
+  noise pins the outputscale-to-noise ratio by fiat, and that ratio -- the latent
+  variance GIBBON consumes -- is the quantity the objective exists to estimate. If PLL
+  collapses the noise onto the 1e-4 floor here as it did on old y, that is a reported
+  RESULT. The floor frontier of section 2d becomes a separate, later sweep on the arm
+  this one picks, and it has no exact-GP counterpart -- which is precisely why it does
+  not belong in a comparison. `jobs/variational_gp_sweep_mila.sh` **refuses** a
+  `surrogate.noise_floor=` override so this cannot be done by accident.
+  **Scale, if it is ever set:** `VariationalGPSurrogate.noise_floor` is on the
+  VARIANCE scale; `FixedFeatureGPSurrogate.noise_std_floor` is a standard deviation.
+  Opposite conventions.
 
 ### Endpoints, declared before launch
-- **Reward** (`gp_molformer_set`, `gibbon_log`): median, p90, fraction above
-  -744.44, `spearman_y`, `top1000_enrichment`; plus value-scale
-  `effective_support` and `n_mass90`.
-- **Latent calibration** (`ampc_331k` and `gentail`, whole set and the `_hit` /
-  `_enriched` / `_bulk` blocks): `latent_z_rms`, `latent_variance_ratio`,
-  `latent_coverage_1std`/`_2std`, `spearman_std_error`, and
-  `latent_slope_debiased` on whole sets only.
-- **Accuracy** (same splits): pearson, r2, rmse, bias.
-- Primary readout is the (reward, latent calibration) frontier. Accuracy is
-  reported as a cost, not optimized.
+
+Unchanged in substance from the parked design, but on the three current sets rather
+than the retired `ampc_331k` / `gentail`:
+
+**ORDERED BY WHAT ANSWERS WHAT -- see 2.0.** The reward is judged on molecules that
+span `y`, not on the untrained prior's samples.
+
+- **PRIMARY -- is the reward flat** (`olivier_invitro`, and
+  `ampc_val_screen_232k` once it is scored; value scale): `effective_support`,
+  `n_mass90`, `entropy_nats`, `fraction_at_floor`, `spearman_y`,
+  `top1000_enrichment`, `top1pct_overlap`, and the same on the `_hit` / `_enriched`
+  blocks, since it is **the high-`y` molecules** whose reward must discriminate. The
+  bar from the exact sweep's winner: in-vitro `fraction_at_floor` **0.8343**,
+  `effective_support` **16.2 of 1,521 (1.07%)**, `top1000_enrichment` **1.25**,
+  `top1pct_overlap` **0.000**. Beating those is the point of this sweep.
+- **SECONDARY -- will RTB get a gradient at step 0** (`gp_molformer_set`,
+  `gibbon_log`): median, p90, fraction above **-744.44**. This is the ONLY question
+  this set answers (2.0): a low level on prior samples is expected and is not a defect,
+  but if nearly everything underflows, the fine-tuning has nothing to descend on. Do
+  NOT read its `effective_support` or `spearman_y` as evidence about the acquisition.
+- **Latent calibration** (`ampc_val_screen_232k` and `olivier_invitro`, whole set and
+  the `_hit` / `_enriched` / `_bulk` blocks): `latent_z_rms`,
+  `latent_variance_ratio`, `latent_coverage_1std`/`_2std`, `spearman_std_error`,
+  `latent_worst_bin_ratio`, and `latent_slope_debiased` on whole sets only.
+- **Accuracy** (same splits, ipw-weighted on the 232k): `pearson`,
+  `weighted_pearson`, `r2`, `rmse`, `bias`, `top1pct_overlap`.
+- **The comparison itself**: every one of the above at n=20,000 against the exact
+  sweep's `on_pinned` arm, which read val `latent_variance_ratio` **10.79**, val
+  `latent_coverage_1std` **0.215**, in-vitro `effective_support` **16.2 of 1,521**,
+  in-vitro `fraction_at_floor` **0.8343** and in-vitro `top1pct_overlap` **0.000**.
+  (The `n_mass90` 2 cited in an earlier draft of this bullet was the
+  `gp_molformer_set` figure and is not a bar -- see 2.0; the in-vitro value is 13.)
+  All six exact arms missed the top 15 of 1,521 in vitro molecules entirely, so
+  beating `top1pct_overlap` 0.000 at all is the floor of the bar, not the top of it.
+
+- **REQUIRED BEFORE LAUNCH, and a new dependency (2.0):** GIBBON on
+  `ampc_val_screen_232k`. It is predict-only in `STUDY_SETS` and has never been
+  scored, so the population-scale answer to "is the reward flat on high-`y`
+  molecules" does not exist. The variational posterior makes it affordable (chunk
+  memory grows with M^2, not n), but `resolve_study_sets` rejects `--extra-set` for a
+  name already in `STUDY_SETS`, so this needs a decision rather than a flag: either
+  prepare an ipw-stratified subsample under its own set name, or give the runner a
+  way to promote a predict-only set to scored. Prefer the subsample -- it is also
+  what makes `CROSS_SET_POOL` non-degenerate again (see `exact_dkl_top_n.py:227-234`,
+  which already names this as the natural fix), and it is what lets the six exact
+  arms be re-scored from `surrogate_state.pt` via `--load-state` with no refit.
+- Primary readout is the (reward, latent calibration) frontier. Accuracy is reported as
+  a cost, not optimized.
+
+**Ungated.** A grid has no optimizer to steer, so gates can only discard cells before
+the trade-off has been seen. Every cell runs and every cell is recorded.
+
+### Resources, and the one place the comparison is not like for like
+
+`jobs/variational_gp_sweep_mila.sh` asks `unkillable`, one **l40s**, 4 CPU, 32G, 3 h.
+The fit is a 4096 x 1024 cross-covariance per step at every size, so fit cost scales
+with the step count alone and is identical in all twelve arms; wall time and memory are
+dominated by GIBBON on the 83,811-molecule prior set. Comparable arms ran 7-25 min.
+`unkillable`'s per-user cap (6 CPU / 32G / 1 GPU) runs the arms **one at a time**;
+`PARTITION=main` would give two at once at 24G, at the risk of preemption -- and a
+preempted arm requeues onto an output directory that already holds its state, which the
+script refuses to reuse.
+
+**The acquisition cost structure is the asymmetry.** The exact GP's posterior carries a
+copy of all n training inputs per batch element -- 39 MB per candidate row at
+n=20,000, which is why its `--score-chunk-size` had to be **128**. The variational
+posterior carries only the (M+1)^2 covariance, so a chunk grows with M^2 and **not with
+n at all**; the job computes `(1024/M)^2 * 256`, i.e. **256** at M=1024. That is the
+variational GP's structural advantage and it should be reported as one, not hidden in a
+flag.
+
+GIBBON's max-value support is capped at 100,000 (`max_support_size`), so the 20k and
+100k arms use their whole training set and only the 300k arm is drawn down by the
+deterministic stratified reservoir. At n=20,000 that is the same 20,000-row support the
+exact sweep's uncapped spec gave, so the matched cell is matched on the acquisition
+too.
+
+### The parked pre-exact-GP design, and what was wrong with it
+
+Kept because it was decided with the user and the reasoning on its own axes is sound.
+**Do not run it as written.** Three things broke it:
+
+1. **It validated on `ampc_331k` (predict-only) and `gentail`.** Both are retired --
+   they rank among DOCKED molecules only and are off `STUDY_SETS` -- so the runner will
+   not even load them without `--extra-set`, and `--predict-only ampc_331k` is now a
+   hard error.
+2. **Datasets 100k and 300k only, 50k dropped.** No cell was comparable to the exact
+   GP, which could only reach 20,000. The size axis above is `{20000, 100000, 300000}`
+   for exactly that reason, decided with the user 2026-11-10.
+3. **~240 arms** (Job A, PLL: dataset x steps x lengthscale_prior x noise_floor x seed
+   = 200; Job B, ELBO, no floor axis: 40), ~40 GPU-hours. Against the exact sweep's
+   six arms that is two orders of magnitude of asymmetry, and it crossed `steps`,
+   `seed` and `noise_floor` -- all three now excluded with a measurement each.
+
+Its fixed block survives intact and is what `variational_gp_sweep.yaml` carries:
+Matern-5/2 in a `ScaleKernel`; `ard: false`; the pinned library mean;
+`noise_prior: true`; `num_inducing: 1024`; `inducing_init: random`;
+`scale_inputs: true`; `standardize_outputs: true`; fp32; batch 4096; lr 3e-3 cosine to
+1e-4.
+
+Its floor-level recipe also survives, for the separate floor sweep: levels as a
+FRACTION of each dataset's own `var(y)`, with one level equal to ELBO's measured
+learned noise so there is a matched-noise cell where the PLL/ELBO contrast is not
+confounded. That still needs step 4 of section 6 (re-derive ELBO's learned noise and
+the Gamma intercept on new y) -- which is no longer a blocker for THIS sweep, since it
+has no floor axis.
 
 ---
 
@@ -1236,19 +1627,20 @@ differs draws different pools and yields a different 20k. See "The svgpscale lad
 
 ## 6. Where we are, and the remaining steps
 
-**Done:** step 2 below. Everything else is open.
+**Done:** step 2, and the exact-GP sweep (section 5a). The variational sweep is
+designed, written and validated but NOT launched (section 5).
 
 | # | step | state |
 |---|---|---|
-| 1a | relabel `train_random`; reconcile `ampc_331k` + `val_set` | **ready to write**, no Nibi data needed |
-| 1b | relabel `gp_molformer_set` from `raw_score`/`pprop` | **BLOCKED** on 7.1 |
-| 1c | check in the corrected `score -> pProp` map | **BLOCKED** on 7.1 |
-| 2 | latent calibration + hit/enriched/bulk split, tested | **DONE** (section 3) |
-| 3 | `scripts/variational_gp_frontier.py`, a versioned analysis script | **ready to write**, next unblocked piece |
-| 4 | re-derive the noise floors on new y | needs a GPU pass; see below |
-| 5 | fix the job scripts | **ready** (see 6.5) |
-| 6 | re-score the 104 existing arms with the step-3 script | needs step 3 |
-| 7 | launch Job B (40 arms), then Job A (200) | needs 1, 3, 4, 5 |
+| 1a | relabel `train_random`; reconcile `ampc_331k` + `val_set` | **MOOT for the sweeps**: both sets are retired from `STUDY_SETS`. Only wanted if a historical arm is ever re-scored |
+| 1b | relabel `gp_molformer_set` from `raw_score`/`pprop` | **BLOCKED** on 7.1. Does NOT block the variational sweep: its prior-set endpoints are the label-free GIBBON distribution |
+| 1c | check in the corrected `score -> pProp` map | **ready**: the table is on disk (4.0); `ampc_hitrate_fits/` is gitignored, so this is now just "track this file" |
+| 2 | latent calibration + hit/enriched/bulk split, tested | **DONE** (section 3), plus `latent_worst_bin_ratio` (5b), 13 tests pass |
+| 3 | `scripts/variational_gp_frontier.py`, a versioned analysis script | **ready to write.** Now the next unblocked piece, and it should read BOTH sweeps' `eval/<set>.csv` so the exact-vs-variational table comes out of one script |
+| 4 | re-derive the noise floors on new y | **NOT a blocker any more**: the variational sweep has no floor axis (section 5). Needed only for the separate floor sweep that follows it |
+| 5 | fix the job scripts | **SUPERSEDED** by `jobs/variational_gp_sweep_mila.sh`. The old `variational_gp_*_mila.sh` scripts cannot run at all now -- `--predict-only ampc_331k` is a hard error -- so they are history, not scripts to fix |
+| 6 | re-score the 104 existing arms with the step-3 script | needs step 3. All OLD y and OLD eval sets, so this is a "do the old findings still hold" cross-check, not a dependency |
+| 7 | launch the 12 variational arms (section 5) | **READY.** Needs nothing: config and job script validated, all five ladder arms and all three eval caches on disk |
 | 8 | prior reward pass on the finalists | needs 7 |
 
 **Step 1a.** New checked-in `scripts/relabel_eval_sets.py` writing a manifest of
