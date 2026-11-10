@@ -19,11 +19,15 @@
 #   minimol_ampc_encoder/                   34M  (package + model/final.pt)
 #   .venv                                        or rebuild it there
 #
-# The four eval CSVs exact_dkl_prepare defaults to (ampc_val_20k,
-# gpmolformer_prior_100k_docked, ampc_331k_with_y, Olivier_Invitro) are absent
-# on Nibi too and did not stop job 26167170 from running 28 minutes, because
-# --sets restricts the encoding loop to the new set. If this job does complain
-# about one, copy it over; do not delete the flags.
+# The four eval CSVs (--val-csv, --gp-molformer-csv, --ampc-331k-csv,
+# --olivier-csv) ARE required: main() resolves them unconditionally, after the
+# selection, to count the new set's overlap with each. Mila job 11535584 died
+# there after 22 min (FileNotFoundError: data/ampc_val_20k.csv). The Nibi job
+# 26167170 cited as proof otherwise was OOM-killed before reaching that line.
+# The resolved copies in cache/ampc/exact_dkl_top_n/{val_set,ampc_331k,
+# olivier_invitro}.csv work as stand-ins; gp_molformer_set.csv needs a
+# passes_sa column appended. Extra args after the script name are forwarded
+# and override the flags below.
 #
 # RESOURCES ARE THE UNVERIFIED PART OF THIS SCRIPT. They could not be checked
 # from Nibi, so treat them as a starting point, not a measurement:
@@ -37,11 +41,14 @@
 #   or OOM-killed, raise --mem and re-submit rather than assuming the build is
 #   broken: an OOM kill here means the cap, not the code.
 #
-#   PARTITION. `unkillable` is the usual choice for a short single-GPU job, but
-#   it is the most restricted one and may not allow this much memory. `main` is
-#   the fallback. Check what is grantable before trusting either:
-#       sinfo -o "%20P %10l %10m %28G"
-#       salloc --partition=main --gres=gpu:1 --cpus-per-task=12 --mem=200G --time=0:20:00
+#   PARTITION. Measured on Mila 2026-11-04 (sacctmgr show qos): the per-user
+#   QOS caps are unkillable cpu=6/mem=32G/gpu=1, main cpu=8/mem=48G/gpu=2, and
+#   short-unkillable requires 4 GPUs. None fits 12 CPUs + 200G on one GPU, and
+#   asking for it fails at submit with QOSMaxCpuPerUserLimit. `long` has no
+#   partition QOS, so it grants this; it is preemptible, but at ~2 h a
+#   preemption costs one re-submit. Check before changing anything:
+#       sacctmgr -n -P show qos format=name,maxtrespu
+#       sbatch --test-only jobs/exact_dkl_balanced_n40000_prepare_mila.sh
 #
 #   GPU. Any modern card: the job needs a few GB (the largest band's pool is
 #   761,800 x 512 x 4 bytes = 1.56 GB) and is bound by MiniMol inference
@@ -50,7 +57,7 @@
 #   TIME. 33 minutes on one H100 for a LARGER 1,610,733-molecule pool
 #   (fps_keep05_n45000). An l40s is slower than an H100, so 1 h is thin; 2 h
 #   here, which is still short enough not to hurt scheduling.
-#SBATCH --partition=unkillable
+#SBATCH --partition=long
 #SBATCH --gres=gpu:l40s:1
 #SBATCH --cpus-per-task=12
 #SBATCH --mem=200G

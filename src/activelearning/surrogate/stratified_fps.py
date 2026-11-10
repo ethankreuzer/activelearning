@@ -174,7 +174,7 @@ def assign_bands(
 def allocate_band_budgets(
     band_sizes: Sequence[int] | np.ndarray,
     n: int,
-    top_fraction: float = DEFAULT_TOP_FRACTION,
+    top_fraction: float | None = DEFAULT_TOP_FRACTION,
     *,
     band_fill: str = DEFAULT_BAND_FILL,
 ) -> np.ndarray:
@@ -186,6 +186,12 @@ def allocate_band_budgets(
     over the bands that still have room, so the returned budgets always sum to
     ``n``.
 
+    ``top_fraction=None`` instead gives the top band the same share as every
+    other band, ``n / n_bands``, which is what bands of equal width in the
+    banding variable call for: there is then nothing that distinguishes the top
+    band, and a ``top_fraction`` tuned to equalize the bands at one ``n`` does
+    not equalize them at another.
+
     Parameters
     ----------
     band_sizes : Sequence[int] or np.ndarray
@@ -193,9 +199,9 @@ def allocate_band_budgets(
         band.
     n : int
         Total number of points to select.
-    top_fraction : float, default=DEFAULT_TOP_FRACTION
+    top_fraction : float or None, default=DEFAULT_TOP_FRACTION
         Share of ``n`` for the top band, in ``[0, 1]``. The band's own size
-        caps it.
+        caps it. ``None`` gives it an equal share, ``n / n_bands``.
     band_fill : str, default=DEFAULT_BAND_FILL
         How the lower bands split what the top band leaves. ``"even"`` gives
         each the same count; ``"proportional"`` gives each its share of
@@ -219,7 +225,7 @@ def allocate_band_budgets(
         raise ValueError(f"band_sizes must describe at least two bands; got {sizes}.")
     if n < 0:
         raise ValueError(f"n must be nonnegative; got {n}.")
-    if not 0.0 <= top_fraction <= 1.0:
+    if top_fraction is not None and not 0.0 <= top_fraction <= 1.0:
         raise ValueError(f"top_fraction must lie in [0, 1]; got {top_fraction}.")
     if band_fill not in BAND_FILLS:
         raise ValueError(f"band_fill must be one of {BAND_FILLS}; got {band_fill!r}.")
@@ -230,7 +236,8 @@ def allocate_band_budgets(
         )
 
     budgets = np.zeros(sizes.size, dtype=np.int64)
-    budgets[-1] = min(int(round(n * top_fraction)), int(sizes[-1]))
+    share = n / sizes.size if top_fraction is None else n * top_fraction
+    budgets[-1] = min(int(round(share)), int(sizes[-1]))
 
     weights = sizes[:-1].astype(np.float64) if band_fill == "proportional" else None
     remaining = _water_fill(budgets, sizes, n - int(budgets[-1]), weights)
@@ -520,7 +527,7 @@ def select_stratified_rows(
     encode_rows: Callable[[np.ndarray], np.ndarray],
     quantiles: Sequence[float] = DEFAULT_QUANTILES,
     band_edges: Sequence[float] | np.ndarray | None = None,
-    top_fraction: float = DEFAULT_TOP_FRACTION,
+    top_fraction: float | None = DEFAULT_TOP_FRACTION,
     pool_multiple: int | Sequence[int] = DEFAULT_POOL_MULTIPLE,
     band_fill: str = DEFAULT_BAND_FILL,
     keep_above: float | None = None,
@@ -557,8 +564,10 @@ def select_stratified_rows(
         Infinite outer edges are added when absent. For a selection repeated
         over rounds on a growing archive: recomputed quantiles would move with
         the enrichment and the rounds would not be comparable.
-    top_fraction : float, default=DEFAULT_TOP_FRACTION
-        Share of each size's budget given to the top band.
+    top_fraction : float or None, default=DEFAULT_TOP_FRACTION
+        Share of each size's budget given to the top band. ``None`` gives the
+        top band an equal share of the filler alongside every other band; see
+        :func:`allocate_band_budgets`.
     pool_multiple : int or Sequence[int], default=DEFAULT_POOL_MULTIPLE
         Candidates drawn per selected point, within each band. One number for
         every band, or one per band: a band whose budget is large sees a smaller
@@ -634,7 +643,9 @@ def select_stratified_rows(
         size: allocate_band_budgets(
             band_sizes,
             size - kept.size,
-            min(1.0, top_fraction * size / (size - kept.size)),
+            None
+            if top_fraction is None
+            else min(1.0, top_fraction * size / (size - kept.size)),
             band_fill=band_fill,
         )
         for size in requested
@@ -759,7 +770,7 @@ def select_stratified_rows(
     diagnostics = {
         "band_edges": [_finite_or_none(edge) for edge in edges],
         "quantiles": [float(level) for level in quantiles],
-        "top_fraction": float(top_fraction),
+        "top_fraction": None if top_fraction is None else float(top_fraction),
         "band_fill": str(band_fill),
         "keep_above": None if keep_above is None else float(keep_above),
         "n_kept": int(kept.size),

@@ -15,46 +15,55 @@ validation set.
 
 The design
 ----------
-**The tail is kept whole in every arm.** All 16,197 molecules above pProp 3.5
-are in the 50k set and in the 300k set alike, so tail supervision is constant
-while bulk grows. That is what makes the arms answer "at fixed tail data, how
-much bulk can the surrogate take", rather than confounding dataset size with
-how much of the tail it was shown. The tail's *share* of each arm necessarily
-falls (32.4% at 50k to 5.4% at 300k); that dilution is the treatment, not a
-defect.
+**The tail is kept whole in every arm.** All 3,654 molecules above pProp 3.5 are
+in the 25k set and in the 300k set alike, so tail supervision is constant while
+bulk grows. That is what makes the arms answer "at fixed tail data, how much
+bulk can the surrogate take", rather than confounding dataset size with how
+much of the tail it was shown. The tail's *share* of each arm necessarily falls
+(14.6% at 25k to 1.2% at 300k); that dilution is the treatment, not a defect.
 
-**Bands are cut at pProp 2.0, 2.5, 3.0 and 3.5, and nowhere below.** The shipped
-score/pProp table prints ``cumul_prop`` to eight decimals while one molecule of
-the 13B reference screen is 7.6e-11 of it, so pProp is constant at 1.5988 across
-every score from -7.045 to +71.665. Recovered DOCK scores for all 10M confirm
-the consequence: the library's minimum pProp *is* 1.5988 (101,313 molecules sit
-exactly there), its median is 1.6443 and its 99th percentile is 2.7299. Bands of
-uniform 0.5 width running down to 0 would therefore be three empty bands and one
-holding 95% of the library. The four edges here are the ones with populations:
+**Bands are cut on pProp, in uniform 0.5-wide steps from 0.0 up to the kept
+tail at 3.5.** Measured on ``pprop_1p7b`` over all 10M rows, every one of those
+bands has a real population:
 
-    pProp > 3.5     16,197   kept whole, no sampling
-    3.0 - 3.5       37,805
-    2.5 - 3.0      111,617
-    2.0 - 2.5      324,640
-    1.5988 - 2.0 9,509,741   (95.1% of the library)
+    pProp >= 3.5     3,654   kept whole, no sampling
+    3.0 - 3.5        7,945
+    2.5 - 3.0       24,716
+    2.0 - 2.5       79,520
+    1.5 - 2.0      250,001
+    1.0 - 1.5      789,593
+    0.5 - 1.0    2,501,433
+    0.0 - 0.5    6,343,138
 
-The edges are passed as *target* values rather than pProp, because y is strictly
-increasing in pProp over this range and y is what the surrogate fits, so the two
-band definitions coincide. The exception is the 34 molecules above the mixture's
-peak at pProp 6.25, whose y falls as their docking improves; they land in a
-lower band than their pProp implies. At 34 of 10M that is immaterial to the
-budgets, and it is left uncorrected on purpose: moving them up would put them in
-a band that the target the surrogate is fitted on contradicts.
+An earlier version of this script cut bands at pProp 2.0, 2.5, 3.0 and 3.5 and
+"nowhere below", on the grounds that the library's minimum pProp *was* 1.5988
+with 101,313 molecules sitting exactly there, so uniform 0.5-wide bands would be
+three empty bands and one holding 95% of the library. That was an artefact of
+the old ``full_scores.df``, whose sentinel pile put 97.48% of the reference
+screen at one score and pinned pProp at ``-log10(0.02518858) = 1.5988``. Against
+the ground-truth ``ampc_full_scores_1p7b.df`` the library spans pProp 0.0635 to
+7.8325 and the degenerate band does not exist, so the uniform edges the design
+always wanted are now the ones it uses.
 
-**The filler budget is split evenly across those four bands, not in proportion
-to the library.** Proportionally, 91% of the growth from 50k to 300k would land
-in the single lowest band, so the largest arm would be a quarter-million
-molecules sharing essentially one target value and the study would measure
-tolerance of duplicate labels rather than the value of more data.
-``--top-fraction`` is the share of each arm given to the 3.0-3.5 band;
-0.169 makes the four bands exactly equal at 50k, and at 300k that band is
-exhausted (37,805 < 50,700) so its surplus water-fills the three below,
-making them equal again there too.
+**The banding variable is pProp, not the target y.** The two are not
+interchangeable: ``y`` is a hit *probability* and is non-monotone in pProp,
+peaking at pProp 6.32 and falling away above it, so a threshold on ``y`` is a
+band closed at both ends rather than a tail. Cut on ``y >= 0.2617``, the kept
+tail would silently drop the library's single best-docking molecule (pProp
+7.8325, ``y`` 0.19) while keeping molecules at pProp 3.5. One molecule of 10M,
+but the one the whole study is trying to find. ``--pprop-csv`` supplies pProp
+per library row; ``y`` remains the target the surrogate is fitted on.
+
+**The filler budget is split evenly across every band, the top one included.**
+Proportionally, 91% of the growth from 50k to 300k would land in the single
+lowest band, so the largest arm would be a quarter-million molecules sharing
+essentially one target value and the study would measure tolerance of duplicate
+labels rather than the value of more data. With bands of equal pProp width there
+is nothing that distinguishes the top band, so ``--top-fraction`` defaults to
+``None``: every band gets ``filler / n_bands``, and a band too small for its
+share (3.0-3.5 at 100k and above) water-fills its surplus into the bands that
+still have room. The old default of 0.169 was that equality evaluated at
+n=50,000 and only at n=50,000.
 
 **The arms are nested.** Farthest point sampling is greedy, so one pass per band
 sized for the largest arm gives every smaller arm a per-band prefix: the 50k set
@@ -71,7 +80,7 @@ in the library.
 
 Usage
 -----
-    python -m scripts.build_svgp_scaling_sets            # 50k, 100k, 300k
+    python -m scripts.build_svgp_scaling_sets            # 25k, 50k, 100k, 300k
     python -m scripts.build_svgp_scaling_sets --sizes 50000 --dry-run
 
 ``--dry-run`` reports the bands and budgets without encoding, selecting or
@@ -82,6 +91,7 @@ the fill would do.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import sys
@@ -92,34 +102,42 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from activelearning.applications.molecules.hit_rate import DEFAULT_ENRICHED_THRESHOLD
+from activelearning.applications.molecules.hit_rate import (
+    DEFAULT_ENRICHED_PPROP,
+    DEFAULT_ENRICHED_THRESHOLD,
+    DEFAULT_HIT_PPROP,
+)
 
 _logger = logging.getLogger("build_svgp_scaling_sets")
 
-#: Band edges, as targets. These are ``HitRateModel.hit_rate_from_pprop(p, 6.5)``
-#: for p in (2.0, 2.5, 3.0) with the shipped AmpC parameters; the module
-#: docstring explains why the bands stop here rather than continuing to 0.
-DEFAULT_BAND_EDGES: tuple[float, ...] = (
-    0.060954058908811566,  # pProp 2.0
-    0.11310500910711611,  # pProp 2.5
-    0.18129163128836587,  # pProp 3.0
-)
+#: Inner band edges, in pProp: uniform 0.5-wide steps from 0.0 up to the kept
+#: tail at ``DEFAULT_KEEP_ABOVE``. The module docstring explains why these are
+#: cut on pProp rather than on the target, and why they run all the way down.
+DEFAULT_BAND_EDGES: tuple[float, ...] = (0.5, 1.0, 1.5, 2.0, 2.5, 3.0)
 
-#: Targets at or above this are kept outright: ``hit_rate_from_pprop(3.5, 6.5)``.
-#: Aliased from the canonical definition so the tail is cut at the same place here,
-#: in the policy pretraining and in the surrogate evaluation's hit / non-hit split.
-DEFAULT_KEEP_ABOVE = DEFAULT_ENRICHED_THRESHOLD
+#: Molecules at or above this pProp are kept outright. Aliased from the
+#: canonical definition so the tail is cut at the same place here, in the policy
+#: pretraining and in the surrogate evaluation's hit / enriched / bulk split.
+DEFAULT_KEEP_ABOVE = DEFAULT_ENRICHED_PPROP
 
-#: Share of each arm given to the 3.0-3.5 band. See the module docstring.
-DEFAULT_TOP_FRACTION = 0.169
+#: The target that ``DEFAULT_KEEP_ABOVE`` corresponds to at the enriched edge.
+#: Recorded in the selection summary, and asserted by the tests, so that moving
+#: the carve onto pProp cannot silently move where the enriched region starts.
+DEFAULT_KEEP_ABOVE_TARGET = DEFAULT_ENRICHED_THRESHOLD
 
-#: Candidates drawn per selected point, per band, lowest band first. The two
-#: bands that barely exceed their budget cannot spread much whatever this says
-#: (2.5-3.0 holds 111,617 for a 300k budget of 81,999, and 3.0-3.5 is taken
-#: whole), so the multiples are spent on the two bands that can.
-DEFAULT_POOL_MULTIPLE: tuple[int, ...] = (8, 3, 2, 1)
+#: ``None`` gives every band, the top one included, an equal share of the filler
+#: budget. See the module docstring and ``allocate_band_budgets``.
+DEFAULT_TOP_FRACTION: float | None = None
 
-DEFAULT_SIZES: tuple[int, ...] = (50_000, 100_000, 300_000)
+#: Candidates drawn per selected point, per band, lowest band first. One entry
+#: per band. A band that barely exceeds its budget cannot spread much whatever
+#: this says -- at 300k the four bands above pProp 2.0 are either exhausted
+#: (3.0-3.5, 2.5-3.0) or nearly so -- so the multiples are spent on the three
+#: bands below pProp 1.5, which hold millions of rows for a budget of tens of
+#: thousands and are where farthest-point sampling can actually choose.
+DEFAULT_POOL_MULTIPLE: tuple[int, ...] = (8, 6, 4, 2, 1, 1, 1)
+
+DEFAULT_SIZES: tuple[int, ...] = (25_000, 50_000, 100_000, 300_000)
 
 
 def read_library(path: Path) -> pd.DataFrame:
@@ -149,8 +167,79 @@ def read_library(path: Path) -> pd.DataFrame:
     return frame
 
 
+def read_pprop(path: Path, column: str, smiles: Sequence[str]) -> np.ndarray:
+    """Read the banding pProp for every library row, in library order.
+
+    The pProp lives in a different file from the target, so the two are checked
+    to describe the same molecules in the same order before either is used.
+    The check is a digest of the SMILES column rather than a comparison of two
+    10M-element lists, because the library's own SMILES are already in memory
+    and a second copy of them is ~1 GB.
+
+    Parameters
+    ----------
+    path : Path
+        CSV, optionally gzipped, with a SMILES column and ``column``.
+    column : str
+        Name of the pProp column to read, such as ``pprop_1p7b``.
+    smiles : Sequence of str
+        The library's SMILES, in library order, to check this file against.
+
+    Returns
+    -------
+    np.ndarray
+        pProp per library row, in library order.
+
+    Raises
+    ------
+    SystemExit
+        If the file is missing a column, has a different number of rows, or
+        does not hold the library's SMILES in the library's order.
+    """
+    _logger.info("reading %s for the banding pProp (%s)", path, column)
+    digest = hashlib.sha256()
+    values: list[np.ndarray] = []
+    n_rows = 0
+    reader = pd.read_csv(
+        path,
+        usecols=lambda name: name == column or name in {"SMILES", "SMILE"},
+        dtype={"SMILES": str, "SMILE": str},
+        chunksize=500_000,
+    )
+    for chunk in reader:
+        if column not in chunk.columns:
+            raise SystemExit(f"{path} is missing the column {column!r}.")
+        smiles_column = "SMILES" if "SMILES" in chunk.columns else "SMILE"
+        for value in chunk[smiles_column]:
+            digest.update(value.encode("utf-8"))
+            digest.update(b"\n")
+        values.append(chunk[column].to_numpy(dtype=np.float64))
+        n_rows += len(chunk)
+    if n_rows != len(smiles):
+        raise SystemExit(
+            f"{path} holds {n_rows} rows but the library holds {len(smiles)}, "
+            "so its pProp cannot be read by library row."
+        )
+    expected = hashlib.sha256()
+    for value in smiles:
+        expected.update(value.encode("utf-8"))
+        expected.update(b"\n")
+    if digest.hexdigest() != expected.hexdigest():
+        raise SystemExit(
+            f"{path} does not hold the library's {len(smiles)} SMILES in "
+            "library order, so its pProp cannot be read by library row."
+        )
+    pprop = np.concatenate(values)
+    if not np.isfinite(pprop).all():
+        raise SystemExit(f"{path} has a non-finite {column!r}.")
+    _logger.info(
+        "pProp spans %.4f to %.4f over %d rows", pprop.min(), pprop.max(), pprop.size
+    )
+    return pprop
+
+
 def band_report(
-    targets: np.ndarray,
+    values: np.ndarray,
     edges: Sequence[float],
     keep_above: float,
 ) -> list[dict[str, Any]]:
@@ -158,12 +247,13 @@ def band_report(
 
     Parameters
     ----------
-    targets : np.ndarray
-        Target per library row.
+    values : np.ndarray
+        Banding value per library row, which is pProp rather than the target;
+        see the module docstring on why the two are not interchangeable.
     edges : Sequence[float]
         Inner band edges, ascending.
     keep_above : float
-        Target at or above which rows are kept whole.
+        Banding value at or above which rows are kept whole.
 
     Returns
     -------
@@ -174,9 +264,9 @@ def band_report(
     report = [
         {
             "band": "kept",
-            "y_low": keep_above,
-            "y_high": None,
-            "n": int((targets >= keep_above).sum()),
+            "low": keep_above,
+            "high": None,
+            "n": int((values >= keep_above).sum()),
         }
     ]
     for index in range(len(bounds) - 1):
@@ -184,9 +274,9 @@ def band_report(
         report.append(
             {
                 "band": index,
-                "y_low": None if np.isneginf(low) else float(low),
-                "y_high": float(high),
-                "n": int(((targets >= low) & (targets < high)).sum()),
+                "low": None if np.isneginf(low) else float(low),
+                "high": float(high),
+                "n": int(((values >= low) & (values < high)).sum()),
             }
         )
     return report
@@ -196,7 +286,7 @@ def planned_budgets(
     band_sizes: Sequence[int],
     sizes: Sequence[int],
     n_kept: int,
-    top_fraction: float,
+    top_fraction: float | None,
     band_fill: str,
 ) -> dict[int, list[int]]:
     """Return the per-band budget of every arm, as the selection will allocate it.
@@ -212,8 +302,9 @@ def planned_budgets(
         Requested arm sizes.
     n_kept : int
         Rows kept whole by ``keep_above``.
-    top_fraction : float
-        Share of each arm for the highest band.
+    top_fraction : float or None
+        Share of each arm for the highest band, or ``None`` to give it an equal
+        share of the filler alongside every other band.
     band_fill : str
         ``"even"`` or ``"proportional"``.
 
@@ -228,7 +319,9 @@ def planned_budgets(
         int(size): allocate_band_budgets(
             band_sizes,
             int(size) - n_kept,
-            min(1.0, top_fraction * size / (size - n_kept)),
+            None
+            if top_fraction is None
+            else min(1.0, top_fraction * size / (size - n_kept)),
             band_fill=band_fill,
         ).tolist()
         for size in sizes
@@ -399,7 +492,27 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         "--library-csv",
         type=Path,
         default=Path("data/10M_unif_random_subset.csv"),
-        help="The library every arm is selected from.",
+        help="The library every arm is selected from, supplying the target y.",
+    )
+    parser.add_argument(
+        "--pprop-csv",
+        type=Path,
+        default=Path("data/ampc_unif_random_10M.csv.gz"),
+        help=(
+            "The library's pProp, in library row order, which is what the "
+            "bands and --keep-above are cut on. Checked against the library's "
+            "SMILES by digest before it is used."
+        ),
+    )
+    parser.add_argument(
+        "--pprop-column",
+        default="pprop_1p7b",
+        help=(
+            "pProp column in --pprop-csv. The default is the one derived from "
+            "the ground-truth ampc_full_scores_1p7b.df table; pprop_OLD in "
+            "that same file comes from the broken full_scores.df and must not "
+            "be used."
+        ),
     )
     parser.add_argument(
         "--store-path",
@@ -435,10 +548,24 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         type=float,
         nargs="+",
         default=list(DEFAULT_BAND_EDGES),
-        help="Inner band edges as targets, ascending, below --keep-above.",
+        help="Inner band edges as pProp, ascending, below --keep-above.",
     )
-    parser.add_argument("--keep-above", type=float, default=DEFAULT_KEEP_ABOVE)
-    parser.add_argument("--top-fraction", type=float, default=DEFAULT_TOP_FRACTION)
+    parser.add_argument(
+        "--keep-above",
+        type=float,
+        default=DEFAULT_KEEP_ABOVE,
+        help="pProp at or above which every molecule is kept, with no sampling.",
+    )
+    parser.add_argument(
+        "--top-fraction",
+        type=float,
+        default=DEFAULT_TOP_FRACTION,
+        help=(
+            "Share of each arm given to the top band. Omitted, every band "
+            "including the top gets an equal share of the filler, which is "
+            "what equal-width bands call for."
+        ),
+    )
     parser.add_argument(
         "--band-fill", choices=("even", "proportional"), default="even"
     )
@@ -470,7 +597,16 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         help="Multi-round run whose docked molecules form the held-out tail set.",
     )
     parser.add_argument("--rounds", type=int, default=10)
-    parser.add_argument("--tail-threshold", type=float, default=DEFAULT_KEEP_ABOVE)
+    parser.add_argument(
+        "--tail-threshold",
+        type=float,
+        default=DEFAULT_KEEP_ABOVE_TARGET,
+        help=(
+            "The generated tail set keeps molecules above this. It is a "
+            "TARGET, not a pProp like --keep-above: generated molecules reach "
+            "this script through a run's stored y and have no pProp here."
+        ),
+    )
     parser.add_argument("--gentail-label", default="gentail")
     parser.add_argument(
         "--skip-gentail",
@@ -530,8 +666,14 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     frame = read_library(args.library_csv)
     targets = frame["y"].to_numpy(dtype=np.float64)
+    # The bands and the kept tail are cut on pProp; y stays the fitted target.
+    # See the module docstring: y is non-monotone in pProp, so a cut on y is a
+    # band closed at both ends and would drop the best-docking molecules.
+    band_values = read_pprop(
+        args.pprop_csv, args.pprop_column, frame["SMILE"].tolist()
+    )
 
-    bands = band_report(targets, args.band_edges, args.keep_above)
+    bands = band_report(band_values, args.band_edges, args.keep_above)
     n_kept = bands[0]["n"]
     band_sizes = [entry["n"] for entry in bands[1:]]
     _logger.info("band populations (tail first): %s", bands)
@@ -558,10 +700,16 @@ def main(argv: Sequence[str] | None = None) -> None:
         "n_library": int(len(frame)),
         "label": args.label,
         "sizes": [int(size) for size in args.sizes],
+        "band_variable": "pprop",
+        "pprop_csv": str(args.pprop_csv),
+        "pprop_column": args.pprop_column,
         "band_edges": [float(edge) for edge in args.band_edges],
         "keep_above": float(args.keep_above),
+        "keep_above_target": DEFAULT_KEEP_ABOVE_TARGET,
+        "hit_pprop": DEFAULT_HIT_PPROP,
         "n_kept": n_kept,
-        "top_fraction": float(args.top_fraction),
+        "n_hit": int((band_values >= DEFAULT_HIT_PPROP).sum()),
+        "top_fraction": None if args.top_fraction is None else float(args.top_fraction),
         "band_fill": args.band_fill,
         "pool_multiple": [int(value) for value in args.pool_multiple],
         "seed": int(args.seed),
@@ -594,7 +742,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         return np.asarray(store[rows], dtype=np.float32)
 
     rows_per_size, diagnostics = select_stratified_rows(
-        targets,
+        band_values,
         args.sizes,
         encode_rows=encode_rows,
         # Inner edges only: the top band runs to +inf and keep_above takes the
@@ -627,21 +775,27 @@ def main(argv: Sequence[str] | None = None) -> None:
             "csv": str(csv_path),
             "cache": str(cache_path),
             "n_rows": int(rows.size),
-            "n_tail": int((targets[rows] >= args.keep_above).sum()),
-            "tail_share": float((targets[rows] >= args.keep_above).mean()),
+            "n_tail": int((band_values[rows] >= args.keep_above).sum()),
+            "tail_share": float((band_values[rows] >= args.keep_above).mean()),
+            "n_hit": int((band_values[rows] >= DEFAULT_HIT_PPROP).sum()),
+            "pprop_max": float(band_values[rows].max()),
             "y_mean": float(targets[rows].mean()),
+            # The exact GP's noise floor, if one is ever used, is a fraction of
+            # this; the variational sweep's floors are fractions of it too.
+            "y_var": float(targets[rows].var()),
         }
 
     if args.random_control is not None:
         size = int(args.random_control)
         name = f"{args.label}_random_{size}"
-        kept = np.flatnonzero(targets >= args.keep_above)
-        rest = np.flatnonzero(targets < args.keep_above)
+        kept = np.flatnonzero(band_values >= args.keep_above)
+        rest = np.flatnonzero(band_values < args.keep_above)
         draw = np.random.default_rng(args.seed).choice(
             rest, size=size - kept.size, replace=False
         )
         rows = np.concatenate((kept, draw))
-        rows = rows[np.lexsort((rows, -targets[rows]))]
+        # Descending pProp, matching the order select_stratified_rows returns.
+        rows = rows[np.lexsort((rows, -band_values[rows]))]
         csv_path = args.data_dir / f"ampc_{name}.csv"
         cache_path = args.cache_dir / f"{name}.npy"
         set_smiles = write_set_csv(csv_path, frame, rows)

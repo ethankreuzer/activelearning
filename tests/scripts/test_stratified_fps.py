@@ -317,6 +317,30 @@ class TestSelectStratifiedRows:
         assert rows[200].size == 200
         assert rows[500].size == 500
 
+    def test_an_equal_share_selects_and_records_its_diagnostics(self) -> None:
+        """``top_fraction=None`` runs end to end, diagnostics included.
+
+        The allocation is covered by TestAllocateBandBudgets; what this pins is
+        the whole call, because the diagnostics block is assembled after every
+        band has been sampled and once coerced the share to a float
+        unconditionally -- so a None share crashed only at the very end, after
+        all of the work.
+        """
+        targets = _skewed_targets()
+
+        rows, diagnostics = select_stratified_rows(
+            targets,
+            (200, 500),
+            encode_rows=self._encode(targets),
+            quantiles=(50.0, 90.0, 99.0),
+            top_fraction=None,
+            pool_multiple=3,
+        )
+
+        assert rows[500].size == 500
+        assert diagnostics["top_fraction"] is None
+        assert len(diagnostics["bands"]) == 4
+
     def test_the_smaller_set_is_a_subset_of_the_larger(self) -> None:
         targets = _skewed_targets()
         rows, _ = select_stratified_rows(
