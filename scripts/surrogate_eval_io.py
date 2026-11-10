@@ -305,16 +305,30 @@ def write_per_molecule_csv(
 ) -> None:
     """Write one row per molecule with its label and every computed column.
 
+    This file is the run's RECORD: every statistic and figure the run reports is
+    recomputable from it, so a later question that nobody thought to log can be
+    answered without refitting. That is why the set's ``weight`` is written here
+    too -- the inverse-propensity weights are an input to the ``weighted_*``
+    metrics and are not derivable from anything else in the file, so without
+    this column those four numbers could be read but never reproduced or
+    replotted.
+
     Parameters
     ----------
     path : Path
         Destination CSV, written atomically.
     eval_set : EvalSet
-        The set, supplying SMILES and targets.
+        The set, supplying SMILES, targets and optional weights.
     columns : Mapping[str, np.ndarray]
-        Extra columns, each aligned with the set.
+        Extra columns, each aligned with the set. A ``weight`` key here takes
+        precedence over the set's own weights, so a caller that has already
+        placed the column keeps control of it.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
+    extra = dict(columns)
+    if eval_set.weights is not None and "weight" not in extra:
+        extra = {"weight": np.asarray(eval_set.weights, dtype=float), **extra}
+    columns = extra
     names = list(columns)
     tmp_path = path.with_name(path.name + ".tmp")
     with tmp_path.open("w", newline="") as handle:

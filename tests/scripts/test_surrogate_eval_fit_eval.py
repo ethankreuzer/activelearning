@@ -404,6 +404,66 @@ def test_write_per_molecule_csv_round_trips(tmp_path: Path) -> None:
     assert not path.with_name("val_set.csv.tmp").exists()
 
 
+def test_weighted_metrics_can_be_recomputed_from_the_csv(tmp_path: Path) -> None:
+    """A weighted set writes its weights, or its weighted_* metrics are dead ends.
+
+    The inverse-propensity weights are an input to ``weighted_rmse`` and friends
+    and are derivable from nothing else in the file, so leaving them out makes
+    those metrics readable but unreproducible.
+    """
+    base = _eval_set("ampc_val_screen_232k", 2)
+    eval_set = fit_script.EvalSet(
+        name=base.name,
+        smiles=base.smiles,
+        targets=base.targets,
+        features=base.features,
+        weights=np.array([0.25, 4.0]),
+    )
+    path = tmp_path / "eval" / "ampc_val_screen_232k.csv"
+
+    fit_script.write_per_molecule_csv(path, eval_set, {"mean": np.array([0.1, 0.2])})
+
+    with path.open(newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    assert [row["weight"] for row in rows] == [repr(0.25), repr(4.0)]
+    # Immediately after y, so the file reads label-then-weight-then-predictions.
+    with path.open(newline="") as handle:
+        assert next(csv.reader(handle))[:3] == ["SMILES", "y", "weight"]
+
+
+def test_unweighted_set_gets_no_weight_column(tmp_path: Path) -> None:
+    """A set with no weights is not given a column of ones to misread later."""
+    path = tmp_path / "eval" / "val_set.csv"
+
+    fit_script.write_per_molecule_csv(
+        path, _eval_set("val_set", 2), {"mean": np.array([0.1, 0.2])}
+    )
+
+    with path.open(newline="") as handle:
+        assert "weight" not in (next(csv.reader(handle)))
+
+
+def test_caller_supplied_weight_column_is_not_overwritten(tmp_path: Path) -> None:
+    """An explicit column wins, so a caller keeps control of its own output."""
+    base = _eval_set("val_set", 2)
+    eval_set = fit_script.EvalSet(
+        name=base.name,
+        smiles=base.smiles,
+        targets=base.targets,
+        features=base.features,
+        weights=np.array([0.25, 4.0]),
+    )
+    path = tmp_path / "eval" / "val_set.csv"
+
+    fit_script.write_per_molecule_csv(
+        path, eval_set, {"weight": np.array([1.0, 2.0])}
+    )
+
+    with path.open(newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    assert [row["weight"] for row in rows] == [repr(1.0), repr(2.0)]
+
+
 def test_log_final_scalars_goes_to_summary_not_metrics() -> None:
     """One-off scalars land in the run summary under their own keys, not as metrics."""
     metrics = {
