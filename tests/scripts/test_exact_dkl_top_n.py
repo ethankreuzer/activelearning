@@ -179,11 +179,13 @@ def test_study_sets_cover_prediction_and_score_roles() -> None:
     assert {name for name, study_set in by_name.items() if study_set.score} == {
         "gp_molformer_set",
         "olivier_invitro",
-        "ampc_331k",
     }
+    # The validation screen is predict-only: scoring 230,887 candidates against
+    # an n=25,000 exact GP is not affordable.
+    assert not by_name["ampc_val_screen_232k"].score
     # The first predicted set absorbs the one-off Cholesky, so the order is
     # part of the contract.
-    assert arm.STUDY_SETS[0].name == "train_random"
+    assert arm.STUDY_SETS[0].name == "ampc_val_screen_232k"
 
 
 def test_prediction_and_score_keys_are_valid_log_keys() -> None:
@@ -229,7 +231,7 @@ def test_epoch_callback_logs_only_the_loss_and_hyperparameters() -> None:
 def test_epoch_callback_includes_hyperparameters_when_fitted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A fitted surrogate contributes the three charted hyperparameters."""
+    """A fitted surrogate contributes the charted hyperparameters."""
     monkeypatch.setattr(
         arm,
         "exact_dkl_hyperparameters",
@@ -237,6 +239,7 @@ def test_epoch_callback_includes_hyperparameters_when_fitted(
             "noise": 0.01,
             "outputscale": 0.5,
             "lengthscale_median": 2.0,
+            "signal_to_noise": 50.0,
             "y_std": 0.1,
         },
     )
@@ -247,7 +250,11 @@ def test_epoch_callback_includes_hyperparameters_when_fitted(
         "train/epoch/noise",
         "train/epoch/outputscale",
         "train/epoch/lengthscale_median",
+        "train/epoch/signal_to_noise",
     }
+    # `constant` is absent unless the arm has a constant kernel, and an absent
+    # key is skipped rather than charted as a zero.
+    assert "train/epoch/constant" not in logger.metrics
     # y_std is a property of the data, not a curve; it belongs in the config.
     assert "train/epoch/y_std" not in logger.metrics
 
@@ -569,6 +576,45 @@ def test_in_training_mask_marks_exact_smiles_matches() -> None:
     assert arm.in_training_mask((), frozenset({"C1"})).shape == (0,)
 
 
+def test_target_cut_blocks_drop_the_debiased_statistics() -> None:
+    """A block cut on the target cannot estimate the gain they rescale by."""
+    eval_set = _eval_set("ampc_val_screen_232k", 60)
+    predictions = _predictions(60)
+
+    metrics, _ = arm.prediction_outputs_with_unseen(
+        eval_set, predictions, np.zeros(60, dtype=bool)
+    )
+
+    blocks = {key.split("/")[0] for key in metrics}
+    for block in blocks:
+        debiased = [
+            key
+            for key in metrics
+            if key.startswith(f"{block}/") and key.endswith("_debiased")
+        ]
+        narrow = block.endswith(("_hit", "_enriched", "_bulk"))
+        assert bool(debiased) is not narrow, f"{block}: {debiased}"
+    # The undebiased pair, which the docstring names as trustworthy on a narrow
+    # subset, is kept everywhere it exists.
+    assert any(key.endswith("_bulk/final/latent_z_rms") for key in metrics)
+    assert any(
+        key.endswith("_bulk/final/latent_variance_ratio") for key in metrics
+    )
+    # The gain itself stays: within a block it is a real statement about
+    # compression, and it is how the prior-mean axis is read.
+    assert any(key.endswith("_bulk/final/latent_debias_gain") for key in metrics)
+    # r2 goes with them -- measured against a within-block target variance that
+    # a target-cut block barely has -- while rmse and bias, which keep an
+    # absolute error scale, stay.
+    assert not any(key.endswith("_hit/final/r2") for key in metrics)
+    assert any(key.endswith("_hit/final/rmse") for key in metrics)
+    assert any(key.endswith("_hit/final/bias") for key in metrics)
+    assert any(key.endswith("_hit/final/pearson") for key in metrics)
+    # Whole set and the wide _unseen block keep r2.
+    assert "ampc_val_screen_232k/final/r2" in metrics
+    assert "ampc_val_screen_232k_unseen/final/r2" in metrics
+
+
 def test_unseen_block_matches_metrics_on_the_unseen_molecules() -> None:
     """The ``_unseen`` keys are the ordinary metrics on a filtered set."""
     eval_set = _eval_set("val_set", 40)
@@ -731,19 +777,19 @@ class TestResolveStudySets:
             arm.resolve_study_sets(["pool", "pool"])
 
     def test_a_predict_only_set_is_predicted_but_not_scored(self) -> None:
-        study_sets, _ = arm.resolve_study_sets([], ["ampc_331k"])
+        study_sets, _ = arm.resolve_study_sets([], ["gp_molformer_set"])
 
         by_name = {s.name: s for s in study_sets}
-        assert by_name["ampc_331k"].predict is True
-        assert by_name["ampc_331k"].score is False
-        assert by_name["gp_molformer_set"].score is True
+        assert by_name["gp_molformer_set"].predict is True
+        assert by_name["gp_molformer_set"].score is False
+        assert by_name["olivier_invitro"].score is True
         assert [s.name for s in study_sets] == [s.name for s in arm.STUDY_SETS]
 
     def test_a_predict_only_set_leaves_the_cross_set_pool(self) -> None:
         """An unscored set has no scores to pool."""
-        _, pool = arm.resolve_study_sets(["gentail"], ["ampc_331k"])
+        _, pool = arm.resolve_study_sets(["gentail"], ["gp_molformer_set"])
 
-        assert pool == {"gp_molformer_set", "gentail"}
+        assert pool == {"gentail"}
 
     def test_an_extra_set_can_be_predict_only(self) -> None:
         study_sets, pool = arm.resolve_study_sets(["gentail"], ["gentail"])
@@ -751,7 +797,7 @@ class TestResolveStudySets:
         assert study_sets[-1].score is False
         assert "gentail" not in pool
 
-    @pytest.mark.parametrize("name", ["val_set", "not_a_set"])
+    @pytest.mark.parametrize("name", ["ampc_val_screen_232k", "not_a_set"])
     def test_rejects_a_predict_only_name_that_is_not_scored(self, name: str) -> None:
         with pytest.raises(SystemExit, match="not a scored set"):
             arm.resolve_study_sets([], [name])
@@ -853,6 +899,9 @@ def test_lbfgs_trace_charts_every_evaluation_and_records_the_attempt() -> None:
         "train/epoch/noise",
         "train/epoch/outputscale",
         "train/epoch/lengthscale_median",
+        # The output scale over the noise: what the acquisition consumes, and
+        # the only one of the three that cannot be traded away silently.
+        "train/epoch/signal_to_noise",
     }
     assert attempts and attempts[-1]["status"] in {"SUCCESS", "STOPPED", "FAILURE"}
     assert sum(attempt["evaluations"] for attempt in attempts) == len(rows)

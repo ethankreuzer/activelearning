@@ -99,7 +99,18 @@ GIBBON_TYPE = "QLowerBoundMaxValueEntropy"
 QMFMES_TYPE = "QMultiFidelityMaxValueEntropy"
 
 #: The only charted series. Everything else is a one-off summary scalar.
-PER_EPOCH_HYPERPARAMETERS = ("noise", "outputscale", "lengthscale_median")
+#: Logged per objective evaluation beside the training loss. ``signal_to_noise``
+#: is the output scale over the noise -- the latent variance the acquisition
+#: consumes -- and is tracked because the fit can trade its two terms freely, so
+#: watching them separately hides the thing that moves. ``constant`` exists only
+#: in the constant-kernel arms and is skipped where the key is absent.
+PER_EPOCH_HYPERPARAMETERS = (
+    "noise",
+    "outputscale",
+    "lengthscale_median",
+    "signal_to_noise",
+    "constant",
+)
 
 #: BoTorch's default exact GP on the fixed fingerprints, fitted by L-BFGS-B.
 FIXED_FEATURE_GP_TYPE = "FixedFeatureGPSurrogate"
@@ -123,6 +134,34 @@ UNSEEN_SUFFIX = "_unseen"
 #: molecules at or above ``DEFAULT_HIT_THRESHOLD`` (pProp 5). Recovering these is
 #: the objective of the project, so they are reported on their own even though
 #: there are few of them: 100 of ampc_331k, 1 of gp_molformer_set.
+#: The de-biased latent-calibration statistics are dropped from the per-block
+#: metrics. Every one of them rescales the predicted std by a gain fitted WITHIN
+#: the block, and :func:`latent_calibration` is explicit that a narrow subset
+#: compresses the target range and collapses that gain -- so the rescaled
+#: readings are distorted and ``latent_slope_debiased`` can even go negative. Its
+#: docstring names ``latent_z_rms`` and ``latent_variance_ratio``, the UNDEBIASED
+#: pair, as the readings to trust on a narrow subset; those are kept, as are the
+#: gain and intercept themselves, which are a legitimate statement about
+#: compression within the block and are how the prior-mean axis is read.
+#:
+#: They remain on the WHOLE set, where ``latent_slope_debiased`` is the only
+#: statistic that tests whether the predicted variance scales PROPORTIONALLY
+#: with squared error across the range rather than merely averaging to the right
+#: size. Dropped here rather than left to be plotted and misread.
+_DEBIASED_SUFFIX = "_debiased"
+
+#: ``r2`` is dropped from a block cut on the target for the same reason, and it
+#: is worse than merely noisy: ``r2 = 1 - SSE/SST`` is measured against the
+#: variance WITHIN the block, and a block such as ``_hit`` has almost none, so a
+#: good model scores far below zero and the number is comparable neither across
+#: blocks nor with the whole set. ``rmse`` and ``bias`` replace it there: an
+#: absolute error scale stays meaningful inside a block, and ``bias`` on
+#: ``_hit`` is the reading that matters -- whether the tail is systematically
+#: under-predicted, which is what breaks the acquisition and what neither
+#: ``r2`` nor ``pearson`` would show. ``pearson`` is kept, range-restricted but
+#: bounded, and compared only across arms within one block.
+_NARROW_BLOCK_DROPPED_METRICS = frozenset({"r2"})
+
 HIT_SUFFIX = "_hit"
 
 #: Appended for the ENRICHED region, at or above ``DEFAULT_ENRICHED_THRESHOLD``
@@ -159,24 +198,40 @@ class StudySet:
 #: Order matters: the first predicted set pays the one-off exact-GP
 #: ``prediction_strategy`` cache build (the n x n Cholesky), so its stage
 #: seconds are not comparable with the later ones. Keeping the order fixed
-#: means that cost always lands on ``predict_train_random``.
+#: means that cost always lands on ``predict_ampc_val_screen_232k``.
 STUDY_SETS = (
-    StudySet("train_random", predict=True, score=False),
-    StudySet("train_top", predict=True, score=False),
-    StudySet("val_set", predict=True, score=False),
+    # The validation set: ground-truth pprop from ampc_full_scores_1p7b.df,
+    # labelled through the fitted curves, and ipw-weighted. It is FIRST because
+    # the first predicted set absorbs the one-off Cholesky (see above), so that
+    # cost always lands on the same set.
+    #
+    # Predict-only. Scoring is per candidate and GIBBON's posterior carries all
+    # n training inputs per batch element, so scoring 230,887 candidates against
+    # an n=25,000 exact GP is not affordable; its prediction takes seconds.
+    StudySet("ampc_val_screen_232k", predict=True, score=False),
     StudySet("gp_molformer_set", predict=True, score=True),
-    # olivier_invitro has no docking target, so its predictions are written to
-    # its CSV but it gets no accuracy metric and no predicted-vs-observed figure.
+    # olivier_invitro IS labelled as of 2026-11-09 (DOCK scores through the 1p7b
+    # table and the fitted curves), so it now earns accuracy and calibration
+    # metrics as well as the GIBBON distribution. It is only 1,521 molecules, so
+    # scoring it is cheap -- but it is 42.8% hits and 75.1% enriched, a
+    # hand-picked top-docking set, so its whole-set numbers describe an enriched
+    # population and its target range is compressed even before any block cut.
     StudySet("olivier_invitro", predict=True, score=True),
-    StudySet("ampc_331k", predict=True, score=True),
 )
 
-#: Sets pooled to ask which one the acquisition prefers. One is a sample of the
-#: library the surrogate was fitted from, the other a generated set drawn from
-#: somewhere else, so the split of a pooled top-k says whether the score is
-#: tracking information or just distance from the training data.
-#: ``olivier_invitro`` is left out: it has no target to interpret a pick with.
-CROSS_SET_POOL = frozenset({"ampc_331k", "gp_molformer_set"})
+#: Sets pooled to ask which one the acquisition prefers. The split of a pooled
+#: top-k says whether the score tracks information about the target or merely
+#: distance from the training data. ``olivier_invitro`` is left out: it has no
+#: target to interpret a pick with.
+#:
+#: DEGENERATE at present, and deliberately so. The library half used to be
+#: ``ampc_331k``, which is retired -- its labels rank among docked molecules
+#: only. ``ampc_val_screen_232k`` cannot replace it here because it is not
+#: scored (see above). ``cross_set_outputs`` yields nothing for fewer than two
+#: sets, so no pooled metric is emitted until a library half exists; the natural
+#: replacement is an ipw-weighted subsample of the 232k, sized to whatever
+#: ``score_chunk_size`` turns out to allow at n=25,000.
+CROSS_SET_POOL = frozenset({"gp_molformer_set"})
 
 
 def resolve_study_sets(
@@ -556,13 +611,18 @@ def prediction_outputs_with_unseen(
     labelled = np.isfinite(targets)
     is_hit = targets >= DEFAULT_HIT_THRESHOLD
     is_enriched = targets >= DEFAULT_ENRICHED_THRESHOLD
-    for suffix, mask in (
-        (UNSEEN_SUFFIX, ~in_train),
-        (HIT_SUFFIX, is_hit),
-        (ENRICHED_SUFFIX, is_enriched),
-        (BULK_SUFFIX, ~is_enriched & labelled),
+    # ``narrow`` marks a block cut on the TARGET, where the de-biased statistics
+    # are invalid; see _DEBIASED_SUFFIX. ``_unseen`` is the whole set minus the
+    # training molecules, which is wide, so it keeps them.
+    for suffix, mask, narrow in (
+        (UNSEEN_SUFFIX, ~in_train, False),
+        (HIT_SUFFIX, is_hit, True),
+        (ENRICHED_SUFFIX, is_enriched, True),
+        (BULK_SUFFIX, ~is_enriched & labelled, True),
     ):
-        subset_metrics = _subset_prediction_outputs(eval_set, predictions, mask, suffix)
+        subset_metrics = _subset_prediction_outputs(
+            eval_set, predictions, mask, suffix, drop_debiased=narrow
+        )
         metrics.update(subset_metrics)
     metrics[f"{eval_set.name}/final/n_hit"] = float(is_hit.sum())
     metrics[f"{eval_set.name}/final/n_enriched"] = float(is_enriched.sum())
@@ -574,11 +634,18 @@ def _subset_prediction_outputs(
     predictions: Mapping[str, np.ndarray],
     mask: np.ndarray,
     suffix: str,
+    *,
+    drop_debiased: bool = False,
 ) -> dict[str, float]:
     """Prediction metrics for the molecules a mask selects, under ``<set><suffix>/``.
 
     Returns an empty dict when the mask selects nothing, so an evaluation set with
     no hits simply has no ``<set>_hit/`` block rather than a block of NaNs.
+
+    ``drop_debiased`` removes the de-biased latent-calibration statistics and
+    ``r2``, for a block narrow enough that neither the gain they rescale by nor
+    the within-block target variance is estimable; see :data:`_DEBIASED_SUFFIX`
+    and :data:`_NARROW_BLOCK_DROPPED_METRICS`.
     """
     keep = np.asarray(mask, dtype=bool)
     if not keep.any():
@@ -597,7 +664,16 @@ def _subset_prediction_outputs(
         {key: np.asarray(values)[keep] for key, values in predictions.items()},
         figures=False,
     )
-    return subset_metrics
+    if not drop_debiased:
+        return subset_metrics
+    return {
+        key: value
+        for key, value in subset_metrics.items()
+        if not (
+            key.rpartition("/")[2].endswith(_DEBIASED_SUFFIX)
+            or key.rpartition("/")[2] in _NARROW_BLOCK_DROPPED_METRICS
+        )
+    }
 
 
 def load_resolved_set(

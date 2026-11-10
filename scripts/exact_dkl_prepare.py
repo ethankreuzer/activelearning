@@ -304,6 +304,7 @@ def parse_extra_sets(values: Sequence[str]) -> tuple[SetSpec, ...]:
 def eval_set_specs(
     *,
     val_csv: Path,
+    val_screen_csv: Path,
     gp_molformer_csv: Path,
     ampc_331k_csv: Path,
     olivier_csv: Path,
@@ -316,13 +317,22 @@ def eval_set_specs(
     Parameters
     ----------
     val_csv : Path
-        Weighted validation set.
+        The OLD weighted validation set, superseded by ``val_screen_csv``. Kept
+        buildable because historical runs reference it; it ranks among docked
+        molecules only, so its labels sit one constant away from the library
+        convention.
+    val_screen_csv : Path
+        The validation screen, 230,887 rows with ground-truth ``pprop`` from
+        ``ampc_full_scores_1p7b.df`` and inverse-probability weights. THIS is
+        the validation set.
     gp_molformer_csv : Path
         Docked generated prior sample.
     ampc_331k_csv : Path
         The 331k labelled subset.
     olivier_csv : Path
-        The in-vitro set, which has no target column.
+        The in-vitro set, labelled by scripts/label_olivier_invitro.py: its
+        DOCK scores through the 1p7b score->pProp table and then the fitted
+        hit-rate curves, which is the library's own label convention.
 
     Returns
     -------
@@ -330,6 +340,18 @@ def eval_set_specs(
         The specs, in preparation order.
     """
     return (
+        SetSpec(
+            # The validation set. Labelled y = hit_rate_from_pprop(pprop, 6.5),
+            # which reproduces the library's own labels exactly, and weighted by
+            # ipw so population-level metrics are available: its unweighted mean
+            # y is 0.1255 against a weighted 0.0042859, a ~29x tail enrichment.
+            # EVERY population number must use the weight column.
+            name="ampc_val_screen_232k",
+            source=val_screen_csv,
+            smiles_column="SMILES",
+            label_column="y",
+            extra_columns=("weight",),
+        ),
         SetSpec(
             name="val_set",
             source=val_csv,
@@ -346,10 +368,19 @@ def eval_set_specs(
             docked_sa_filter=True,
         ),
         SetSpec(
+            # Labelled as of 2026-11-09. It was label_column=None while the only
+            # stage-1 table was the broken full_scores.df; the 1p7b table makes
+            # a score-based label legitimate, so this set now carries y and
+            # earns accuracy and calibration metrics like any other.
+            #
+            # It is heavily top-selected -- 42.8% hits, 75.1% enriched, 378 bulk
+            # of 1,521 -- so even its WHOLE-set range is compressed, and r2 and
+            # the de-biased statistics deserve the same scepticism there as on a
+            # target-cut block of a broad set.
             name="olivier_invitro",
             source=olivier_csv,
             smiles_column="SMILES",
-            label_column=None,
+            label_column="y",
         ),
         SetSpec(
             name="ampc_331k",
@@ -698,6 +729,16 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     )
     parser.add_argument("--val-csv", type=Path, default=Path("data/ampc_val_20k.csv"))
     parser.add_argument(
+        "--val-screen-csv",
+        type=Path,
+        default=Path("data/ampc_val_screen_232k_labelled.csv"),
+        help=(
+            "The validation screen, SMILES,y,weight. Written from "
+            "data/ampc_val_screen_232k.csv by applying the fitted hit-rate "
+            "curves to its ground-truth pprop column."
+        ),
+    )
+    parser.add_argument(
         "--gp-molformer-csv",
         type=Path,
         default=Path("data/gpmolformer_prior_100k_docked.csv"),
@@ -706,7 +747,10 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         "--ampc-331k-csv", type=Path, default=Path("data/ampc_331k_with_y.csv")
     )
     parser.add_argument(
-        "--olivier-csv", type=Path, default=Path("data/Olivier_Invitro.csv")
+        "--olivier-csv",
+        type=Path,
+        # The LABELLED file, not data/Olivier_Invitro.csv, which has no y column.
+        default=Path("data/Olivier_Invitro_labelled.csv"),
     )
     parser.add_argument("--data-dir", type=Path, default=Path("data"))
     parser.add_argument("--train-sizes", type=str, default="2000,3000")
@@ -905,7 +949,16 @@ def main(argv: Sequence[str] | None = None) -> None:
     strat_diagnostics: dict[str, Any] = {}
     strat_names: list[str] = []
 
-    if not args.skip_subsets or not args.skip_caches:
+    # The 10M read exists only to derive the training sets and the train_* eval
+    # sets. When --sets asks for none of them it is pure cost -- minutes of IO
+    # and gigabytes resident -- so it is skipped. A stratified selection always
+    # needs it.
+    _wants_training_rows = (
+        args.selected_sets is None
+        or bool(args.strat_sizes)
+        or any(name.startswith("train_") for name in args.selected_sets)
+    )
+    if (not args.skip_subsets or not args.skip_caches) and _wants_training_rows:
         _logger.info("reading %s", args.training_csv)
         smiles, targets, fidelities = read_training_targets(args.training_csv)
         _logger.info("read %d training rows", len(smiles))
@@ -976,12 +1029,20 @@ def main(argv: Sequence[str] | None = None) -> None:
     for spec in (
         *eval_set_specs(
             val_csv=args.val_csv,
+            val_screen_csv=args.val_screen_csv,
             gp_molformer_csv=args.gp_molformer_csv,
             ampc_331k_csv=args.ampc_331k_csv,
             olivier_csv=args.olivier_csv,
         ),
         *parse_extra_sets(args.extra_set),
     ):
+        # Filtered HERE rather than after resolution: resolve_set opens the
+        # spec's source, so a run that wants one set must not be killed by
+        # another set's CSV being absent. Several built-in sources exist only on
+        # the cluster the sets were first prepared on.
+        if args.selected_sets is not None and spec.name not in args.selected_sets:
+            _logger.info("skipping %s: not in --sets", spec.name)
+            continue
         resolved_sets.append(resolve_set(spec))
         _logger.info("resolved %s: %d rows", spec.name, len(resolved_sets[-1].smiles))
 

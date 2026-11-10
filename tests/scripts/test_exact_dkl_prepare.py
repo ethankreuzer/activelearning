@@ -273,24 +273,33 @@ def test_incomplete_cache_is_not_treated_as_current(tmp_path: Path) -> None:
     assert prep.cache_is_current(cache_path, resolved) is False
 
 
-def test_eval_set_specs_cover_the_four_standalone_sets(tmp_path: Path) -> None:
-    """The training sets come from the 10M set; these four come from their own files."""
+def test_eval_set_specs_cover_the_standalone_sets(tmp_path: Path) -> None:
+    """The training sets come from the 10M set; these come from their own files."""
     specs = prep.eval_set_specs(
         val_csv=tmp_path / "val.csv",
+        val_screen_csv=tmp_path / "val_screen.csv",
         gp_molformer_csv=tmp_path / "gen.csv",
         ampc_331k_csv=tmp_path / "331k.csv",
         olivier_csv=tmp_path / "olivier.csv",
     )
     assert [spec.name for spec in specs] == [
+        "ampc_val_screen_232k",
         "val_set",
         "gp_molformer_set",
         "olivier_invitro",
         "ampc_331k",
     ]
     by_name = {spec.name: spec for spec in specs}
+    # The validation screen carries ipw through as `weight`; without it every
+    # population-level metric on it would describe the enriched sample only.
+    assert by_name["ampc_val_screen_232k"].label_column == "y"
+    assert by_name["ampc_val_screen_232k"].extra_columns == ("weight",)
     assert by_name["val_set"].extra_columns == ("weight",)
     assert by_name["gp_molformer_set"].docked_sa_filter is True
-    assert by_name["olivier_invitro"].label_column is None
+    # olivier_invitro became a labelled set on 2026-11-09: its DOCK scores
+    # through the 1p7b table and the fitted curves. It was label_column=None
+    # only while the broken full_scores.df was the sole stage-1 table.
+    assert by_name["olivier_invitro"].label_column == "y"
 
 
 def test_train_sizes_must_fit_inside_the_top_selection() -> None:
