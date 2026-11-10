@@ -261,6 +261,7 @@ class VariationalGPSurrogate(BoTorchGPSurrogate):
         ard: bool = True,
         lengthscale_prior: bool = False,
         noise_prior: bool = False,
+        noise_floor: float | None = None,
         prior_mean: float | None = None,
         scale_inputs: bool = False,
         state_path: Path | str | None = None,
@@ -306,6 +307,16 @@ class VariationalGPSurrogate(BoTorchGPSurrogate):
             Whether the noise takes BoTorch's ``LogNormal(-4, 1)`` prior, its
             ``1e-4`` floor and its starting point at the prior's mode. ``False``
             keeps the historical prior-free noise started at 0.1.
+        noise_floor : float, optional
+            Lower bound on the observation-noise VARIANCE, on the original target
+            scale. It is converted with each fit's output standardization, as
+            ``prior_mean`` is, so it means the same value whatever the training
+            targets. Meant for the variance the features cannot explain (e.g. a
+            nearest-neighbour Gamma-test estimate): under
+            ``PredictiveLogLikelihood`` the noise otherwise collapses towards
+            zero and that variance is absorbed into the latent variance the
+            acquisition reads. Replaces the ``1e-4`` floor when larger. ``None``
+            keeps the existing floor.
         prior_mean : float, optional
             Constant mean pinned on the original target scale and excluded from
             training. It is converted with each fit's output standardization, so
@@ -336,6 +347,8 @@ class VariationalGPSurrogate(BoTorchGPSurrogate):
                 "ard=False, lengthscale_prior, noise_prior, prior_mean and "
                 "scale_inputs are single-fidelity only."
             )
+        if noise_floor is not None and not noise_floor > 0.0:
+            raise ValueError(f"noise_floor must be positive, got {noise_floor}.")
         if encoder.feature_dim < 1:
             raise ValueError("encoder.feature_dim must be positive.")
         if num_inducing < 1:
@@ -366,6 +379,7 @@ class VariationalGPSurrogate(BoTorchGPSurrogate):
         self._ard = ard
         self._lengthscale_prior = lengthscale_prior
         self._noise_prior = noise_prior
+        self._noise_floor = None if noise_floor is None else float(noise_floor)
         self._prior_mean = None if prior_mean is None else float(prior_mean)
         self._scale_inputs = scale_inputs
         self._input_offset: torch.Tensor | None = None
@@ -951,15 +965,32 @@ class VariationalGPSurrogate(BoTorchGPSurrogate):
         because L-BFGS-B enforces it as a bound; here it keeps gpytorch's
         softplus so Adam stays above it.
         """
+        floor = self._standardized_noise_floor()
         if not self._noise_prior:
-            return gpytorch.likelihoods.GaussianLikelihood()
+            if floor is None:
+                return gpytorch.likelihoods.GaussianLikelihood()
+            # The start value is set by _remove_noise_prior, above the floor.
+            return gpytorch.likelihoods.GaussianLikelihood(
+                noise_constraint=GreaterThan(floor)
+            )
         prior = LogNormalPrior(loc=-4.0, scale=1.0)
+        lower = MIN_INFERRED_NOISE_LEVEL if floor is None else max(
+            floor, MIN_INFERRED_NOISE_LEVEL
+        )
         likelihood = gpytorch.likelihoods.GaussianLikelihood(
             noise_prior=prior,
-            noise_constraint=GreaterThan(MIN_INFERRED_NOISE_LEVEL),
+            noise_constraint=GreaterThan(lower),
         )
-        likelihood.noise = prior.mode
+        # The constraint is floor + softplus(raw), so the start must sit strictly
+        # above the floor; the prior's mode (~6.7e-3) can lie below it.
+        likelihood.noise = max(float(prior.mode), 1.1 * lower)
         return likelihood
+
+    def _standardized_noise_floor(self) -> float | None:
+        """Return ``noise_floor`` on the standardized scale the GP trains on."""
+        if self._noise_floor is None:
+            return None
+        return self._noise_floor / (self._y_std**2)
 
     def _fix_prior_mean(self, prior_mean: float) -> None:
         """Pin the constant mean at ``prior_mean`` and exclude it from training.
@@ -1237,5 +1268,6 @@ class VariationalGPSurrogate(BoTorchGPSurrogate):
         assert self._likelihood is not None
         noise_covar = self._likelihood.noise_covar
         noise_covar._priors.pop("noise_prior", None)
+        floor = self._standardized_noise_floor()
         with torch.no_grad():
-            noise_covar.noise = 0.1
+            noise_covar.noise = 0.1 if floor is None else max(0.1, 1.1 * floor)

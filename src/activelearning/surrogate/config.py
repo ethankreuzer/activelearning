@@ -502,6 +502,9 @@ class VariationalGPSurrogateConfig(BaseModel):
     ard: bool = True
     lengthscale_prior: bool = False
     noise_prior: bool = False
+    # Lower bound on the noise variance, original target scale; see
+    # VariationalGPSurrogate.noise_floor.
+    noise_floor: float | None = Field(default=None, gt=0.0)
     prior_mean: float | None = None
     scale_inputs: bool = False
     # A saved fit restored in place of every fit, as for
@@ -562,6 +565,7 @@ class VariationalGPSurrogateConfig(BaseModel):
             ard=self.ard,
             lengthscale_prior=self.lengthscale_prior,
             noise_prior=self.noise_prior,
+            noise_floor=self.noise_floor,
             prior_mean=self.prior_mean,
             scale_inputs=self.scale_inputs,
             state_path=self.state_path,

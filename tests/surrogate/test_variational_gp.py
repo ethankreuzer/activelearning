@@ -484,6 +484,45 @@ def test_variational_gp_borrowed_settings_build_the_exact_gp_model() -> None:
     assert hyperparameters["lengthscale_dims"] == 1.0
 
 
+@pytest.mark.parametrize("noise_prior", [True, False])
+def test_variational_gp_noise_floor_holds_on_the_original_scale(
+    noise_prior: bool,
+) -> None:
+    """PLL's noise stays at or above the floor, converted by the target scale."""
+    torch.manual_seed(0)
+    training = _training().model_copy(
+        update={"variational_objective": "PredictiveLogLikelihood"}
+    )
+    floor = 0.3
+    surrogate = VariationalGPSurrogate(
+        encoder=_NumericFixedEncoder(),
+        training_params=training,
+        num_inducing=4,
+        noise_prior=noise_prior,
+        noise_floor=floor,
+    )
+    observations = _grid_observations()
+    surrogate.fit(observations)
+
+    assert surrogate._likelihood is not None
+    y_var = float(torch.tensor([o.y for o in observations]).var())
+    standardized_floor = floor / y_var
+    assert float(surrogate._likelihood.noise) >= standardized_floor * (1 - 1e-5)
+    hyperparameters = gp_hyperparameters(surrogate)
+    assert hyperparameters["noise"] >= standardized_floor * (1 - 1e-5)
+
+
+def test_variational_gp_noise_floor_must_be_positive() -> None:
+    """A zero or negative floor is rejected."""
+    with pytest.raises(ValueError, match="noise_floor"):
+        VariationalGPSurrogate(
+            encoder=_NumericFixedEncoder(),
+            training_params=_training(),
+            num_inducing=4,
+            noise_floor=0.0,
+        )
+
+
 def test_variational_gp_default_kernel_is_unchanged() -> None:
     """Without the borrowed settings the kernel stays ARD, prior-free, at sqrt(d)."""
     surrogate = VariationalGPSurrogate(
