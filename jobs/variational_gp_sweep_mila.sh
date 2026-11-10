@@ -91,27 +91,36 @@
 # it at the ~1 GB that 256 candidates take at M = 1024, which peaked at 10.7 GB
 # allocated on the 300k scaling arm.
 #
-# RESOURCES. The fit is a 4096 x 1024 cross-covariance per step regardless of
-# size, so fit cost scales with the step count alone and is the same in all
-# twelve arms; memory and wall time are dominated by GIBBON scoring on the
-# 83,811-molecule prior set. The balanced arms took 7-8 minutes; the 300k
-# scaling arms ran in ~25. 3 hours and 32G leave ample room.
+# RESOURCES, all MEASURED on the 2026-11-10 pilot's stage_profile.csv rather
+# than inherited: GPU peak 12.74 GiB reserved, host RSS peak 2.05 GiB, run
+# 8.1 min at 2,500 steps and 10.4 min at 10,000. The fit is a 4096 x 1024
+# cross-covariance per step regardless of training size, so an arm's cost is set
+# by its AXIS-4 step level and nothing else; wall time is dominated by GIBBON on
+# the 83,811-molecule prior set and the 45,850-row validation slice, which are
+# the same in every arm.
 #
-# l40s explicitly: the fit is plain float32 (no TF32), where an L40S (~90
-# TFLOPS) is about five times an RTX 8000 and faster than an A100, and Mila has
-# ~90 L40S nodes. An untyped request lands on whichever card is free first,
-# usually an RTX 8000.
+# main, NOT unkillable, and mem=24G is the reason. The per-user QOS caps are
+# cpu=8 / mem=48G / gpu=2, so 48/24 = 2 and 8/4 = 2 both land exactly on the GPU
+# cap: TWO ARMS RUN AT ONCE, as the exact sweep's six did. The older
+# variational_gp_scaling_mila.sh asked 32G, which is 16x the measured 2.05 GiB
+# and would have allowed only one arm; unkillable caps at 1 GPU and would also
+# have serialized the grid. At 2 at a time, 48 arms is ~3.6 h.
 #
-# unkillable rather than main: a preempted arm would be requeued onto an output
-# directory that already holds its state, which the script refuses to reuse.
-# Note the per-user cap -- 6 CPU / 32G / 1 GPU -- means arms run ONE AT A TIME
-# on this partition. For the full twelve, PARTITION=main gives cpu=8 / mem=48G /
-# gpu=2, so two arms at once at 24G each, at the risk of preemption.
-#SBATCH --partition=unkillable
-#SBATCH --gres=gpu:l40s:1
+# VRAM is not the binding constraint at all: 12.74 GiB fits every card Mila has,
+# including a 24 GB one. l40s is requested for SPEED -- the fit is plain float32
+# (no TF32), where an L40S (~90 TFLOPS) is about five times an RTX 8000 and
+# faster than an A100, and an untyped request lands on whichever card is free
+# first, usually an RTX 8000. If l40s is backed up, override on the submit line
+# itself: sbatch --gres=gpu:a100:1 jobs/variational_gp_sweep_mila.sh pll on 2500
+#
+# The cost of main over unkillable is preemption: a preempted arm requeues onto
+# an output directory that already holds its state, which the script refuses to
+# reuse. Re-submit that arm rather than passing --overwrite blindly.
+#SBATCH --partition=main
+#SBATCH --gres=gpu:l40s:1   # 12.74 GiB measured peak; override on the submit line
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=32G
-#SBATCH --time=3:00:00
+#SBATCH --mem=24G
+#SBATCH --time=2:00:00
 #SBATCH --job-name=variational_gp_sweep
 #SBATCH --output=slurm_logs/variational_gp_sweep_%j.out
 #SBATCH --error=slurm_logs/variational_gp_sweep_%j.err
