@@ -1,6 +1,9 @@
 # The exact GP sweep: BoTorch's exact GP on the frozen MiniMol AmpC
-# fingerprints, fitted to the 25,000-molecule svgpscale set, with ONE axis --
-# whether the lengthscale carries BoTorch's dimension-scaled LogNormal prior.
+# fingerprints, fitted to the 20,000-molecule svgpscale set.
+#
+# THE TRAINING SIZE IS 20,000, the smallest arm of the svgpscale ladder. The two
+# paths below are the only size-dependent settings; jobs/exact_gp_sweep_mila.sh
+# overrides both from SIZE, so another arm of the ladder needs no edit here.
 #
 # TWO AXES, FULLY CROSSED: 2 x 3 = SIX ARMS. Everything not named here is
 # pinned across every arm, so a contrast is attributable to the axes and
@@ -67,7 +70,7 @@ runtime:
   # WHY, and what the risk is. The fp64 full fit (Nibi job 24352820) was
   # cancelled at 1 h 55 min after ~4,400 objective evaluations, ~1.5 s each, and
   # was STILL far from converging; it peaked at 38.8 GB. fp64 does not converge
-  # in feasible wall-clock at n=25,000. The fp32 full fit (job 24352829) did
+  # in feasible wall-clock at this n. The fp32 full fit (job 24352829) did
   # report convergence after 94 steps / 164 evaluations, which is a FALSE
   # convergence -- but that run was ard=true, and its degeneracy was 512
   # lengthscales collapsing with the minimum pinned at the 0.025 bound and ~32
@@ -78,7 +81,7 @@ runtime:
   # trustworthy at this precision. JUDGE EACH FIT ON ITS LOSS TRACE, not on the
   # status flag -- and note this is what makes accept_abnormal_lbfgsb below
   # load-bearing rather than precautionary. Watch also for psd_safe_cholesky
-  # jitter escalation: one 25,000 x 25,000 Cholesky is ~2.5 GB in fp32, cheap,
+  # jitter escalation: one 20,000 x 20,000 Cholesky is ~1.5 GB in fp32, cheap,
   # but a Matern over 512-d fingerprints is where fp32 jitter starts to bite.
   #
   # A reward-shape arm restoring this state must also run at 32.
@@ -88,15 +91,21 @@ runtime:
 dataset:
   type: ListDataset
   initial_data:
-    # Built 2026-11-09 by jobs/build_svgp_scaling_sets_mila.sh (job 11616447)
+    # Built 2026-11-10 by jobs/build_svgp_scaling_sets_mila.sh (job 11627959)
     # from the CORRECTED 10M library, with bands cut on pProp in uniform
-    # 0.5-wide steps. n=25,000: mean(y) 0.10886673, var(y) 0.014415757.
+    # 0.5-wide steps. n=20,000: mean(y) 0.11866336, var(y) 0.016138535,
+    # sd 0.12703753. It is the innermost arm of a five-arm nested ladder, so it
+    # is a subset of the 25,000 / 50,000 / 100,000 / 300,000 sets.
+    #
+    # It keeps the whole pProp >= 3.5 tail (3,654 rows) like every arm, so its
+    # mean y is HIGHER than the 25,000 set's 0.10886673: the same tail over
+    # fewer bulk molecules.
     #
     # NOT data/ampc_balanced_25000.csv, which stratifies on quantiles of the
     # OLD, wrong y -- a biased SELECTION, not just stale labels, recorded as
     # skip_selection_biased in the relabel manifest and unfixable by
     # relabelling.
-    path: data/ampc_svgpscale_25000.csv
+    path: data/ampc_svgpscale_20000.csv
     x_columns: SMILE
     y_column: y
     fidelity_column: fidelity
@@ -115,7 +124,7 @@ surrogate:
     # A cache miss is a loud error rather than hours of silent MiniMol
     # inference, which would destroy the timing measurement.
     cache_only: true
-    feature_cache_path: cache/ampc/exact_dkl_top_n/svgpscale_25000.npy
+    feature_cache_path: cache/ampc/exact_dkl_top_n/svgpscale_20000.npy
   # THE AXIS. true here; the PRIOR=off arm overrides it to false. See the
   # header for what the two arms differ in, and the module docstring of
   # surrogate/fixed_feature_gp.py for the two asymmetries that follow -- the
@@ -144,7 +153,7 @@ surrogate:
   #
   # WHY THIS IS AN AXIS AND NOT A FIXED CHOICE. What the kernel fits is the
   # residual y - m(X), so a mean pinned 25x below the training targets' own mean
-  # leaves every one of the 25,000 residuals shifted the same way: on the
+  # leaves every one of the 20,000 residuals shifted the same way: on the
   # standardized scale the pinned mean sits at (0.0042864 - 0.1088667) /
   # 0.1200656 = -0.871, so the kernel must explain a constant +0.871 sigma
   # offset across every training point. A stationary zero-mean kernel can only
@@ -172,7 +181,8 @@ surrogate:
   # Makes the hyperparameters dimensionless; prior_mean and any noise bound are
   # converted through the same transform automatically.
   standardize_outputs: true
-  # Must exceed n = 25,000. Above GPyTorch's 800-row default the marginal
+  # Must exceed n (20,000 here; 30000 also covers the 25,000 arm). Above
+  # GPyTorch's 800-row default the marginal
   # likelihood becomes a conjugate-gradient/Lanczos STOCHASTIC estimate, and
   # L-BFGS-B's line search assumes a deterministic objective. At precision 32
   # this matters MORE, not less: a stochastic objective and a precision-limited
@@ -190,12 +200,13 @@ acquisition:
   #
   # NOTE on cost at this n, before anything is scored: GIBBON's posterior
   # carries a copy of all n training inputs per batch element, chunk x (n+1) x
-  # 512 x 4 bytes at precision 32. At n=25,000 ONE candidate row is 51 MB (it
+  # 512 x 4 bytes at precision 32. At n=20,000 ONE candidate row is 39 MB (51 MB
+  # at n=25,000, where chunk 128 was measured, so 128 is conservative here) (it
   # would be 102 MB in float64), so the 128 that was right for n=2000 would be
   # ~6.5 TB. score_chunk_size must be set from a measurement, not inherited.
   type: QLowerBoundMaxValueEntropy
   candidate_set_spec:
-    # The support for max-value sampling. At n=25,000 the training set is the
+    # The support for max-value sampling. At this n the training set is the
     # support and the fallback never triggers.
     type: TrainDataCandidateSetSpec
     fallback_size: 100000
@@ -253,5 +264,5 @@ logger:
   # Stripped by the script, which builds its own run logger from the
   # --wandb-* flags.
   type: ConsoleLogger
-  project_name: ampc-exact-gp-25k
-  run_name: exact-gp-25k
+  project_name: ampc-exact-gp-sweep
+  run_name: exact-gp-sweep

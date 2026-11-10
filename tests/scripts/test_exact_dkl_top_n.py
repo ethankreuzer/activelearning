@@ -598,6 +598,9 @@ def test_run_configuration_identifies_the_gp_on_flat_keys() -> None:
         args,
         {
             "runtime": {"device": "cuda", "precision": 32, "seed": 42},
+            "dataset": {
+                "initial_data": {"path": "data/ampc_svgpscale_20000.csv"}
+            },
             "surrogate": surrogate,
             "acquisition": {"type": arm.GIBBON_TYPE},
         },
@@ -607,6 +610,10 @@ def test_run_configuration_identifies_the_gp_on_flat_keys() -> None:
         set_sizes={},
     )
 
+    # The training set itself, flat: the ladder is nested, so n_train alone
+    # would not say which set.
+    assert config["train_csv"] == "data/ampc_svgpscale_20000.csv"
+    assert config["n_train"] == 25000
     # Both swept axes, flat.
     assert config["lengthscale_prior"] is True
     assert config["constant_kernel"] is True

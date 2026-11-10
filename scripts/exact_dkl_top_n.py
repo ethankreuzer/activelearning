@@ -1117,8 +1117,17 @@ def run_configuration(
     training = dict(surrogate.get("training_params", {}))
     runtime = dict(resolved.get("runtime", {}))
     acquisition = dict(resolved.get("acquisition", {}))
+    dataset = dict(resolved.get("dataset", {}))
+    initial_data = dict(dataset.get("initial_data", {}))
     return {
         "n_train": n_train,
+        # Flat, beside n_train: WHICH training set, not just how many rows of it.
+        # The svgpscale arms are nested, so two sizes are not two samples but a
+        # set and its subset, and n_train alone would leave a run's training data
+        # identified only inside `effective`.
+        "train_csv": (
+            None if initial_data.get("path") is None else str(initial_data["path"])
+        ),
         "acquisition_type": acquisition_type,
         "scorings": ",".join(scoring.name for scoring in scorings),
         "surrogate_type": surrogate.get("type"),
