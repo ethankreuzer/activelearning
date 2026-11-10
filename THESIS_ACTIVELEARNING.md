@@ -527,7 +527,7 @@ else. Grouped by what each setting controls.
 | setting | value | why |
 |---|---|---|
 | surrogate | `FixedFeatureGPSurrogate` | see "Model" above: `ExactDKLSurrogate` hard-codes everything worth sweeping |
-| training set | `data/ampc_svgpscale_25000.csv` | built 2026-11-09, job 11616447, from the CORRECTED library with bands cut on pProp in uniform 0.5-wide steps. **mean(y) 0.10886673, var(y) 0.014415757, sd 0.12006564** |
+| training set | `data/ampc_svgpscale_25000.csv` | built 2026-11-09 (job 11616447), rebuilt 2026-11-10 (job 11627959) BIT-IDENTICAL -- see "The svgpscale ladder" below -- from the CORRECTED library with bands cut on pProp in uniform 0.5-wide steps. **mean(y) 0.10886673, var(y) 0.014415757, sd 0.12006564** |
 | n (training) | **25,000** | a HARDWARE bound, not a modelling choice: 38.8 GB measured peak against an L40S's 48 GB, and n=40,000 needs ~48 GiB. This is also what forces a library-mean prior -- a tail-enriched 25k out of 10M is not the library |
 | encoder | `MiniMolAmpcSmilesFixedEncoder`, `cache_only: true` | FROZEN fingerprints, no trainable layer. `cache_only` makes a cache miss a loud error instead of hours of silent MiniMol inference, which would destroy the timing measurement |
 | feature cache | `cache/ampc/exact_dkl_top_n/svgpscale_25000.npy` | written by the same build job; its `.npy.json` hashes the ordered SMILES |
@@ -835,6 +835,55 @@ dropped only keys that repeat a key that remains (`<set>_unseen/*` where
 monotonicity), are constant by construction (`gibbon_log/fraction_zero` = 1.0), or
 live in `stage_profile.csv` (six of eight `run/stage/*` fields). **Job 11620200
 predates the trim and carries the wider key set.**
+
+### The svgpscale ladder, and why a 20k could be added without disturbing it (2026-11-10)
+
+The ladder is now **five nested arms**, `data/ampc_svgpscale_{20000,25000,50000,100000,300000}.csv`,
+built by job 11627959 in 4 min 37 s. `20000` was added after the fact, and the four
+that already existed came back **byte-for-byte identical** -- all 12 files (CSV, `.npy`,
+`.npy.json`) verified by md5 against a manifest taken before the rebuild.
+
+**A smaller arm cannot be carved out of a larger one's CSV, but adding one costs
+nothing.** Both halves of that matter:
+
+- **Not post hoc.** Nesting is a PREFIX property of the greedy farthest-point order,
+  and that order is discarded on write: `stratified_fps.py` returns each arm as
+  `rows[np.lexsort((rows, -values[rows]))]`, i.e. sorted by descending pProp. The CSV
+  therefore records WHICH molecules, never the order they were chosen in, so the
+  "first 2,336 of band 0" that a 20k needs is unrecoverable from the 25k file.
+- **But re-running is non-destructive.** `requested = sorted(sizes)` and
+  `max_budgets = budgets[requested[-1]]`, so the candidate pools are sized by the
+  LARGEST arm alone; with 300,000 still largest and `seed=42`, every band's pool,
+  greedy order and per-arm prefix are unchanged. Adding a SMALLER arm is free. Adding
+  a larger one would not be -- it would redraw every pool and change all the others.
+
+`allocate_band_budgets` gives n=20,000 `[2336, 2335 x 6]` on the seven filler bands
+against the 300k's `[52737, ...]`, so the nesting guard at `stratified_fps.py:657`
+(which raises if any band's budget exceeds the largest arm's) passes with room.
+Verified on the files: **20k subset of 25k subset of 50k subset of 100k subset of
+300k, zero molecules missing at every step.**
+
+The 20k arm: 20,000 rows, 19,999 distinct SMILES, mean(y) 0.11866336, and the whole
+pProp >= 3.5 tail (3,654 rows) kept as every arm does.
+
+Two quirks of the ladder, both pre-existing and both expected:
+
+- **The arms carry a few duplicate SMILES** -- 19,999 distinct of 20,000, 24,999 of
+  25,000, 299,958 of 300,000. Harmless to a fit, but a table claiming "n = 300,000
+  molecules" is reporting 299,958 distinct ones.
+- **3,653 rows have `y >= 0.26175` while `n_kept` is 3,654.** Not an off-by-one: the
+  kept band is cut on `pProp >= 3.5` and y is NOT monotone in pProp above the peak at
+  6.32, so one very-high-pProp molecule sits below the y-equivalent threshold. The
+  count is 3,653 in every arm, which is what makes it a property of the band rather
+  than of any one arm -- and it is the same non-monotonicity that is the reason the
+  bands are cut on pProp instead of y.
+
+The pre-rebuild copies are in `backup/svgpscale_prerebuild_20261110/` with their
+manifest. They are redundant now that the md5s match and can be deleted. NOTE: they
+are deliberately NOT under the `_OLD_YBANDS` suffix the build job's error message
+suggests -- `_OLD_YBANDS` files already exist for 50k/100k/300k and are the genuinely
+superseded y-banded sets, so following that message would have overwritten real
+history with identical copies of the current files.
 
 ### Why the balanced sets cannot be reused
 

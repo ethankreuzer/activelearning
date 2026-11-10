@@ -359,3 +359,7 @@ slurm_logs/
 minimol_ampc_encoder/
 analyze_archive_diversity/
 analyze_scored_samples_csv/
+
+# Pre-rebuild copies of regenerated datasets; large, and reproducible by re-running
+# the build job. See THESIS_ACTIVELEARNING.md "The svgpscale ladder".
+backup/

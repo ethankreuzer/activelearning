@@ -4,10 +4,24 @@
 #
 #   SIZES=25000 sbatch jobs/build_svgp_scaling_sets_mila.sh          # the exact GP's set
 #   SIZES="50000 100000 300000" sbatch jobs/build_svgp_scaling_sets_mila.sh
-#   sbatch jobs/build_svgp_scaling_sets_mila.sh                      # all four, nested
+#   sbatch jobs/build_svgp_scaling_sets_mila.sh                      # all five, nested
 #
 # 25,000 is the exact GP's training size: its fit is an exact Cholesky, which at
 # n=25,000 peaked at 38.8 GB of an L40S's 48 GB, and n=40,000 would need ~48 GiB.
+#
+# ADDING AN ARM SMALLER THAN THE LARGEST IS FREE, and 20,000 was added this way
+# on 2026-11-10 (job 11627959, 4 min 37 s for all five). The pools are sized by
+# `budgets[requested[-1]]`, the LARGEST arm, so re-running with a smaller size
+# appended leaves every other arm's pool, greedy order and prefix untouched: the
+# four arms that already existed came back byte-for-byte identical, verified by
+# md5. A LARGER arm is a different matter -- it redraws every pool and changes
+# every existing set.
+#
+# What you cannot do is carve the new arm out of an existing CSV. The written
+# file is sorted by descending pProp (`rows[np.lexsort((rows, -values[rows]))]`),
+# so it records WHICH molecules were selected and not the greedy order a prefix
+# would need. Re-run the build instead; back the old arms up first, because the
+# builder refuses to overwrite, and see the warning on the suffix below.
 #
 # NESTING, and what splitting this job costs. Within ONE job the arms are
 # nested -- a single farthest-point pass per band, sized for the largest arm,
@@ -78,7 +92,7 @@ cd "${HOME}/activelearning"
 
 # Which arms to build. Space-separated, passed through to --sizes. See the
 # nesting note above before splitting a build across jobs.
-SIZES="${SIZES:-25000 50000 100000 300000}"
+SIZES="${SIZES:-20000 25000 50000 100000 300000}"
 for size in ${SIZES}; do
   if [[ ! "${size}" =~ ^[1-9][0-9]*$ ]]; then
     echo "SIZES must be positive integers; got '${SIZES}'." >&2
@@ -137,7 +151,16 @@ for size in ${SIZES}; do
     "data/ampc_svgpscale_${size}.csv"
   do
     if [[ -e "${guarded}" ]]; then
-      echo "${guarded} already exists. Back the old arm up first:" >&2
+      echo "${guarded} already exists. Back the old arm up first." >&2
+      echo >&2
+      echo "WARNING: _OLD_YBANDS files ALREADY EXIST for 50k/100k/300k and are" >&2
+      echo "the genuinely superseded y-banded sets. Use that suffix only if you" >&2
+      echo "are replacing a y-banded arm; to re-run the CURRENT recipe (e.g. to" >&2
+      echo "append a smaller size), move the files to a dated directory instead," >&2
+      echo "as backup/svgpscale_prerebuild_20261110/ does, or you will overwrite" >&2
+      echo "real history with identical copies of the current files." >&2
+      echo >&2
+      echo "Replacing a y-banded arm:" >&2
       echo "  mv data/ampc_svgpscale_${size}.csv data/ampc_svgpscale_${size}_OLD_YBANDS.csv" >&2
       echo "  for ext in npy npy.json; do" >&2
       echo "    mv cache/ampc/exact_dkl_top_n/svgpscale_${size}.\${ext} \\" >&2
