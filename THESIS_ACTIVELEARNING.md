@@ -500,11 +500,101 @@ the training set is not.
 
 **The hyperparameters and the axes are SETTLED** (2026-11-09, with the user) and are
 documented below as two tables: everything held fixed across all six arms, then the two
-axes being swept. Nothing has been launched.
+axes being swept.
 
-**What is still open, and was deferred explicitly:** what is logged, and what is run on
-the held-out sets. No job script exists for these arms yet. See "Still open" at the end
-of this section -- a later session must not read the settled tables as covering that.
+~~Nothing has been launched. What is still open: what is logged, and what is run on the
+held-out sets. No job script exists for these arms yet.~~ **ALL SIX ARMS RAN
+2026-11-10 at n=20,000** (jobs 11628247-11628252, 5-6 min each) and the sweep is
+DECIDED. See the next subsection. The tables below are the design as run.
+
+### RESULT: `on_pinned` is the config the 10-round AL run uses (2026-11-10)
+
+**DECISION: the 10-round active-learning run uses the `on_pinned` arm** --
+`lengthscale_prior=true`, the constant mean PINNED at the library mean 0.0042864189360438442,
+`constant_kernel=false`. That is `config/ampc/exact_gp_sweep.yaml` exactly as written,
+with no override beyond the training size.
+
+All six arms ran at n=20,000, all six converged (L-BFGS-B SUCCESS, 41-78 evaluations),
+all six synced to W&B project `ExactGP_thesis`, group `exact-gp-n20000`.
+
+| arm | job | W&B |
+|---|---|---|
+| `n20000_on_pinned` | 11628247 | `0br6t9mz` |
+| `n20000_on_learned` | 11628248 | `kw2x7jxt` |
+| `n20000_on_constant` | 11628249 | `prsumom4` |
+| `n20000_off_pinned` | 11628250 | `vkfboxp0` |
+| `n20000_off_learned` | 11628251 | `wbzrddm1` |
+| `n20000_off_constant` | 11628252 | `xfojyr8j` |
+
+**AXIS 2 HAS NO MEASURABLE EFFECT.** Its whole spread is 16-89x SMALLER than the axis-1
+gap on every endpoint, and the final losses within the prior-on group (0.73425 / 0.73420
+/ 0.73430) differ by an order of magnitude LESS than the recorded seed noise of 4e-4.
+This answers the question the axis was added for: the pinned library mean costs nothing,
+so pinning is free.
+
+| endpoint | axis-2 spread | axis-1 gap | ratio |
+|---|---|---|---|
+| val `pearson` | 0.0004 | 0.0165 | 43x |
+| val `weighted_pearson` | 0.0015 | 0.1013 | 39x |
+| val `latent_variance_ratio` | 0.32 | 15.54 | 16x |
+| gpmol GIBBON `effective_support` | 0.011 | 0.96 | 89x |
+| olivier `spearman_y` | 0.0003 | 0.0171 | 67x |
+
+**AXIS 1 IS A TRADEOFF, AND THE ACQUISITION DECIDES IT.** `off` predicts BETTER on the
+validation set -- pearson 0.842 vs 0.825, weighted_pearson 0.372 vs 0.272, rmse 0.095 vs
+0.101, nll -0.67 vs -0.48, top1pct 0.256 vs 0.243 -- and is far worse at everything the
+acquisition consumes:
+
+| | `on` | `off` |
+|---|---|---|
+| val `latent_variance_ratio` (1.0 ideal) | 10.8 | 26.4 |
+| val `latent_coverage_1std` (0.68 ideal) | 0.215 | 0.133 |
+| olivier `latent_variance_ratio` | 49 | 134 |
+| gpmol GIBBON `n_mass90` | 2 | **1** |
+| gpmol GIBBON `entropy_nats` | 0.671 | **0.000** |
+| gpmol GIBBON `effective_support` | 1.96 | 1.00 |
+| olivier GIBBON `effective_support` | 16.2 | 3.6 |
+| median log GIBBON, gpmol | -148 | -452 |
+| gpmol acquisition `spearman_y` | +0.134 | **-0.057** |
+
+`n_mass90 = 1` at zero entropy means ONE molecule of 83,811 holds 90% of the acquisition
+mass. A 64-molecule batch would be one informative pick and 63 arbitrary ones, so the
+prior-off arms are unusable for AL whatever their pointwise accuracy.
+
+**The mechanism is in the hyperparameters.** Without the prior the fit lands in a
+degenerate corner: lengthscale **19.2** against 2.75, outputscale **18.2** against 0.18,
+signal-to-noise **84** against 1.07. A near-constant kernel with enormous amplitude is a
+global linear fit -- accurate pointwise, but with almost no VARIATION in latent variance
+for GIBBON to rank on. It also predicts bad behaviour on generated molecules, since
+outputscale 18.2 is a huge prior variance far from the data, which is the same mechanism
+as the deep-floor validity collapse in the reward-shape arms.
+
+**Why `pinned` and not the other two, given axis 2 is a tie.** Decided on ROUND-TO-ROUND
+STABILITY, which a single-round sweep cannot measure and which a 10-round run turns on:
+
+- The pinned mean is a FIXED physical constant (the 10M library mean). Round 7's scores
+  are comparable with round 1's.
+- A learned mean is a moving target. AL adds hits every round, so the fitted mean (here
+  -1.157, in units of a training mean AND sd that both shift each round) climbs
+  monotonically and inflates predictions for unseen molecules exactly as the pool is
+  exhausted. Rounds stop being comparable.
+- `constant_kernel` adds a SECOND amplitude to the already-degenerate
+  (outputscale, lengthscale) ridge -- more freedom to drift across rounds, for wins that
+  live in the fourth decimal.
+
+**TWO CAVEATS that must travel with this decision.**
+
+1. **The losses are NOT comparable across axis 1.** With the prior on, the objective is
+   -(MLL + log p(lengthscale)), so `on`'s 0.734 against `off`'s 0.761 compares two
+   different functions; `off` may well have the better pure marginal likelihood, which
+   is consistent with it predicting better. The case for `on` rests on calibration and
+   the acquisition, NOT on the loss.
+2. **Every arm is still badly over-confident.** The best `latent_variance_ratio` is 10.8
+   where 1.0 is correct, and `latent_coverage_1std` is 0.215 against 0.68.
+   `olivier_invitro`'s `top1pct_overlap` is **0.000 in all six arms** -- none finds the
+   top 15 of 1,521 in vitro molecules. `on_pinned` is the best of six, not good in
+   absolute terms, and this is the same miscalibration the noise-floor work was chasing
+   on the SVGP. It is NOT fixed by this sweep and is the thing to carry into section 5.
 
 ### Model: `FixedFeatureGPSurrogate`
 
