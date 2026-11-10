@@ -569,6 +569,81 @@ def test_run_configuration_records_the_cost_confounders() -> None:
     assert isinstance(config["argv"], str)
 
 
+def test_run_configuration_identifies_the_gp_on_flat_keys() -> None:
+    """Every setting that defines the GP must be filterable, not only nested.
+
+    These runs are the thesis's, so a W&B run has to identify its own GP without
+    opening ``resolved_config``: a nested key cannot be a runs-table column, a
+    filter, or a parallel-coordinates axis. ``constant_kernel`` is half of a
+    SWEPT axis, so its absence would make arms 3 and 6 indistinguishable from 1
+    and 4 in exactly the view the six arms are compared in.
+    """
+    args, _ = arm._parse_args(["--output-dir", "out", "cfg.yaml"])
+    surrogate = {
+        "type": arm.FIXED_FEATURE_GP_TYPE,
+        "ard": False,
+        "kernel": "matern",
+        "outputscale": True,
+        "lengthscale_prior": True,
+        "constant_kernel": True,
+        "prior_mean": 0.0042864189360438442,
+        "scale_inputs": True,
+        "standardize_outputs": True,
+        "max_cholesky_size": 30000,
+        "accept_abnormal_lbfgsb": True,
+        "fit_kwargs": {"optimizer_kwargs": {"options": {"maxfun": 50}}},
+        "encoder": {"type": "MiniMolAmpcSmilesFixedEncoder", "cache_only": True},
+    }
+    config = arm.run_configuration(
+        args,
+        {
+            "runtime": {"device": "cuda", "precision": 32, "seed": 42},
+            "surrogate": surrogate,
+            "acquisition": {"type": arm.GIBBON_TYPE},
+        },
+        n_train=25000,
+        acquisition_type=arm.GIBBON_TYPE,
+        scorings=arm.scoring_plan(arm.GIBBON_TYPE),
+        set_sizes={},
+    )
+
+    # Both swept axes, flat.
+    assert config["lengthscale_prior"] is True
+    assert config["constant_kernel"] is True
+    assert config["prior_mean"] == pytest.approx(0.0042864189360438442)
+    # The settings pinned across arms, flat, so a later reader never has to take
+    # the thesis's word for what was fixed.
+    assert config["ard"] is False
+    assert config["scale_inputs"] is True
+    assert config["standardize_outputs"] is True
+    assert config["kernel"] == "matern"
+    assert config["outputscale"] is True
+    assert config["max_cholesky_size"] == 30000
+    assert config["accept_abnormal_lbfgsb"] is True
+    assert config["runtime_precision"] == 32
+    assert config["runtime_seed"] == 42
+    # A capped fit is not the arm as designed, so the cap has to be visible.
+    assert "maxfun" in config["fit_kwargs"]
+
+
+def test_run_configuration_records_an_uncapped_fit_as_empty() -> None:
+    """No cap must read as 'no cap', not as a missing value."""
+    args, _ = arm._parse_args(["--output-dir", "out", "cfg.yaml"])
+    config = arm.run_configuration(
+        args,
+        {
+            "runtime": {},
+            "surrogate": {"type": arm.FIXED_FEATURE_GP_TYPE, "encoder": {}},
+            "acquisition": {"type": arm.GIBBON_TYPE},
+        },
+        n_train=25000,
+        acquisition_type=arm.GIBBON_TYPE,
+        scorings=arm.scoring_plan(arm.GIBBON_TYPE),
+        set_sizes={},
+    )
+    assert config["fit_kwargs"] == "{}"
+
+
 def test_in_training_mask_marks_exact_smiles_matches() -> None:
     """Matched on the string, the way the prep job counts overlap."""
     mask = arm.in_training_mask(("C0", "C1", "C2"), frozenset({"C1", "C9"}))

@@ -1145,6 +1145,20 @@ def run_configuration(
         "outputscale": surrogate.get("outputscale"),
         "lengthscale_prior": surrogate.get("lengthscale_prior"),
         "noise_prior": surrogate.get("noise_prior"),
+        # Flat, not only inside `resolved_config`, because this is one of the two
+        # SWEPT axes: with `prior_mean` it is what separates the pinned, learned
+        # and constant arms, and a nested key cannot be a column, a filter or a
+        # parallel-coordinates axis in the runs table where the six arms are
+        # compared.
+        "constant_kernel": surrogate.get("constant_kernel"),
+        # Fixed across the arms, but it decides whether an ABNORMAL L-BFGS-B exit
+        # is accepted as a fit or raised, so a run's convergence claim cannot be
+        # read without it.
+        "accept_abnormal_lbfgsb": surrogate.get("accept_abnormal_lbfgsb"),
+        # Empty unless MAXFUN capped the optimizer. A capped fit ends ABNORMAL by
+        # construction and is NOT the arm as designed, so the cap belongs with
+        # the settings that identify the fit rather than only in `argv`.
+        "fit_kwargs": json.dumps(surrogate.get("fit_kwargs") or {}, sort_keys=True),
         "num_mv_samples": acquisition.get("num_mv_samples"),
         "num_fantasies": acquisition.get("num_fantasies"),
         "num_y_samples": acquisition.get("num_y_samples"),
