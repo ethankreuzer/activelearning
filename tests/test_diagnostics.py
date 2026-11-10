@@ -111,9 +111,12 @@ def test_predict_pool_covers_every_candidate_across_chunks() -> None:
     predicted = predict_pool(surrogate, candidates, chunk_size=3)
 
     assert predicted is not None
-    means, _ = predicted
+    means, _, total_stds = predicted
     assert len(means) == len(candidates)
     assert means == predict_pool(surrogate, candidates, chunk_size=100)[0]
+    # DummyMeanSurrogate has no encode_candidates/predict_encoded, so the
+    # total column is absent rather than silently equal to the latent one.
+    assert total_stds is None
 
 
 def test_predict_pool_rejects_a_chunk_size_below_one() -> None:

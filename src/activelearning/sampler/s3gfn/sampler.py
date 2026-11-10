@@ -41,6 +41,8 @@ from activelearning.sampler.s3gfn.logging import (
     _RoundMetrics,
     write_pool_log,
     write_reject_log,
+    write_training_samples_log,
+    write_training_steps_log,
 )
 from activelearning.sampler.s3gfn.model import S3GFNModel, TrajectoryLoss
 from activelearning.sampler.s3gfn.replay_buffer import ReplayBuffer
@@ -168,6 +170,8 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
         reject_sample_size: int = 2000,
         reject_log_path: str | None = None,
         pool_log_path: str | None = None,
+        training_sample_log_path: str | None = None,
+        training_step_log_path: str | None = None,
         step_bin_size: int = 100,
         seed: int = 42,
     ) -> None:
@@ -411,6 +415,8 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
         self.reject_sample_size = reject_sample_size
         self.reject_log_path = reject_log_path
         self.pool_log_path = pool_log_path
+        self.training_sample_log_path = training_sample_log_path
+        self.training_step_log_path = training_step_log_path
         self.step_bin_size = step_bin_size
         self.seed = seed
         # Separate from the global seed so sampling rejects never consumes
@@ -555,6 +561,8 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
             # exactly the round whose rejects explain why. Write them first.
             self._write_reject_log(round_number)
         self._write_pool_log(round_number, candidates)
+        # After training and generation, so both hold the whole round.
+        self._write_training_logs(round_number)
         self.round_metrics.generation_duration_s = (
             time.perf_counter() - generation_started
         )
@@ -837,6 +845,10 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
             ),
             raw_reward_scores=prepared.reward_scores.detach().cpu().tolist(),
             acq_scores=prepared.acq_scores,
+            # The molecules themselves, so the round's exploration survives
+            # the run: the policy is not checkpointed and the 100k pool is
+            # only a post-training snapshot.
+            smiles=prepared.smiles,
             # Canonical SMILES, so a repeat is the same molecule: this is the only
             # per-step reading of mode collapse that keeps validity high.
             unique_count=len(set(prepared.smiles)),
@@ -1417,6 +1429,25 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
             )
         except OSError as error:
             _logger.warning("Could not write the reject log: %s", error)
+
+    def _write_training_logs(self, round_number: int) -> None:
+        """Write the round's training molecules and per-step series.
+
+        Never fails the round: these are a record of a round that has already
+        happened, and its metrics, figures and pool are already safe.
+        """
+        for path, writer, label in (
+            (self.training_sample_log_path, write_training_samples_log, "samples"),
+            (self.training_step_log_path, write_training_steps_log, "steps"),
+        ):
+            if path is None:
+                continue
+            try:
+                writer(self.round_metrics, path, round_index=round_number)
+            except (OSError, ValueError) as error:
+                _logger.warning(
+                    "Could not write the training %s log: %s", label, error
+                )
 
     def _write_pool_log(
         self,

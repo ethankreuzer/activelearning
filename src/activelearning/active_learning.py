@@ -7,7 +7,10 @@ from activelearning.acquisition.acquisition import Acquisition
 from activelearning.budget.budget import Budget
 from activelearning.dataset.dataset import Dataset
 from activelearning.logger.logger import Logger
-from activelearning.monitoring.diagnostics import predict_pool
+from activelearning.monitoring.diagnostics import (
+    docked_chemistry_diagnostics,
+    predict_pool,
+)
 from activelearning.monitoring.diagnostics_config import DiagnosticsConfig
 from activelearning.monitoring.orchestration import (
     StageStash,
@@ -286,6 +289,19 @@ def active_learning(
             if not selected_samples:
                 break
 
+            # What fraction of the molecules this round is about to spend its
+            # whole budget docking are valid and synthesizable. Computed before
+            # the oracle runs, on the selection itself, because that is the set
+            # the budget buys -- the failures the oracle returns are a separate
+            # question, answerable afterwards from the saved SMILES.
+            docked_chemistry: dict[str, float] = {}
+            if diagnostics_config.docked_sa_threshold is not None:
+                with profile_operation(profiling, "diagnostics/docked_chemistry"):
+                    docked_chemistry = docked_chemistry_diagnostics(
+                        selected_samples,
+                        sa_threshold=diagnostics_config.docked_sa_threshold,
+                    )
+
             # Query oracle to obtain total cost for the samples.
             with profile_operation(profiling, "oracle/get_costs"):
                 costs = oracle.get_costs(selected_samples)
@@ -377,6 +393,10 @@ def active_learning(
                     if initial_budget > 0
                     else 0.0
                 ),
+                # Core metrics rather than diagnostics: these describe what the
+                # budget was spent on, and a round that cannot say that has not
+                # recorded its own result. Empty unless configured.
+                **docked_chemistry,
             }
 
             # What the surrogate predicted for every molecule in the pool, for
@@ -387,6 +407,13 @@ def active_learning(
             # reads it.
             sampled_means: list[float] | None = None
             sampled_stds: list[float] | None = None
+            # The TOTAL sd as well. `sampled_stds` is the LATENT one, which
+            # is what GIBBON consumed; residual calibration has to divide by
+            # the total one, and it cannot be recovered afterwards because the
+            # two differ by the fitted noise, which moves every round. The
+            # second posterior call rides on the encode this pass already paid
+            # for.
+            sampled_total_stds: list[float] | None = None
             if getattr(run_writer, "write_sample_scores", False):
                 with profile_operation(profiling, "surrogate/predict_pool"):
                     pool_predictions = predict_pool(surrogate, samples)
@@ -397,7 +424,11 @@ def active_learning(
                         num_rounds,
                     )
                 else:
-                    sampled_means, sampled_stds = pool_predictions
+                    (
+                        sampled_means,
+                        sampled_stds,
+                        sampled_total_stds,
+                    ) = pool_predictions
 
             preliminary_record = RoundRecord(
                 round_index=num_rounds,
@@ -418,6 +449,7 @@ def active_learning(
                 selection_scores=selection_scores,
                 sampled_means=sampled_means,
                 sampled_stds=sampled_stds,
+                sampled_total_stds=sampled_total_stds,
             )
             with profile_operation(profiling, "diagnostics/total"):
                 (

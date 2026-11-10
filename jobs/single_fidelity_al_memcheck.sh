@@ -8,6 +8,21 @@
 #   sbatch jobs/single_fidelity_al_memcheck.sh 45000
 #   sbatch jobs/single_fidelity_al_memcheck.sh 40000
 #
+# DATASET_MODE=full probes the OTHER dataset regime, where the GP fits the whole
+# archive instead of a subset of it:
+#
+#   DATASET_MODE=full sbatch jobs/single_fidelity_al_memcheck.sh \
+#     25000 data/ampc_balanced_25000.csv sf-full-smoke
+#
+# In that mode subset_size is IGNORED -- there is no subset, the fit is the
+# archive -- so the number is only still required to keep one usage shape, and
+# the probe's two rounds fit the archive's own size and then that plus the
+# round's acquisitions. It is an argument-level check that the regime is wired
+# up, not a size probe: with the budget shortened to 10 docks a round, round 2
+# fits ~10 rows more than round 1, nowhere near any ceiling. Read
+# surrogate/subset_gp/train/archive_fraction, which must be 1.000 in both
+# rounds, and the growing subset_size in the summary below.
+#
 # Replaces jobs/single_fidelity_al_50k_memcheck.sh, which hard-coded 50,000 and
 # answered it: job 26159147 completed round 1 (fit 736 s at n=50,000) and died
 # in ROUND 2's fit with `torch.OutOfMemoryError: Tried to allocate 9.31 GiB`
@@ -95,6 +110,14 @@ fi
 SUBSET_SIZE="$1"
 ARCHIVE_CSV="${2:-data/ampc_svgpscale_50000.csv}"
 RUN_NAME="${3:-sf-${SUBSET_SIZE}-memcheck}"
+# From the environment, not a 4th positional, because ${@:4} is already the
+# passthrough for extra overrides. sbatch exports the submitting environment.
+DATASET_MODE="${DATASET_MODE:-subset}"
+
+if [[ "${DATASET_MODE}" != "subset" && "${DATASET_MODE}" != "full" ]]; then
+  echo "DATASET_MODE must be 'subset' or 'full'; got '${DATASET_MODE}'." >&2
+  exit 2
+fi
 
 if [[ ! "${SUBSET_SIZE}" =~ ^[0-9]+$ ]] || (( SUBSET_SIZE < 1 )); then
   echo "subset_size must be a positive integer; got '${SUBSET_SIZE}'." >&2
@@ -136,7 +159,12 @@ mkdir -p "${OUTPUT_DIR}" slurm_logs
 export WANDB_MODE=offline
 export WANDB_DIR="${OUTPUT_DIR}"
 
-echo "=== probe: subset_size=${SUBSET_SIZE}, archive=${ARCHIVE_CSV} (${ARCHIVE_ROWS} rows)"
+if [[ "${DATASET_MODE}" == "full" ]]; then
+  echo "=== probe: dataset_mode=full, archive=${ARCHIVE_CSV} (${ARCHIVE_ROWS} rows)"
+  echo "=== subset_size=${SUBSET_SIZE} is IGNORED in this mode; the fit is the archive"
+else
+  echo "=== probe: subset_size=${SUBSET_SIZE}, archive=${ARCHIVE_CSV} (${ARCHIVE_ROWS} rows)"
+fi
 echo "=== GPU before the run"
 nvidia-smi --query-gpu=name,memory.total,memory.used --format=csv
 
@@ -146,12 +174,24 @@ nvidia-smi --query-gpu=name,memory.total,memory.used --format=csv
 # An OOM is a RESULT here, not an accident, so the failure must not take the
 # summary below with it: `set -e` would exit before the one reading this job
 # exists to produce. The exit status is kept and re-raised at the very end.
+CONFIGS=("config/ampc/subset_fixed_gp.yaml")
+SUBSET_OVERRIDES=("surrogate.training_subset.size=${SUBSET_SIZE}")
+if [[ "${DATASET_MODE}" == "full" ]]; then
+  # The FullArchive regime has no subset size -- the fit IS the archive -- so
+  # the size override must not be passed, and the node has to be replaced
+  # rather than merged into. See config/ampc/overrides/full_archive.yaml.
+  CONFIGS+=("config/ampc/overrides/full_archive.yaml")
+  SUBSET_OVERRIDES=(
+    "surrogate.training_subset={type: FullArchive, top_threshold: 0.5, max_size: 40000}"
+  )
+fi
+
 STATUS=0
 uv run --no-sync python scripts/run_with_sigterm_flush.py \
-  config/ampc/subset_fixed_gp.yaml \
+  "${CONFIGS[@]}" \
   "run_name=${RUN_NAME}" \
   "dataset.initial_data.path=${ARCHIVE_CSV}" \
-  "surrogate.training_subset.size=${SUBSET_SIZE}" \
+  "${SUBSET_OVERRIDES[@]}" \
   "oracle={type: ConstantOracle, value: 0.0, fidelity_costs: {1: 1.0}}" \
   "sampler.n_train_steps=50" \
   "sampler.n_samples=10000" \

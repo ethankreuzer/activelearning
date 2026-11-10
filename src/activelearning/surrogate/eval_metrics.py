@@ -1111,3 +1111,333 @@ def error_by_std_figure(
     figure.suptitle(title)
     figure.tight_layout(rect=(0.0, 0.0, 1.0, 0.94))
     return figure
+
+# ---------------------------------------------------------------------------
+# RETIRED, kept here only so the AL round diagnostics keep importing while the
+# port happens. The metrics the framework TRACKS are `latent_calibration`'s --
+# see THESIS_ACTIVELEARNING.md section 5b. These divide by the TOTAL variance,
+# which on the same run reads 2.79 where `latent_variance_ratio` reads 10.79,
+# so the two are NOT comparable and must never share a table or a plot.
+# `diagnostics.py` is to be ported to `latent_calibration`, after which this
+# block and tests/surrogate/test_variance_calibration.py go.
+# ---------------------------------------------------------------------------
+
+#: Latent variance deciles the reliability regression is fitted on. Raw squared
+#: residuals are chi-squared with one degree of freedom, so their pointwise
+#: scatter dwarfs the trend being measured and an unbinned fit is dominated by
+#: noise. Binning by predicted variance and regressing the bin means recovers
+#: the trend; ten is enough to see curvature without emptying the bins.
+CALIBRATION_BINS = 10
+
+#: Fewest finite points a calibration readout is computed from. Below this the
+#: slope is an artefact of three molecules, and reporting it as a measurement is
+#: worse than reporting nothing -- which matters for the high-y stratum, which
+#: starts nearly empty and fills over rounds.
+MIN_CALIBRATION_POINTS = 50
+
+#: Median |z| of a standard normal: the reference value for ``z_abs_median``.
+_NORMAL_ABS_MEDIAN = 0.6744897501960817
+
+#: Fraction of a standard normal beyond two standard deviations.
+_NORMAL_TAIL_2STD = 0.04550026389635842
+
+
+def _calibration_bin_means(
+    variance: np.ndarray, squared_error: np.ndarray, *, bins: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Group by predicted-variance quantile; return per-bin means and counts.
+
+    Quantile edges rather than equal-width ones: predicted variances are
+    strongly right-skewed, so equal-width bins put almost every molecule in the
+    first one and fit the regression to a single point.
+    """
+    order = np.argsort(variance, kind="stable")
+    variance = variance[order]
+    squared_error = squared_error[order]
+    # array_split handles a point count that is not a multiple of `bins`.
+    groups = [
+        group
+        for group in zip(
+            np.array_split(variance, bins), np.array_split(squared_error, bins)
+        )
+        if group[0].size
+    ]
+    mean_variance = np.array([float(np.mean(v)) for v, _ in groups])
+    mean_squared_error = np.array([float(np.mean(s)) for _, s in groups])
+    counts = np.array([int(v.size) for v, _ in groups])
+    return mean_variance, mean_squared_error, counts
+
+
+def variance_calibration_metrics(
+    targets: Sequence[float] | np.ndarray,
+    mean: Sequence[float] | np.ndarray,
+    latent_std: Sequence[float] | np.ndarray,
+    total_std: Sequence[float] | np.ndarray,
+    *,
+    bins: int = CALIBRATION_BINS,
+    min_points: int = MIN_CALIBRATION_POINTS,
+) -> dict[str, float]:
+    """How well the predicted latent variance accounts for the actual error.
+
+    The question a GP's own fit metrics cannot answer: when the surrogate says
+    it is confident, is it right to be? A large residual paired with a small
+    predicted latent variance is the failure that matters here, because the
+    acquisition consumes the latent variance -- so a surrogate that is accurate
+    on average but overconfident in the tail sends the docking budget to the
+    wrong molecules while every ``r2`` and ``rmse`` panel looks healthy.
+
+    For a calibrated Gaussian process with homoskedastic noise,
+    ``E[(y - mu)^2] = latent_var + noise_var``. Regressing the binned mean
+    squared residual on the binned mean latent variance therefore has slope 1
+    and intercept ``noise_var``: the free intercept is what lets the latent
+    variance be judged on its own, without the observation noise it excludes
+    being charged against it as apparent overconfidence.
+
+    ``slope`` and ``z_var_mean`` fail independently and both are needed. The
+    slope asks whether the variance TRACKS the error across its range; it can
+    be 1.0 while every variance is uniformly five times too small.
+    ``z_var_mean`` asks about that overall magnitude and would read 5.0.
+
+    Parameters
+    ----------
+    targets, mean : Sequence[float] or np.ndarray
+        Observed values and predicted means.
+    latent_std : Sequence[float] or np.ndarray
+        Predicted standard deviation WITHOUT observation noise -- what the
+        acquisition sees.
+    total_std : Sequence[float] or np.ndarray
+        Predicted standard deviation WITH observation noise, used for the
+        z-score statistics, where the residual's own noise belongs in the
+        denominator.
+    bins : int, optional
+        Variance quantile bins for the regression.
+    min_points : int, optional
+        Below this many finite points, every value is ``nan``.
+
+    Returns
+    -------
+    dict[str, float]
+        ``count``, and:
+
+        ``slope``, ``intercept``, ``fit_r2``
+            The binned regression. Calibrated: slope 1, intercept ``noise_var``.
+            Slope below 1 means the variance does not rise with the error as
+            fast as it should.
+        ``intercept_over_noise_var``
+            The fitted intercept against the likelihood's own noise variance,
+            measured as ``mean(total_var - latent_var)``. Above 1 means error
+            the GP attributes to the model is really irreducible noise.
+        ``z_var_mean``
+            ``mean(residual^2 / total_var)``, the reduced chi-square.
+            Calibrated 1.0; 5.0 means variances five times too small.
+        ``z_abs_median``
+            ``median(|residual| / total_std)``. Calibrated 0.674. Robust to the
+            few large residuals that dominate ``z_var_mean``.
+        ``frac_outside_2std``
+            Calibrated 0.046. The tail-failure rate.
+        ``worst_bin_ratio``
+            The largest per-bin ``mean squared residual / mean total variance``.
+            Catches nine healthy bins hiding one catastrophic one, which the
+            slope averages away.
+        ``spearman_latent_std_abs_error``
+            Rank correlation of latent standard deviation with absolute error.
+            Acquisition ranks molecules, so this is the ordering that matters;
+            it can be strong while the scale is badly wrong.
+    """
+    nan = float("nan")
+    keys = (
+        "latent_std_mean",
+        "total_std_mean",
+        "slope",
+        "intercept",
+        "fit_r2",
+        "intercept_over_noise_var",
+        "z_var_mean",
+        "z_abs_median",
+        "frac_outside_2std",
+        "worst_bin_ratio",
+        "spearman_latent_std_abs_error",
+    )
+    y, mu, latent = _finite_triple(targets, mean, latent_std)
+    _, _, total = _finite_triple(targets, mean, total_std)
+    if y.size < min_points or total.size != y.size:
+        return {"count": float(y.size), **dict.fromkeys(keys, nan)}
+
+    latent_var = np.clip(latent, MIN_STD, None) ** 2
+    total_var = np.clip(total, MIN_STD, None) ** 2
+    squared_error = (y - mu) ** 2
+    absolute_error = np.abs(y - mu)
+
+    metrics: dict[str, float] = {
+        "count": float(y.size),
+        # The latent scale itself, per stratum, which no other panel reports:
+        # `std_mean` elsewhere is the total. Read beside the slope it separates
+        # "the GP shrank its uncertainty" from "the GP mis-ranked it", and a
+        # high-target stratum whose latent std falls while its slope rises is
+        # the surrogate becoming confidently wrong exactly where the budget goes.
+        "latent_std_mean": float(np.mean(latent)),
+        "total_std_mean": float(np.mean(total)),
+        "z_var_mean": float(np.mean(squared_error / total_var)),
+        "z_abs_median": float(np.median(absolute_error / np.sqrt(total_var))),
+        "frac_outside_2std": float(
+            np.mean(absolute_error > 2.0 * np.sqrt(total_var))
+        ),
+        "spearman_latent_std_abs_error": rank_correlation(latent, absolute_error),
+    }
+
+    bin_variance, bin_squared_error, _ = _calibration_bin_means(
+        latent_var, squared_error, bins=bins
+    )
+    # The SECOND element is the mean of the second argument: the per-bin mean
+    # total variance, grouped by the same latent-variance quantiles as above.
+    _, bin_total_variance, _ = _calibration_bin_means(
+        latent_var, total_var, bins=bins
+    )
+    # Range, not standard deviation, and relative to the scale. `np.std` of
+    # bit-identical floats returns ~1e-18 rather than 0 (mean-subtraction
+    # rounding), so a `> 0` test lets a singular system through to polyfit,
+    # which answers with an arbitrary slope and a RankWarning. A latent variance
+    # that barely varies cannot support a regression either, and a garbage
+    # slope is worse than no slope for a panel whose whole purpose is to say
+    # when the surrogate should not be believed.
+    spread = float(np.ptp(bin_variance)) if bin_variance.size else 0.0
+    scale = float(np.mean(np.abs(bin_variance))) if bin_variance.size else 0.0
+    if bin_variance.size >= 2 and spread > max(MIN_STD, 1e-9 * scale):
+        slope, intercept = np.polyfit(bin_variance, bin_squared_error, 1)
+        predicted = slope * bin_variance + intercept
+        total_sum_squares = float(
+            np.sum((bin_squared_error - bin_squared_error.mean()) ** 2)
+        )
+        metrics["slope"] = float(slope)
+        metrics["intercept"] = float(intercept)
+        metrics["fit_r2"] = (
+            float(1.0 - np.sum((bin_squared_error - predicted) ** 2) / total_sum_squares)
+            if total_sum_squares > 0.0
+            else nan
+        )
+        # The likelihood's noise variance, read off the two predictions rather
+        # than out of the model: exact for a homoskedastic Gaussian likelihood,
+        # and it keeps this function independent of any surrogate's internals.
+        noise_var = float(np.mean(total_var - latent_var))
+        metrics["intercept_over_noise_var"] = (
+            float(intercept / noise_var) if noise_var > MIN_STD else nan
+        )
+    else:
+        metrics.update(
+            dict.fromkeys(("slope", "intercept", "fit_r2", "intercept_over_noise_var"), nan)
+        )
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ratios = np.divide(
+            bin_squared_error,
+            bin_total_variance,
+            out=np.full_like(bin_squared_error, np.nan),
+            where=bin_total_variance > MIN_STD,
+        )
+    metrics["worst_bin_ratio"] = (
+        float(np.nanmax(ratios)) if np.any(np.isfinite(ratios)) else nan
+    )
+    return metrics
+
+
+def variance_calibration_figure(
+    *,
+    title: str,
+    strata: Mapping[str, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]],
+    bins: int = CALIBRATION_BINS,
+    min_points: int = MIN_CALIBRATION_POINTS,
+) -> Figure | None:
+    """Binned mean squared residual against mean predicted latent variance.
+
+    The reliability curve for the latent variance. A calibrated surrogate's
+    points lie on ``y = x + noise_var``, drawn dashed; points BELOW it are
+    overconfident -- the error is larger than the variance admits -- and that is
+    the regime that misdirects the acquisition.
+
+    One series per stratum, because a surrogate can be calibrated over the bulk
+    and overconfident exactly in the potent tail the loop exists to grow, and a
+    single pooled curve averages the two together. Both axes are logarithmic:
+    predicted variances span orders of magnitude.
+
+    Parameters
+    ----------
+    title : str
+        Panel title, usually the evaluation set's name.
+    strata : Mapping[str, tuple of np.ndarray]
+        Stratum name to ``(targets, mean, latent_std, total_std)``. A stratum
+        with fewer than ``min_points`` finite rows is skipped, so an empty
+        high-target stratum in an early round draws nothing rather than a line
+        through three molecules.
+    bins, min_points : int, optional
+        As for :func:`variance_calibration_metrics`.
+
+    Returns
+    -------
+    Figure or None
+        The figure, or ``None`` when no stratum had enough data. The caller owns
+        it and should close it after use.
+    """
+    figure = Figure(figsize=(6.5, 5.5))
+    axis = figure.add_subplot(1, 1, 1)
+    drawn: list[float] = []
+    annotations: list[str] = []
+
+    for name, (targets, mean, latent_std, total_std) in strata.items():
+        y, mu, latent = _finite_triple(targets, mean, latent_std)
+        _, _, total = _finite_triple(targets, mean, total_std)
+        if y.size < min_points or total.size != y.size:
+            continue
+        latent_var = np.clip(latent, MIN_STD, None) ** 2
+        bin_variance, bin_squared_error, counts = _calibration_bin_means(
+            latent_var, (y - mu) ** 2, bins=bins
+        )
+        axis.plot(
+            bin_variance,
+            bin_squared_error,
+            marker="o",
+            linewidth=1.2,
+            markersize=4,
+            label=f"{name} (n = {y.size})",
+        )
+        drawn.extend(bin_variance.tolist())
+        drawn.extend(bin_squared_error.tolist())
+        metrics = variance_calibration_metrics(
+            y, mu, latent, total, bins=bins, min_points=min_points
+        )
+        annotations.append(
+            f"{name}: slope {metrics['slope']:.2f}, "
+            f"z_var {metrics['z_var_mean']:.2f}"
+        )
+        del counts
+
+    positive = [value for value in drawn if value > 0.0]
+    if not positive:
+        return None
+    low, high = min(positive), max(positive)
+    reference = np.geomspace(low, high, 64)
+    axis.plot(
+        reference,
+        reference,
+        color="black",
+        linestyle="--",
+        linewidth=1.0,
+        label="calibrated (y = x)",
+    )
+    axis.set_xscale("log")
+    axis.set_yscale("log")
+    axis.set_xlabel("Mean predicted latent variance (per decile)")
+    axis.set_ylabel("Mean squared residual")
+    axis.legend(fontsize=8, loc="upper left")
+    if annotations:
+        axis.text(
+            0.97,
+            0.03,
+            "\n".join(annotations),
+            transform=axis.transAxes,
+            horizontalalignment="right",
+            verticalalignment="bottom",
+            fontsize=8,
+            bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.8},
+        )
+    figure.suptitle(f"Latent-variance calibration: {title}")
+    return figure

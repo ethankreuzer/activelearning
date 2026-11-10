@@ -14,9 +14,10 @@ repos:
       - id: check-toml
       - id: check-json
       - id: check-added-large-files
-        # ampc_hitrate_fits/data/full_scores.df is a 540 KB reference table
-        # the DOCK3 oracle needs at runtime, just over the 500 KB default.
-        args: ['--maxkb=600']
+        # ampc_hitrate_fits/data/ holds score/pProp reference tables the DOCK3
+        # oracle needs at runtime: full_scores.df is 540 KB and
+        # full_scores_1p47b.df is 2.3 MB, both over the 500 KB default.
+        args: ['--maxkb=2400']
       - id: check-case-conflict
 
   # Jupyter Notebook cleaning

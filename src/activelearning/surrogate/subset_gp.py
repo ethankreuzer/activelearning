@@ -12,6 +12,7 @@ archive.
 from __future__ import annotations
 
 import csv
+import logging
 import math
 import time
 from collections.abc import Sequence
@@ -27,7 +28,115 @@ from activelearning.surrogate.training_subset import (
     TrainingSubset,
     TrainingSubsetSelector,
 )
-from activelearning.utils.types import Observation
+from activelearning.utils.types import DEFAULT_FIDELITY, Observation
+
+_logger = logging.getLogger(__name__)
+
+#: Name of the per-fit training-set CSV, formatted with the fit index.
+SUBSET_FILE_TEMPLATE = "training_subset_fit_{index:04d}.csv"
+
+#: Name of the per-fit GP state file, formatted with the fit index. Written
+#: beside the subset CSV of the SAME index, because an exact GP's state dict
+#: carries hyperparameters and transforms but not the data it conditions on:
+#: the pair is what reconstructs a round's surrogate, and neither half is
+#: usable alone. See :func:`load_fit`.
+STATE_FILE_TEMPLATE = "gp_state_fit_{index:04d}.pt"
+
+
+def read_training_subset(path: Path) -> list[Observation]:
+    """Read a per-fit training-set CSV back into observations.
+
+    The rows a fit trained on, in the order it trained on them, which is the
+    order an exact GP's state dict assumes. ``archive_index`` is dropped: it
+    locates the row in the archive of that round, which a later archive no
+    longer indexes the same way.
+
+    Parameters
+    ----------
+    path : Path
+        A ``training_subset_fit_<k>.csv`` written by
+        :class:`SubsetFixedFeatureGPSurrogate`.
+
+    Returns
+    -------
+    list[Observation]
+        The training set, ready to pass to
+        :meth:`FixedFeatureGPSurrogate.restore`.
+
+    Raises
+    ------
+    ValueError
+        If the file has no rows, since a restore needs its training data.
+    """
+    observations: list[Observation] = []
+    with Path(path).open("r", encoding="utf-8", newline="") as handle:
+        for row in csv.DictReader(handle):
+            fidelity = row["fidelity"]
+            observations.append(
+                Observation(
+                    x=row["x"],
+                    y=float(row["y"]),
+                    # Blank is how _write_subset records a None fidelity, so it
+                    # reads back as the default rather than as a guess: a
+                    # substituted fidelity would restore the fit at the wrong
+                    # one and nothing downstream would complain.
+                    fidelity=(
+                        DEFAULT_FIDELITY if fidelity == "" else int(fidelity)
+                    ),
+                )
+            )
+    if not observations:
+        raise ValueError(f"{path} holds no training rows to restore from.")
+    return observations
+
+
+def load_fit(
+    directory: Path, index: int, surrogate: FixedFeatureGPSurrogate
+) -> FixedFeatureGPSurrogate:
+    """Restore the exact GP of one fit into ``surrogate``.
+
+    Reads the pair this module writes -- the training-set CSV and the state
+    dict of the same index -- and rebuilds the fitted model on them instead of
+    refitting. ``surrogate`` must be built with the SAME configuration the run
+    used (encoder, kernel, ard, outputscale, prior_mean, the transforms), or
+    loading the state raises: the state dict is keyed to the model structure,
+    not to a description of it. The run's ``effective.surrogate`` config and
+    the encoder checkpoint recorded in ``provenance.input_files`` are what
+    makes that reconstructable after the fact.
+
+    Conditioning on the training set is the fit's cost, not a lookup: this
+    needs the same class of GPU the round ran on.
+
+    Parameters
+    ----------
+    directory : Path
+        The run's ``training_subsets`` directory.
+    index : int
+        Zero-based fit index. Fit ``k`` is round ``k`` of the loop.
+    surrogate : FixedFeatureGPSurrogate
+        An unfitted surrogate of the run's configuration, restored in place.
+
+    Returns
+    -------
+    FixedFeatureGPSurrogate
+        ``surrogate``, restored and in eval mode.
+
+    Raises
+    ------
+    FileNotFoundError
+        If either half of the pair is missing.
+    """
+    directory = Path(directory)
+    subset_path = directory / SUBSET_FILE_TEMPLATE.format(index=index)
+    state_path = directory / STATE_FILE_TEMPLATE.format(index=index)
+    for path in (subset_path, state_path):
+        if not path.is_file():
+            raise FileNotFoundError(f"No fit {index} in {directory}: {path} is absent.")
+    surrogate.restore(
+        read_training_subset(subset_path),
+        torch.load(state_path, map_location="cpu", weights_only=True),
+    )
+    return surrogate
 
 
 #: Target thresholds the chosen training set's composition is reported against.
@@ -266,8 +375,14 @@ class SubsetFixedFeatureGPSurrogate(FixedFeatureGPSurrogate):
         selector : TrainingSubsetSelector
             Chooses the rows of the archive each fit trains on.
         subset_dir : Path, optional
-            Directory that receives one ``training_subset_fit_<k>.csv`` per
-            fit, listing the chosen rows. ``None`` writes nothing.
+            Directory that receives, per fit, one
+            ``training_subset_fit_<k>.csv`` listing the chosen rows and one
+            ``gp_state_fit_<k>.pt`` holding the fitted GP state. ``None``
+            writes neither. The two are written together deliberately: an
+            exact GP's state dict does not carry the data it conditions on, so
+            a checkpoint without its training set cannot be restored, and
+            pairing them by index keeps that invariant impossible to break.
+            :func:`load_fit` reads a round back.
         ard, kernel, outputscale, prior_mean, noise_std_floor, scale_inputs,
         standardize_outputs, fit_kwargs, max_cholesky_size,
         accept_abnormal_lbfgsb, is_multi_fidelity
@@ -315,6 +430,7 @@ class SubsetFixedFeatureGPSurrogate(FixedFeatureGPSurrogate):
         subset = self._selector.select(archive, encoder=self._encoder)
         selected_s = time.perf_counter() - started
         training = [archive[index] for index in subset.indices]
+        fit_index = self._fit_count
         if self._subset_dir is not None:
             self._write_subset(archive, subset)
         self._fit_count += 1
@@ -335,6 +451,8 @@ class SubsetFixedFeatureGPSurrogate(FixedFeatureGPSurrogate):
         _reset_cuda_peak()
         started = time.perf_counter()
         super().fit(training)
+        if self._subset_dir is not None:
+            self._write_state(fit_index)
         self._fit_profiling = {
             "profiling/surrogate/subset_select_s": selected_s,
             "profiling/surrogate/gp_fit_s": time.perf_counter() - started,
@@ -395,13 +513,43 @@ class SubsetFixedFeatureGPSurrogate(FixedFeatureGPSurrogate):
         """Return timings and sizes of the most recent fit."""
         return dict(self._fit_profiling)
 
+    def _write_state(self, fit_index: int) -> None:
+        """Record this fit's GP state beside the training set it was fitted on.
+
+        The two halves of a recoverable round. The state dict holds the fitted
+        hyperparameters and the input and outcome transforms -- kilobytes,
+        against the hundreds of megabytes a round already writes -- and the
+        CSV of the same index holds the data an exact GP conditions on, which
+        the state dict does not carry. :func:`load_fit` reads the pair.
+
+        Tensors are moved to CPU so the file loads without the device it was
+        fitted on, and a failure here is warned about rather than raised: a
+        checkpoint that cannot be written must not end a run whose fit
+        succeeded, and every metric and figure of that round is already safe.
+        """
+        assert self._subset_dir is not None
+        state = self.get_state_dict()
+        if state is None:
+            # fit() is the only caller and it has just fitted, so this means
+            # the model was not built -- worth a line rather than a silent skip.
+            _logger.warning("No GP state to record for fit %d.", fit_index)
+            return
+        path = self._subset_dir / STATE_FILE_TEMPLATE.format(index=fit_index)
+        try:
+            self._subset_dir.mkdir(parents=True, exist_ok=True)
+            torch.save(
+                {key: value.detach().cpu() for key, value in state.items()}, path
+            )
+        except Exception:
+            _logger.warning("Could not record GP state to %s.", path, exc_info=True)
+
     def _write_subset(
         self, archive: Sequence[Observation], subset: TrainingSubset
     ) -> None:
         """Record the chosen rows of this fit as a CSV."""
         assert self._subset_dir is not None
         self._subset_dir.mkdir(parents=True, exist_ok=True)
-        path = self._subset_dir / f"training_subset_fit_{self._fit_count:04d}.csv"
+        path = self._subset_dir / SUBSET_FILE_TEMPLATE.format(index=self._fit_count)
         with path.open("w", encoding="utf-8", newline="") as handle:
             writer = csv.writer(handle)
             writer.writerow(["archive_index", "x", "fidelity", "y"])

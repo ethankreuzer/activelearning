@@ -1095,6 +1095,44 @@ sites need rewriting. That test file tests an implementation being retired, so m
 it goes -- but read it first for edge cases (empty bins, degenerate variance, all-equal
 predictions) worth keeping as tests of the replacement.
 
+## 5b-bis. The 2026-11-07 note said the OPPOSITE, and why 5b stands anyway
+
+**Recorded because it is a real contradiction and must not be discovered by
+accident.** The merge of 2026-11-10 brought in a section 0 written at the end of
+the 2026-11-07 session which says, of commit `9d0d644` -- the commit that
+introduced `latent_calibration`, the metric section 5b just made authoritative:
+
+> That commit is **orphaned and superseded**: it was this session's first attempt,
+> written before the branch had been fetched, and it contained a duplicate
+> calibration metric. Its surviving content is in `420538e` in corrected form.
+> **Do not merge, rebase or push `9d0d644`.** Discard it.
+
+That instruction was NOT followed, deliberately, and section 0 is therefore not
+carried into this document. The reasoning:
+
+1. **It was written without the evidence that now exists.** On 2026-11-10 the
+   six-arm sweep RAN on `latent_calibration`'s metrics, and those numbers are the
+   ones in the W&B project `ExactGP_thesis` and in section 5a's RESULT. The
+   2026-11-07 session could not weigh that.
+2. **The two metrics are not a duplicate pair, they measure different things.**
+   `latent_calibration` divides by the LATENT variance, `variance_calibration_metrics`
+   by the TOTAL; on the same run that is 10.79 against 2.79. Calling one a
+   "duplicate" of the other was the mistake, not the writing of the second one.
+3. **The latent one is the correct target on the merits**, independent of which
+   was written first: the noise term is constant per molecule, so putting it in
+   the denominator dilutes exactly the per-candidate variation GIBBON ranks on.
+   Section 5b has the argument and the sweep evidence.
+
+What the 2026-11-07 note got right, and what actually happened: it correctly
+identified that the local checkout had diverged and that three files were changed
+on both sides. Nobody acted on it, so the divergence grew to 19 commits against
+18 before being merged on 2026-11-10. The lesson is the one the user drew --
+this project runs on two clusters and the repo needs attention per session, not
+per milestone.
+
+Section 0's reconciliation recipe (`git reset --hard origin/exact-dkl-top-n`) is
+now obsolete and would have destroyed the sweep had it been run on 2026-11-10.
+
 ## 5c. HANDOFF TO NIBI: what the 10-round AL run needs (2026-11-10)
 
 **READ THIS BEFORE PULLING ON NIBI. Neither branch on the remote can run the AL job

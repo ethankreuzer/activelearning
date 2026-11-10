@@ -1,13 +1,25 @@
-"""Choose the fixed-size training set a GP fits on from the full archive.
+"""Choose the training set a GP fits on from the full archive.
 
 The archive -- every labeled molecule, the initial set plus each round's docked
-acquisitions -- outgrows what an exact GP can fit. A
-:class:`TrainingSubsetSelector` picks the rows the GP fits on each round. New
-acquisitions get no priority: they compete for a place like any other row.
+acquisitions -- is append-only and grows every round. A
+:class:`TrainingSubsetSelector` decides what the GP fits on, and the choice of
+selector is the choice between two ways of managing data over rounds:
 
-Only a placeholder is implemented so far, :class:`ThresholdRandomSubsetSelector`.
-It keeps every row at or above a target threshold and fills the rest of the
-budget uniformly at random.
+Subset the archive to a fixed size.
+    :class:`StratifiedFPSSubsetSelector` and :class:`ThresholdRandomSubsetSelector`.
+    The fit stays the same size however large the archive gets, so cost and
+    memory are flat and the selection decides what the GP sees. New
+    acquisitions get no priority: they compete for a place like any other row.
+    This is what produced ``sf-10round-5000dock-5000steps-seed42``, whose
+    archive grew 25,000 -> 66,283 while every fit used exactly 25,000 rows.
+
+Fit the whole thing.
+    :class:`FullArchiveSubsetSelector`. No selection at all; the training set
+    *is* the archive and grows with it. Simpler to reason about, and nothing
+    mediates between what has been docked and what the GP learns from -- but an
+    exact GP's kernel matrix is O(n^2), so the regime has a hard size ceiling
+    and the number of rounds it can run is bounded by VRAM rather than by the
+    docking budget. See :func:`predicted_fit_peak_gib`.
 """
 
 from __future__ import annotations
@@ -30,6 +42,39 @@ from activelearning.surrogate.stratified_fps import (
     select_stratified_rows,
 )
 from activelearning.utils.types import Observation
+
+#: Measured fit-memory model of the exact fixed-feature GP, in GiB:
+#: ``peak = _FIT_PEAK_QUADRATIC * n**2 + _FIT_PEAK_INTERCEPT``. Fitted to
+#: outputs/ampc/gp_scaling_benchmark/n{25000,40000,50000}.json, and it reproduces
+#: both two-round loop probes to within 0.15 GiB (job 26162761 at n=40,000
+#: peaked at 48.58 GiB against a predicted 48.43; job 26162757 at n=45,000 at
+#: 61.29 against 61.21). Reported to make a size cap's error message
+#: quantitative; no code branches on it.
+_FIT_PEAK_QUADRATIC = 3.0068e-08
+_FIT_PEAK_INTERCEPT = 0.325
+
+
+def predicted_fit_peak_gib(size: int) -> float:
+    """Predicted peak CUDA memory of an exact GP fit on ``size`` rows, in GiB.
+
+    The fit alone, on an otherwise empty device. What is actually available is
+    the card's total less whatever the policy, the prior and the encoder hold
+    resident, which is measured per round as
+    ``profiling/surrogate/cuda_reserved_before_fit_gib`` rather than predicted
+    here -- so this number is a floor on the requirement, not a verdict on
+    whether a given size fits.
+
+    Parameters
+    ----------
+    size : int
+        Number of training rows.
+
+    Returns
+    -------
+    float
+        Predicted peak, in GiB.
+    """
+    return _FIT_PEAK_QUADRATIC * float(size) ** 2 + _FIT_PEAK_INTERCEPT
 
 
 @dataclass(frozen=True)
@@ -296,6 +341,105 @@ class StratifiedFPSSubsetSelector(TrainingSubsetSelector):
         return TrainingSubset(indices=indices.tolist(), top_count=top_count)
 
 
+class FullArchiveSubsetSelector(TrainingSubsetSelector):
+    """The whole archive, every round: one dataset that grows instead of a subset.
+
+    The other selectors answer "which rows of the archive should the GP fit?".
+    This one removes the question: the training set is the archive. A run that
+    starts at 25,000 and docks 5,000 fits 25,000 rows, then ~29,700, then
+    ~34,400, and so on -- the per-round gain is below the docking budget because
+    failed docks return no row.
+
+    There is no ``size``, which is the point. The cost is that an exact GP's
+    kernel matrix is O(n^2), so this regime has a ceiling. The ceiling is not
+    the one :func:`predicted_fit_peak_gib` implies: that model describes a fit
+    with the card to itself, and the loop never has that. Probed in the real
+    loop on an 80 GB card, two rounds each with the policy and encoder
+    resident, 40,000 rows passed (job 26162761) and 45,000 did not (jobs
+    26162757 and 26215104), the latter needing one more contiguous 7.54 GiB
+    matrix beside ~7.6 GiB of live policy, prior, encoder and acquisition
+    state. So the measured cap is 40,000.
+
+    The run's round count is therefore bounded by memory rather than by the
+    budget, which the operator is expected to have sized for -- ``max_size`` is
+    here to make the stop legible rather than to defend against it.
+    """
+
+    def __init__(
+        self,
+        *,
+        top_threshold: float | None = None,
+        max_size: int | None = None,
+    ) -> None:
+        """Initialize the selector.
+
+        Parameters
+        ----------
+        top_threshold : float, optional
+            Rows with ``y >= top_threshold`` are counted into
+            :attr:`TrainingSubset.top_count`. Nothing is selected or excluded by
+            it -- every row is taken either way. It exists so ``top_count`` and
+            the metrics derived from it stay comparable against a subsetting
+            selector, where the same threshold is the tier kept outright. Left
+            unset, ``top_count`` is 0.
+        max_size : int, optional
+            Refuse to fit more rows than this. Unset, the regime fits whatever
+            it is given and a dataset past the device's ceiling ends the run
+            with a CUDA out-of-memory raised inside the Cholesky factorization.
+            Set, the same run ends with a message naming the size, the cap and
+            the predicted peak. Preferred over bounding the round count alone,
+            because the rows gained per round vary with the docking failure rate
+            and so a round count predicts the final size only loosely.
+
+        Raises
+        ------
+        ValueError
+            If ``max_size`` is given and is not positive.
+        """
+        if max_size is not None and max_size < 1:
+            raise ValueError("max_size must be positive when set.")
+        self.top_threshold = top_threshold
+        self.max_size = max_size
+
+    def select(
+        self,
+        observations: Sequence[Observation],
+        *,
+        encoder: FixedEncoder,
+    ) -> TrainingSubset:
+        """Return every row of the archive, in order.
+
+        Raises
+        ------
+        ValueError
+            If ``max_size`` is set and the archive has grown past it.
+        """
+        del encoder
+        size = len(observations)
+        if self.max_size is not None and size > self.max_size:
+            raise ValueError(
+                f"the training set has grown to {size} rows, past the "
+                f"configured max_size of {self.max_size}. An exact GP fit on "
+                f"{size} rows is predicted to peak at "
+                f"{predicted_fit_peak_gib(size):.1f} GiB of CUDA memory, "
+                f"against {predicted_fit_peak_gib(self.max_size):.1f} GiB at "
+                "the cap, before the resident policy and encoder are counted. "
+                "Raise max_size only against measured headroom "
+                "(profiling/surrogate/cuda_headroom_at_peak_gib), or lower "
+                "budget.max_rounds so the run ends before this round."
+            )
+        top_count = 0
+        if self.top_threshold is not None and size:
+            targets = np.fromiter(
+                (float(observation.y) for observation in observations),
+                dtype=np.float64,
+                count=size,
+            )
+            # A non-finite target compares false, so it is not counted.
+            top_count = int(np.count_nonzero(targets >= self.top_threshold))
+        return TrainingSubset(indices=list(range(size)), top_count=top_count)
+
+
 class ThresholdRandomSubsetSelectorConfig(BaseModel):
     """Configuration for :class:`ThresholdRandomSubsetSelector`."""
 
@@ -348,10 +492,39 @@ class StratifiedFPSSubsetSelectorConfig(BaseModel):
         )
 
 
+class FullArchiveSubsetSelectorConfig(BaseModel):
+    """Configuration for :class:`FullArchiveSubsetSelector`.
+
+    Has no ``size``, so switching to it from a subsetting selector means
+    replacing the ``training_subset`` node rather than merging onto it: a merge
+    leaves the old ``size``/``keep_above``/``band_edges`` keys behind and
+    ``extra="forbid"`` rejects them. That rejection is deliberate -- a config
+    naming this selector while still carrying a subset size is ambiguous about
+    which regime was intended, and should fail rather than pick one.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["FullArchive"] = "FullArchive"
+    #: Counted into ``top_count`` for comparability with a subsetting selector's
+    #: kept tier. Selects nothing: every row is fitted either way.
+    top_threshold: Optional[float] = None
+    #: Largest training set to fit, past which the run stops with a named error
+    #: instead of a CUDA out-of-memory. Unset, there is no limit but the device's.
+    max_size: Optional[int] = Field(default=None, ge=1)
+
+    def build(self) -> FullArchiveSubsetSelector:
+        """Build the configured selector."""
+        return FullArchiveSubsetSelector(
+            top_threshold=self.top_threshold, max_size=self.max_size
+        )
+
+
 TrainingSubsetSelectorConfig = Annotated[
     Union[
         ThresholdRandomSubsetSelectorConfig,
         StratifiedFPSSubsetSelectorConfig,
+        FullArchiveSubsetSelectorConfig,
     ],
     Field(discriminator="type"),
 ]

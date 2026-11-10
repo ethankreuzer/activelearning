@@ -12,8 +12,11 @@ import torch
 from matplotlib.figure import Figure
 
 from activelearning.surrogate.eval_metrics import (
+    MIN_CALIBRATION_POINTS,
     predicted_vs_observed_figure,
     prediction_metrics,
+    variance_calibration_figure,
+    variance_calibration_metrics,
 )
 from activelearning.surrogate.plotting import (
     PredictionPanel,
@@ -51,14 +54,32 @@ def predict_pool(
     candidates: Sequence[Candidate],
     *,
     chunk_size: int = _POOL_PREDICT_CHUNK,
-) -> tuple[list[float], list[float] | None] | None:
-    """Predict the posterior mean and standard deviation for a sampled pool.
+) -> tuple[list[float], list[float] | None, list[float] | None] | None:
+    """Predict the mean, total and latent standard deviation for a sampled pool.
 
     Chunked, because ``Surrogate.predict`` encodes and predicts everything it is
     given in one call. Returns ``None`` when any chunk fails to predict, rather
     than a partial pool: the caller writes these alongside the acquisition score
     of the same molecule, and a column covering an unmarked subset of the rows
     would be read as covering all of them.
+
+``predict`` returns the LATENT standard deviation: it calls
+    ``model.posterior`` without ``observation_noise``, which BoTorch defaults
+    to ``False``. That is the one GIBBON consumes, so it is the second output
+    and the long-standing ``gp_std`` column.
+
+    The TOTAL standard deviation -- latent plus the fitted observation noise --
+    is the third output, and ``predict`` cannot produce it at all since it does
+    not expose the flag. It comes from one encode and a second posterior call
+    per chunk via :func:`_predict_latent_and_total_in_chunks`. The encode
+    dominates for a store-backed encoder, so the extra call is close to free
+    against the pass that was already happening. It is needed because residual
+    calibration divides by the total sd -- a residual contains the measurement
+    noise, so dividing by the latent sd makes a calibrated GP look
+    overconfident by construction -- and it cannot be recovered from the latent
+    sd afterwards, because the noise is re-fitted every round. ``None`` for a
+    surrogate without ``encode_candidates``/``predict_encoded``, which records
+    no total column rather than a wrong one.
 
     Parameters
     ----------
@@ -71,9 +92,10 @@ def predict_pool(
 
     Returns
     -------
-    result : tuple[list[float], list[float] | None] | None
-        Means and, where the surrogate reports them, standard deviations; or
-        ``None`` when the pool could not be predicted.
+    result : tuple[list[float], list[float] | None, list[float] | None] | None
+        Means, LATENT standard deviations where the surrogate reports them, and
+        TOTAL ones where it can produce them; or ``None`` when the pool could
+        not be predicted.
     """
     if not candidates:
         return None
@@ -93,7 +115,24 @@ def predict_pool(
             stds_complete = False
         elif stds_complete:
             standard_deviations.extend(chunk_stds)
-    return means, standard_deviations if stds_complete else None
+    # A second pass for the TOTAL standard deviation, which `predict` above
+    # cannot expose: it omits observation_noise, which BoTorch defaults to
+    # False, so everything above is the latent sd. Its own chunking and failure
+    # handling, so a surrogate that cannot produce it loses one column rather
+    # than the whole pool.
+    predicted_pair = _predict_latent_and_total_in_chunks(
+        surrogate, candidates, chunk_size
+    )
+    total_stds = (
+        None
+        if predicted_pair is None
+        else [float(value) for value in predicted_pair[2]]
+    )
+    return (
+        means,
+        standard_deviations if stds_complete else None,
+        total_stds,
+    )
 
 
 def evaluate_held_out_set(
@@ -157,6 +196,21 @@ def evaluate_held_out_set(
         )
         if figure is not None:
             figures[f"{prefix}/predicted_vs_observed"] = figure
+
+    # Whether the LATENT variance -- the one the acquisition consumes, which the
+    # metrics above never see -- is worth believing. On this set because it is
+    # the same molecules every round, so the slope is comparable across rounds.
+    calibration_metrics, calibration_figures = latent_calibration_diagnostics(
+        surrogate,
+        prefix=prefix,
+        title=held_out.name,
+        candidates=held_out.candidates,
+        targets=held_out.targets,
+        include_figure=include_figure,
+        chunk_size=chunk_size,
+    )
+    metrics.update(calibration_metrics)
+    figures.update(calibration_figures)
     return metrics, figures
 
 
@@ -191,6 +245,138 @@ def _predict_encoded_in_chunks(
     return np.concatenate(means), np.concatenate(stds)
 
 
+#: Observed target at or above which a molecule counts as the potent tail, for
+#: the y-stratified calibration readouts. 0.5 is the training subset's
+#: ``keep_above``: the tier the loop exists to grow, and the one whose
+#: acquisition decides where the docking budget goes.
+DEFAULT_HIGH_TARGET_THRESHOLD = 0.5
+
+
+def latent_calibration_diagnostics(
+    surrogate: Surrogate,
+    *,
+    prefix: str,
+    title: str,
+    candidates: Sequence[Candidate],
+    targets: Sequence[float],
+    include_figure: bool,
+    chunk_size: int = _POOL_PREDICT_CHUNK,
+    high_target_threshold: float = DEFAULT_HIGH_TARGET_THRESHOLD,
+) -> tuple[dict[str, int | float], dict[str, Figure]]:
+    """Is the latent variance the acquisition consumes worth believing?
+
+    Every other uncertainty panel in this module reads the TOTAL predictive
+    standard deviation, observation noise included. The acquisition does not:
+    GIBBON consumes the latent variance, so a surrogate whose latent variance
+    is far too small sends the docking budget to molecules it is wrongly
+    confident about, while ``rmse``, ``r2`` and ``coverage_1std`` stay healthy
+    because the noise term masks the error. This measures that directly.
+
+    Both standard deviations come from one encode per chunk and two posterior
+    calls, since the encoding dominates for a store-backed encoder.
+
+    Strata, because a pooled curve hides the case that matters. A surrogate can
+    be calibrated across the bulk of near-inactive molecules and overconfident
+    precisely in the potent tail, and the tail is where the budget goes:
+
+    ``all``
+        Every finite row.
+    ``low_y`` / ``high_y``
+        Split at ``high_target_threshold``. A stratum with fewer than
+        ``MIN_CALIBRATION_POINTS`` rows reports ``nan`` rather than a slope
+        fitted to a handful of molecules, so the high-target stratum stays
+        silent in early rounds and begins reporting as the loop fills it.
+
+    Returns
+    -------
+    tuple[dict, dict[str, Figure]]
+        Metrics under ``<prefix>/calibration/<stratum>/<name>`` and, with
+        ``include_figure``, the reliability curve under
+        ``<prefix>/calibration/reliability``. Both empty when the surrogate
+        cannot produce latent predictions.
+    """
+    predicted = _predict_latent_and_total_in_chunks(surrogate, candidates, chunk_size)
+    if predicted is None:
+        return {}, {}
+    means, latent_stds, total_stds = predicted
+    observed = np.asarray(targets, dtype=np.float64).reshape(-1)
+    if observed.size != means.size:
+        _logger.warning(
+            "Calibration skipped for %s: %d targets against %d predictions.",
+            title,
+            observed.size,
+            means.size,
+        )
+        return {}, {}
+
+    high = observed >= high_target_threshold
+    strata: dict[str, tuple[np.ndarray, ...]] = {
+        "all": (observed, means, latent_stds, total_stds),
+        "low_y": (
+            observed[~high],
+            means[~high],
+            latent_stds[~high],
+            total_stds[~high],
+        ),
+        "high_y": (observed[high], means[high], latent_stds[high], total_stds[high]),
+    }
+
+    metrics: dict[str, int | float] = {}
+    for name, (y, mu, latent, total) in strata.items():
+        for key, value in variance_calibration_metrics(y, mu, latent, total).items():
+            metrics[f"{prefix}/calibration/{name}/{key}"] = value
+    metrics[f"{prefix}/calibration/high_target_threshold"] = float(
+        high_target_threshold
+    )
+
+    figures: dict[str, Figure] = {}
+    if include_figure:
+        figure = variance_calibration_figure(title=title, strata=strata)
+        if figure is not None:
+            figures[f"{prefix}/calibration/reliability"] = figure
+    return metrics, figures
+
+
+def _predict_latent_and_total_in_chunks(
+    surrogate: Surrogate,
+    candidates: Sequence[Candidate],
+    chunk_size: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+    """Return means, latent standard deviations and total ones, or ``None``.
+
+    Needs ``encode_candidates`` and ``predict_encoded``: ``predict`` does not
+    expose the observation-noise flag, so it cannot give the latent standard
+    deviation at all. A surrogate without them records no calibration rather
+    than a wrong one.
+    """
+    encode = getattr(surrogate, "encode_candidates", None)
+    predict_encoded = getattr(surrogate, "predict_encoded", None)
+    if not callable(encode) or not callable(predict_encoded) or not candidates:
+        return None
+    means: list[np.ndarray] = []
+    latent_stds: list[np.ndarray] = []
+    total_stds: list[np.ndarray] = []
+    try:
+        for start in range(0, len(candidates), chunk_size):
+            chunk = candidates[start : start + chunk_size]
+            features = encode(chunk)
+            latent = predict_encoded(features, observation_noise=False)
+            total = predict_encoded(features, observation_noise=True)
+            means.append(np.asarray(latent["mean"], dtype=np.float64).reshape(-1))
+            latent_stds.append(np.asarray(latent["std"], dtype=np.float64).reshape(-1))
+            total_stds.append(np.asarray(total["std"], dtype=np.float64).reshape(-1))
+    except (NotImplementedError, TypeError, ValueError, RuntimeError, KeyError):
+        _logger.warning("Latent calibration prediction failed.", exc_info=True)
+        return None
+    if not means:
+        return None
+    return (
+        np.concatenate(means),
+        np.concatenate(latent_stds),
+        np.concatenate(total_stds),
+    )
+
+
 def surrogate_diagnostics(
     surrogate: Surrogate,
     record: "RoundRecord",
@@ -217,12 +403,40 @@ def surrogate_diagnostics(
         max_points=max_points,
     )
     metrics: dict[str, int | float] = {}
+    figures: dict[str, Figure] = {}
     if current_panel is not None:
         _add_prediction_metrics(
             metrics,
             "surrogate/general/held_out/current_round",
             current_panel,
         )
+        # Latent-variance calibration on the molecules the POLICY proposed and
+        # the acquisition actually ranked. The fixed evaluation set says whether
+        # the surrogate is calibrated on the library; this says whether it is
+        # calibrated where the budget was spent, which is off-distribution and
+        # can differ sharply. Predicted before these enter the archive, so the
+        # reading stays leakage-free like the metrics above.
+        # Candidates and targets must be filtered TOGETHER: a failed dock
+        # returns a non-finite y, so taking all the candidates and only the
+        # finite targets would misalign every pair after the first failure.
+        # ~8% of docks failed in the completed 10-round run.
+        scored = [
+            (candidate, target)
+            for candidate, observation in zip(
+                record.selected_candidates, record.queried_observations
+            )
+            if (target := _finite_scalar(observation.y)) is not None
+        ]
+        calibration_metrics, calibration_figures = latent_calibration_diagnostics(
+            surrogate,
+            prefix="surrogate/general/held_out/current_round",
+            title="Current round (policy proposals)",
+            candidates=[candidate for candidate, _ in scored],
+            targets=[target for _, target in scored],
+            include_figure=include_figures,
+        )
+        metrics.update(calibration_metrics)
+        figures.update(calibration_figures)
 
     updated_history = append_prequential_panel(
         prequential_history,
@@ -237,7 +451,6 @@ def surrogate_diagnostics(
             rolling_panel,
         )
 
-    figures: dict[str, Figure] = {}
     if include_figures:
         figure_panels: list[PredictionPanel] = []
         if current_panel is not None:
@@ -814,3 +1027,110 @@ def _combine_prediction_panels(
         ),
         fidelities=tuple(fidelity for panel in panels for fidelity in panel.fidelities),
     )
+
+
+#: Namespace for the chemistry profile of the candidates sent to the oracle.
+_DOCKED_CHEMISTRY_PREFIX = "active_learning/docked"
+
+
+def docked_chemistry_diagnostics(
+    candidates: Sequence[Candidate],
+    *,
+    sa_threshold: float,
+) -> dict[str, float]:
+    """Profile the validity and synthesizability of one round's docked set.
+
+    The candidates handed to the oracle are the molecules a round spends its
+    whole budget on, and neither property is otherwise recorded for them. The
+    sampler's own ``validity_rate`` and ``synthesizable_rate`` are measured on
+    TRAINING batches, and the pool the selection is drawn from is filtered for
+    canonicalization and duplication only -- never for synthesizability -- so
+    nothing upstream states what fraction of the docked molecules a chemist
+    could make.
+
+    Validity is expected to be 1.0, because the generator admits a candidate
+    only after RDKit canonicalizes it. It is measured rather than assumed: a
+    rate below 1.0 means the pool filter regressed or an unfiltered candidate
+    source was configured, which is worth an explicit series rather than a
+    silent assumption.
+
+    Parameters
+    ----------
+    candidates : Sequence[Candidate]
+        The candidates selected for this round's oracle queries. ``x`` is read
+        as a SMILES string; a candidate whose ``x`` is not a string counts as
+        invalid rather than raising, so a non-molecular run cannot break the
+        loop by enabling this diagnostic.
+    sa_threshold : float
+        Strict upper bound on the SA score counted as synthesizable, matching
+        the sampler's ``sa_threshold`` so the two series mean the same thing.
+
+    Returns
+    -------
+    dict[str, float]
+        Counts and rates under ``active_learning/docked/``. Empty when
+        ``candidates`` is empty, so a round that selected nothing contributes
+        no misleading zero-of-zero rate.
+
+    Raises
+    ------
+    activelearning.sampler.s3gfn._optional.S3GFNOptionalDependencyError
+        If RDKit is unavailable. The diagnostic is opt-in, so a run that cannot
+        score molecules should not have asked for it.
+    """
+    if not candidates:
+        return {}
+
+    # Imported here, not at module scope: this is the one diagnostic that needs
+    # RDKit, and monitoring must stay importable without the molecule extra.
+    from activelearning.sampler.s3gfn._optional import require_rdkit
+    from activelearning.sampler.s3gfn.synthesizability import (
+        SAScoreSynthesizability,
+        passes_sa_threshold,
+    )
+
+    chem, _, _ = require_rdkit()
+    # One scorer for this call, sized to the batch: the docked sets are
+    # disjoint across rounds by construction, so a cache outliving the round
+    # would hold entries that can never be hit again.
+    scorer = SAScoreSynthesizability(
+        threshold=sa_threshold, cache_size=len(candidates)
+    )
+
+    total = len(candidates)
+    valid = 0
+    synthesizable = 0
+    sa_scores: list[float] = []
+    for candidate in candidates:
+        smiles = candidate.x
+        if not isinstance(smiles, str) or chem.MolFromSmiles(smiles) is None:
+            continue
+        valid += 1
+        score = scorer.score(smiles)
+        sa_scores.append(score)
+        if passes_sa_threshold(score, sa_threshold):
+            synthesizable += 1
+
+    metrics = {
+        f"{_DOCKED_CHEMISTRY_PREFIX}/total": float(total),
+        f"{_DOCKED_CHEMISTRY_PREFIX}/valid_count": float(valid),
+        f"{_DOCKED_CHEMISTRY_PREFIX}/validity_rate": valid / total,
+        f"{_DOCKED_CHEMISTRY_PREFIX}/synthesizable_count": float(synthesizable),
+        f"{_DOCKED_CHEMISTRY_PREFIX}/synthesizable_rate": synthesizable / total,
+        f"{_DOCKED_CHEMISTRY_PREFIX}/sa_threshold": float(sa_threshold),
+    }
+    if sa_scores:
+        # The threshold is one cut through a distribution; the mean and the
+        # median say whether a flat rate is hiding a drift toward the cut.
+        ordered = sorted(sa_scores)
+        middle = len(ordered) // 2
+        metrics[f"{_DOCKED_CHEMISTRY_PREFIX}/sa_score_mean"] = float(
+            sum(ordered) / len(ordered)
+        )
+        metrics[f"{_DOCKED_CHEMISTRY_PREFIX}/sa_score_median"] = float(
+            ordered[middle]
+            if len(ordered) % 2
+            else 0.5 * (ordered[middle - 1] + ordered[middle])
+        )
+        metrics[f"{_DOCKED_CHEMISTRY_PREFIX}/sa_score_max"] = float(ordered[-1])
+    return metrics

@@ -1350,3 +1350,72 @@ def test_al_loop_omits_the_already_queried_count_when_the_check_is_off():
     assert run_writer.rounds
     for record in run_writer.rounds:
         assert "active_learning/samples/already_queried" not in record["metrics"]
+
+
+def test_active_learning_records_the_docked_chemistry_when_configured(
+    dataset, surrogate, acquisition, sampler, selector, oracle, budget
+):
+    """The docked set's validity and synthesizability reach the round record.
+
+    Asserted through the loop rather than on the diagnostic alone, because the
+    wiring fails silently: a missing merge into the metrics mapping leaves the
+    series simply absent, which looks identical to the feature being off.
+
+    This fixture's candidates are tuples, not SMILES, so validity is 0.0 here.
+    That is the point -- what is under test is that the keys arrive, and that
+    enabling a molecular diagnostic on a non-molecular run cannot raise.
+    """
+    pytest.importorskip("rdkit", reason="The docked chemistry profile needs RDKit.")
+    writer = RecordingRunWriter()
+
+    active_learning(
+        dataset=dataset,
+        surrogate=surrogate,
+        acquisition=acquisition,
+        sampler=sampler,
+        selector=selector,
+        oracle=oracle,
+        budget=budget,
+        run_writer=writer,
+        diagnostics_config=DiagnosticsConfig(docked_sa_threshold=4.0),
+    )
+
+    assert writer.rounds, "no round was recorded"
+    for round_record in writer.rounds:
+        metrics = round_record["metrics"]
+        assert metrics["active_learning/docked/sa_threshold"] == 4.0
+        # Every candidate the oracle was asked about is counted, so the total
+        # has to agree with what the round said it selected.
+        assert (
+            metrics["active_learning/docked/total"]
+            == metrics["active_learning/samples/selected"]
+        )
+        assert metrics["active_learning/docked/validity_rate"] == 0.0
+        assert metrics["active_learning/docked/synthesizable_rate"] == 0.0
+
+
+def test_the_docked_chemistry_is_absent_unless_it_is_configured(
+    dataset, surrogate, acquisition, sampler, selector, oracle, budget
+):
+    """Off by default, so a run without RDKit records the same rounds it did."""
+    writer = RecordingRunWriter()
+
+    active_learning(
+        dataset=dataset,
+        surrogate=surrogate,
+        acquisition=acquisition,
+        sampler=sampler,
+        selector=selector,
+        oracle=oracle,
+        budget=budget,
+        run_writer=writer,
+        diagnostics_config=DiagnosticsConfig(),
+    )
+
+    assert writer.rounds, "no round was recorded"
+    for round_record in writer.rounds:
+        assert not [
+            key
+            for key in round_record["metrics"]
+            if key.startswith("active_learning/docked/")
+        ]

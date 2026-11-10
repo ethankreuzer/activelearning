@@ -54,7 +54,7 @@ Tick boxes and add dated notes under each step as work lands.
 - **The 331k set has no `y`.** Its binding probability comes from its `pprop` via
   `HitRateModel.hit_rate_from_pprop(pprop, pki_threshold=6.5)` (`hit_rate.py`), with the
   base config's oracle hit-rate settings (`ampc_hitrate_fits/fitted_params.json`,
-  `ampc_hitrate_fits/data/full_scores.df`, target `ampc`). The probability is not
+  `ampc_hitrate_fits/data/ampc_full_scores_1p7b.df`, target `ampc`). The probability is not
   monotone in the score, so `pprop` itself is not the target.
 - **W&B project: `ampc-surrogate-eval`.**
 
@@ -209,7 +209,7 @@ Result (job 4321393, finished 2026-09-30, 3 min 39 s): `data/ampc_331k_with_y.cs
 `data/ampc_val_20k.json`, `data/ampc_val_20k.png`. Verified 2026-10-01 that the job
 read its hit-rate settings from the `Dock3Oracle` block of
 `config/ampc/s3gfn_minimol_ampc_variational_single_fidelity.yaml`
-(`ampc_hitrate_fits/fitted_params.json`, target `ampc`, `full_scores.df`,
+(`ampc_hitrate_fits/fitted_params.json`, target `ampc`, `ampc_full_scores_1p7b.df`,
 `pki_threshold: 6.5`) — the same settings the oracle uses in the loop, unmodified
 since 2026-09-09. No `y` is non-finite and no score fell outside the table range.
 
