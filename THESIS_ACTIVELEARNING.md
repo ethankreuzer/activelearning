@@ -743,13 +743,15 @@ features -- which is exactly what the `learned` and `constant` arms separate.
    instead one that was not on the original list, and the reasoning for it is under "Why
    axis 2 exists".
 
-   **Still genuinely open, deferred by the user, and NOT covered by the settled tables:
-   what is logged, and what is run on the held-out sets.** No job script exists for
-   these six arms. Three things block it: `score_chunk_size` has no safe default at
-   n=25,000 (51 MB per candidate row at fp32); three of the six cached eval sets have
-   unusable labels (see the eval-set table in section 4); and at fp32 the loss trace is
-   the only evidence a fit converged, so it must reach W&B densely enough to judge
-   that, alongside the per-arm L-BFGS-B status and evaluation count.
+   ~~**Still open: what is logged, and what is run on the held-out sets.** No job
+   script exists for these six arms.~~ **CLOSED 2026-11-09/10.**
+   `jobs/exact_gp_25k_mila.sh` takes both axes as arguments and all three blockers are
+   settled: `--score-chunk-size 128` is MEASURED, not guessed (256 OOM'd as job
+   11620005, and 128 peaked at 39,644 MiB of an A100-40GB's 40,960, so do not raise
+   it); the eval sets are the three in item 3 below; and the loss trace reaches W&B per
+   evaluation in `loss_curve.csv` alongside the L-BFGS-B status, attempt count and
+   evaluation count in `fit_summary.json`. What is logged is listed under "Where each
+   arm's data is saved locally".
 3. ~~Everything about datasets and eval sets.~~ **CLOSED 2026-11-09.** Three held-out
    sets, all three cached and verified:
 
@@ -785,6 +787,54 @@ features -- which is exactly what the `learned` and `constant` arms separate.
    distribution endpoints -- `gibbon_log` median/p99, fraction above -744.44, and
    `gibbon_value`'s `effective_support` / `n_mass90` / `fraction_at_floor` -- are
    unaffected. Unresolved.
+
+### Where each arm's data is saved locally (2026-11-10)
+
+Every arm writes to `outputs/ampc/exact_gp_25k/<arm>/`, where `<arm>` is
+`<on|off>_<pinned|learned|constant>` -- the same string as the W&B run name minus the
+job id. **48 MB per arm**, so ~290 MB for the six. Nothing here is a copy of W&B:
+W&B is the dashboard, these files are the record.
+
+| path | what it holds |
+|---|---|
+| `eval/<set>.csv` | **one row per molecule**: `SMILES, y, [weight,] in_train, mean, std_total, std_latent` and, on the scored sets, `score_gibbon_value, score_gibbon_log`. 44 MB over the three sets |
+| `eval_summary.json` | every logged scalar, including the ones no longer sent to W&B |
+| `fit_summary.json` | fitted hyperparameters, L-BFGS-B attempts/status/evaluations, set sizes |
+| `loss_curve.csv` | per-evaluation loss, noise, outputscale, lengthscale, signal-to-noise |
+| `stage_profile.csv` | all nine profile columns per stage, rewritten after every stage so a killed run keeps what it measured |
+| `resolved_config.json` | the fully resolved config plus `provenance.git_commit` / `git_dirty` |
+| `surrogate_state.pt` | the fitted model, so predictions on a NEW set need no refit |
+
+**The guarantee, tested on job 11620200 rather than assumed: every statistic and
+figure an arm reports is recomputable from `eval/<set>.csv` alone.** Checked key by
+key -- `rmse`, `bias`, `pearson`, `coverage_1std`, `std_latent/mean`,
+`latent_variance_ratio` and the `_unseen` block all reproduce to ten decimals from the
+three prediction columns. So a figure nobody thought to make, or a block cut at a
+different threshold, costs a CSV read and no GPU.
+
+That guarantee had one hole, found and closed on 2026-11-10. `ampc_val_screen_232k`'s
+**ipw weights are an input, not a function of the saved columns**, so while
+`weighted_rmse / weighted_bias / weighted_pearson / weighted_r2` were logged, nothing
+under the run could reproduce them. `write_per_molecule_csv` now writes `weight` after
+`y` for any weighted set, and job 11620200's CSV was backfilled from
+`cache/ampc/exact_dkl_top_n/ampc_val_screen_232k.csv` -- the join verified on all
+230,887 rows by SMILES and `y` before the write, and confirmed after by recomputing
+`weighted_rmse` 0.0804760188 and `weighted_bias` 0.0699949904 from the file alone,
+matching the logged values. Note `relabel_eval_sets.py` records that `weight` is
+`1/P(selected)` **for the rule actually applied and must never be recomputed** -- which
+is why it is saved rather than derived.
+
+Two things are deliberately NOT under the run directory, both reproducible without it:
+the MiniMol features, shared in `cache/ampc/exact_dkl_top_n/<set>.npy` and
+deterministic given the encoder identity (~650 MB per arm if duplicated); and GIBBON's
+50,000-row max-value support, fixed by `--acquisition-seed 42`.
+
+W&B carries 449 scalars per arm after the 2026-11-10 trim, down from 647, having
+dropped only keys that repeat a key that remains (`<set>_unseen/*` where
+`n_in_train = 0`; `gibbon_log`'s rank metrics, identical to `gibbon_value`'s by
+monotonicity), are constant by construction (`gibbon_log/fraction_zero` = 1.0), or
+live in `stage_profile.csv` (six of eight `run/stage/*` fields). **Job 11620200
+predates the trim and carries the wider key set.**
 
 ### Why the balanced sets cannot be reused
 
