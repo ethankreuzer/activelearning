@@ -20,6 +20,23 @@ the model stays BoTorch's default.
 ``kernel="matern"`` swaps the RBF for a Matern-5/2 under the same prior and
 constraint, as BoTorch's ``use_rbf_kernel=False`` does.
 
+``lengthscale_prior=False`` drops the dimension-scaled LogNormal prior from the
+lengthscale, leaving it fitted by the marginal likelihood alone and started at
+``sqrt(input_dim)`` -- the prior-free kernel ``ExactDKLSurrogate`` and
+``VariationalGPSurrogate`` use (``variational_gp._matern_kernel``). It needs
+``ard=False``: BoTorch's ARD kernel comes from
+``get_covar_module_with_dim_scaled_prior``, which has no way to omit the prior.
+Two asymmetries are deliberate and worth knowing when reading a fit.
+
+* The ``GreaterThan(2.5e-2)`` floor stays in both cases. It is kept so
+  L-BFGS-B sees the same box either way, and it sits two orders of magnitude
+  below where a 512-feature fit operates, so it cannot bind.
+* ``fit_gpytorch_mll`` resamples a retry's hyperparameters from the priors, and
+  ``sample_all_priors`` iterates ``named_priors()`` -- so a parameter with no
+  prior is never resampled. Without the lengthscale prior a retry restarts the
+  lengthscale from wherever the discarded attempt left it, and only the noise is
+  redrawn. (The ``outputscale`` is prior-free in both cases and never resampled.)
+
 Two further departures from the default, both off unless set. ``outputscale``
 wraps the kernel in a ``ScaleKernel``, so the signal variance -- the latent
 variance far from the data -- is learned instead of fixed at the training
@@ -27,6 +44,19 @@ targets' variance. ``prior_mean`` pins the constant mean, the prediction far
 from the data, to a known value such as the mean of the library the training
 set was drawn from, instead of learning it from a training set that may be
 enriched in high scorers.
+
+``constant_kernel`` ADDS a ``ConstantKernel`` to the covariance, which carries
+the prior variance of an unknown constant offset and integrates that constant
+out analytically rather than fitting it as a free parameter. It exists for a
+pinned ``prior_mean``: what the kernel fits is the residual ``y - m(X)``, so a
+mean pinned far from the training targets' own mean leaves every residual
+shifted the same way, and a stationary kernel can only absorb a constant offset
+by lengthening its lengthscale and raising its output scale -- spending latent
+variance on a known constant instead of on variation between inputs. The
+constant term gives that offset somewhere else to live. It is prior-free, so
+like ``outputscale`` it is never resampled on a retry, and it is rejected
+alongside a learned mean (``prior_mean=None``), which would represent the same
+constant twice.
 
 ``accept_abnormal_lbfgsb`` keeps an L-BFGS-B attempt that scipy ends with
 ``ABNORMAL`` -- its line search found no further decrease -- instead of letting
@@ -54,7 +84,13 @@ from botorch.models.utils.gpytorch_modules import (
     get_covar_module_with_dim_scaled_prior,
 )
 from gpytorch.constraints import GreaterThan
-from gpytorch.kernels import Kernel, MaternKernel, RBFKernel, ScaleKernel
+from gpytorch.kernels import (
+    ConstantKernel,
+    Kernel,
+    MaternKernel,
+    RBFKernel,
+    ScaleKernel,
+)
 from gpytorch.priors import LogNormalPrior
 
 from matplotlib.figure import Figure
@@ -99,7 +135,9 @@ class FixedFeatureGPSurrogate(BoTorchGPSurrogate):
         *,
         ard: bool = True,
         kernel: Literal["rbf", "matern"] = "rbf",
+        lengthscale_prior: bool = True,
         outputscale: bool = False,
+        constant_kernel: bool = False,
         prior_mean: Optional[float] = None,
         noise_std_floor: Optional[float] = None,
         scale_inputs: bool = True,
@@ -126,12 +164,25 @@ class FixedFeatureGPSurrogate(BoTorchGPSurrogate):
             The stationary kernel: BoTorch's default RBF, or a Matern-5/2 under
             the same lengthscale prior and constraint. ``"matern"`` is
             single-fidelity only.
+        lengthscale_prior : bool, default=True
+            Whether the lengthscale carries BoTorch's dimension-scaled
+            LogNormal prior, started at its mode. ``False`` fits it from the
+            marginal likelihood alone, started at ``sqrt(feature_dim)``, as the
+            prior-free kernels elsewhere in this package are. Requires
+            ``ard=False``, and a retry then never resamples it -- see the module
+            docstring.
         outputscale : bool, default=False
             Whether to wrap the kernel in a ``ScaleKernel`` with a learned,
             prior-free output scale, initialized at 1. ``False`` keeps
             BoTorch's default, which has none: the signal variance is then fixed
             at 1 on the standardized scale, the training targets' variance.
             Single-fidelity only.
+        constant_kernel : bool, default=False
+            Whether to ADD a ``ConstantKernel``, the prior variance of an
+            unknown constant offset, to the covariance. It gives a pinned
+            ``prior_mean``'s residual offset somewhere to live other than the
+            lengthscale and output scale; see the module docstring. Requires a
+            pinned ``prior_mean`` and single-fidelity data.
         prior_mean : float, optional
             Fixed GP prior mean on the original target scale, held constant
             through every fit, as in ``ExactDKLSurrogate``. It is converted with
@@ -178,7 +229,9 @@ class FixedFeatureGPSurrogate(BoTorchGPSurrogate):
             ``max_cholesky_size`` is negative, ``noise_std_floor`` is not
             positive, ``kernel`` is unknown, or
             ``ard`` is false, ``kernel`` is ``"matern"`` or ``outputscale`` is
-            true in multi-fidelity mode.
+            true in multi-fidelity mode, ``lengthscale_prior`` is false
+            without ``ard=False``, or ``constant_kernel`` is true in
+            multi-fidelity mode or without a pinned ``prior_mean``.
         """
         if encoder.feature_dim < 1:
             raise ValueError("encoder.feature_dim must be positive.")
@@ -196,8 +249,25 @@ class FixedFeatureGPSurrogate(BoTorchGPSurrogate):
             raise ValueError("kernel='matern' supports single-fidelity data only.")
         if outputscale and is_multi_fidelity:
             raise ValueError("outputscale=True supports single-fidelity data only.")
+        if constant_kernel and is_multi_fidelity:
+            raise ValueError("constant_kernel=True supports single-fidelity data only.")
+        if constant_kernel and prior_mean is None:
+            # A learned ConstantMean and the constant kernel's implicit constant
+            # both represent the level of the function, so the two compete for
+            # the same quantity and the fit is not interpretable.
+            raise ValueError(
+                "constant_kernel=True requires a pinned prior_mean; with a learned "
+                "mean the constant is represented twice."
+            )
+        if not lengthscale_prior and ard:
+            # BoTorch's ARD kernel comes from get_covar_module_with_dim_scaled_prior,
+            # which has no way to omit the prior; only the isotropic kernel built
+            # here can.
+            raise ValueError("lengthscale_prior=False requires ard=False.")
         self._ard = ard
         self._kernel = kernel
+        self._lengthscale_prior = lengthscale_prior
+        self._constant_kernel = constant_kernel
         self._outputscale = outputscale
         self._prior_mean = None if prior_mean is None else float(prior_mean)
         self._noise_std_floor = None if noise_std_floor is None else float(noise_std_floor)
@@ -483,13 +553,20 @@ class FixedFeatureGPSurrogate(BoTorchGPSurrogate):
 
     def _build_model(self, train_X: torch.Tensor, train_Y: torch.Tensor) -> None:
         """Build the GP with the configured kernel and, if set, a pinned mean."""
-        if not self._ard or self._outputscale or self._kernel != "rbf":
+        if (
+            not self._ard
+            or self._outputscale
+            or self._constant_kernel
+            or self._kernel != "rbf"
+        ):
             # Fresh on every build, as SingleTaskGP's default kernel is, so a
             # refit or restore never starts from an earlier fit's values.
             use_rbf_kernel = self._kernel == "rbf"
             kernel: Kernel = (
                 _isotropic_dim_scaled_kernel(
-                    train_X.shape[-1], use_rbf_kernel=use_rbf_kernel
+                    train_X.shape[-1],
+                    use_rbf_kernel=use_rbf_kernel,
+                    lengthscale_prior=self._lengthscale_prior,
                 )
                 if not self._ard
                 else get_covar_module_with_dim_scaled_prior(
@@ -500,6 +577,10 @@ class FixedFeatureGPSurrogate(BoTorchGPSurrogate):
                 kernel = ScaleKernel(kernel)
                 # Start where the kernel without an output scale sits.
                 kernel.outputscale = 1.0
+            if self._constant_kernel:
+                # Added OUTSIDE the output scale: an independent constant
+                # component, not a scaled one.
+                kernel = kernel + ConstantKernel()
             self.covar_module = kernel
         super()._build_model(train_X, train_Y)
         if self._prior_mean is not None:
@@ -621,9 +702,9 @@ class FixedFeatureGPSurrogate(BoTorchGPSurrogate):
 
 
 def _isotropic_dim_scaled_kernel(
-    input_dim: int, *, use_rbf_kernel: bool = True
+    input_dim: int, *, use_rbf_kernel: bool = True, lengthscale_prior: bool = True
 ) -> RBFKernel | MaternKernel:
-    """Return a kernel with one lengthscale and BoTorch's default prior.
+    """Return a kernel with one lengthscale, with or without BoTorch's prior.
 
     The prior and constraint are those of
     ``get_covar_module_with_dim_scaled_prior``. The prior is still scaled by the
@@ -638,19 +719,31 @@ def _isotropic_dim_scaled_kernel(
     use_rbf_kernel : bool, default=True
         RBF if true, Matern-5/2 otherwise, as in
         ``get_covar_module_with_dim_scaled_prior``.
+    lengthscale_prior : bool, default=True
+        Whether the lengthscale carries the dimension-scaled LogNormal prior and
+        starts at its mode. ``False`` leaves it prior-free and starts it at
+        ``sqrt(input_dim)``, as the prior-free kernels elsewhere in this package
+        do, keeping the same floor so L-BFGS-B sees the same box either way.
 
     Returns
     -------
     RBFKernel or MaternKernel
-        Isotropic kernel, initialized at the prior's mode.
+        Isotropic kernel, initialized at the prior's mode or, prior-free, at
+        ``sqrt(input_dim)``.
     """
-    lengthscale_prior = LogNormalPrior(
-        loc=SQRT2 + math.log(input_dim) * 0.5, scale=SQRT3
-    )
     base_class = RBFKernel if use_rbf_kernel else MaternKernel
+    if not lengthscale_prior:
+        kernel = base_class(
+            lengthscale_constraint=GreaterThan(
+                2.5e-2, transform=None, initial_value=math.sqrt(input_dim)
+            )
+        )
+        kernel.lengthscale = math.sqrt(input_dim)
+        return kernel
+    prior = LogNormalPrior(loc=SQRT2 + math.log(input_dim) * 0.5, scale=SQRT3)
     return base_class(
-        lengthscale_prior=lengthscale_prior,
+        lengthscale_prior=prior,
         lengthscale_constraint=GreaterThan(
-            2.5e-2, transform=None, initial_value=lengthscale_prior.mode
+            2.5e-2, transform=None, initial_value=prior.mode
         ),
     )

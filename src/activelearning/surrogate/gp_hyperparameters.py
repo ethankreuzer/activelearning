@@ -18,12 +18,17 @@ import numpy as np
 def gp_hyperparameters(surrogate: Any) -> dict[str, float]:
     """Read the learned hyperparameters of an exact GP.
 
-    Three kernel structures occur: ``EncoderKernel(base_kernel=ScaleKernel(
+    Four kernel structures occur: ``EncoderKernel(base_kernel=ScaleKernel(
     MaternKernel))`` for ``ExactDKLSurrogate``, BoTorch's bare ``RBFKernel``
-    (or a configured variant) for ``FixedFeatureGPSurrogate``, and
-    ``ScaleKernel(MaternKernel)`` for ``VariationalGPSurrogate``. The reader
-    walks ``base_kernel`` down to the kernel with lengthscales; a kernel with no
-    ``ScaleKernel`` has an output scale of exactly 1.
+    (or a configured variant) for ``FixedFeatureGPSurrogate``,
+    ``ScaleKernel(MaternKernel)`` for ``VariationalGPSurrogate``, and
+    ``AdditiveKernel(ScaleKernel(MaternKernel), ConstantKernel)`` for
+    ``FixedFeatureGPSurrogate`` with ``constant_kernel=True``. The reader walks
+    ``base_kernel`` down to the kernel with lengthscales, descending into an
+    additive kernel's summands; a kernel with no ``ScaleKernel`` has an output
+    scale of exactly 1. An ``AdditiveKernel`` has NO ``base_kernel``, so walking
+    it blindly raises ``AttributeError`` -- which is what the constant-kernel
+    arms of the exact-GP sweep hit on their first logging callback.
 
     The variational GP's model is an adapter that wraps the GP and likelihood
     and carries its output standardization as two numbers rather than an
@@ -52,9 +57,30 @@ def gp_hyperparameters(surrogate: Any) -> dict[str, float]:
         likelihood = model.likelihood
     kernel = gp.covar_module
     outputscale = 1.0
+    constant = None
     while not kernel.has_lengthscale:
         if hasattr(kernel, "outputscale"):
             outputscale = float(kernel.outputscale.detach())
+        if hasattr(kernel, "kernels"):
+            # An additive kernel: the constant summand is the prior variance of
+            # an unknown constant offset, recorded as its own hyperparameter,
+            # and the walk continues into the summand that carries lengthscales.
+            summands = list(kernel.kernels)
+            for summand in summands:
+                if hasattr(summand, "constant") and not summand.has_lengthscale:
+                    constant = float(summand.constant.detach().reshape(-1)[0])
+            with_lengthscale = [
+                summand
+                for summand in summands
+                if summand.has_lengthscale or hasattr(summand, "base_kernel")
+            ]
+            if len(with_lengthscale) != 1:
+                raise ValueError(
+                    "Cannot read hyperparameters from an additive kernel with "
+                    f"{len(with_lengthscale)} lengthscale-bearing summands."
+                )
+            kernel = with_lengthscale[0]
+            continue
         kernel = kernel.base_kernel
     lengthscale = kernel.lengthscale.detach().reshape(-1)
     noise = float(likelihood.noise.detach().mean())
@@ -83,6 +109,13 @@ def gp_hyperparameters(surrogate: Any) -> dict[str, float]:
         "lengthscale_effective_dims": effective_ard_dims(lengthscale),
         "y_mean": y_mean,
         "y_std": y_std,
+        # The latent variance the acquisition consumes is set by this ratio, not
+        # by either term alone: the fit can trade output scale against noise
+        # freely, so logging both without the ratio hides the thing that moves.
+        "signal_to_noise": float(outputscale / noise) if noise > 0.0 else float("inf"),
+        # Present only for a kernel with a constant summand; the prior variance
+        # of the unknown constant offset, on the standardized target scale.
+        **({} if constant is None else {"constant": constant}),
     }
 
 

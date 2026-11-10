@@ -286,11 +286,21 @@ class FixedFeatureGPSurrogateConfig(BaseModel):
     kernel : {"rbf", "matern"}, default="rbf"
         BoTorch's default RBF, or a Matern-5/2 under the same lengthscale prior;
         ``matern`` is single-fidelity only.
+    lengthscale_prior : bool, default=True
+        Whether the lengthscale carries BoTorch's dimension-scaled LogNormal
+        prior, started at its mode. ``false`` fits it from the marginal
+        likelihood alone, started at ``sqrt(feature_dim)``. Requires
+        ``ard: false``.
     outputscale : bool, default=False
         Whether the kernel gets a learned, prior-free output scale (a
         ``ScaleKernel``). ``false`` keeps BoTorch's default, which fixes the
         signal variance at the training targets' variance; single-fidelity
         only.
+    constant_kernel : bool, default=False
+        Whether to ADD a ``ConstantKernel`` -- the prior variance of an unknown
+        constant offset, integrated out analytically -- to the covariance. It
+        gives a pinned ``prior_mean``'s residual offset somewhere to live other
+        than the lengthscale and output scale. Requires a pinned ``prior_mean``.
     prior_mean : float, optional
         Fixed GP prior mean on the original target scale, such as the mean of
         the library the training set was drawn from, held constant through
@@ -324,7 +334,9 @@ class FixedFeatureGPSurrogateConfig(BaseModel):
     encoder: FixedEncoderConfig
     ard: bool = True
     kernel: Literal["rbf", "matern"] = "rbf"
+    lengthscale_prior: bool = True
     outputscale: bool = False
+    constant_kernel: bool = False
     prior_mean: float | None = None
     noise_std_floor: float | None = Field(default=None, gt=0)
     scale_inputs: bool = True
@@ -364,7 +376,9 @@ class FixedFeatureGPSurrogateConfig(BaseModel):
             encoder=self.encoder.build(),
             ard=self.ard,
             kernel=self.kernel,
+            lengthscale_prior=self.lengthscale_prior,
             outputscale=self.outputscale,
+            constant_kernel=self.constant_kernel,
             prior_mean=self.prior_mean,
             noise_std_floor=self.noise_std_floor,
             scale_inputs=self.scale_inputs,

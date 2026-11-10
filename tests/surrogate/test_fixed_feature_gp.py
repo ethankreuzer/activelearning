@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import gpytorch
+import math
 import warnings
 
 import pytest
@@ -16,7 +17,13 @@ from botorch.exceptions.warnings import OptimizationWarning
 from botorch.models import SingleTaskGP
 from botorch.optim.fit import fit_gpytorch_mll_scipy
 from botorch.models.transforms.input import Normalize
-from gpytorch.kernels import MaternKernel, RBFKernel, ScaleKernel
+from gpytorch.kernels import (
+    AdditiveKernel,
+    ConstantKernel,
+    MaternKernel,
+    RBFKernel,
+    ScaleKernel,
+)
 from pydantic import TypeAdapter
 from torch import Tensor
 
@@ -30,6 +37,7 @@ from activelearning.surrogate.config import (
 from activelearning.surrogate.encoder import FixedEncoder
 from activelearning.surrogate.fixed_feature_gp import (
     FixedFeatureGPSurrogate,
+    _isotropic_dim_scaled_kernel,
     accept_abnormal_lbfgsb_warnings,
 )
 from activelearning.surrogate.subset_gp import SubsetFixedFeatureGPSurrogate
@@ -194,6 +202,116 @@ def test_matern_kernel_keeps_the_default_lengthscale_prior(ard: bool) -> None:
     assert torch.equal(matern.lengthscale_prior.loc, rbf.lengthscale_prior.loc)
     assert torch.equal(matern.lengthscale_prior.scale, rbf.lengthscale_prior.scale)
     assert matern.raw_lengthscale_constraint.lower_bound == pytest.approx(0.025)
+
+
+def test_lengthscale_prior_false_drops_the_prior_and_keeps_the_floor() -> None:
+    """The prior-free arm fits the lengthscale from the likelihood alone."""
+    with_prior = _fitted(ard=False, kernel="matern", outputscale=True)
+    without = _fitted(
+        ard=False, kernel="matern", outputscale=True, lengthscale_prior=False
+    )
+    kept = with_prior.get_model().covar_module.base_kernel
+    dropped = without.get_model().covar_module.base_kernel
+
+    assert hasattr(kept, "lengthscale_prior")
+    assert not any(name == "lengthscale_prior" for name, *_ in dropped.named_priors())
+    # The floor is identical, so L-BFGS-B sees the same box either way, and it
+    # cannot bind: both arms operate orders of magnitude above it.
+    assert dropped.raw_lengthscale_constraint.lower_bound == pytest.approx(0.025)
+    assert kept.raw_lengthscale_constraint.lower_bound == pytest.approx(0.025)
+    # The noise prior is untouched: it is the only prior the prior-free arm has,
+    # and so the only hyperparameter a retry can resample.
+    assert hasattr(without.get_model().likelihood.noise_covar, "noise_prior")
+
+
+def test_lengthscale_prior_false_starts_at_sqrt_input_dim() -> None:
+    """Prior-free starts where this package's other prior-free kernels do."""
+    unfitted = FixedFeatureGPSurrogate(
+        _SmilesFeatureEncoder(), ard=False, lengthscale_prior=False
+    )
+    kernel = _isotropic_dim_scaled_kernel(
+        unfitted._encoder.feature_dim, lengthscale_prior=False
+    )
+
+    assert float(kernel.lengthscale) == pytest.approx(math.sqrt(4))
+    # With the prior it starts at the prior's mode instead, which is a
+    # different point: the two arms differ in start as well as in gradient.
+    with_prior = _isotropic_dim_scaled_kernel(4, lengthscale_prior=True)
+    assert float(with_prior.lengthscale) != pytest.approx(float(kernel.lengthscale))
+
+
+def test_constant_kernel_adds_an_independent_constant_component() -> None:
+    """The constant term is ADDED, outside the output scale, not folded in."""
+    plain = _fitted(ard=False, kernel="matern", outputscale=True, prior_mean=0.004)
+    with_constant = _fitted(
+        ard=False,
+        kernel="matern",
+        outputscale=True,
+        prior_mean=0.004,
+        constant_kernel=True,
+    )
+    kernel = with_constant.get_model().covar_module
+
+    assert isinstance(plain.get_model().covar_module, ScaleKernel)
+    assert isinstance(kernel, AdditiveKernel)
+    scaled, constant = kernel.kernels
+    assert isinstance(scaled, ScaleKernel)
+    assert isinstance(constant, ConstantKernel)
+    assert isinstance(scaled.base_kernel, MaternKernel)
+    # Prior-free, like the output scale, and so never resampled on a retry.
+    assert not any(name.endswith("prior") for name, *_ in constant.named_priors())
+
+
+def test_constant_kernel_is_constant_across_every_pair() -> None:
+    """It is the prior variance of one unknown constant, not a per-input term."""
+    surrogate = _fitted(
+        ard=False,
+        kernel="matern",
+        outputscale=True,
+        prior_mean=0.004,
+        constant_kernel=True,
+    )
+    train_X, _ = surrogate.get_train_data()
+    _, constant = surrogate.get_model().covar_module.kernels
+    block = constant(train_X[:4]).to_dense()
+
+    assert torch.allclose(block, block[0, 0].expand_as(block))
+    assert float(block[0, 0]) > 0.0
+
+
+def test_constant_kernel_keeps_the_mean_pinned() -> None:
+    """It gives the offset a home; it does not free the mean."""
+    surrogate = _fitted(
+        ard=False,
+        kernel="matern",
+        outputscale=True,
+        prior_mean=0.004,
+        constant_kernel=True,
+    )
+    mean = surrogate.get_model().mean_module.constant
+
+    assert not mean.requires_grad
+    assert _prior_mean_original_scale(surrogate) == pytest.approx(0.004, abs=1e-6)
+
+
+def test_constant_kernel_rejects_a_learned_mean_and_multi_fidelity() -> None:
+    """A learned mean and the implicit constant represent the same quantity."""
+    with pytest.raises(ValueError, match="requires a pinned prior_mean"):
+        FixedFeatureGPSurrogate(_SmilesFeatureEncoder(), ard=False, constant_kernel=True)
+    with pytest.raises(ValueError, match="single-fidelity"):
+        FixedFeatureGPSurrogate(
+            _SmilesFeatureEncoder(),
+            ard=False,
+            constant_kernel=True,
+            prior_mean=0.004,
+            is_multi_fidelity=True,
+        )
+
+
+def test_lengthscale_prior_false_requires_ard_false() -> None:
+    """BoTorch's ARD kernel has no way to omit the prior."""
+    with pytest.raises(ValueError, match="requires ard=False"):
+        FixedFeatureGPSurrogate(_SmilesFeatureEncoder(), lengthscale_prior=False)
 
 
 def test_matern_kernel_rejects_multi_fidelity_and_unknown_kernels() -> None:
