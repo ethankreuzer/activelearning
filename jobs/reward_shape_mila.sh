@@ -173,6 +173,84 @@ export HF_HUB_OFFLINE=1   # nothing is downloaded: the prior and encoder are cac
 # Mila compute nodes reach the internet, so wandb runs online and there is no
 # `wandb sync` step afterwards, unlike the Nibi arms.
 
+# Optional fine-tuned prior, produced by jobs/pretrain_prior_rtb_mila.sh. Unset
+# means the stock GP-MoLFormer checkpoint and behaviour identical to every arm
+# run before this existed.
+#
+#   PRIOR_CKPT=outputs/ampc/prior_rtb/<arm>/policy \
+#     sbatch jobs/reward_shape_mila.sh power 0.175 0 2500 42
+#
+# THIS IS THE WARM-START VARIANT: only the POLICY is initialised from pi_1. The
+# RTB prior stays GP-MoLFormer (S3GFNModel.from_pretrained's
+# prior_model_name_or_path is left alone and nothing here passes it), which
+# leaves the target distribution provably unchanged -- so every number in
+# REWARD_SHAPE_UNDERFLOW_GAP.md remains the valid comparison. A run that also
+# replaces the prior changes the target to pi_0 * exp(a*y) * acq^beta / Z and is
+# NOT comparable; it needs a config field that does not exist yet
+# (PRIOR_RTB_PRETRAIN.md section 8).
+#
+# THE ARM NAME MUST IDENTIFY WHICH PRIOR, because more than one fine-tuned prior
+# will exist and two runs that differ only in their starting policy would
+# otherwise collide in the same output directory and be indistinguishable in
+# W&B. Three things are recorded, at decreasing readability and increasing
+# precision: a compacted form of the checkpoint's arm directory in the ARM name
+# and run name, the same as a `priorarm-` tag, and the first 12 hex of the
+# sha256 of model.safetensors as a `priorsha-` tag. The hash is the identifier
+# that actually pins it: directories get renamed and re-run in place, weights do
+# not, and the never-overwrite guard below only protects against a collision it
+# can see.
+PRIOR_CKPT="${PRIOR_CKPT:-}"
+PRIOR_OVERRIDE=()
+PRIOR_TAGS=""
+PRIOR_NOTE="Prior/policy: STOCK ibm-research/GP-MoLFormer-Uniq, not fine-tuned."
+if [[ -n "${PRIOR_CKPT}" ]]; then
+  if [[ ! -d "${PRIOR_CKPT}" ]]; then
+    echo "PRIOR_CKPT is not a directory: ${PRIOR_CKPT}" >&2
+    exit 2
+  fi
+  if [[ ! -f "${PRIOR_CKPT}/model.safetensors" ]]; then
+    echo "${PRIOR_CKPT} holds no model.safetensors." >&2
+    echo "Point PRIOR_CKPT at the 'policy' directory a pretrain run wrote," >&2
+    echo "not at the arm directory above it." >&2
+    exit 2
+  fi
+  # The arm directory is the parent of 'policy'; fall back to the basename if
+  # someone points at a checkpoint laid out differently.
+  PRIOR_ARM_DIR="$(basename "$(dirname "$(readlink -f "${PRIOR_CKPT}")")")"
+  if [[ "${PRIOR_ARM_DIR}" == "." || -z "${PRIOR_ARM_DIR}" ]]; then
+    PRIOR_ARM_DIR="$(basename "$(readlink -f "${PRIOR_CKPT}")")"
+  fi
+  # Compacted for the ARM name: the generated names are long and carry a full
+  # float beta. Underscores become dashes so the ARM's own '_' stays the field
+  # separator, and the redundant surrogate suffix is dropped.
+  PRIOR_ID="$(printf '%s' "${PRIOR_ARM_DIR}" \
+    | sed -e 's/^prior_rtb_//' -e 's/_svgp300k$//' \
+          -e 's/beta\([0-9]*\.[0-9][0-9]\)[0-9]*/b\1/' \
+          -e 's/steps/st/' -e 's/onpolicy/op/' \
+    | tr '_' '-' | tr -cd 'A-Za-z0-9.-')"
+  PRIOR_SHA="$(sha256sum "${PRIOR_CKPT}/model.safetensors" | cut -c1-12)"
+  ARM="${ARM}_prior${PRIOR_ID}"
+  PRIOR_OVERRIDE=("sampler.model_name_or_path=${PRIOR_CKPT}")
+  # W&B rejects any tag over 64 characters, and the generated arm directories
+  # run to 76 because the sweep's beta is a full float -- so the TAG carries the
+  # compacted id, not the raw directory. The untruncated directory name and the
+  # full checkpoint path live in WANDB_NOTES and arm_description.txt, which have
+  # no such limit, and the sha tag identifies the weights exactly either way.
+  PRIOR_TAGS=",finetuned-prior,priorarm-${PRIOR_ID},priorsha-${PRIOR_SHA}"
+  for tag in "finetuned-prior" "priorarm-${PRIOR_ID}" "priorsha-${PRIOR_SHA}"; do
+    if (( ${#tag} > 64 )); then
+      echo "Derived W&B tag '${tag}' is ${#tag} characters; the limit is 64." >&2
+      echo "Shorten the pretraining arm directory name, or extend the sed" >&2
+      echo "compaction above that builds PRIOR_ID." >&2
+      exit 2
+    fi
+  done
+  PRIOR_NOTE="Prior/policy: FINE-TUNED, WARM START. sampler.model_name_or_path=${PRIOR_CKPT} (sha256 of model.safetensors begins ${PRIOR_SHA}; pretraining arm ${PRIOR_ARM_DIR}; see its arm_description.txt for beta, step count, on-policy fraction and the held-out generalization gaps). The RTB prior is still stock GP-MoLFormer, so the target distribution is unchanged and this arm IS comparable with the non-fine-tuned arms of the same (transform, beta, floor, steps)."
+  echo "Fine-tuned prior: ${PRIOR_CKPT}"
+  echo "  arm  ${PRIOR_ARM_DIR}"
+  echo "  sha  ${PRIOR_SHA}"
+fi
+
 STATE_PATH="${FITTED_DIR}/surrogate_state.pt"
 OUTPUT_DIR="outputs/ampc/reward_shape_mila/${ARM}"
 REJECT_LOG_PATH="${OUTPUT_DIR}/rejects_round_{round}.csv"
@@ -212,11 +290,12 @@ Reward: transform=${TRANSFORM}, beta=${BETA}, log(acq) floored at the FIXED valu
 WHAT THE THREE DOCKED ARMS OF 2026-10-27/28 ESTABLISHED, which this scan follows up: floor depth governs VALIDITY and beta governs DIVERSITY, and they fail in different directions. Both floor -500 arms held validity >= 0.83 while spanning a 2x range of above-floor fraction and a 3x range of prior_divergence; the single floor -1000 arm fell to 0.545, because a deep floor pays out for being slightly unusual rather than genuinely good and the cheapest route to unusual in SMILES space is syntactic. Separately, beta=0.1 at floor -500 kept validity 0.882 and the largest prior_divergence of any arm (16.5) but rejected 90.1% of its generations as duplicates, yielding 7,273 unique molecules from 2,000,000 attempts.
 WHAT TO READ: train/batch_health for BOTH validity and uniqueness, read AT the step acq/trajectory plateaus rather than as a run-level average (in the beta=0.03 arm validity was 0.92 at the plateau and 0.70 at the end, and its average of 0.83 describes neither); the step at which reward/above_floor_fraction first leaves zero, which is how long the policy searched before the reward said anything (~1,150 steps at floor -500, ~700 at floor -1000) and is what bounds how shallow the floor can go; the step at which acq/trajectory plateaus, after which further steps cost validity and buy nothing; reward/effective_support and reward/concentration; train/prior_divergence, which on this evidence does NOT predict validity loss; and the training-loss panel. A falling online RTB is not automatically good: in the floor -1000 arm it peaked at step 1,200 and fell because the policy had converged onto an off-manifold mode, over exactly the window in which validity collapsed.
 TRAINING LENGTH: this arm runs ${N_TRAIN_STEPS} steps. A shorter arm is not a longer one stopped early -- the warmup/decay schedule spans n_train_steps, so 2,500 steps decays the learning rate twice as fast as 5,000.
-Arm name: ${ARM}. Submitted with: sbatch jobs/reward_shape_mila.sh $*   (Slurm job ${SLURM_JOB_ID:-unknown})"
+${PRIOR_NOTE}
+Arm name: ${ARM}. Submitted with: ${PRIOR_CKPT:+PRIOR_CKPT=${PRIOR_CKPT} }sbatch jobs/reward_shape_mila.sh $*   (Slurm job ${SLURM_JOB_ID:-unknown})"
 printf '%s\n' "${WANDB_NOTES}" > "${OUTPUT_DIR}/arm_description.txt"
 
 RUN_NAME="${ARM//_/-}-${SLURM_JOB_ID:-local}"
-TAGS="reward-shape,no-docking,${TRANSFORM},beta${BETA},vargrad,floor${LOG_SCORE_FLOOR},steps${N_TRAIN_STEPS},${SURROGATE_TAGS},restored-state,1-round${SEED_TAG}${ARM_SUFFIX:+,suffix${ARM_SUFFIX}}"
+TAGS="reward-shape,no-docking,${TRANSFORM},beta${BETA},vargrad,floor${LOG_SCORE_FLOOR},steps${N_TRAIN_STEPS},${SURROGATE_TAGS},restored-state,1-round${SEED_TAG}${ARM_SUFFIX:+,suffix${ARM_SUFFIX}}${PRIOR_TAGS}"
 
 # Restated as one YAML value each rather than overridden field by field:
 # OmegaConf.from_dotlist reads every path segment as a dict key, so
@@ -243,6 +322,7 @@ uv run --no-sync python scripts/run_with_sigterm_flush.py \
   "sampler.log_score_floor=${LOG_SCORE_FLOOR}" \
   "sampler.log_z_learning_rate=${LOG_Z_LR}" \
   "${SEED_OVERRIDE[@]}" \
+  "${PRIOR_OVERRIDE[@]}" \
   "run_writer.output_dir=${OUTPUT_DIR}" \
   "sampler.reject_log_path=${REJECT_LOG_PATH}" \
   "sampler.pool_log_path=${POOL_LOG_PATH}" \
