@@ -1,0 +1,230 @@
+# Prior-pretraining sweep, FOURTH DESIGN: sweep 3's space re-centred for the
+# corrected y labels.
+#
+#   wandb sweep --project ampc-prior-rtb --entity models-mila5723 \
+#     config/ampc/prior_rtb_sweep4.yaml
+#   sbatch --array=1-2 jobs/prior_rtb_sweep_agent_mila.sh <sweep_id>
+#
+# WHY A FOURTH SWEEP. Sweep 3 (8xifmsj5, array 11505463, 61 finished / 60
+# feasible) was a success on its own terms: best arm beta 34.9, lr 5.71e-5,
+# 704 steps, on-policy 0.25 reached rate 0.0142 -- 10x the untrained prior's
+# 0.00142 -- at validity 0.963 and SA 0.959, with memorization share 0.250 and
+# all three log-probability gaps POSITIVE (tail_train 5.57, tail_holdout 4.74,
+# bulk_unseen 1.40). holdout_minus_bulk +3.33 against train_minus_holdout +0.83
+# is the generalizing signature, and unlike sweep 2 the policy now raises the
+# tail in absolute terms rather than merely dropping it less than the bulk.
+#
+# It is nonetheless void as a result, because every trial scored itself against
+# the OLD y labels. `data/10M_unif_random_subset.csv` and the three
+# `ampc_svgpscale_*.csv` sets were relabelled on 2026-11-06 (job 11569178); the
+# old files are kept as `*_OLD_WRONG_Y.csv`. Three things moved underneath the
+# sweep, and only the first is a config edit:
+#
+#   1. THE LIBRARY MEAN FELL 9.2x, from 0.03956042999405787 to
+#      0.0042864189360438442. That number is the GP's pinned constant mean, so
+#      it was wrong in prior_rtb_pretrain.yaml, reward_shape_svgp300k.yaml and
+#      variational_gp_scaling.yaml, and -- hardcoded, not read from the config --
+#      in the ARM directory name built by jobs/variational_gp_scaling_mila.sh.
+#      All four are corrected as of 2026-11-07.
+#
+#   2. THE SURROGATE HAD TO BE REFITTED. The headline rate is GIBBON over the
+#      restored SVGP, so the objective itself was defined by old labels. The
+#      replacement arm is
+#      svgpscale_300000_svgp_M1024_iso_matern_scaled_pm0.0042864_elbo_cosine_lr3e-3_steps10064_fp32,
+#      the byte-identical schedule (ELBO, lr 3e-3, 136 epochs x 74 = 10064
+#      steps) refitted on the new 300k. Note the old fit was ALSO paired with a
+#      feature cache rebuilt on 2026-11-06 for a different molecule set, so
+#      restoring it today was not merely stale but inconsistent.
+#
+#   3. THE TRAINING TAIL SHRANK 4.5x, AND THIS IS THE REAL CHANGE. y >= 0.2617
+#      held 16,292 molecules and now holds 3,653. The tail's own mean barely
+#      moved (0.3362 against 0.3306); what collapsed was the bulk, whose mean
+#      fell from 0.1155 to 0.0466. See the two sections below, because this cuts
+#      in opposite directions for beta and for n-steps.
+#
+# BETA IS NOW 1.29x MORE POTENT PER UNIT, so the nominal range barely moves
+# while the pressure it spans rises. RTB trains toward pi_0 * exp(beta * y), so
+# what the policy feels is beta times the tail-minus-bulk separation. That
+# separation WIDENED, because the bulk fell away from a tail that stayed put:
+#
+#   tail-minus-bulk gap      OLD 0.2274      NEW 0.2932      ratio 1.29
+#
+#   beta    OLD nats    NEW nats    new beta matching the old pressure
+#     18      4.09        5.28                  14.0
+#     25      5.69        7.33                  19.4
+#     35      7.96       10.26                  27.2
+#
+# Sweep 3's ceiling of 35 was binding -- its top quartile of beta (28.7-34.9)
+# averaged objective 0.0065 against 0.0033-0.0040 for the three quartiles below,
+# and the four best arms sat at 31.3-34.9. So headroom is wanted. But in new
+# units old-35 is only 27.2, so a nominal ceiling of 36 already buys 33% more
+# pressure than anything measured, and the equivalent old-units span of this
+# file's range is 23.2 to 46.4. Raising the NUMBER further would be a third
+# consecutive sweep spent discovering its own ceiling.
+#
+# N-STEPS COMES DOWN, against its own correlation, and this is the one place
+# this sweep overrides sweep 3's ranking. Steps correlated +0.43 with objective
+# and the best arms ran 595-756 against a ceiling of 800, which in isolation
+# argues for raising it. It also correlated +0.688 with memorization share --
+# confirming sweep 2's +0.70, and still the only knob in this space that touches
+# criterion 4.
+#
+# THE STEP COUNT IS NOT COMPARABLE BETWEEN THE TWO SWEEPS, which is the whole
+# argument. `split_batch_sizes` puts 24 tail + 24 bulk + 16 on-policy molecules
+# in each batch of 64 at on-policy 0.25, so what the policy actually experiences
+# is steps * 24 / training-tail-size -- passes over the tail, not steps. With
+# --holdout-size 600 the training tail is 3,053 where sweep 3 trained on 14,292,
+# a factor of 4.68:
+#
+#   steps    passes @ 14,292 (sweep 3)    passes @ 3,053 (here)
+#     300            0.50                        2.36
+#     595            1.00                        4.68
+#     704            1.18   <- best arm          5.53
+#     756            1.27                        5.94
+#     800            1.34   <- old ceiling       6.29
+#
+# Sweep 3 never completed 1.4 passes over its tail; at its best arm each tail
+# molecule was seen about ONCE. Matching that exposure here takes 127 steps for
+# 1.00 passes and 162 for 1.18, so the floor of 130 sits inside the measured
+# regime. THE CEILING OF 450 (3.54 passes) DELIBERATELY GOES PAST IT, because
+# sweep 3's 800-step ceiling was BINDING -- its best arms crowded 595-756 -- so
+# ~1.2 passes is merely the most exposure anyone has measured, NOT a shown
+# optimum. Treating it as one would bake sweep 3's unexplored edge into this
+# sweep. Keeping 300-800 would instead have run at 2.4-6.3 passes with no
+# coverage of the regime known to work; 130-450 spans both.
+#
+# AND WARMUP HAD TO MOVE WITH IT. --num-warmup-steps defaults to 100, which was
+# 14% of a 704-step run but would be 33-77% of a run in this range, making the
+# LR schedule qualitatively different rather than shorter. 30 holds warmup at
+# 10-23%, bracketing sweep 3's 14%.
+#
+# A CAVEAT, since it argues the other way. The objective already discounts the
+# share multiplicatively at MEMORIZATION_WEIGHT 1.0, so a sweep could in
+# principle find its own step count. But the share is
+# train_minus_holdout / holdout_minus_bulk, estimated off the holdout this file
+# cuts from 2,000 molecules to 600, which makes exactly that regulator noisier.
+# Raising the holdout back does not escape the bind either: it shrinks the
+# training tail further and so INCREASES passes per molecule at fixed steps
+# (holdout 2,000 leaves 1,653 tail molecules, i.e. 10.2 passes at 704 steps).
+# Controlling the step count directly is the cheaper side of that trade, but if
+# share comes back flat across this range, widening it is the first thing to try.
+#
+# ON-POLICY-FRACTION IS PINNED AT 0.25 AND NO LONGER SEARCHED. Sweep 3 settled
+# it from both directions at once: it was the single strongest predictor of the
+# objective (+0.66, mean 0.0053 against 0.0031, max 0.0106 against 0.0052, and
+# all twelve top arms) AND it correlates -0.50 with memorization share. A knob
+# that raises the rate while lowering memorization is not a trade to explore,
+# and searching the binary spends half the trials re-confirming it.
+#
+# THE VALIDITY GATE DID NOT BIND AND IS KEPT ANYWAY. Across all 60 feasible
+# trials the minimum validity was 0.956 against a 0.95 gate, and exactly one
+# trial of 61 failed it. That is why the lr ceiling rises here: sweep 2 put the
+# validity wall at 8e-5 (0.903) to 1e-4 (0.745), but sweep 3 measured 0.962 at
+# lr 7.77e-5, so the wall is softer at these betas than sweep 2's confounded
+# estimate suggested. 1.0e-4 probes just past it with the gate as the guard
+# rather than removing the guard.
+#
+# RANDOM, AND THE SEED IS NOT SEARCHED, for the reasons in sweep 3's header: the
+# space is dominated by one narrow lr dimension, and a `seed` parameter under an
+# optimizer buys exploitation rather than replicates. Re-run the top arms at
+# 2-3 seeds afterwards, which is a separate step and the only way to get them.
+program: scripts/pretrain_prior_rtb.py
+method: random
+
+metric:
+  name: objective
+  goal: maximize
+
+command:
+  - ${env}
+  - python
+  - ${program}
+  - config/ampc/prior_rtb_pretrain.yaml
+  # Must be the reward-shape arms' own config, or the headline rate is not
+  # comparable with what the library gives. Now pinned to the pm0.0042864
+  # surrogate; see item 2 of the header.
+  - --gibbon-config
+  - config/ampc/reward_shape_svgp300k.yaml
+  - --out-dir-root
+  - outputs/ampc/prior_rtb/sweep4
+  # NOT NEGOTIABLE. At 2,048 the objective is a count of 2 to 4 molecules with
+  # Poisson error +-2 and ranks trials by noise; three wrong conclusions were
+  # drawn from exactly that in sweep 1.
+  - --eval-sample-size
+  - "65536"
+  # 600, NOT THE DEFAULT 2000. The tail is 3,653 molecules now, so the default
+  # would withhold 55% of it and train the policy on 1,653 -- a holdout larger
+  # than the training set. 600 leaves 3,053 for training and preserves roughly
+  # the 85/15 split the 16,292-tail sweeps actually ran at, while keeping the
+  # held-out set big enough to measure gap/tail_holdout against gap/bulk_unseen.
+  - --holdout-size
+  - "600"
+  # 30, NOT THE DEFAULT 100. Scaled with the shortened n-steps range so warmup
+  # stays 10-23% of training, bracketing the 14% sweep 3's best arm ran at; at
+  # the default it would be a third to three quarters of the run. See "AND
+  # WARMUP HAD TO MOVE WITH IT" in the header.
+  - --num-warmup-steps
+  - "30"
+  - --skip-policy-save
+  # Rate discounted for memorization and nothing else; validity is gated below
+  # rather than priced, because rate x validity prefers 0.85 at a high rate over
+  # 0.98 at a lower one and that is the trade this line of sweeps refuses.
+  - --no-price-validity
+  - --min-validity
+  - "0.95"
+  - --min-sa-rate
+  - "0.94"
+  - --seed
+  - "42"
+  # REQUIRED UNDER AN AGENT: without these the script falls back to a
+  # ConsoleLogger, never calls wandb.init, and "objective" never reaches a run
+  # summary.
+  - --wandb-project
+  - ampc-prior-rtb
+  - --wandb-entity
+  - models-mila5723
+  - ${args}
+
+parameters:
+  # Floor raised from 3.5e-5: sweep 3's bottom lr quartile (below 4.36e-5)
+  # averaged objective 0.0032, the worst of the four, and no arm below 5.09e-5
+  # reached the top six. Ceiling raised from 8.0e-5 because validity held at
+  # 0.962 at 7.77e-5 and the 0.95 gate bound on one trial in 61; see "THE
+  # VALIDITY GATE DID NOT BIND" above.
+  learning-rate:
+    distribution: log_uniform_values
+    min: 4.5e-5
+    max: 1.0e-4
+
+  # Nominally sweep 3's range, but 1.29x the reward pressure per unit under the
+  # corrected labels, so this spans old-equivalent 23.2-46.4 and puts its
+  # ceiling 33% past anything yet measured. See "BETA IS NOW 1.29x MORE POTENT".
+  beta:
+    distribution: log_uniform_values
+    min: 18.0
+    max: 36.0
+
+  # LOWERED from 300-800 despite correlating +0.43 with the objective, because
+  # the training tail fell from 14,292 molecules to 3,053, so a step buys 4.68x
+  # the exposure it used to and share correlates +0.688 with steps. 130 steps is
+  # 1.02 passes over the tail, 450 is 3.54, against sweep 3's best arms at
+  # 1.00-1.27. The floor sits in the measured regime and the ceiling reaches
+  # ~3x past it, because sweep 3's step ceiling was binding and so never
+  # established that ~1.2 passes is optimal. Paired with --num-warmup-steps 30
+  # in the command block (7-23% of the run across this range, against sweep 3's
+  # 14%); the two cannot be changed independently. See "N-STEPS COMES DOWN".
+  n-steps:
+    distribution: int_uniform
+    min: 130
+    max: 450
+
+  # PINNED, not searched. +0.66 with the objective and -0.50 with memorization
+  # share: it is better on both criteria at once. See "ON-POLICY-FRACTION IS
+  # PINNED" above.
+  on-policy-fraction:
+    values: [0.25]
+
+# NO `seed` PARAMETER, and no replicates bought from inside the sweep. Seed
+# spread is real (REWARD_SHAPE_UNDERFLOW_GAP.md section 10 item 4), so the top
+# arms must be re-run at 2-3 seeds, and the chosen one re-run without
+# --skip-policy-save, before any of this is believed or handed downstream.

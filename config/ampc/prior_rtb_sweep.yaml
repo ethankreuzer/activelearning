@@ -1,0 +1,152 @@
+# Bayesian sweep over the prior-pretraining hyperparameters, SECOND DESIGN.
+#
+# Create it once, then run agents (see jobs/prior_rtb_sweep_agent_mila.sh):
+#
+#   wandb sweep --project ampc-prior-rtb --entity models-mila5723 \
+#     config/ampc/prior_rtb_sweep.yaml
+#   sbatch --array=1-2 jobs/prior_rtb_sweep_agent_mila.sh <sweep_id>
+#
+# WHAT THE FIRST SWEEP ESTABLISHED, and why this one is shaped differently. All
+# of it is in outputs/ampc/prior_rtb/tail_analysis/tail_report.json, measured
+# against an untrained control arm (--n-steps 0) sampled at 65,536 molecules.
+#
+#   1. THE FEASIBLE REGION WAS DEAD. Every arm the old gates admitted was
+#      indistinguishable from the untouched prior. Per-trial p90 deltas were
+#      +41, +39, +21, +2, -1, -64, -65 nats against bootstrap CIs roughly 100
+#      nats wide, and exceedance rates at the underflow edge scattered around
+#      the prior's own 0.145% at 0.098% to 0.195%. Nothing was learned because
+#      nothing in that region does anything.
+#
+#   2. THE APPARENT +61-NAT EFFECT WAS A SAMPLE-SIZE ARTEFACT. The first
+#      baseline was measured at 2,048 molecules and came back 60.4 nats
+#      [-101.9, -4.2] below the same policy measured at 65,536. Trials were
+#      being compared against a low draw of their own reference.
+#
+#   3. ONE ARM WORKED AND THE VALIDITY GATE THREW IT OUT. beta 18.2,
+#      lr 1.3e-4: +304.4 nats [+256.8, +364.6] at the p90, +286.6 at the p99,
+#      0.928% above the edge against the prior's 0.145% -- 19 molecules where 3
+#      were expected -- with uniqueness 1.000 and SA 0.968 intact. Validity was
+#      0.715 against a gate at 0.95.
+#
+#   4. THE lr BAND WAS EFFECTIVELY TRUNCATED AT ~1e-5. It nominally reached
+#      2e-4, but everything above ~1e-5 breached the validity gate and was
+#      scored -10000, so the optimizer learned to avoid the only live direction.
+#
+# THE OBJECTIVE IS NOW A PRODUCT OF RATES, not a percentile in nats:
+#
+#     objective = frac_above_underflow * validity_rate * (1 - clip(share, 0, 1))
+#
+# The first two factors are exactly the probability that one generation attempt
+# yields a molecule that is both valid and gradeable, which is what the
+# downstream sampler experiences: S3-GFN draws 64 at a time and needs about one
+# gradeable molecule among them to escape Var(r) = 0. So the target is 1/64 =
+# 0.0156, the untrained prior sits at 0.00142, and the arm above scored 0.00663.
+#
+# WHY VALIDITY IS PRICED AND NO LONGER GATED AT 0.95. log GIBBON is scored on
+# molecules that already passed validity -- generate, canonicalize, drop
+# invalid, score what is left -- so the exceedance rate is CONDITIONAL on
+# validity and low validity costs generation throughput, not reward signal. At
+# 0.715 a policy needs 90 attempts to fill a batch of 64. Multiplying prices
+# that at exactly its cost with no weight to invent. GATE_MIN_VALIDITY survives
+# at 0.50 as a floor against outright collapse, where the trade stops being
+# about throughput and starts being evidence the prior's chemistry is gone.
+#
+# NO p90 PROXY. The old config maximized log_gibbon_p90 because the edge
+# fraction "read exactly 0.0". That was 2,048 molecules, where the expected
+# count at the prior's true rate is 3 and drawing zero is routine. At 65,536
+# the untrained prior registers 95 molecules above the edge -- 0.145% with a
+# standard error of 0.015% -- so the real objective is continuous from the
+# first trial. The p90 was not merely unnecessary but misleading: it sits in
+# the bulk, and it ranked the one arm that moved the tail below arms that did
+# nothing.
+#
+# EVERY TRIAL EVALUATES AT 65,536. This is the single most important change and
+# it is not optional. At 2,048 the objective is a count of 2 to 4 molecules
+# with a Poisson error of +-2, which ranks trials by noise; three wrong
+# conclusions were drawn from exactly that. It adds about 12 minutes per trial.
+#
+# ONE SEED PER TRIAL IS STILL A KNOWN WEAKNESS. The optimizer will chase seed
+# noise. Treat the result as a region to examine and re-run the top few
+# configurations at two or three seeds before concluding anything --
+# REWARD_SHAPE_UNDERFLOW_GAP.md section 10 item 4 records one cell producing
+# three different outcomes across seeds.
+
+program: scripts/pretrain_prior_rtb.py
+method: bayes
+
+metric:
+  name: objective
+  goal: maximize
+
+command:
+  - ${env}
+  - python
+  - ${program}
+  - config/ampc/prior_rtb_pretrain.yaml
+  # Must be the reward-shape arms' own config, or the headline rate is not
+  # comparable with the 0.0158 the library gives. log_output=true is forced by
+  # the script.
+  - --gibbon-config
+  - config/ampc/reward_shape_svgp300k.yaml
+  # Each trial derives its own subdirectory; a sweep agent cannot be handed a
+  # distinct --out-dir per trial.
+  - --out-dir-root
+  - outputs/ampc/prior_rtb/sweep
+  # THE CHANGE THAT MATTERS MOST. See "EVERY TRIAL EVALUATES AT 65,536" above.
+  - --eval-sample-size
+  - "65536"
+  # 179 MB per trial is wasted when only the winner's weights are wanted, and
+  # re-running the winner costs ten minutes.
+  - --skip-policy-save
+  # REQUIRED, NOT OPTIONAL, UNDER AN AGENT. scripts/pretrain_prior_rtb.py passes
+  # --wandb-project through to build_run_logger, which falls back to a
+  # ConsoleLogger when the project is None. Without these two flags a trial logs
+  # to stdout only: it never calls wandb.init, so it never attaches to the run
+  # the agent pre-created, that run stays empty and W&B marks it crashed, the
+  # sweep re-serves the same run ids to later agents, and -- the part that
+  # actually matters -- "objective" never reaches any run summary, so the
+  # Bayesian optimizer has nothing to fit and the search degenerates to random.
+  - --wandb-project
+  - ampc-prior-rtb
+  - --wandb-entity
+  - models-mila5723
+  - ${args}
+
+parameters:
+  # THE LIVE DIRECTION, recentred. The first sweep's band was 2e-6 to 2e-4 and
+  # the validity gate truncated it at ~1e-5; every trial below that line was
+  # indistinguishable from the untrained prior, and the only arm that moved the
+  # tail sat at 1.3e-4. So the floor here is above the old dead region and the
+  # ceiling is deliberately past where validity will break: 6e-4 should breach
+  # even the 0.50 floor, which is informative -- it locates the wall rather
+  # than assuming where it is. Log-uniform because the effect is multiplicative.
+  learning-rate:
+    distribution: log_uniform_values
+    min: 3.0e-5
+    max: 6.0e-4
+
+  # Upper half of the old band only. effective_support/64 is 30 at beta=10, 17
+  # at 15 and 5 at 25, and all of the tail movement was at the high end
+  # (the working arm was 18.2). Below 10 the first sweep measured nothing, so
+  # there is no reason to spend trials there again. 25 was previously called
+  # "past the useful region" on an effective_support argument that the tail
+  # measurements did not bear out, so it is included as the ceiling.
+  beta:
+    distribution: log_uniform_values
+    min: 10.0
+    max: 25.0
+
+  # NARROWED, because n-steps showed no effect across 549 to 2373 while being
+  # the main driver of trial time (6 to 54 minutes). The working arm used 552.
+  # Keeping the range short buys more trials per agent-hour, and the gap trace
+  # inside each run still shows where the memorization wall is.
+  n-steps:
+    distribution: int_uniform
+    min: 300
+    max: 1200
+
+  # Whether a quarter of each batch is policy-generated and surrogate-scored.
+  # The only thing that constrains the loss on the policy's own support, and the
+  # working arm had it on, so it stays a binary choice rather than being fixed.
+  on-policy-fraction:
+    values: [0.0, 0.25]

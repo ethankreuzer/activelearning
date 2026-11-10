@@ -1,0 +1,162 @@
+# Prior-pretraining sweep, THIRD DESIGN: maximum tail mass at the stock prior's
+# own validity.
+#
+#   wandb sweep --project ampc-prior-rtb --entity models-mila5723 \
+#     config/ampc/prior_rtb_sweep3.yaml
+#   sbatch --array=1-2 jobs/prior_rtb_sweep_agent_mila.sh <sweep_id>
+#
+# WHY A THIRD SWEEP. Sweep 2's winner (beta 23.1, lr 9.9e-5, 939 steps) reached
+# 10x the untrained prior's gradeable mass at validity 0.831, and it was then
+# handed to the reward-shape arms. It collapsed: validity fell 0.852 -> 0.247
+# over 2500 steps at floor -1000, where the stock prior on the byte-identical
+# cell held 0.977. See PRIOR_RTB_SWEEP2_FINDINGS.md.
+#
+#   The mode of failure was 70.5% UNTERMINATED generations -- sequences that
+#   never emit EOS inside the 80-token cap -- not malformed syntax (0.5% parse
+#   errors) and not disconnected fragments (4.3%). A reject-log reservoir makes
+#   this look like a disconnection problem; the exact counts in each arm's
+#   round_history.jsonl do not.
+#
+# So this sweep stops trading validity away. The goal is the largest tail mass
+# obtainable from a prior that is statically indistinguishable from stock
+# GP-MoLFormer on validity (0.98) and synthesizability.
+#
+# WHETHER THAT HELPS IS AN OPEN QUESTION, not an assumption. One data point
+# links a prior's static validity to whether validity decays under reward
+# pressure. These priors are the clean test of it: if a 0.975-validity prior
+# also collapses, the problem is not the prior's validity and this whole
+# direction is wrong.
+#
+# THE FINDING THIS SPACE IS BUILT ON: at low learning rate, BETA COSTS NO
+# VALIDITY. Across sweep 2's trials below lr 7e-5, beta spanned 10.2 to 22.4
+# while validity stayed flat at 0.941-0.978, and sa_rate RISES with beta
+# (Spearman +0.73). Validity is governed almost entirely by lr (-0.942 over 38
+# trials), so beta is nearly free rate inside the safe band -- and sweep 2's
+# ceiling of 25 was never tested there. That is the unexplored direction.
+#
+# THE OBJECTIVE IS GATED, NOT PRICED. --no-price-validity removes validity from
+# the product and --min-validity 0.95 enforces it instead, so inside the
+# feasible region the objective is the exceedance rate discounted for
+# memorization and nothing else. The product form was correct when low validity
+# was a throughput cost worth paying; it is wrong here, because rate x validity
+# prefers 0.85 at a high rate over 0.98 at a lower one, which is precisely the
+# trade this sweep exists to refuse. Measured: sweep 2's winner scores 0.00856
+# under the old objective and is INFEASIBLE under this one.
+#
+# A 0.95 GATE TRUNCATED SWEEP 1 AND WILL NOT TRUNCATE THIS ONE. There the search
+# spanned lr to 2e-4 and every productive trial breached 0.95, so the optimizer
+# learned to avoid the only live direction. Here the entire lr range sits inside
+# the band where sweep 2 measured validity at 0.97+, so the gate binds on almost
+# nothing and merely stops the search wandering out of it.
+
+# RANDOM, NOT BAYES, AND THE SEED IS NOT SEARCHED. The first launch of this
+# sweep (array 11502277, sweep ki1jrvgy, 13 feasible trials) listed
+# `seed: values: [42, 43, 44]` under a `bayes` method. A Bayesian optimizer
+# treats that as a dimension to EXPLOIT, not as a replicate: it proposed the
+# seed it expected to score best and concentrated on 44, which took 7 of 13
+# feasible trials and 6 of the last 8. W&B's parameter importance then ranked
+# seed first at 0.24 -- the surrogate noticing its own search drift, since seed
+# and learning rate were confounded by the optimizer's own choices.
+#
+# Worse, no configuration was ever run at two seeds, so the seeds produced ZERO
+# actual replicates; every trial was a distinct point in a 5-dimensional space.
+# Replicates cannot be bought from inside a sweep this way. They come from
+# re-running the top arms at 2-3 seeds afterwards, which is what the agent
+# script's closing note has always said to do.
+#
+# PRIOR_RTB_SWEEP2_FINDINGS.md section 8 already recommended `random` for this
+# space and the reason still holds: it is dominated by one narrow lr dimension,
+# a surrogate adds nothing to exploring it, and across two sweeps the
+# optimizer's main achievement has been finding something to crowd -- a gate
+# cliff in sweep 2, a lucky seed here.
+program: scripts/pretrain_prior_rtb.py
+method: random
+
+metric:
+  name: objective
+  goal: maximize
+
+command:
+  - ${env}
+  - python
+  - ${program}
+  - config/ampc/prior_rtb_pretrain.yaml
+  # Must be the reward-shape arms' own config, or the headline rate is not
+  # comparable with the 0.0158 the library gives.
+  - --gibbon-config
+  - config/ampc/reward_shape_svgp300k.yaml
+  - --out-dir-root
+  - outputs/ampc/prior_rtb/sweep3
+  # NOT NEGOTIABLE. At 2,048 the objective is a count of 2 to 4 molecules with
+  # Poisson error +-2 and ranks trials by noise; three wrong conclusions were
+  # drawn from exactly that in sweep 1.
+  - --eval-sample-size
+  - "65536"
+  - --skip-policy-save
+  # THE OBJECTIVE CHANGE. See "THE OBJECTIVE IS GATED, NOT PRICED" above.
+  - --no-price-validity
+  - --min-validity
+  - "0.95"
+  # SA ran 0.94 to 0.975 across both earlier sweeps and was never binding, so
+  # this guards against a regression rather than shaping the search.
+  - --min-sa-rate
+  - "0.94"
+  # PINNED, and stated here rather than left to prior_rtb_pretrain.yaml's
+  # runtime.seed so that the trial logs record which seed ran. See "RANDOM, NOT
+  # BAYES" above for why the seed is no longer a searched parameter.
+  - --seed
+  - "42"
+  # REQUIRED UNDER AN AGENT: without these the script falls back to a
+  # ConsoleLogger, never calls wandb.init, and "objective" never reaches a run
+  # summary -- so the Bayesian optimizer has nothing to fit and the search
+  # degenerates to random.
+  - --wandb-project
+  - ampc-prior-rtb
+  - --wandb-entity
+  - models-mila5723
+  - ${args}
+
+parameters:
+  # THE VALIDITY-PRESERVING BAND, and nothing outside it. Sweep 2 measured
+  # validity 0.972 at lr ~3e-5 and 0.745 at ~1e-4; 8.08e-5 gave 0.924 and
+  # 8.46e-5 gave 0.903. So the ceiling brackets the wall rather than assuming
+  # where it is, and the floor is where rate becomes measurable at all
+  # (3.52e-5 still gave 2.0x the prior). Log-uniform: the effect is
+  # multiplicative, and this is barely more than one octave.
+  learning-rate:
+    distribution: log_uniform_values
+    min: 3.5e-5
+    max: 8.0e-5
+
+  # THE ONLY DIRECTION THAT BUYS RATE WITHOUT COSTING VALIDITY HERE, pushed well
+  # past sweep 2's ceiling of 25 because that ceiling was never tested at low
+  # lr. Within lr bands, beta's rank correlation with rate was +0.72 to +0.87.
+  # The best low-lr arms sat at 20-22.4 (rate 0.0043-0.0049, validity 0.975+);
+  # 35 is deliberately past where anything has been measured, so the sweep
+  # locates the point where beta finally does break validity.
+  beta:
+    distribution: log_uniform_values
+    min: 18.0
+    max: 35.0
+
+  # SHORT, for two reasons. Memorization share correlates +0.70 with n_steps and
+  # ~0.00 with both lr and beta, so step count is the ONLY knob in this space
+  # that touches it. And the best low-lr rates came at 417-452 steps with no
+  # advantage from longer runs, while trial cost is dominated by training.
+  n-steps:
+    distribution: int_uniform
+    min: 300
+    max: 800
+
+  # GENUINELY UNRESOLVED: both 0.0 and 0.25 appear among sweep 2's
+  # highest-validity mass-gaining arms, and the on-policy stratum is the only
+  # term constraining the loss on the policy's own support.
+  on-policy-fraction:
+    values: [0.0, 0.25]
+
+# NO `seed` PARAMETER. It was here to buy replicates and could not; see "RANDOM,
+# NOT BAYES, AND THE SEED IS NOT SEARCHED" at the top of this file. Seed spread
+# is real -- REWARD_SHAPE_UNDERFLOW_GAP.md section 10 item 4 records one cell
+# producing three different outcomes across seeds -- so the top arms from this
+# sweep must be re-run at 2-3 seeds before any of them is believed. That is a
+# separate step after the sweep, not a dimension inside it.

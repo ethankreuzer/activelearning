@@ -820,7 +820,10 @@ def test_ampc_fixed_feature_gp_fps_keep05_round1_config_parses() -> None:
     round0 = OmegaConf.to_container(
         OmegaConf.load(config_dir / "fixed_feature_gp_fps_keep05.yaml")
     )
-    assert raw["dataset"]["initial_data"]["path"] == "data/round1/ampc_fps_keep05_r1_25000.csv"
+    assert (
+        raw["dataset"]["initial_data"]["path"]
+        == "data/round1/ampc_fps_keep05_r1_25000.csv"
+    )
     raw["dataset"]["initial_data"]["path"] = round0["dataset"]["initial_data"]["path"]
     raw["surrogate"]["encoder"]["feature_cache_path"] = round0["surrogate"]["encoder"][
         "feature_cache_path"
@@ -866,3 +869,37 @@ def test_ampc_reward_shape_fixedgp_fps_keep05_config_parses() -> None:
     for config_dict in (raw, dkl):
         del config_dict["surrogate"]
     assert raw == dkl
+
+
+def test_ampc_prior_rtb_pretrain_config_parses() -> None:
+    """Pin the pretraining config's reward path, stub oracle and dataset.
+
+    The arm's whole point is that the reward is the real label on a bounded
+    scale, so the three settings that could silently undo that are asserted:
+    the transform must be ``exponential`` (``r = y``, no floor), the acquisition
+    must be value-scale and on ``y``'s own scale, and the oracle must be the stub
+    because Mila cannot construct ``Dock3Oracle``.
+    """
+    config_path = REPOSITORY_ROOT / "config" / "ampc" / "prior_rtb_pretrain.yaml"
+
+    config = load_and_parse(config_path, ActiveLearningConfig)
+
+    # r = y, so log R = beta * y: bounded, hence no log_score_floor and none of
+    # the underflow-gap apparatus.
+    assert config.sampler.reward_transform == "exponential"
+    assert config.sampler.log_score_floor is None
+    # PosteriorMean predicts y itself, so a mixed batch of labelled and generated
+    # molecules carries one reward unit rather than two.
+    assert config.acquisition.type == "PosteriorMean"
+    assert config.acquisition.maximize is True
+    # No receptors on Mila: anything else fails at construction, before round one.
+    assert config.oracle.type == "ConstantOracle"
+    assert config.oracle.mol_repr == "smiles"
+    assert config.sampler.fidelities == [1]
+    assert config.sampler.sa_threshold == pytest.approx(4.0)
+    # The labelled set holding the entire y > 0.2617 tail of the 10M library.
+    assert config.dataset.initial_data.path == REPOSITORY_ROOT.joinpath(
+        "data/ampc_svgpscale_300000.csv"
+    ).relative_to(REPOSITORY_ROOT)
+    assert config.runtime.precision == 32
+    assert config.budget.max_rounds == 1

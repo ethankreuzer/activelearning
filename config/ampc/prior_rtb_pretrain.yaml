@@ -1,0 +1,164 @@
+# Off-policy RTB prior pretraining on the true binding probability.
+#
+#   sbatch jobs/pretrain_prior_rtb_mila.sh 25 2500 0.0 42
+#
+# Consumed by scripts/pretrain_prior_rtb.py, NOT by the active-learning loop.
+# The script builds the dataset and the S3-GFN model from this file and trains
+# the policy toward
+#
+#     pi_1(x)  proportional to  pi_0(x) * exp(beta * y(x))
+#
+# with y the real docking-derived binding probability already stored in
+# data/ampc_svgpscale_300000.csv. Beta and the step count are script flags, not
+# config fields, because nothing in ActiveLearningConfig reads them for this run.
+#
+# Three sections below are present only to satisfy ActiveLearningConfig's
+# validators and are NEVER exercised by the default arm:
+#
+#   - surrogate / acquisition: built only when --on-policy-fraction > 0, which
+#     needs predicted y for generated molecules that have no label. With the
+#     default 0.0 the script never calls cfg.surrogate.build().
+#   - oracle / selector / budget: no round loop runs at all. The oracle is the
+#     ConstantOracle stub because Mila has no AmpC receptor files and
+#     Dock3Oracle raises FileNotFoundError at construction.
+#
+# Differences from reward_shape_svgp300k.yaml, which this is otherwise a copy of:
+# the acquisition is PosteriorMean rather than GIBBON, the oracle is the stub,
+# the budget is 1, and the reward transform is exponential.
+
+runtime:
+  device: cuda
+  # 32, matching the fit the surrogate state was saved from. The script also
+  # keeps the policy in FP32: the RTB residual is a difference of sequence
+  # log-probabilities, where reduced precision costs more than the speed is
+  # worth on a run this short.
+  precision: 32
+  seed: 42
+
+dataset:
+  # The 300,000 labelled molecules. This file holds the whole y > 0.2617 tail of
+  # the 10M library -- all 3,653 of it, kept whole in every arm of the scaling
+  # study (cache/ampc/exact_dkl_top_n/svgpscale_selection.json, keep_above and
+  # n_kept) -- so the enriched stratum needs no surrogate pre-screen to find and
+  # nothing has to be copied from another cluster.
+  type: ListDataset
+  initial_data:
+    path: data/ampc_svgpscale_300000.csv
+    x_columns: SMILE
+    y_column: y
+    fidelity_column: fidelity
+
+surrogate:
+  # Only reached with --on-policy-fraction > 0. Restored, never trained.
+  type: VariationalGPSurrogate
+  state_path: outputs/ampc/variational_gp/svgpscale_300000_svgp_M1024_iso_matern_scaled_pm0.0042864_elbo_cosine_lr3e-3_steps10064_fp32/surrogate_state.pt
+  encoder:
+    type: MiniMolAmpcSmilesFixedEncoder
+    checkpoint_path: minimol_ampc_encoder/model/final.pt
+    package_path: minimol_ampc_encoder
+    device: cuda
+    batch_size: 64
+    cache_size: 4096
+    # Generated molecules are in no cache, so live encoding is required.
+    cache_only: false
+    feature_cache_path: cache/ampc/exact_dkl_top_n/svgpscale_300000.npy
+  training_params:
+    # Unused by a restore; stated so the config describes the fit it restores.
+    epochs: 136
+    lr: 3.0e-3
+    batch_size: 4096
+    lr_schedule: cosine
+    lr_min: 1.0e-4
+    variational_objective: VariationalELBO
+  num_inducing: 1024
+  inducing_init: random
+  ard: false
+  lengthscale_prior: true
+  scale_inputs: true
+  noise_prior: true
+  prior_mean: 0.0042864189360438442  # Mean y of data/10M_unif_random_subset.csv, recomputed 2026-11-07 after the y relabel (was 0.03956042999405787 from the OLD_WRONG_Y file).
+  standardize_outputs: true
+
+acquisition:
+  # The posterior mean of y, i.e. the predicted binding probability, on the SAME
+  # scale as the true labels the off-policy strata carry. That shared scale is
+  # the reason this is PosteriorMean rather than ProbabilityOfImprovement: a
+  # mixed batch must not mix reward units.
+  #
+  # It is also score_scale "value", which is what lets it coexist with the
+  # exponential transform under ActiveLearningConfig._reject_doubly_logged_reward
+  # and S3GFNSampler._validate_acquisition.
+  type: PosteriorMean
+  maximize: true
+  score_chunk_size: 256
+
+sampler:
+  # The script reads EXACTLY these seven fields from here: model_name_or_path,
+  # tokenizer_name_or_path, trust_remote_code, max_length, batch_size,
+  # generation_batch_size, sa_threshold.
+  #
+  # Everything else in this section is INERT. n_train_steps, beta,
+  # num_warmup_steps, learning_rate and gradient_clip_norm are script flags
+  # (--n-steps, --beta, --num-warmup-steps, --learning-rate,
+  # --gradient-clip-norm) and the values here are never read -- they are left at
+  # the sampler's own defaults so this file still describes a valid sampler.
+  # n_samples is unused because no candidate pool is generated, and
+  # performance_mode is ignored on purpose: it would put the policy in BF16, and
+  # the RTB residual is a difference of sequence log-probabilities.
+  type: S3GFNSampler
+  n_samples: 100000
+  fidelities: [1]
+  model_name_or_path: ibm-research/GP-MoLFormer-Uniq
+  tokenizer_name_or_path: ibm-research/MoLFormer-XL-both-10pct
+  trust_remote_code: true
+  performance_mode: optimized
+  max_length: 80
+  batch_size: 64
+  replay_batch_size: 64
+  generation_batch_size: 128
+  n_train_steps: 2500
+  num_warmup_steps: 100
+  # r = y, so log R = beta * y. Bounded, so there is no underflow, no
+  # log_score_floor, no 255.6-nat accidental gap and no per-batch floor drift --
+  # the entire apparatus REWARD_SHAPE_UNDERFLOW_GAP.md is about does not apply.
+  reward_transform: exponential
+  beta: 25.0
+  aux_coefficient: 0.001
+  sa_threshold: 4.0
+
+selector:
+  type: CostAwareSelector
+
+oracle:
+  # Mila has no AmpC receptor files and no dock64, so Dock3Oracle cannot even be
+  # constructed. Nothing in this run queries an oracle; the stub exists so the
+  # config validates.
+  type: ConstantOracle
+  value: 0.0
+  mol_repr: smiles
+  fidelity_costs:
+    1: 1.0
+  fidelity_confidences:
+    1: 1.0
+
+budget:
+  available_budget: 1.0
+  schedule:
+    type: constant
+    value: 1.0
+  # Required with surrogate.state_path.
+  max_rounds: 1
+
+logger:
+  # The script builds its own logger from --wandb-* flags; this section is here
+  # for schema completeness and is not read by it.
+  type: ConsoleLogger
+  project_name: ampc-prior-rtb
+  run_name: prior-rtb-pretrain
+
+run_writer:
+  type: JSONLinesRunWriter
+  output_dir: outputs/ampc/prior_rtb/default
+  write_samples: false
+  write_sample_scores: false
+  write_config: true
