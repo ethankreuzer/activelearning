@@ -95,7 +95,12 @@ class TestStrata:
 
         for stratum in ("all", "low_y", "high_y"):
             prefix = f"surrogate/eval_set/ampc_331k/calibration/{stratum}"
-            for name in ("z_var_mean", "slope", "latent_std_mean", "count"):
+            for name in (
+                "latent_variance_ratio",
+                "latent_worst_bin_ratio",
+                "latent_z_rms",
+                "count",
+            ):
                 key = f"{prefix}/{name}"
                 assert key in metrics, key
                 assert not math.isnan(metrics[key]), key
@@ -119,8 +124,12 @@ class TestStrata:
             DEFAULT_HIGH_TARGET_THRESHOLD
         )
 
-    def test_a_sparse_high_stratum_reports_nan_not_a_slope(self) -> None:
-        """Early rounds hold almost no hits; a slope from 4 of them is noise."""
+    def test_a_sparse_high_stratum_reports_nan_not_a_binned_read(self) -> None:
+        """Early rounds hold almost no hits; a binned read from 4 is noise.
+
+        The POOLED ratio needs no bins and is still reported, so a thin stratum
+        says what it can and stays silent on what it cannot.
+        """
         count = 400
         targets = [0.9] * 4 + [0.05] * (count - 4)
 
@@ -134,8 +143,10 @@ class TestStrata:
         )
 
         assert metrics["p/calibration/high_y/count"] == 4.0
-        assert math.isnan(metrics["p/calibration/high_y/slope"])
-        assert not math.isnan(metrics["p/calibration/low_y/z_var_mean"])
+        assert math.isnan(metrics["p/calibration/high_y/latent_worst_bin_ratio"])
+        assert not math.isnan(
+            metrics["p/calibration/low_y/latent_variance_ratio"]
+        )
 
 
 class TestLatentStandardDeviationIsRequested:

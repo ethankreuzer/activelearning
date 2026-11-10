@@ -13,10 +13,10 @@ from matplotlib.figure import Figure
 
 from activelearning.surrogate.eval_metrics import (
     MIN_CALIBRATION_POINTS,
+    latent_calibration,
+    latent_calibration_figure,
     predicted_vs_observed_figure,
     prediction_metrics,
-    variance_calibration_figure,
-    variance_calibration_metrics,
 )
 from activelearning.surrogate.plotting import (
     PredictionPanel,
@@ -309,29 +309,35 @@ def latent_calibration_diagnostics(
         )
         return {}, {}
 
+    # THE LATENT STANDARD DEVIATION ONLY, not the total. The acquisition reads
+    # the latent variance, and the observation noise is a single learned
+    # constant, so folding it into the denominator dilutes exactly the
+    # per-candidate variation the acquisition ranks on -- on one exact-GP arm
+    # that is a ratio of 2.79 against 10.79 for the same fit.
+    #
+    # It is also what makes a round comparable with the exact-GP sweep, whose
+    # arms are reported in these keys: see THESIS_ACTIVELEARNING.md section 5b.
+    # `total_stds` is still predicted, because prediction_metrics elsewhere
+    # measures coverage against it.
     high = observed >= high_target_threshold
-    strata: dict[str, tuple[np.ndarray, ...]] = {
-        "all": (observed, means, latent_stds, total_stds),
-        "low_y": (
-            observed[~high],
-            means[~high],
-            latent_stds[~high],
-            total_stds[~high],
-        ),
-        "high_y": (observed[high], means[high], latent_stds[high], total_stds[high]),
+    strata: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = {
+        "all": (observed, means, latent_stds),
+        "low_y": (observed[~high], means[~high], latent_stds[~high]),
+        "high_y": (observed[high], means[high], latent_stds[high]),
     }
 
     metrics: dict[str, int | float] = {}
-    for name, (y, mu, latent, total) in strata.items():
-        for key, value in variance_calibration_metrics(y, mu, latent, total).items():
+    for name, (y, mu, latent) in strata.items():
+        for key, value in latent_calibration(y, mu, latent).items():
             metrics[f"{prefix}/calibration/{name}/{key}"] = value
+        metrics[f"{prefix}/calibration/{name}/count"] = float(y.size)
     metrics[f"{prefix}/calibration/high_target_threshold"] = float(
         high_target_threshold
     )
 
     figures: dict[str, Figure] = {}
     if include_figure:
-        figure = variance_calibration_figure(title=title, strata=strata)
+        figure = latent_calibration_figure(title=title, strata=strata)
         if figure is not None:
             figures[f"{prefix}/calibration/reliability"] = figure
     return metrics, figures

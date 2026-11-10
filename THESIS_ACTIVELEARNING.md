@@ -1082,11 +1082,30 @@ mode, and the Nibi metric is the one that would not show it.
 
 **AMENDMENT -- keep one idea from the Nibi version.** It computes `worst_bin_ratio`,
 "the largest per-bin mean squared residual / mean total variance", which catches nine
-healthy bins hiding one catastrophic one. The pooled ratio cannot see that, and over 10
-rounds it matters: AL draws from the HIGH-latent-variance tail, so miscalibration
-concentrated there is both the likeliest and the most consequential. Port the binning,
-but compute it on LATENT variance so it complements `latent_variance_ratio` on one
-scale instead of reintroducing the incomparable denominator.
+healthy bins hiding one catastrophic one. Ported as `latent_worst_bin_ratio`, computed
+on LATENT variance so it complements `latent_variance_ratio` on one scale instead of
+reintroducing the incomparable denominator.
+
+~~Over 10 rounds it matters because AL draws from the HIGH-latent-variance tail, so
+miscalibration concentrated there is both the likeliest and the most consequential.~~
+**That rationale was WRONG and the measurement says so** (2026-11-10, on log-normal
+latent variances, n = 4,000, one decile broken by 10x):
+
+| broken decile | `latent_variance_ratio` | `latent_worst_bin_ratio` | sharper |
+|---|---|---|---|
+| highest variance | 46.29 | 100.00 | 2.2x |
+| **lowest variance** | **1.59** | **100.00** | **62.8x** |
+
+The pooled ratio is `mean(residual^2) / mean(variance)`, so both terms are dominated by
+the largest values and it ALREADY responds to a broken high-variance bin. The blind
+spot is the other end: a pooled 1.59 reads as calibrated while one decile is 100x off,
+because those absolute errors are too small to reach the mean.
+
+That blind spot is still worth closing, for a different reason than the one first
+given. Those are the molecules the surrogate is MOST confident about, so GIBBON
+deprioritises them and the loop never revisits the ones it is confidently wrong about.
+`tests/surrogate/test_latent_calibration.py` pins both cases, including the
+high-variance one, so the metric is not oversold later.
 
 **What the port actually involves.** `variance_calibration_metrics` is called from
 `src/activelearning/monitoring/diagnostics.py` and `scripts/surrogate_eval_io.py`, and
