@@ -37,6 +37,24 @@ from typing import Any, Callable
 #: table and GiB loses the resolution that distinguishes the stages.
 MIB = 1024**2
 
+#: The per-stage fields :meth:`StageProfiler.metrics` reports by default, and so
+#: the only ones that reach a run summary.
+#:
+#: The full nine-column record always goes to the stage CSV, which is rewritten
+#: after every stage and is where the profile is actually read from. Flattening
+#: all of it into scalars instead costs eight keys per stage -- 112 of the 647 in
+#: job 11620200, more than any eval set -- to say in a runs table what one CSV
+#: says better, and four of the eight (``host_rss_start/end/delta`` and
+#: ``host_peak_rss_mib``) are views of a single quantity whose run-level maximum
+#: :meth:`StageProfiler.run_peaks` already carries.
+#:
+#: These two are kept because they are the two that have driven a decision:
+#: ``seconds`` sets the wall-clock budget, and ``cuda_peak_allocated_mib`` is what
+#: the chunk-size-256 OOM of job 11620005 was diagnosed from. Widen this tuple
+#: rather than calling :meth:`metrics` with ``fields=None`` if a third is needed
+#: across a whole sweep.
+SUMMARY_FIELDS: tuple[str, ...] = ("seconds", "cuda_peak_allocated_mib")
+
 
 @dataclass(frozen=True)
 class StageRecord:
@@ -276,24 +294,53 @@ class StageProfiler:
         """Return the completed stages, in the order they finished."""
         return tuple(self._records)
 
-    def metrics(self, prefix: str = "run/stage") -> dict[str, float]:
+    def metrics(
+        self,
+        prefix: str = "run/stage",
+        *,
+        fields: Sequence[str] | None = SUMMARY_FIELDS,
+    ) -> dict[str, float]:
         """Flatten the records into one-off scalars for the run summary.
 
         Parameters
         ----------
         prefix : str, default="run/stage"
             Key prefix. The result is ``<prefix>/<stage>/<field>``.
+        fields : Sequence[str] or None, default=SUMMARY_FIELDS
+            Which per-stage fields to report; ``None`` reports all of them, as
+            this method did before the field became selectable. The default
+            keeps the summary to the two fields that get read -- see
+            :data:`SUMMARY_FIELDS` -- while :meth:`rows` keeps all nine.
 
         Returns
         -------
         dict[str, float]
-            Every finite measurement. ``None`` columns are omitted rather than
-            reported as zero.
+            Every finite measurement among the requested fields. ``None``
+            columns are omitted rather than reported as zero.
+
+        Raises
+        ------
+        ValueError
+            If ``fields`` names something that is not a record field, which
+            would otherwise silently report nothing.
         """
+        known = {field for field in self.column_names() if field != "name"}
+        if fields is not None:
+            unknown = sorted(set(fields) - known)
+            if unknown:
+                raise ValueError(
+                    f"fields names no such stage measurement: {unknown}. "
+                    f"Known fields are {sorted(known)}."
+                )
+            wanted: set[str] | None = set(fields)
+        else:
+            wanted = None
         metrics: dict[str, float] = {}
         for record in self._records:
             for field, value in asdict(record).items():
                 if field == "name" or value is None:
+                    continue
+                if wanted is not None and field not in wanted:
                     continue
                 metrics[f"{prefix}/{record.name}/{field}"] = float(value)
         return metrics

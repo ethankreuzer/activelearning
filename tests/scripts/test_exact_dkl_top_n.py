@@ -580,10 +580,12 @@ def test_target_cut_blocks_drop_the_debiased_statistics() -> None:
     """A block cut on the target cannot estimate the gain they rescale by."""
     eval_set = _eval_set("ampc_val_screen_232k", 60)
     predictions = _predictions(60)
+    # Some overlap with the training data, so the wide ``_unseen`` block exists
+    # to be checked alongside the narrow ones.
+    in_train = np.zeros(60, dtype=bool)
+    in_train[::5] = True
 
-    metrics, _ = arm.prediction_outputs_with_unseen(
-        eval_set, predictions, np.zeros(60, dtype=bool)
-    )
+    metrics, _ = arm.prediction_outputs_with_unseen(eval_set, predictions, in_train)
 
     blocks = {key.split("/")[0] for key in metrics}
     for block in blocks:
@@ -679,6 +681,86 @@ def test_fully_trained_on_set_has_no_unseen_block() -> None:
     )
     assert metrics["train_top/final/n_in_train"] == 8.0
     assert not [key for key in metrics if key.startswith("train_top_unseen/")]
+
+
+def test_set_disjoint_from_training_has_no_unseen_block() -> None:
+    """With no overlap, ``_unseen`` would repeat the unfiltered block exactly."""
+    eval_set = _eval_set("ampc_val_screen_232k", 20)
+    metrics, _ = arm.prediction_outputs_with_unseen(
+        eval_set, _predictions(20), np.zeros(20, dtype=bool), figures=False
+    )
+    assert metrics["ampc_val_screen_232k/final/n_in_train"] == 0.0
+    assert not [
+        key for key in metrics if key.startswith("ampc_val_screen_232k_unseen/")
+    ]
+    # The blocks that do NOT depend on the training overlap are untouched.
+    assert "ampc_val_screen_232k/final/rmse" in metrics
+    assert any(key.startswith("ampc_val_screen_232k_bulk/") for key in metrics)
+
+
+def test_log_scoring_drops_the_metrics_its_companion_already_reports() -> None:
+    """The log scale orders candidates identically, so its ranking is a copy."""
+    eval_set = _eval_set("gp_molformer_set", 40)
+    # Strictly increasing, so the log scale is a monotone transform of it.
+    values = np.linspace(1e-30, 1.0, 40)
+
+    value_metrics, _ = score_outputs(
+        eval_set, values, scoring="gibbon_value", label="GIBBON", figures=False
+    )
+    log_metrics, _ = score_outputs(
+        eval_set,
+        np.log(values),
+        scoring="gibbon_log",
+        label="log GIBBON",
+        log_floor=None,
+        figures=False,
+        rank_metrics=False,
+    )
+
+    def stats(metrics: dict[str, float], scoring: str) -> set[str]:
+        prefix = f"gp_molformer_set/acquisition/{scoring}/"
+        return {key[len(prefix) :] for key in metrics}
+
+    value_stats = stats(value_metrics, "gibbon_value")
+    log_stats = stats(log_metrics, "gibbon_log")
+    # Gone from the log pass: the rank metrics, and fraction_zero, which is 1.0
+    # for any log scoring whatever it did.
+    assert "spearman_y" in value_stats
+    assert "spearman_y" not in log_stats
+    assert "top100_enrichment" in value_stats
+    assert not [key for key in log_stats if key.startswith(("top100_", "top1000_"))]
+    assert "fraction_zero" in value_stats
+    assert "fraction_zero" not in log_stats
+    # Kept: the distribution's shape, which is what the log scale is scored for,
+    # since the value scale loses it to underflow.
+    assert {"median", "p99", "p999", "max", "count"} <= log_stats
+
+
+def test_log_and_value_rank_metrics_would_have_been_identical() -> None:
+    """The justification for dropping them, asserted rather than assumed."""
+    eval_set = _eval_set("gp_molformer_set", 40)
+    values = np.linspace(1e-30, 1.0, 40)
+
+    value_metrics, _ = score_outputs(
+        eval_set, values, scoring="scale", label="value", figures=False
+    )
+    log_metrics, _ = score_outputs(
+        eval_set,
+        np.log(values),
+        scoring="scale",
+        label="log",
+        log_floor=None,
+        figures=False,
+    )
+
+    shared = {
+        key
+        for key in value_metrics.keys() & log_metrics.keys()
+        if key.rpartition("/")[2].startswith(("spearman_y", "top100_", "top1000_"))
+    }
+    assert shared, "no rank metrics to compare"
+    for key in shared:
+        assert value_metrics[key] == log_metrics[key], key
 
 
 def test_weights_follow_the_unseen_molecules() -> None:

@@ -550,6 +550,7 @@ def score_outputs(
     label: str,
     log_floor: float | None = SCORE_LOG_FLOOR,
     figures: bool = True,
+    rank_metrics: bool = True,
 ) -> tuple[dict[str, float], dict[str, Any]]:
     """Acquisition-score statistics and figures for one set.
 
@@ -570,6 +571,13 @@ def score_outputs(
         scores that are already logarithms and so may be negative.
     figures : bool, default=True
         Whether to build the figures.
+    rank_metrics : bool, default=True
+        Whether to report the metrics that depend only on the ORDER of the
+        scores: ``spearman_y`` and the per-budget enrichments. Pass ``False``
+        for a scoring whose order is a monotone transform of one already
+        reported for the same set -- a log scale against the value scale it was
+        taken from -- where every one of them is identical by construction and
+        reporting both doubles the keys without adding a number.
 
     Returns
     -------
@@ -588,7 +596,15 @@ def score_outputs(
     name = eval_set.name
     values = np.asarray(scores, dtype=np.float64)
     measured = dict(score_stats(values, eval_set.targets))
-    if eval_set.has_targets:
+    if log_floor is None:
+        # A log score is never positive, so score_stats' "fraction at or below
+        # zero" is 1.0 whatever the scoring did, and it reads on a dashboard as
+        # though every candidate had scored zero. The value scale is where that
+        # statistic means something.
+        measured.pop("fraction_zero", None)
+    if not rank_metrics:
+        measured.pop("spearman_y", None)
+    if eval_set.has_targets and rank_metrics:
         # What a round of this size would actually select. Reported per budget
         # because a selection can look good at 100 and wash out by 1000.
         for budget in SCORE_SELECTION_BUDGETS:

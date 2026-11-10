@@ -307,12 +307,17 @@ class Scoring:
     log_floor : float or None
         Clamp used by the score figures, or ``None`` when the scores are
         already logarithms and may be negative.
+    rank_metrics : bool
+        Whether this pass reports the rank-based metrics (``spearman_y`` and the
+        per-budget enrichments). ``False`` for a pass whose ranking is a
+        monotone transform of an earlier pass's, where they would be identical.
     """
 
     name: str
     label: str
     config_update: dict[str, Any]
     log_floor: float | None
+    rank_metrics: bool = True
 
 
 def scoring_plan(acquisition_type: str) -> tuple[Scoring, ...]:
@@ -352,6 +357,15 @@ def scoring_plan(acquisition_type: str) -> tuple[Scoring, ...]:
                 label="log GIBBON information gain",
                 config_update={"log_space": True, "log_output": True},
                 log_floor=None,
+                # The log scale is a strictly increasing transform of the value
+                # scale, so it ORDERS the candidates identically and every
+                # rank-based metric is bit-identical to gibbon_value's -- which
+                # was confirmed on job 11620200, where all 14 of them matched to
+                # the last digit on both scored sets. Reported once, under
+                # gibbon_value. What the log scale adds is the distribution's
+                # SHAPE, which the value scale loses to underflow, so median,
+                # p99, p999 and max are still reported here.
+                rank_metrics=False,
             ),
         )
     if acquisition_type == QMFMES_TYPE:
@@ -601,7 +615,9 @@ def prediction_outputs_with_unseen(
     tuple[dict[str, float], dict[str, Any]]
         The metrics of :func:`prediction_outputs` under ``<set>/``, the count
         ``<set>/final/n_in_train``, and the same metrics under
-        ``<set>_unseen/`` when at least one molecule is unseen; and the figures.
+        ``<set>_unseen/`` when the set holds BOTH training and unseen molecules;
+        and the figures. A set with no training molecule in it gets no
+        ``_unseen`` block, because the block would duplicate ``<set>/`` exactly.
     """
     metrics, built = prediction_outputs(eval_set, predictions, figures=figures)
     in_train = np.asarray(in_train, dtype=bool)
@@ -614,12 +630,18 @@ def prediction_outputs_with_unseen(
     # ``narrow`` marks a block cut on the TARGET, where the de-biased statistics
     # are invalid; see _DEBIASED_SUFFIX. ``_unseen`` is the whole set minus the
     # training molecules, which is wide, so it keeps them.
-    for suffix, mask, narrow in (
-        (UNSEEN_SUFFIX, ~in_train, False),
+    blocks = [
         (HIT_SUFFIX, is_hit, True),
         (ENRICHED_SUFFIX, is_enriched, True),
         (BULK_SUFFIX, ~is_enriched & labelled, True),
-    ):
+    ]
+    if in_train.any():
+        # Only emitted when the set and the training data actually overlap. With
+        # no overlap ``~in_train`` selects the whole set, so every key in the
+        # block repeats the unfiltered one above it bit for bit -- 28 to 32 dead
+        # scalars per set, which is what ``n_in_train`` is there to tell you.
+        blocks.insert(0, (UNSEEN_SUFFIX, ~in_train, False))
+    for suffix, mask, narrow in blocks:
         subset_metrics = _subset_prediction_outputs(
             eval_set, predictions, mask, suffix, drop_debiased=narrow
         )
@@ -1524,6 +1546,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                             scoring=scoring.name,
                             label=scoring.label,
                             log_floor=scoring.log_floor,
+                            rank_metrics=scoring.rank_metrics,
                         )
                         final_metrics.update(metrics)
                         final_figures.update(figures)

@@ -215,3 +215,47 @@ def test_cpu_run_reports_no_cuda_columns() -> None:
     (record,) = profiler.records()
     assert record.cuda_peak_allocated_mib is None
     assert record.seconds > 0.0
+
+
+def test_summary_reports_only_the_fields_that_get_read() -> None:
+    """The run summary carries two fields per stage; the CSV carries all nine."""
+    profiler = _profiler(cuda_reader=_FakeCuda(allocated=[0, 0], peak_allocated=[1, 1]))
+    with profiler.stage("gp_fit"):
+        pass
+
+    summary = profiler.metrics()
+
+    assert set(summary) == {
+        "run/stage/gp_fit/seconds",
+        "run/stage/gp_fit/cuda_peak_allocated_mib",
+    }
+    # Dropped from the summary, still a column of the profile CSV.
+    assert "run/stage/gp_fit/host_rss_start_mib" not in summary
+    assert "host_rss_start_mib" in StageProfiler.column_names()
+    assert set(profiler.rows()[0]) == set(StageProfiler.column_names())
+
+
+def test_summary_fields_may_be_widened_or_turned_off() -> None:
+    """``fields=None`` restores the pre-trim behaviour, for a one-off run."""
+    profiler = _profiler(cuda_reader=_FakeCuda(allocated=[0, 0], peak_allocated=[1, 1]))
+    with profiler.stage("gp_fit"):
+        pass
+
+    everything = profiler.metrics(fields=None)
+    widened = profiler.metrics(fields=("seconds", "host_peak_rss_mib"))
+
+    assert "run/stage/gp_fit/host_rss_start_mib" in everything
+    assert set(widened) == {
+        "run/stage/gp_fit/seconds",
+        "run/stage/gp_fit/host_peak_rss_mib",
+    }
+
+
+def test_unknown_summary_field_is_refused() -> None:
+    """A typo would otherwise silently report an empty summary."""
+    profiler = _profiler()
+    with profiler.stage("gp_fit"):
+        pass
+
+    with pytest.raises(ValueError, match="no such stage measurement"):
+        profiler.metrics(fields=("seconds", "cuda_peak_allocated"))
