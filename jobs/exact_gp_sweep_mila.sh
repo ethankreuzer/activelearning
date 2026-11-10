@@ -85,10 +85,21 @@
 #     ABNORMAL, which accept_abnormal_lbfgsb already accepts. Use it for a test
 #     run; do not use it for the six arms without recording that the cap was
 #     applied to all six equally, since an unequal cap is a confound.
+#
+# HOST MEMORY, and why it is 24G and not more. This job's memory pressure is on
+# the CARD, not the host: job 11620200's whole-run host peak was 1.94 GB (its
+# largest single demand is one eval set's features, 230,887 x 512 fp32 = 472 MB).
+# 24G is twelve times that.
+#
+# It is not lower because `main`'s per-user QOS caps are cpu=8, mem=48G, gpu=2,
+# and 48/24 = 2 is exactly the GPU cap: two arms run at once, which is the most
+# this partition allows however little memory is asked for. The first launch
+# asked 32G and the other five sat in QOSMaxMemoryPerUser, running the six arms
+# strictly one at a time for no benefit.
 #SBATCH --partition=main
 #SBATCH --gres=gpu:a100:1
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=32G
+#SBATCH --mem=24G
 #SBATCH --time=12:00:00
 #SBATCH --job-name=exact_gp_sweep
 #SBATCH --output=slurm_logs/exact_gp_sweep_%j.out
