@@ -963,9 +963,12 @@ Three things follow, and the section should say all three:
    model classes and 1700x of calibration. It also sits naturally beside `fit.md` C2's
    finding that no arm can order within the hit block -- both say the top of the ranking
    is determined by something other than the surrogate's hyperparameters.
-3. **`top100_in_true_top` spans 0.03-0.13**, so the best arm recovers 13 of the true top
-   100 and the worst 3. That is the one selection-quality metric with a 4x spread, and it
-   is the only place single-round quality moves at all. **Measured (2026-11-13): it does
+3. **`top100_in_true_top` spans 0.03-0.13.** Read it carefully: it is the fraction of the
+   **100 molecules the round selects** that lie in the pool's **top 1% by `y`** -- on the
+   45,850-molecule `_acq` pool that is the top ~459 -- not an overlap with a true top 100.
+   So the best arm puts 13 of its 100 picks in that top 1% and the worst 3. That is the
+   one selection-quality metric with a 4x spread, and it is the only place single-round
+   quality moves at all. **Measured (2026-11-13): it does
    not track calibration arm-by-arm.** Rank correlations over the 54 arms are weak in
    every direction -- hit-block `latent_coverage_1std` **+0.393**, `gp_molformer_set`
    effective support +0.301, 232k `latent_variance_ratio` -0.285, `latent_worst_bin_ratio`
