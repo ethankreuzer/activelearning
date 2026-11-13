@@ -964,11 +964,27 @@ Three things follow, and the section should say all three:
    finding that no arm can order within the hit block -- both say the top of the ranking
    is determined by something other than the surrogate's hyperparameters.
 3. **`top100_in_true_top` spans 0.03-0.13**, so the best arm recovers 13 of the true top
-   100 and the worst 3. That is the one selection-quality metric with a 4x spread, it is
-   the only place single-round quality moves at all, and whether it tracks the calibration
-   metrics is **not yet computed**. It is build item 5 and it is the cheapest possible
-   strengthening of this section -- if it correlates with `latent_variance_ratio`, §6
-   weakens considerably.
+   100 and the worst 3. That is the one selection-quality metric with a 4x spread, and it
+   is the only place single-round quality moves at all. **Measured (2026-11-13): it does
+   not track calibration arm-by-arm.** Rank correlations over the 54 arms are weak in
+   every direction -- hit-block `latent_coverage_1std` **+0.393**, `gp_molformer_set`
+   effective support +0.301, 232k `latent_variance_ratio` -0.285, `latent_worst_bin_ratio`
+   -0.286, hit/bulk latent-std ratio **+0.004**, 232k_acq `n_mass90` -0.038 -- and no
+   stronger than the fit side's (hit `bias` +0.292, ipw `pearson` -0.248). **So the
+   concession above stands at arm level and must not be softened.**
+
+   What *does* separate, at configuration level, is the grouping: mean
+   `top100_in_true_top` is **0.120** for the four n=20,000 PLL prior-`on` arms, 0.088 for
+   n=20,000 PLL prior-`off`, 0.055 at n=100,000 and 0.053 at n=300,000, and 0.055 for the
+   24 ELBO arms. The five best arms in the sweep are all n=20,000 PLL. That is consistent
+   with §4/V6 and with `fit.md` V1, and it is the only selection-quality evidence in the
+   chapter that points the same way as the calibration metrics -- so report it as a
+   group-level tendency, in a sentence, and not as a per-arm correlation.
+
+   **Hedge it hard.** The metric lives on a 1/100 grid with n=1 per arm, so 0.13 against
+   0.10 is thirteen molecules against ten. The four-arm group means are the defensible
+   readout; the individual values are not, and this is another place build item 4's seed
+   re-runs would change what can be said.
 
 ---
 
@@ -1009,7 +1025,7 @@ calibration advantage converts into hits over rounds, which is the AL section's 
 | 2 | **fix the `score_degeneracy` underflow** and recompute `effective_support` / `entropy_nats` from `score_gibbon_log` | hours, CPU | §0.6. 150 NaN values over 28 arms; blocks G1 panel (c)/(d) on the 232k_acq. The per-molecule log column is complete in all 58 arms, so this is a recompute, **not a refit**. Supersedes `fit.md` §6's "not a blocker for this section" |
 | 3 | per-molecule variance-vs-error binning helper, shared by E6, E7 and V-reuse | hours, CPU | binning on `y` with explicit threshold bins (reuse `fit.md` item 3) **and** on predicted latent variance in quantile bins. Also settles the §0.3 unverified within-hit PLL sign |
 | 4 | seeds 43 and 44 on the 3-5 finalist arms, **reporting variance-metric seed noise** | ~20 min each, 1 GPU | §0.7. More necessary here than in `fit.md`: no variance-metric seed noise has ever been measured, and V5's step trend needs it |
-| 5 | correlate `top100_in_true_top` against the calibration metrics over the 54 arms | ~1 hour, CPU | §6 item 3. The cheapest possible strengthening of the section, and it could also weaken it -- run it before the figures are final, not after |
+| 5 | ~~correlate `top100_in_true_top` against the calibration metrics over the 54 arms~~ | **DONE 2026-11-13** | §6 item 3. Result: no arm-level correlation (max \|rho\| 0.393), but a clear group-level ordering favouring n=20,000 PLL prior-`on`. Folded into §6; nothing further needed unless item 4 runs, which would let the group means carry error bars |
 
 Nothing here needs a GPU except item 4, and nothing needs a refit: every statistic is
 recomputable from `eval/<set>.csv`, which carries `mean`, `std_total`, `std_latent`,
