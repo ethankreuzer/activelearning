@@ -89,6 +89,11 @@
 #     effective_support 7207 -> 4304. The learned noise also fell 5.3e-4 ->
 #     1.2e-4, i.e. onto the 1e-4 floor.
 #
+#     ADDENDUM 2026-11-18: a fifth level, 7,500, was added at n=20,000 only
+#     (pll/elbo x prior on/off = 4 arms, n20000_<obj>_<prior>_s7500) to see
+#     whether the 5,000 -> 10,000 deterioration is gradual or a late knee. It is
+#     outside the 48-arm grid.
+#
 #     10,000 IS NOT A LEVEL, deliberately. Its only wins were enriched rmse
 #     (0.169 vs 0.186) and bias (-0.128 vs -0.157) -- accuracy, which the
 #     endpoint list reports as a COST and does not optimise -- plus continuity

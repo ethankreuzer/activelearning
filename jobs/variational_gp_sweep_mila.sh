@@ -9,6 +9,11 @@
 # DOWN, on the 2026-11-10 pilot's evidence; 10,000 is deliberately not a level.
 # config/ampc/variational_gp_sweep.yaml "AXIS 4" has the numbers.
 #
+# 7500 was ADDED 2026-11-18 as a fifth level at n=20,000 ONLY (4 arms: pll/elbo
+# x on/off), to close the gap between 5,000 and the 10,000-step pilot:
+#   for o in pll elbo; do for p in on off; do sbatch jobs/variational_gp_sweep_mila.sh $o $p 7500; done; done
+# It is NOT part of the 48-arm grid, which stays 625/1250/2500/5000.
+#
 #   sbatch jobs/variational_gp_sweep_mila.sh pll  on  2500
 #   sbatch jobs/variational_gp_sweep_mila.sh elbo off 625
 #   SIZE=300000 sbatch jobs/variational_gp_sweep_mila.sh pll on 1250
