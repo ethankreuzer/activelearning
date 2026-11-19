@@ -1,16 +1,16 @@
 # Archived from the surrogate chapter
 
-Moved out of the chapter when the experimental framework was restructured. Originally Sections 5.1.2-5.1.4 (experimental design, evaluation datasets, evaluation criteria) and 5.4 (comparative analysis).
+Moved out of the chapter when the experimental framework was restructured. Originally Sections 3.1.2-3.1.4 (experimental design, evaluation datasets, evaluation criteria) and 5.4 (comparative analysis).
 
 ---
 
-### 5.1.2 Experimental design of the GP sweeps
+### 3.1.2 Experimental design of the GP sweeps
 
 **Purpose**
 
 Describe the two separate W&B experiments and distinguish their experimental designs.
 
-**Table 5.1 — ExactGP experimental design**
+**Table 3.1 — ExactGP experimental design**
 
 | Category | Configuration |
 |---|---|
@@ -32,9 +32,9 @@ The three mean parameterizations were:
 
 The lengthscale prior was either enabled (LogNormal prior, mode 4.63) or disabled (initialization at sqrt(512)).
 
-Mean parameterization made no measurable difference to the ExactGP. All ExactGP analysis in Section 5.2 therefore uses the pinned-mean runs only (`n20000_off_pinned` and `n20000_on_pinned`), i.e. the lengthscale prior is the single factor compared there.
+Mean parameterization made no measurable difference to the ExactGP. All ExactGP analysis in Section 3.2 therefore uses the pinned-mean runs only (`n20000_off_pinned` and `n20000_on_pinned`), i.e. the lengthscale prior is the single factor compared there.
 
-**Table 5.2 — VariationalGP experimental design**
+**Table 3.2 — VariationalGP experimental design**
 
 | Category | Configuration |
 |---|---|
@@ -54,15 +54,15 @@ The three experimental factors were:
 - Objective: PLL versus ELBO.
 - Lengthscale prior: enabled versus disabled.
 - Training size: fixed at 20k. The effect of the initial dataset size is deliberately not studied: the active-learning framework, not the initial set, is meant to decide how the training set grows. Runs at other sizes exist but are not used.
-- Nominal training steps: 625, 1,250, 2,500, 5,000, 7,500 and 10,000. The first four levels were the original 16-run grid. The 7,500-step level (four runs) and the ELBO 10,000-step runs (two) were added afterwards; the two PLL 10,000-step runs are the earlier pilot (Section 5.3.8), which used the same configuration but an earlier code commit.
+- Nominal training steps: 625, 1,250, 2,500, 5,000, 7,500 and 10,000. The first four levels were the original 16-run grid. The 7,500-step level (four runs) and the ELBO 10,000-step runs (two) were added afterwards; the two PLL 10,000-step runs are the earlier pilot (Section 3.3.8), which used the same configuration but an earlier code commit.
 
-### 5.1.3 Evaluation datasets
+### 3.1.3 Evaluation datasets
 
 **Purpose**
 
 Explain the three held-out sets and why they evaluate different aspects of the modeling problem.
 
-**Table 5.3 — Held-out evaluation datasets**
+**Table 3.3 — Held-out evaluation datasets**
 
 | Dataset | Size | Evaluation purpose |
 |---|---:|---|
@@ -72,7 +72,7 @@ Explain the three held-out sets and why they evaluate different aspects of the m
 
 Emphasize that GP-Molformer is particularly important because it provides information about how the GP behaves on molecules the GFlowNet initially generates, rather than only on molecules drawn from the original screening library.
 
-**Figure 5.2 — Distribution of docking-derived target values across the three evaluation sets**
+**Figure 3.2 — Distribution of docking-derived target values across the three evaluation sets**
 
 - Three panels: Validation, InVitro and GP-Molformer.
 - X-axis: true docking-derived score, `y`.
@@ -81,7 +81,7 @@ Emphasize that GP-Molformer is particularly important because it provides inform
 
 **Purpose of figure:** Establish how the target distributions differ between evaluation datasets. This context is important when interpreting differences in RMSE, calibration and enrichment.
 
-### 5.1.4 Evaluation criteria
+### 3.1.4 Evaluation criteria
 
 **Purpose**
 
@@ -104,13 +104,13 @@ Explain that predictive accuracy and uncertainty calibration are not interchange
 
 ---
 
-## 5.4 Comparative Analysis: ExactGP versus VariationalGP
+## 3.4 Comparative Analysis: ExactGP versus VariationalGP
 
 This should be a relatively short synthesis section. Its purpose is to put the findings in context and show which behaviors appear associated with the GP objective or approximation.
 
 These should be descriptive comparisons, not controlled claims that one family is better. ExactGP and VariationalGP differ in optimization procedure and posterior representation.
 
-### 5.4.1 Comparison of uncertainty allocation
+### 3.4.1 Comparison of uncertainty allocation
 
 **Purpose**
 
@@ -122,7 +122,7 @@ Compare learned uncertainty decomposition between:
 
 Restrict the main comparison to 20k training observations.
 
-**Figure 5.28 — Uncertainty allocation across GP model families**
+**Figure 3.28 — Uncertainty allocation across GP model families**
 
 - X-axis: GP model type/objective (ExactGP, PLL, ELBO).
 - Y-axis: learned latent variance and likelihood noise.
@@ -133,20 +133,20 @@ Restrict the main comparison to 20k training observations.
 
 Discuss the observation that PLL places considerably more uncertainty into the latent posterior, whereas ExactGP and ELBO place more into likelihood noise. Ensure variance and standard-deviation units are made consistent before direct comparison.
 
-### 5.4.2 Comparison of predictive and acquisition performance
+### 3.4.2 Comparison of predictive and acquisition performance
 
 **Purpose**
 
 Determine whether differences in uncertainty allocation are accompanied by meaningful differences in predictive means and GIBBON outputs.
 
-**Figure 5.29 — Predictive performance across GP model families**
+**Figure 3.29 — Predictive performance across GP model families**
 
 - Three dataset panels.
 - X-axis: ExactGP, PLL, ELBO.
 - Y-axis: RMSE and Spearman in separate panels.
 - Restrict to 20k training-size configurations.
 
-**Figure 5.30 — GIBBON enrichment across GP model families**
+**Figure 3.30 — GIBBON enrichment across GP model families**
 
 - Three dataset panels.
 - X-axis: ExactGP, PLL, ELBO.
