@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Make every figure outlined in surrogate_model_chapter.md (Figures 5.1 - 5.28).
+"""Make every figure outlined in surrogate_model_chapter.md (Figures 5.1 - 5.31).
 
 Inputs (already on disk):
   outputs/ampc/exact_gp_sweep_results.csv        (6 arms)
@@ -32,6 +32,7 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
+import matplotlib.ticker  # noqa: E402
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 from matplotlib.lines import Line2D  # noqa: E402
@@ -144,7 +145,6 @@ def save(fig, section: str, fname: str, title: str, *, legend=None, note: str | 
     out = HERE / SECTIONS[section]
     out.mkdir(parents=True, exist_ok=True)
     fig.savefig(out / f"{fname}.png", dpi=200, bbox_inches="tight")
-    fig.savefig(out / f"{fname}.pdf", bbox_inches="tight")
     plt.close(fig)
     _made.append(f"{SECTIONS[section]}/{fname}")
     print("wrote", _made[-1])
@@ -395,26 +395,24 @@ def bar_label(ax, x, y, text, *, fontsize=12, bold=False, rotation=0, gap=6):
                 rotation=rotation, zorder=6, annotation_clip=False)
 
 
-def prior_bars(ax, vals, *, fmt="{:.3f}"):
-    for i, pr in enumerate(("off", "on")):
-        ax.bar(i, vals[pr], 0.6, color=PRIOR_COL[pr], edgecolor="black", linewidth=1.1, zorder=3)
-        bar_label(ax, i, vals[pr], fmt.format(vals[pr]), fontsize=13, bold=True)
-    ax.set_xticks([0, 1])
-    ax.set_xticklabels(["prior off", "prior on"])
-    ax.set_xlim(-0.6, 1.6)
-
-
 def fig_5_3(df):
     e = exact(df)
-    fig, axes = plt.subplots(1, 2, figsize=(11, 5.8), sharey=True)
-    for ax, (col, t) in zip(axes, [("lengthscale", "Lengthscale"), ("outputscale", "Outputscale")]):
-        prior_dots(ax, e, col, log=True)
-        ax.set_ylim(0.1, 40)
-        lab(ax, "Lengthscale prior", "Learned value (log scale, shared by both panels)", t)
+    fig, ax = plt.subplots(figsize=(9.5, 7.2))
+    for pr in ("off", "on"):
+        x, y = float(e.loc[pr, "lengthscale"]), float(e.loc[pr, "outputscale"])
+        ax.scatter(x, y, s=320, color=PRIOR_COL[pr], edgecolors="black", linewidths=1.3, zorder=3, label=f"lengthscale prior {pr}")
+        ax.annotate(f"lengthscale {x:.2f}\noutputscale {y:.3g}", (x, y), xytext=(14, 10), textcoords="offset points", fontsize=12.5,
+                    fontweight="bold", zorder=4)
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.set_xlim(1, 40)
+    ax.set_ylim(0.1, 40)
+    lab(ax, "Learned lengthscale (log scale)", "Learned outputscale (log scale)")
     save(fig, "5.2", "fig5_03_learned_kernel_hyperparameters",
          "Figure 5.3 — The lengthscale prior reshapes the learned ExactGP kernel",
-         note="ExactGP, 20k training molecules, pinned mean. Both panels share one y-axis so the two parameters can be "
-              "compared directly.")
+         legend=h_prior_col(), legend_cols=2,
+         note="ExactGP, 20k training molecules, pinned mean. One point per prior setting: lengthscale on the x-axis, outputscale on the y-axis, "
+              "both on log scales.")
 
 
 def latent_stats() -> dict:
@@ -430,8 +428,8 @@ def latent_stats() -> dict:
     return out
 
 
-def fig_5_4c(df):
-    """Predicted vs true score on Validation, prior off (left) and prior on (right). Counterpart of Figures 5.12a and 5.12b."""
+def fig_5_6(df):
+    """Predicted vs true score on Validation, prior off (left) and prior on (right). Counterpart of Figures 5.18a and 5.18b."""
     from matplotlib.colors import LogNorm
     from scipy.stats import spearmanr
     lim = (-0.05, 0.70)
@@ -458,45 +456,14 @@ def fig_5_4c(df):
     cb = fig.colorbar(hb, cax=cax)
     cb.set_label("Molecules per bin (log)")
     cax._no_axes_labels = True
-    save(fig, "5.2", "fig5_04c_predicted_vs_true",
-         "Figure 5.4c — ExactGP: predicted vs true score on Validation, prior off and prior on",
+    save(fig, "5.2", "fig5_06_predicted_vs_true",
+         "Figure 5.6 — ExactGP: predicted vs true score on Validation, prior off and prior on",
          note="Validation set (about 231k molecules), ExactGP at 20k training molecules, pinned mean. Left: prior off. Right: prior on. Dotted verticals "
               "mark the enriched (y ≥ 0.26) and hit (y ≥ 0.52) bands; dashed diagonal = perfect prediction. Same axes and colour scale in both panels "
-              "and in Figures 5.12a and 5.12b.")
+              "and in Figures 5.18a and 5.18b.")
 
 
-def fig_5_5(df):
-    """Uncertainty allocation space: learned noise variance vs median latent variance, like Figure 5.15 (one point per prior setting)."""
-    e = exact(df)
-    st = latent_stats()
-    noise = {pr: float(e.loc[pr, "learned_noise_std_original"]) ** 2 for pr in ("off", "on")}
-    for pref, _ in DS:
-        for pr in ("off", "on"):
-            d = exact_csv(pr, DS_FILE[pref], ["std_total"]).dropna()
-            tot = float(np.median(d.std_total ** 2))
-            # per molecule total = latent + constant noise, so the median total is noise + median latent variance
-            assert abs(tot - (noise[pr] + st[(pref, pr, "All")][3])) < 1e-6 * tot + 1e-9, (pref, pr)
-    vlim = variance_limits(var(df))  # the same range as Figures 5.14 and 5.15
-    fig, axes = plt.subplots(1, 3, figsize=(18, 6.4))
-    for ax, (pref, dname) in zip(axes, DS):
-        for pr in ("off", "on"):
-            lat_med = st[(pref, pr, "All")][3]
-            ax.scatter(noise[pr], lat_med, s=260, color=PRIOR_COL[pr], edgecolors="black", linewidths=1.3, zorder=3)
-            ax.annotate(f"noise {noise[pr]:.1e}\nlatent {lat_med:.1e}", (noise[pr], lat_med), xytext=(-16, 4 if pr == "on" else -4),
-                        textcoords="offset points", ha="right", va="bottom" if pr == "on" else "top", fontsize=11.5, zorder=6)
-        ax.set_xscale("log")
-        ax.set_yscale("log")
-        ax.set_xlim(*vlim)
-        ax.set_ylim(*vlim)
-        lab(ax, "Learned likelihood noise variance σₙ²\n(score units², log scale)", "Median latent variance of f(x)\n(score units², log scale)", dname)
-    save(fig, "5.2", "fig5_05_uncertainty_allocation_space",
-         "Figure 5.5 — The prior moves variance from likelihood noise into the latent GP",
-         legend=h_prior_col(), legend_cols=2,
-         note="One point per prior setting; axes and range as in Figures 5.14 and 5.15. The noise is a fit-level constant and the latent variance is "
-              "the median over molecules, so the total predictive variance is the noise plus the latent value (checked on the per-molecule outputs).")
-
-
-def fig_5_5b(df):
+def fig_5_7(df):
     """Distribution of the per-molecule latent variance over each entire set, prior off vs on, all three sets in one panel."""
     st = latent_stats()
     ymax = max(st[(pref, pr, "All")][5] for pref, _ in DS for pr in ("off", "on")) * 1.15
@@ -515,8 +482,8 @@ def fig_5_5b(df):
     ax.set_xlim(-0.6, len(DS) - 0.4)
     ax.set_ylim(0, ymax)
     lab(ax, "Evaluation set", "Latent variance of f(x) per molecule\n(score units²)")
-    save(fig, "5.2", "fig5_05b_latent_variance_distribution",
-         "Figure 5.5b — The prior raises the latent variance of every molecule",
+    save(fig, "5.2", "fig5_07_latent_variance_distribution",
+         "Figure 5.7 — The prior raises the latent variance of every molecule",
          legend=h_prior_col() + [Line2D([], [], color="black", lw=2, marker="_", ms=14, label="whisker: 5th–95th percentile of molecules")], legend_cols=3,
          note="Per-molecule latent variance of f(x) over each entire evaluation set (box = 25th–75th percentile, white/black line = median, "
               "whiskers = 5th–95th, value = median).")
@@ -526,8 +493,8 @@ def exact_val(pr, cols=("y", "mean", "std_latent", "block")):
     return exact_csv(pr, DS_FILE["val"], list(cols)).dropna()
 
 
-def fig_5_4a(df):
-    """ExactGP fit, part 1: separation of enriched molecules from the bulk (Validation). Counterpart of Figure 5.10."""
+def fig_5_4(df):
+    """ExactGP fit, part 1: separation of enriched molecules from the bulk (Validation). Counterpart of Figure 5.16."""
     from scipy.stats import rankdata
     rec = {}
     for pr in ("off", "on"):
@@ -550,15 +517,15 @@ def fig_5_4a(df):
     axes[1].text(1.85, base, f"random pick ({base:.3f})", ha="right", va="bottom", fontsize=10.5, color="#555555")
     axes[1].set_ylim(0, 1.0)
     lab(axes[1], "Lengthscale prior", "Share of true hits in top-N\n(N = number of true hits)", "Validation set: finding the hits")
-    save(fig, "5.2", "fig5_04a_separation_of_enriched_from_bulk",
-         "Figure 5.4a — The prior does not change how well the mean separates enriched from bulk",
+    save(fig, "5.2", "fig5_04_separation_of_enriched_from_bulk",
+         "Figure 5.4 — The prior does not change how well the mean separates enriched from bulk",
          note="ExactGP, 20k training molecules, pinned mean, Validation set. Left: AUC of the predicted mean for telling molecules with "
               "y ≥ 0.26 from the low-score bulk. Right: among the N molecules with the highest predicted mean, where N is the number of "
-              "true hits (y ≥ 0.52), the fraction that are true hits. Dashed = chance or a random pick. Same construction as Figure 5.10.")
+              "true hits (y ≥ 0.52), the fraction that are true hits. Dashed = chance or a random pick. Same construction as Figure 5.16.")
 
 
-def fig_5_4b(df):
-    """ExactGP fit, part 2: signed bias and RMSE by true-score bin (Validation). Counterpart of Figure 5.11, with its y-scales."""
+def fig_5_5(df):
+    """ExactGP fit, part 2: signed bias and RMSE by true-score bin (Validation). Counterpart of Figure 5.17, with its y-scales."""
     centers = 0.5 * (YBIN_EDGES[:-1] + YBIN_EDGES[1:])
     res = {}
     for pr in ("off", "on"):
@@ -581,125 +548,175 @@ def fig_5_4b(df):
             ax.axhline(0, color="#888888", ls="-", lw=1.0)
         lab(ax, "True score y (binned)", ylabel, title)
         if "bias" not in FIT_YLIM:
-            fig_5_11(df)  # defines the y-scales of Figure 5.11, which this figure reuses exactly
+            fig_5_17(df)  # defines the y-scales of Figure 5.17, which this figure reuses exactly
         lo, hi = FIT_YLIM[key]
         vals = np.concatenate([res[pr][key][keep] for pr in ("off", "on")])
         assert lo <= vals.min() and vals.max() <= hi, (key, lo, hi, vals.min(), vals.max())  # every ExactGP value fits
         ax.set_ylim(lo, hi)
-    save(fig, "5.2", "fig5_04b_error_by_true_y_bin",
-         "Figure 5.4b — Fit by score range on the Validation set: both models under-predict high scorers",
+    save(fig, "5.2", "fig5_05_error_by_true_y_bin",
+         "Figure 5.5 — Fit by score range on the Validation set: both models under-predict high scorers",
          legend=h_prior_col(), legend_cols=2,
          note="ExactGP, 20k training molecules, pinned mean, Validation set; true score binned in steps of 0.06 (bins under 50 "
-              "molecules dropped). Dotted verticals mark the enriched (y ≥ 0.26) and hit (y ≥ 0.52) bands. Same construction and exactly the same y-scales as Figure 5.11.")
+              "molecules dropped). Dotted verticals mark the enriched (y ≥ 0.26) and hit (y ≥ 0.52) bands. Same construction and exactly the same y-scales as Figure 5.17.")
 
 
-def fig_5_5c(df):
-    """ExactGP: is the latent uncertainty informative about error? (Validation). Counterpart of Figures 5.20 and 5.21."""
+def fig_5_8(df):
+    """ExactGP: within each true-score bin, does the latent SD rank the errors? (Validation). Counterpart of Figure 5.24."""
     from scipy.stats import spearmanr
-    bands = [("All", None), ("Bulk", 0), ("Enriched", 1), ("Hit", 2)]
     centers = 0.5 * (YBIN_EDGES[:-1] + YBIN_EDGES[1:])
-    sse, prof = {}, {}
+    rho = {}
     for pr in ("off", "on"):
         d = exact_val(pr)
-        err = (d["mean"] - d.y).abs()
-        sse[pr] = {b: float(spearmanr((d if k is None else d[d.block == k]).std_latent,
-                                      (err if k is None else err[d.block == k]))[0]) for b, k in bands}
-        idx = np.clip(np.digitize(d.y.to_numpy(), YBIN_EDGES) - 1, 0, len(YBIN_EDGES) - 2)
-        n = np.bincount(idx, minlength=len(centers))
-        prof[pr] = dict(n=n, ratio=np.bincount(idx, weights=d.std_latent.to_numpy(), minlength=len(centers)) /
-                        np.maximum(np.bincount(idx, weights=err.to_numpy(), minlength=len(centers)), 1e-12))
-    fig, axes = plt.subplots(1, 2, figsize=(16, 6.2))
-    ax = axes[0]
-    for bi, (b, _) in enumerate(bands):
-        for pr, off in (("off", -0.19), ("on", 0.19)):
-            v = sse[pr][b]
-            ax.bar(bi + off, v, 0.36, color=PRIOR_COL[pr], edgecolor="black", linewidth=1, zorder=3)
-            bar_label(ax, bi + off, v, f"{v:+.2f}", fontsize=11)
-    ax.axhline(0, color="#444444", lw=1)
-    ax.set_xticks(range(len(bands)))
-    ax.set_xticklabels([b for b, _ in bands])
-    ax.set_ylim(-0.7, 0.95)
-    lab(ax, "Subset of Validation", "Spearman: latent SD vs |error|\n(positive = more uncertain where more wrong)",
-        "Does the uncertainty rank the errors?")
-    ax = axes[1]
-    keep = prof["off"]["n"] >= 50
+        err = (d["mean"] - d.y).abs().to_numpy()
+        lat = d.std_latent.to_numpy()
+        idx = np.clip(np.digitize(d.y.to_numpy(), YBIN_EDGES) - 1, 0, len(centers) - 1)
+        rho[pr] = np.full(len(centers), np.nan)
+        for b in range(len(centers)):
+            k = idx == b
+            if k.sum() >= 50:  # bins under 50 molecules are not computed
+                rho[pr][b] = float(spearmanr(lat[k], err[k])[0])
+    fig, ax = plt.subplots(figsize=(11, 6.8))
     for pr in ("off", "on"):
-        ax.plot(centers[keep], prof[pr]["ratio"][keep], color=PRIOR_COL[pr], ls="-" if pr == "on" else "--", lw=2.6, marker="o", ms=6)
+        keep = ~np.isnan(rho[pr])
+        ax.plot(centers[keep], rho[pr][keep], color=PRIOR_COL[pr], ls="-" if pr == "on" else "--", lw=2.6, marker="o", ms=8)
     for x in (0.262, 0.525):
         ax.axvline(x, color="#888888", ls=":", lw=1.6)
-    ax.axhline(1.0, color="#888888", ls=":", lw=1.8)
-    ax.set_yscale("log")
-    ax.set_ylim(0.05, 1.3)
-    lab(ax, "True score y (binned)", "Mean latent SD ÷ mean |error|\n(1 = latent SD matches typical error)",
-        "Is the uncertainty the right size?")
-    save(fig, "5.2", "fig5_05c_latent_uncertainty_vs_error",
-         "Figure 5.5c — ExactGP latent uncertainty versus error",
+    ax.axhline(0, color="#444444", lw=1)
+    ax.set_ylim(-1, 1)
+    lab(ax, "True score y (bin centre; bins of 0.06)", "Spearman: latent SD vs |error| within the bin\n(positive = more uncertain where more wrong)",
+        "Does the uncertainty rank the errors at a fixed true score?")
+    save(fig, "5.2", "fig5_08_latent_uncertainty_vs_error",
+         "Figure 5.8 — At a fixed true score, latent uncertainty ranks errors only above y ≈ 0.25",
          legend=h_prior_col(), legend_cols=2,
-         note="ExactGP, 20k training molecules, pinned mean, Validation set. Left: Spearman correlation between each molecule's latent "
-              "standard deviation and its absolute prediction error, over all molecules and within the bulk, enriched and hit bands "
-              "(the enriched and hit bands are selected on y, so this is a diagnostic, not a selection criterion). Right: ratio of mean "
-              "latent SD to mean absolute error by true score (bins of 0.06, bins under 50 molecules dropped); dotted verticals mark "
-              "the enriched and hit bands, the horizontal dotted line is a ratio of 1. Same constructions as Figures 5.20 and 5.21.")
+         note="ExactGP, 20k training molecules, pinned mean, Validation set. Each point is the Spearman correlation between a molecule's latent "
+              "standard deviation and its absolute prediction error, computed within one true-score bin (width 0.06; bins under 50 molecules dropped). "
+              "Dotted verticals mark the enriched (0.26) and hit (0.52) boundaries; dashed = prior off, solid = prior on.")
 
 
-def fig_5_6(df):
-    """90% coverage of the ExactGP, from the TOTAL and from the LATENT-ONLY predictive SD (counterparts of Figures 5.18 and 5.19)."""
+def fig_5_9(df):
+    """90% coverage of the ExactGP from the TOTAL predictive SD (counterpart of the 90% column of Figure 5.21)."""
     from scipy.stats import norm
-    z90 = float(norm.ppf(0.95))
     groups = [("All molecules", None), ("Enriched", 1)]
-    rows = [("std_total", "90% coverage, total variance\n(latent + noise)"), ("std_latent", "90% coverage, latent variance only")]
-    fig, axes = plt.subplots(2, 3, figsize=(17, 10.5), sharey=True)
+    levels = (0.9, 0.7, 0.5)  # nominal central-interval coverage, one row each
+    fig, axes = plt.subplots(len(levels), 3, figsize=(17, 17), sharey=True)
     for c, (pref, dname) in enumerate(DS):
-        data = {pr: exact_csv(pr, DS_FILE[pref], ["y", "mean", "std_total", "std_latent", "block"]).dropna() for pr in ("off", "on")}
-        for r, (sd_col, ylabel) in enumerate(rows):
+        data = {pr: exact_csv(pr, DS_FILE[pref], ["y", "mean", "std_total", "block"]).dropna() for pr in ("off", "on")}
+        for r, level in enumerate(levels):
+            z = float(norm.ppf(0.5 + level / 2))  # half-width of the central interval in SDs
             ax = axes[r, c]
             for gi, (g, blk) in enumerate(groups):
                 for pr, off, ha, dx in (("off", -0.14, "right", -13), ("on", 0.14, "left", 13)):
                     d = data[pr] if blk is None else data[pr][data[pr].block == blk]
                     if len(d) < MIN_N:
                         continue
-                    cov = float(np.mean((d.y - d["mean"]).abs() <= z90 * d[sd_col]))
+                    cov = float(np.mean((d.y - d["mean"]).abs() <= z * d["std_total"]))
                     ax.scatter(gi + off, cov, s=200, color=PRIOR_COL[pr], edgecolors="black", linewidths=1.3, zorder=3)
                     ax.annotate(f"{cov:.2f}", (gi + off, cov), xytext=(dx, 0), textcoords="offset points", ha=ha, va="center",
                                 fontsize=12, fontweight="bold")
-            ax.axhline(0.9, color="#888888", ls=":", lw=1.8)
+            ax.axhline(level, color="#888888", ls=":", lw=1.8)
             ax.set_xticks(range(len(groups)))
             ax.set_xticklabels([g for g, _ in groups])
             ax.set_xlim(-0.6, 1.6)
             ax.set_ylim(0, 1.05)
             ax.tick_params(axis="y", labelleft=True)
-            lab(ax, "Subset of the evaluation set", ylabel, dname if r == 0 else None)
-    save(fig, "5.2", "fig5_06_coverage_total_vs_latent",
-         "Figure 5.6 — 90% interval coverage of the ExactGP, from total and from latent-only variance",
-         legend=h_prior_col() + [Line2D([], [], color="#888888", ls=":", lw=2, label="nominal 0.90")], legend_cols=3,
-         note="Coverage = fraction of molecules with |y − μ| ≤ 1.645 σ. Top row: σ is the total predictive SD (latent + likelihood noise); "
-              "bottom row: σ is the latent SD alone, which is what GIBBON uses. Enriched = 0.26 ≤ y < 0.52 (GP-Molformer has only 46). "
-              "Same quantities as Figures 5.18 and 5.19.")
+            lab(ax, "Subset of the evaluation set", f"{level:.0%} coverage, total variance\n(latent + noise)",
+                dname if r == 0 else None)
+    save(fig, "5.2", "fig5_09_coverage_total_variance",
+         "Figure 5.9 — ExactGP interval coverage from total variance, at 90%, 70% and 50%",
+         legend=h_prior_col() + [Line2D([], [], color="#888888", ls=":", lw=2, label="nominal level (dotted)")], legend_cols=3,
+         note="Coverage = fraction of molecules with |y − μ| ≤ z σ, where σ is the total predictive SD (latent + likelihood noise) and z is the "
+              "two-sided normal quantile for the row's level (1.645, 1.036, 0.674). Top row 90%, middle 70%, bottom 50%. "
+              "Enriched = 0.26 ≤ y < 0.52 (GP-Molformer has only 46). Same quantity as the 90% column of Figure 5.21.")
 
 
-def fig_5_7(df):
+def _exact_proper_scores() -> dict:
+    """Gaussian NLPD / CRPS / 90% coverage of the ExactGP per (dataset, prior, band); band None if fewer than MIN_N molecules."""
+    out = {}
+    for pref, _ in DS:
+        for pr in ("off", "on"):
+            d = exact_csv(pr, DS_FILE[pref], ["y", "mean", "std_total", "block"]).dropna()
+            out[(pref, pr, "All")] = _gauss_band_metrics(d)
+            e = d[d.block == 1]
+            out[(pref, pr, "Enriched")] = _gauss_band_metrics(e) if len(e) >= MIN_N else None
+    return out
+
+
+def _exact_score_grid(key, fname, title, ylabel, note):
+    """1x3 grid, one panel per held-out set. X: whole set and enriched band, with prior off and on side by side in each group. One y-scale for all panels."""
+    s = _exact_proper_scores()
+    bands = [("All", "Whole set"), ("Enriched", "Enriched, 0.26 ≤ y < 0.52")]
+    fig, axes = plt.subplots(1, 3, figsize=(17, 6.8), sharey=True)
+    vals = [s[(p, pr, band)][key] for band, _ in bands for p, _ in DS for pr in ("off", "on") if s[(p, pr, band)] is not None]
+    lo, hi = min(vals), max(vals)
+    pad = 0.25 * (hi - lo) if hi > lo else 0.05 * abs(hi) + 0.01
+    for c, (pref, dname) in enumerate(DS):
+        ax = axes[c]
+        for gi, (band, _) in enumerate(bands):
+            for pr, dx in (("off", -0.17), ("on", 0.17)):
+                m = s[(pref, pr, band)]
+                if m is None:
+                    continue
+                v = m[key]
+                ax.scatter(gi + dx, v, s=260, color=PRIOR_COL[pr], edgecolors="black", linewidths=1.3, zorder=3)
+                ax.annotate(f"{v:.3f}", (gi + dx, v), xytext=(0, 16), textcoords="offset points", ha="center", fontsize=13,
+                            fontweight="bold")
+        ax.set_xticks([0, 1])
+        ax.set_xticklabels([b for _, b in bands])
+        ax.set_xlim(-0.6, 1.6)
+        ax.set_ylim(lo - pad, hi + pad)
+        ax.tick_params(axis="y", labelleft=True)
+        lab(ax, "Evaluation subset", ylabel, dname)
+    save(fig, "5.2", fname, title, legend=h_prior_col(), legend_cols=2, note=note)
+
+
+def fig_5_10(df):
+    _exact_score_grid("nlpd", "fig5_10_nlpd_by_set_and_prior",
+                      "Figure 5.10 — ExactGP NLPD on each held-out set, prior off and on",
+                      "NLPD (nats, lower = better)",
+                      note="NLPD of the Gaussian predictive N(μ, σ_total²) with the total learned variance (latent + noise), averaged over molecules. "
+                           "Each panel is one held-out set; within it, the whole set and the enriched molecules (0.26 ≤ y < 0.52; GP-Molformer has only 46) "
+                           "are groups, with prior off and on side by side. All three panels share one y-scale.")
+
+
+def fig_5_11(df):
+    _exact_score_grid("crps", "fig5_11_crps_by_set_and_prior",
+                      "Figure 5.11 — ExactGP CRPS on each held-out set, prior off and on",
+                      "CRPS (score units, lower = better)",
+                      note="CRPS of the Gaussian predictive N(μ, σ_total²) with the total learned variance (latent + noise), averaged over molecules, "
+                           "in the same units as y. Each panel is one held-out set; within it, the whole set and the enriched molecules "
+                           "(0.26 ≤ y < 0.52; GP-Molformer has only 46) are groups, with prior off and on side by side. All three panels share one y-scale.")
+
+
+def fig_5_12(df):
     e = exact(df)
     fig, axes = plt.subplots(1, 3, figsize=(15.5, 5.6))
     for ax, (pref, dname) in zip(axes, DS):
-        prior_bars(ax, {pr: float(e.loc[pr, f"{pref}_gibbon_value_top100_enrichment"]) for pr in ("off", "on")}, fmt="{:.2f}×")
+        for i, pr in enumerate(("off", "on")):
+            v = float(e.loc[pr, f"{pref}_gibbon_value_top100_enrichment"])
+            ax.scatter(i, v, s=260, color=PRIOR_COL[pr], edgecolors="black", linewidths=1.3, zorder=3)
+            ax.annotate(f"{v:.2f}×", (i, v), xytext=(0, 16), textcoords="offset points", ha="center", fontsize=13, fontweight="bold")
         ax.axhline(1, color="#888888", ls="--", lw=1.6)
+        ax.set_xticks([0, 1])
+        ax.set_xticklabels(["prior off", "prior on"])
+        ax.set_xlim(-0.6, 1.6)
         ax.set_ylim(0, max(float(e[f"{pref}_gibbon_value_top100_enrichment"].max()) * 1.2, 1.5))
-        lab(ax, "Lengthscale prior", "GIBBON top-100 enrichment\n(picks ÷ pool mean)", dname)
-    save(fig, "5.2", "fig5_07_gibbon_top100_enrichment",
-         "Figure 5.7 — The prior raises GIBBON enrichment only on the GP-Molformer distribution",
+        ax.tick_params(axis="y", labelleft=True)
+        lab(ax, "", "GIBBON top-100 enrichment\n(picks ÷ pool mean)", dname)
+        ax._no_axes_labels = True  # no x-axis title: the tick labels say which prior setting
+    save(fig, "5.2", "fig5_12_gibbon_top100_enrichment",
+         "Figure 5.12 — The prior raises GIBBON enrichment only on the GP-Molformer distribution",
          legend=h_prior_col(), legend_cols=2,
          note="Enrichment = mean true docking score of the 100 molecules GIBBON ranks highest ÷ mean over the whole set; 1× is a random pick. "
               "Top-100 only: top-1,000 would cover about two thirds of the 1,521-molecule InVitro set and is nearly "
               "identical to top-100 elsewhere. Dashed line = 1× (random). " + ACQ_NOTE)
 
 
-def fig_5_8(df):
-    """Per-molecule log GIBBON as violins over the entire set (counterpart of Figure 5.24): Validation and GP-Molformer, prior off vs on."""
+def fig_5_13(df):
+    """Per-molecule log GIBBON as violins over the entire set (counterpart of Figure 5.27): Validation and GP-Molformer, prior off vs on."""
     from matplotlib.patches import Patch
     from matplotlib.ticker import FixedLocator, FuncFormatter, NullLocator
     from scipy.stats import gaussian_kde
     sets = [("val", "Validation (acquisition slice)"), ("gpmol", "GP-Molformer")]
-    col = FAM_COL["exact"]
     rng = np.random.default_rng(0)
     half = 0.18
     fig, axes = plt.subplots(1, 2, figsize=(12.5, 7.6), sharey=True)
@@ -718,9 +735,9 @@ def fig_5_8(df):
             dens = gaussian_kde(sub, bw_method=0.15)(grid)
             w = half * np.sqrt(dens / dens.max())  # sqrt width keeps the sparse tail visible
             if pr == "on":
-                ax.fill_betweenx(10 ** grid, x0 - w, x0 + w, facecolor=col, edgecolor="black", linewidth=0.9, alpha=0.85, zorder=2)
+                ax.fill_betweenx(10 ** grid, x0 - w, x0 + w, facecolor=PRIOR_COL["on"], edgecolor="black", linewidth=0.9, alpha=0.85, zorder=2)
             else:
-                ax.fill_betweenx(10 ** grid, x0 - w, x0 + w, facecolor="white", edgecolor=col, linewidth=2.0, linestyle="--", zorder=2)
+                ax.fill_betweenx(10 ** grid, x0 - w, x0 + w, facecolor="white", edgecolor=PRIOR_COL["off"], linewidth=2.0, linestyle="--", zorder=2)
             ax.scatter(x0, float(np.median(mag)), s=60, color="black" if pr == "on" else "white", edgecolors="black", linewidths=1.3, zorder=5)
         ax.set_yscale("log")
         ax.set_xticks([-0.2, 0.2])
@@ -728,28 +745,28 @@ def fig_5_8(df):
         ax.set_xlim(-0.6, 0.6)
         lab(ax, "Lengthscale prior", "Log GIBBON acquisition value\n(natural log; log-scaled axis)", f"{dname} (n = {n_mol:,})")
     if "elbo" not in GIBBON_VIOLIN_YLIM:
-        fig_5_24(df)  # defines the y-scale of Figure 5.24's ELBO row, which this figure reuses exactly
+        fig_5_27(df)  # defines the y-scale of Figure 5.27's ELBO row, which this figure reuses exactly
     ybot, ytop = GIBBON_VIOLIN_YLIM["elbo"]
     assert ybot >= hi_all, (ybot, hi_all)  # every ExactGP value fits inside that scale
     for ax in axes:
-        ax.set_ylim(ybot, ytop)  # identical to Figure 5.24 (inverted: 0 (best) at the top)
+        ax.set_ylim(ybot, ytop)  # identical to Figure 5.27 (inverted: 0 (best) at the top)
         ax.yaxis.set_major_locator(FixedLocator([1, 10, 100, 1000]))
         ax.yaxis.set_minor_locator(NullLocator())
         ax.yaxis.set_major_formatter(FuncFormatter(lambda t, _: f"−{t:,.0f}"))
         ax.tick_params(axis="y", labelleft=True)
-    handles = [Patch(facecolor=col, edgecolor="black", alpha=0.85, label="prior ON (filled violin, black median dot)"),
-               Patch(facecolor="white", edgecolor=col, linestyle="--", linewidth=2, label="prior OFF (open violin, white median dot)")]
-    save(fig, "5.2", "fig5_08_gibbon_log_distributions",
-         "Figure 5.8 — Distribution of log GIBBON acquisition values: lengthscale prior on vs off",
+    handles = [Patch(facecolor=PRIOR_COL["on"], edgecolor="black", alpha=0.85, label="prior ON (filled violin, black median dot)"),
+               Patch(facecolor="white", edgecolor=PRIOR_COL["off"], linestyle="--", linewidth=2, label="prior OFF (open violin, white median dot)")]
+    save(fig, "5.2", "fig5_13_gibbon_log_distributions",
+         "Figure 5.13 — Distribution of log GIBBON acquisition values: lengthscale prior on vs off",
          legend=handles, legend_cols=2,
          note="ExactGP, 20k training molecules, pinned mean; per-molecule log GIBBON scores over the entire set. Log GIBBON is negative, so the y-axis "
               "shows its magnitude on a log scale, inverted: the top is 0 (highest acquisition value). Violins are density estimates on that axis over the "
               "full range, so the top tip is the best molecule; width is proportional to the square root of density to keep the sparse tail visible, "
               "with the same maximum width for every violin; dots are medians. Same construction and exactly the same y-scale as the ELBO row of "
-              "Figure 5.24. " + ACQ_NOTE)
+              "Figure 5.27. " + ACQ_NOTE)
 
 
-def fig_5_9(df):
+def fig_5_14(df):
     e = exact(df)
     fig, axes = plt.subplots(1, 3, figsize=(15.5, 5.6))
     for ax, (pref, dname) in zip(axes, DS):
@@ -758,11 +775,14 @@ def fig_5_9(df):
         ax.set_ylim(bottom=0.7)
         ax.axhline(1, color="#888888", ls="--", lw=1.4)
         lab(ax, "Lengthscale prior", "Effective support\n(# molecules sharing the score, log)", dname)
-    save(fig, "5.2", "fig5_09_gibbon_effective_support",
-         "Figure 5.9 — How many molecules carry the GIBBON acquisition mass",
+    save(fig, "5.2", "fig5_14_gibbon_effective_support",
+         "Figure 5.14 — How many molecules carry the GIBBON acquisition mass",
          legend=h_prior_col(), legend_cols=2,
          note="Effective support = exp(entropy) of the normalised acquisition scores; 1 (dashed line) means all the mass sits on a "
               "single molecule. " + ACQ_NOTE)
+
+
+EXACT_ARMS = {f"n20000_{pr}_{m}" for pr in ("on", "off") for m in ("pinned", "learned", "constant")}
 
 
 # ================================================================== 5.3  VariationalGP
@@ -776,56 +796,13 @@ def n_runs():
 
 
 def variance_limits(v):
-    """One log-scale range covering every variance plotted in Figures 5.14 and 5.15 (noise and latent, all sets)."""
+    """One log-scale range covering every variance plotted in Figure 5.19 (noise and latent, all sets)."""
     cols = ["noise_var"] + [f"{pref}_latent_var_median" for pref, _ in DS]
     lo, hi = min(v[c].min() for c in cols), max(v[c].max() for c in cols)
     return lo / 1.6, hi * 1.6
 
 
-def fig_5_13(df):
-    """Fit: how the fit on the high-score bands evolves over training steps (Validation, 20k)."""
-    v = fit_table(var(df))
-    panels = [("enr_rmse", "Validation, enriched: RMSE", "RMSE (score units)", None),
-              ("enr_bias", "Validation, enriched: signed bias", "Mean prediction − truth", 0.0),
-              ("hit_bias", "Validation, hits: signed bias", "Mean prediction − truth", 0.0)]
-    fig, axes = plt.subplots(1, 3, figsize=(17, 5.6))
-    for ax, (col, ptitle, ylabel, zero) in zip(axes.ravel(), panels):
-        _steps_panel(ax, v, col)
-        if zero is not None:
-            ax.axhline(zero, color="#888888", ls=":", lw=1.6)
-        lab(ax, "Nominal training steps (log scale)", ylabel, ptitle)
-    lo, hi = zip(*(axes[i].get_ylim() for i in (1, 2)))  # enriched and hit bias share one y-scale
-    for i in (1, 2):
-        axes[i].set_ylim(min(lo), max(hi))
-    save(fig, "5.3", "fig5_13_fit_vs_training_steps",
-         "Figure 5.13 — Fit on the high-score bands versus training steps",
-         legend=h_fam(["pll", "elbo"]) + h_prior_ls(), legend_cols=4,
-         note="Validation set, 20k training molecules; one line per objective and prior setting. Enriched = 0.26 ≤ y < 0.52, "
-              "hits = y ≥ 0.52. Signed bias = mean prediction − truth (negative = under-prediction).")
-
-
-def fig_5_14(df):
-    v = var(df)
-    vlim = variance_limits(v)
-    groups = fam_groups(["pll", "elbo"])
-    fig, axes = plt.subplots(2, 2, figsize=(15, 11))
-    flat = axes.ravel()
-    for ax, (pref, dname) in zip(flat[:3], DS):
-        strip_panel(ax, v, f"{pref}_latent_var_median", groups, log=True)
-        lab(ax, "Training objective", "Median latent variance of f(x)\n(score units², log scale)", dname)
-    strip_panel(flat[3], v, "noise_var", groups, log=True)
-    lab(flat[3], "Training objective", "Learned likelihood noise variance σₙ²\n(score units², log scale)", "Likelihood noise (fit-level)")
-    for ax in flat:  # one y-scale in every panel, so latent and noise variance compare directly
-        ax.set_ylim(*vlim)
-        ax.tick_params(axis="y", labelleft=True)
-    save(fig, "5.3", "fig5_14_objective_uncertainty_allocation",
-         "Figure 5.14 — PLL puts uncertainty in the latent posterior; ELBO puts it in the likelihood noise",
-         legend=h_fam(["pll", "elbo"]) + h_prior(), legend_cols=2,
-         note=f"{n_runs()} runs per objective (6 step counts × 2 prior settings, all at 20k training molecules). Latent panels: median over molecules, "
-              "per run. Right panel: learned noise variance σₙ² = (learned noise SD)², so all four panels are variances in score units².")
-
-
-def fig_5_15(df):
+def fig_5_19(df):
     v = var(df)
     vlim = variance_limits(v)
     fig, axes = plt.subplots(1, 3, figsize=(18, 6.4))
@@ -837,16 +814,16 @@ def fig_5_15(df):
         ax.set_xscale("log")
         ax.set_yscale("log")
         ax.set_xlim(*vlim)
-        ax.set_ylim(*vlim)  # same range as every panel of Figure 5.14
+        ax.set_ylim(*vlim)  # one range for every panel
         lab(ax, "Learned likelihood noise variance σₙ²\n(score units², log scale)", "Median latent variance of f(x)\n(score units², log scale)", dname)
-    save(fig, "5.3", "fig5_15_uncertainty_allocation_space",
-         "Figure 5.15 — PLL and ELBO occupy different regions of uncertainty-allocation space",
+    save(fig, "5.3", "fig5_19_uncertainty_allocation_space",
+         "Figure 5.19 — PLL and ELBO occupy different regions of uncertainty-allocation space",
          legend=h_fam(["pll", "elbo"]) + h_prior(), legend_cols=4,
          note=f"Each point is one of the {2 * n_runs()} grid runs. Both axes are variances in score units²; the median latent variance is over molecules "
-              "for that run, matching Figure 5.14.")
+              "for that run.")
 
 
-# ------------------------------------------------------------------ fit (predicted-mean) figures: Figures 5.13, 5.11, 5.14, 5.13
+# ------------------------------------------------------------------ fit (predicted-mean) figures: Figures 5.17 and 5.18a-b
 FIT_BANDS = {"all": "Whole set", "bulk": "Low-score bulk (y < 0.26)", "enr": "Enriched (0.26 ≤ y < 0.52)", "hit": "Hits (y ≥ 0.52)"}
 _FIT_CACHE: dict = {}
 
@@ -883,7 +860,7 @@ def fit_table(v):
     return _FIT_CACHE[key]
 
 
-def fig_5_10(df):
+def fig_5_16(df):
     """Fit, part 1: separation of enriched molecules from the bulk, per run (Validation, 20k)."""
     v = fit_table(var(df))
     groups = fam_groups(["pll", "elbo"])
@@ -902,8 +879,8 @@ def fig_5_10(df):
     axes[1].set_ylim(0, 1.0)
     lab(axes[1], "Training objective", "Share of true hits in top-N\n(N = number of true hits)",
         "Validation set: finding the hits")
-    save(fig, "5.3", "fig5_10_separation_of_enriched_from_bulk",
-         "Figure 5.10 — Every model separates enriched molecules from the bulk equally well",
+    save(fig, "5.3", "fig5_16_separation_of_enriched_from_bulk",
+         "Figure 5.16 — Every model separates enriched molecules from the bulk equally well",
          legend=h_prior(), legend_cols=2,
          note="Validation set, 20k training molecules; one point per run (12 per objective). Left: AUC of the predicted mean for "
               "telling molecules with y ≥ 0.26 from the low-score bulk. Right: among the N molecules with the highest predicted mean, "
@@ -913,7 +890,7 @@ def fig_5_10(df):
 FIT_YLIM: dict = {}
 
 
-def fig_5_11(df):
+def fig_5_17(df):
     """Fit: error and bias by true-score bin (Validation, 20k). Bold = 2,500 steps; faint = the other step counts."""
     v = var(df)
     centers = 0.5 * (YBIN_EDGES[:-1] + YBIN_EDGES[1:])
@@ -941,9 +918,9 @@ def fig_5_11(df):
         if key == "bias":
             ax.axhline(0, color="#888888", ls="-", lw=1.0)
         lab(ax, "True score y (binned)", ylabel, title)
-        FIT_YLIM[key] = ax.get_ylim()  # reused by Figure 5.4b so the two figures share one scale
-    save(fig, "5.3", "fig5_11_error_by_true_y_bin",
-         "Figure 5.11 — Fit by score range on the Validation set: every model under-predicts high scorers",
+        FIT_YLIM[key] = ax.get_ylim()  # reused by Figure 5.5 so the two figures share one scale
+    save(fig, "5.3", "fig5_17_error_by_true_y_bin",
+         "Figure 5.17 — Fit by score range on the Validation set: every model under-predicts high scorers",
          legend=h_fam(["pll", "elbo"]) + h_prior_ls(), legend_cols=4,
          note="Validation set, 20k training molecules, true score binned in steps of 0.06 (bins under 50 molecules dropped). Bold = "
               "2,500 steps; faint = the other step counts. Dotted verticals mark the enriched (y ≥ 0.26) and hit (y ≥ 0.52) bands. "
@@ -991,25 +968,25 @@ def _predicted_vs_true(df, cls: str, fname: str, title: str):
               "(y ≥ 0.26) and hit (y ≥ 0.52) bands. Same axes and colour scale in every panel.")
 
 
-def fig_5_12a(df):
-    _predicted_vs_true(df, "pll", "fig5_12a_predicted_vs_true_pll",
-                       "Figure 5.12a — PLL: predicted vs true score on Validation (20k training molecules)")
+def fig_5_18a(df):
+    _predicted_vs_true(df, "pll", "fig5_18a_predicted_vs_true_pll",
+                       "Figure 5.18a — PLL: predicted vs true score on Validation (20k training molecules)")
 
 
-def fig_5_12b(df):
-    _predicted_vs_true(df, "elbo", "fig5_12b_predicted_vs_true_elbo",
-                       "Figure 5.12b — ELBO: predicted vs true score on Validation (20k training molecules)")
+def fig_5_18b(df):
+    _predicted_vs_true(df, "elbo", "fig5_18b_predicted_vs_true_elbo",
+                       "Figure 5.18b — ELBO: predicted vs true score on Validation (20k training molecules)")
 
 
-def fig_5_16(df):
+def fig_5_15(df):
     v = var(df)
     fig, axes = plt.subplots(1, 2, figsize=(13, 5.8))
     for ax, (col, ylabel, t) in zip(axes, [("lengthscale", "Learned lengthscale (log scale)", "Lengthscale"),
                                            ("outputscale", "Learned outputscale (log scale)", "Outputscale")]):
         strip_panel(ax, v, col, fam_groups(["pll", "elbo"]), log=True, show_median=False)
         lab(ax, "Training objective", ylabel, t)
-    save(fig, "5.3", "fig5_16_lengthscale_outputscale_objective_prior",
-         "Figure 5.16 — The lengthscale prior shifts the learned kernel under both objectives",
+    save(fig, "5.3", "fig5_15_lengthscale_outputscale_objective_prior",
+         "Figure 5.15 — The lengthscale prior shifts the learned kernel under both objectives",
          legend=h_prior(), legend_cols=2,
          note=f"Each point is one of the {n_runs()} runs per objective; left cluster in each group = prior off, right = prior on.")
 
@@ -1037,7 +1014,7 @@ def steps_axis(ax, d):
     ax.minorticks_off()
 
 
-def fig_5_17(df):
+def fig_5_20(df):
     """Noise (top row, one value per run) and Validation latent variance (bottom row) against training steps."""
     v = var(df)
     fig, axes = plt.subplots(2, len(ACTIVE_SIZES), figsize=(max(8.5, 5.8 * len(ACTIVE_SIZES) + 0.1), 10.5), sharex="col",
@@ -1065,8 +1042,8 @@ def fig_5_17(df):
         axes[0, c].set_xticks(sorted(d.steps.unique()))
         axes[0, c].set_xticklabels([f"{int(t):,}" for t in sorted(d.steps.unique())], rotation=40, ha="right")
         axes[0, c].tick_params(axis="x", labelbottom=True)
-    save(fig, "5.3", "fig5_17_noise_and_latent_vs_training_steps",
-         "Figure 5.17 — Training steps move the two objectives in opposite directions in noise and latent variance",
+    save(fig, "5.3", "fig5_20_noise_and_latent_vs_training_steps",
+         "Figure 5.20 — Training steps move the two objectives in opposite directions in noise and latent variance",
          legend=h_fam(["pll", "elbo"]) + h_prior_ls(), legend_cols=4,
          note="Top row: learned noise SD, one value per run (the noise does not depend on the evaluation set). Bottom row: mean latent "
               "variance on the Validation set. All runs use 20k training molecules; the axis shows each run's actual step count.")
@@ -1126,47 +1103,89 @@ def calib_band_columns(v):
     return v
 
 
-def fig_5_18(df):
-    v = calib_band_columns(var(df))
-    ylab = "90% coverage, total variance\n(latent + noise)"
-    rows = [("cov90", "All molecules", ylab),
-            ("enr_cov90", "Enriched", ylab)]
-    fig, axes = plt.subplots(2, 3, figsize=(17.5, 10.5))
-    for r, (key, band, ylabel) in enumerate(rows):
-        for c, (pref, dname) in enumerate(DS):
+_BAND_FRAME: dict = {}
+
+
+def _proper_score_frame(df):
+    """Validation NLPD/CRPS on all molecules (val_*) and on the enriched band (val_enr_*) for every 20k variational run, cached."""
+    if "v" not in _BAND_FRAME:
+        _BAND_FRAME["v"] = calib_band_columns(var(df))
+    return _BAND_FRAME["v"]
+
+
+def _proper_score_grid(df, metric, fname, title, ylabel, note):
+    """2x2 grid: rows PLL and ELBO, columns Validation all molecules and enriched only, against actual steps.
+
+    One shared y-scale across all four panels, so the two objectives compare directly. Solid = prior on, dashed = prior off.
+    """
+    v = _proper_score_frame(df)
+    fig, axes = plt.subplots(2, 2, figsize=(13.5, 10.5), sharey=True, sharex=True, squeeze=False)
+    panels = [("val", "Validation, all molecules"), ("val_enr", "Validation, enriched molecules only")]
+    for r, cls in enumerate(["pll", "elbo"]):
+        d = v[v.cls == cls]
+        for c, (pref, sub) in enumerate(panels):
             ax = axes[r, c]
-            col = f"{pref}_{key}"
-            m = v.groupby(["cls", "prior", "steps_nominal"])[col].mean().reset_index()
-            fam_prior_series(ax, m, "steps_nominal", col)
-            if key.endswith("cov90"):
-                ax.axhline(0.9, color="#888888", ls=":", lw=1.8)
-                ax.set_ylim(0, 1.02)
-            ax.set_xscale("log")
-            ax.set_xticks(STEPS_NOMINAL)
-            ax.set_xticklabels([f"{t:,}" for t in STEPS_NOMINAL], rotation=40, ha="right")  # 7,500 and 10,000 sit close on a log axis
-            ax.minorticks_off()
-            ax.tick_params(axis="y", labelleft=True)
-            lab(ax, "Nominal training steps (log scale)", f"{ylabel}\n[{band}]", dname if r == 0 else None)
-    save(fig, "5.3", "fig5_18_calibration_vs_training_steps",
-         "Figure 5.18 — 90% interval coverage from total learned variance (latent + noise) falls short on enriched molecules",
-         legend=h_fam(["pll", "elbo"]) + h_prior_ls(), legend_cols=4,
-         note="Top row: all molecules; bottom row: enriched molecules (0.26 ≤ y < 0.52). All runs use 20k training molecules. "
-              "Coverage = fraction of molecules with |y − μ| ≤ 1.645 σ_total, where σ_total² = latent variance of f(x) + learned likelihood noise variance σₙ² "
-              "(the total predictive variance, not the latent variance alone; latent-only coverage is Figure 5.19). "
-              "Dotted line = nominal 0.90. GP-Molformer enriched has only 46 molecules.")
+            series_lines(ax, d, "steps", f"{pref}_{metric}", key_cols=["prior"],
+                         color_fn=lambda k, cls=cls: FAM_COL[cls], ls_fn=lambda k: "-" if k[0] == "on" else "--")
+            steps_axis(ax, d)
+            lab(ax, "Actual training steps (log scale)", ylabel,
+                f"{FAM[cls]}: {sub}")
+    lo = min(ax.get_ylim()[0] for ax in axes.ravel())
+    hi = max(ax.get_ylim()[1] for ax in axes.ravel())
+    step = None
+    if metric == "nlpd":  # NLPD goes negative: round the range to whole steps so negative tick labels are drawn
+        step = 5
+        lo, hi = np.floor(lo / step) * step, np.ceil(hi / step) * step
+    for ax in axes.ravel():
+        ax.set_ylim(lo, hi)
+        if step:
+            ax.yaxis.set_major_locator(matplotlib.ticker.MultipleLocator(step))
+        ax.tick_params(axis="y", labelleft=True)
+        ax.tick_params(axis="x", labelbottom=True)  # sharex hides the top row's step labels; restore them
+    legend = [Line2D([], [], color="black", ls="-", lw=2.4, label="prior on (solid)"),
+              Line2D([], [], color="black", ls="--", lw=2.4, label="prior off (dashed)"),
+              Line2D([], [], color=FAM_COL["pll"], ls="-", lw=2.4, label="PLL (green)"),
+              Line2D([], [], color=FAM_COL["elbo"], ls="-", lw=2.4, label="ELBO (orange)")]
+    save(fig, "5.3", fname, title, legend=legend, legend_cols=4, note=note)
 
 
-EXACT_ARMS = {f"n20000_{pr}_{m}" for pr in ("on", "off") for m in ("pinned", "learned", "constant")}
+def fig_5_22(df):
+    _proper_score_grid(df, "nlpd", "fig5_22_nlpd_vs_training_steps_pll_elbo",
+                       "Figure 5.22 — NLPD against training steps: PLL (top) and ELBO (bottom)",
+                       "NLPD (nats, lower = better)",
+                       note="One point per run at 20k training molecules, six nominal step levels. Columns: all Validation molecules and the "
+                            "enriched band (0.26 ≤ y < 0.52). All four panels share one y-scale. NLPD of the total predictive distribution "
+                            "(latent + noise).")
 
 
-def fig_5_18c(df):
-    """Empirical coverage of the 50/80/90% central predictive intervals on Validation, against actual training steps.
+def fig_5_23(df):
+    _proper_score_grid(df, "crps", "fig5_23_crps_vs_training_steps_pll_elbo",
+                       "Figure 5.23 — CRPS against training steps: PLL (top) and ELBO (bottom)",
+                       "CRPS (score units, lower = better)",
+                       note="One point per run at 20k training molecules, six nominal step levels. Columns: all Validation molecules and the "
+                            "enriched band (0.26 ≤ y < 0.52). All four panels share one y-scale. CRPS of the total predictive distribution "
+                            "(latent + noise).")
+
+
+def fig_5_21(df):
+    """Empirical coverage of the 50/70/90% central predictive intervals on Validation, against actual training steps.
 
     Coverage columns (val_cov50/80/90) come from scripts/export_sweep_csv.py: fraction of molecules with
     |y - mu| <= z * sigma_total, sigma_total being the total (latent + noise) predictive sd.
     """
-    v = var(df)
-    levels = [("50", 0.50), ("80", 0.80), ("90", 0.90)]
+    from scipy.stats import norm
+    v = _proper_score_frame(df).copy()
+    z70 = float(norm.ppf(0.85))  # half-width of the central 70% interval in SDs
+    cov70, cov90 = [], []
+    for arm in v.arm:
+        d = pd.read_csv(AMPC / "variational_gp_sweep" / arm / "eval" / f"{DS_FILE['val']}.csv",
+                        usecols=["y", "mean", "std_total"]).dropna()
+        err = (d.y - d["mean"]).abs()
+        cov70.append(float(np.mean(err <= z70 * d.std_total)))
+        cov90.append(float(np.mean(err <= float(norm.ppf(0.95)) * d.std_total)))
+    assert np.allclose(cov90, v["val_cov90"].to_numpy(), atol=1e-6), "70% method check: 90% does not match the export"
+    v["val_cov70"] = cov70
+    levels = [("50", 0.50), ("70", 0.70), ("90", 0.90)]
     fig, axes = plt.subplots(2, 3, figsize=(17.5, 10.5), sharex=True, sharey=True, squeeze=False)
     for r, cls in enumerate(["pll", "elbo"]):
         d = v[v.cls == cls]
@@ -1186,11 +1205,11 @@ def fig_5_18c(df):
               Line2D([], [], color="#888888", ls=":", lw=1.8, label="nominal coverage (dotted)"),
               Line2D([], [], color=FAM_COL["pll"], ls="-", lw=2.4, label="PLL (green)"),
               Line2D([], [], color=FAM_COL["elbo"], ls="-", lw=2.4, label="ELBO (orange)")]
-    save(fig, "5.3", "fig5_18c_empirical_coverage_50_80_90_vs_training_steps",
-         "Figure 5.18c — Empirical coverage of 50%, 80% and 90% intervals vs training steps",
+    save(fig, "5.3", "fig5_21_empirical_coverage_50_80_90_vs_training_steps",
+         "Figure 5.21 — Empirical coverage of 50%, 70% and 90% intervals vs training steps",
          legend=legend, legend_cols=3,
          note="One run per point at 20k training molecules, six nominal step levels, all Validation molecules. Intervals are central "
-              "Gaussian intervals of the total predictive distribution N(μ, σ_total²) (latent + learned noise), as in Figure 5.18. "
+              "Gaussian intervals of the total predictive distribution N(μ, σ_total²) (latent + learned noise). "
               "Each panel is judged against its dotted nominal line; the y-axis is shared across all six panels.")
 
 
@@ -1239,40 +1258,79 @@ def _steps_panel(ax, v, col):
     ax.tick_params(axis="y", labelleft=True)
 
 
-def fig_5_19(df):
-    v = latent_diag_columns(var(df), sets=("val", "invitro"))
-    fig, axes = plt.subplots(2, 2, figsize=(12.5, 11.4))
-    panels = [("val", "all", "Validation: all molecules"), ("val", "enr", "Validation: enriched molecules"),
-              ("invitro", "all", "InVitro: entire set"), ("invitro", "enr", "InVitro: enriched molecules")]
-    for ax, (pref, key, title) in zip(axes.ravel(), panels):
-        _steps_panel(ax, v, f"{pref}_{key}_latcov90")
-        ax.axhline(0.9, color="#888888", ls=":", lw=1.8)
-        ax.set_ylim(0, 1.02)
-        lab(ax, "Nominal training steps (log scale)", "90% latent-only coverage", title)
-    save(fig, "5.3", "fig5_19_latent_only_coverage_vs_training_steps",
-         "Figure 5.19 — Latent variance alone covers far less under ELBO than under PLL",
-         legend=h_fam(["pll", "elbo"]) + h_prior_ls(), legend_cols=4,
-         note="Top row: Validation set. Bottom row: InVitro set (1,521 molecules; 492 in the enriched band). 20k training "
-              "molecules. Same interval rule as Figure 5.18 but using only the latent standard deviation (no likelihood noise): "
-              "covered if |y − μ| ≤ 1.645 σ_latent. Because it ignores observation noise, even a perfect model with real noise "
-              "would fall below 0.90. Dotted = nominal 0.90.")
+_WITHIN_BIN_CACHE: dict = {}
 
 
-def fig_5_20(df):
-    v = latent_diag_columns(var(df))
-    ex = latent_diag_columns(df[df.cls == "exact"])
-    fig, axes = plt.subplots(1, 2, figsize=(12.5, 7.4))
-    for ax, (key, band) in zip(axes, [("all", "All molecules"), ("enr", "Enriched")]):
-        _steps_panel(ax, v, f"val_{key}_sse")
-        exact_reference(ax, ex, f"val_{key}_sse")
-        ax.axhline(0.0, color="#888888", ls=":", lw=1.8)
-        lab(ax, "Nominal training steps (log scale)", "Spearman ρ(latent SD, |error|)", band)
-    save(fig, "5.3", "fig5_20_spearman_std_error_vs_training_steps",
-         "Figure 5.20 — PLL ranks its errors best overall; ELBO and ExactGP rank them best on enriched molecules",
-         legend=h_fam(["exact", "pll", "elbo"]) + h_prior_ls(), legend_cols=3,
-         note="Validation set, 20k training molecules. Rank correlation between each molecule's latent SD and its absolute error "
-              "(spearman_std_error): positive = more uncertain where more wrong, 0 = uninformative, negative = wrong way. Blue "
-              "horizontal lines = ExactGP at 20k (pinned mean), which has no step count.")
+def _within_bin_table(df):
+    """Within-bin Spearman of latent SD vs |error| for every 20k variational run (Validation). NaN where a bin has under 50 molecules."""
+    from scipy.stats import spearmanr
+    if "wb" not in _WITHIN_BIN_CACHE:
+        E = YBIN_EDGES
+        nb = len(E) - 1
+        rows = []
+        for _, r in var(df).iterrows():
+            d = pd.read_csv(AMPC / "variational_gp_sweep" / r.arm / "eval" / f"{DS_FILE['val']}.csv",
+                            usecols=["y", "mean", "std_latent"]).dropna()
+            err = (d["mean"] - d.y).abs().to_numpy()
+            lat = d.std_latent.to_numpy()
+            idx = np.clip(np.digitize(d.y.to_numpy(), E) - 1, 0, nb - 1)
+            rec = {"cls": r.cls, "prior": r.prior, "steps": int(r.steps_nominal)}
+            for b in range(nb):
+                k = idx == b
+                rec[f"b{b}"] = float(spearmanr(lat[k], err[k])[0]) if k.sum() >= 50 else np.nan
+            rows.append(rec)
+        _WITHIN_BIN_CACHE["wb"] = pd.DataFrame(rows)
+    return _WITHIN_BIN_CACHE["wb"]
+
+
+def _shade(hex_col, t):
+    """Blend a family colour toward white: t = 1 is the full colour, smaller t is lighter."""
+    rgb = [int(hex_col[i:i + 2], 16) / 255 for i in (1, 3, 5)]
+    return tuple(1 - t * (1 - c) for c in rgb)
+
+
+def _within_bin_figure(df, cls, fname, title, note):
+    """One objective: a panel per prior setting, one line per training-step count (lighter = fewer steps), over the true-score bins."""
+    R = _within_bin_table(df)
+    centers = 0.5 * (YBIN_EDGES[:-1] + YBIN_EDGES[1:])
+    cols = [f"b{b}" for b in range(len(centers))]
+    steps = sorted(R.steps.unique())
+    fig, axes = plt.subplots(1, 2, figsize=(15.5, 7.0), sharey=True)
+    for ax, pr in zip(axes, ("off", "on")):
+        sub = R[(R.cls == cls) & (R.prior == pr)].set_index("steps")
+        for i, st in enumerate(steps):
+            t = 0.4 + 0.6 * i / (len(steps) - 1)
+            y = sub.loc[st, cols].to_numpy(dtype=float)
+            keep = ~np.isnan(y)
+            ax.plot(centers[keep], y[keep], color=_shade(FAM_COL[cls], t), lw=2.6, marker="o", ms=7, zorder=3)
+        for x in (0.262, 0.525):
+            ax.axvline(x, color="#888888", ls=":", lw=1.6)
+        ax.axhline(0, color="#444444", lw=1)
+        ax.set_ylim(-1, 1)
+        lab(ax, "True score y (bin centre; bins of 0.06)",
+            "Spearman: latent SD vs |error| within the bin\n(positive = more uncertain where more wrong)",
+            f"{FAM_SHORT[cls]}, {PRIOR_NAME[pr]}")
+    legend = [Line2D([], [], color=_shade(FAM_COL[cls], 0.4 + 0.6 * i / (len(steps) - 1)), lw=2.6, marker="o", ms=7,
+                     label=f"{st:,} steps") for i, st in enumerate(steps)]
+    save(fig, "5.3", fname, title, legend=legend, legend_cols=6, note=note)
+
+
+def fig_5_24a(df):
+    _within_bin_figure(df, "pll", "fig5_24a_within_bin_rank_pll",
+                       "Figure 5.24a — PLL: within a true-score bin, latent uncertainty ranks errors only above y ≈ 0.3",
+                       note="VariationalGP PLL, 20k training molecules, Validation set, all 12 runs (6 step counts × 2 priors). Each point is the Spearman "
+                            "correlation between a molecule's latent standard deviation and its absolute prediction error, within one true-score bin "
+                            "(width 0.06; bins under 50 molecules dropped). Dotted verticals mark the enriched (0.26) and hit (0.52) boundaries. "
+                            "Lighter lines = fewer training steps.")
+
+
+def fig_5_24b(df):
+    _within_bin_figure(df, "elbo", "fig5_24b_within_bin_rank_elbo",
+                       "Figure 5.24b — ELBO: within a true-score bin, latent uncertainty ranks errors only above y ≈ 0.2",
+                       note="VariationalGP ELBO, 20k training molecules, Validation set, all 12 runs (6 step counts × 2 priors). Each point is the Spearman "
+                            "correlation between a molecule's latent standard deviation and its absolute prediction error, within one true-score bin "
+                            "(width 0.06; bins under 50 molecules dropped). Dotted verticals mark the enriched (0.26) and hit (0.52) boundaries. "
+                            "Lighter lines = fewer training steps.")
 
 
 YBIN_EDGES = np.linspace(0.0, 0.66, 12)  # 11 bins of 0.06 over the Validation y range (0 to 0.666)
@@ -1295,47 +1353,12 @@ def ybin_profiles(v):
     return out
 
 
-def fig_5_21(df):
-    v = var(df)
-    prof = ybin_profiles(v)
-    centers = 0.5 * (YBIN_EDGES[:-1] + YBIN_EDGES[1:])
-    count = prof[0]["count"]
-    keep = count >= 50  # drop sparsely populated bins
-    panels = [("err", "Mean |error| = |y − μ|\n(score units, log)", True),
-              ("sd", "Mean latent SD σ_latent\n(score units, log)", True),
-              ("ratio", "Mean latent SD ÷ mean |error|\n(1 = latent SD matches typical error)", True)]
-    fig, axes = plt.subplots(1, 3, figsize=(18, 7.6))
-    for ax, (key, ylabel, logy) in zip(axes, panels):
-        def val(p_):
-            return p_["sd"] / np.maximum(p_["err"], 1e-12) if key == "ratio" else p_[key]
-        for p_ in prof:
-            ax.plot(centers[keep], val(p_)[keep], color=FAM_COL[p_["cls"]], ls="-" if p_["prior"] == "on" else "--",
-                    lw=1, alpha=0.2, zorder=2)
-        for cls in ("pll", "elbo"):
-            for pr in ("on", "off"):
-                ys = np.mean([val(p_) for p_ in prof if p_["cls"] == cls and p_["prior"] == pr], axis=0)
-                ax.plot(centers[keep], ys[keep], color=FAM_COL[cls], ls="-" if pr == "on" else "--", marker="o", ms=6,
-                        lw=2.6, zorder=3)
-        for x in (0.262, 0.525):  # enriched and hit band boundaries
-            ax.axvline(x, color="#888888", ls=":", lw=1.6)
-        if key == "ratio":
-            ax.axhline(1.0, color="#888888", ls=":", lw=1.8)
-        ax.set_yscale("log")
-        lab(ax, "True score y (binned)", ylabel)
-    save(fig, "5.3", "fig5_21_latent_sd_vs_error_by_y_bin",
-         "Figure 5.21 — Latent uncertainty versus error across the range of true scores",
-         legend=h_fam(["pll", "elbo"]) + h_prior_ls(), legend_cols=4,
-         note="Validation set, 20k training molecules; true score binned in steps of 0.06 (bins under 50 molecules dropped). Bold = mean over "
-              "the six step counts per objective and prior; faint = each run. Dotted verticals mark the enriched (y ≥ 0.26) and hit "
-              "(y ≥ 0.52) bands. Acquisition cannot condition on y.")
-
-
-def fig_5_22(df):
-    strip_grid(var(df), fam_groups(["pll", "elbo"]), [ENR100, ENR1000], section="5.3",
-               fname="fig5_22_gibbon_enrichment",
-               title="Figure 5.22 — GIBBON enrichment of VariationalGP models across evaluation sets",
+def fig_5_25(df):
+    strip_grid(var(df), fam_groups(["pll", "elbo"]), [ENR100], section="5.3",
+               fname="fig5_25_gibbon_enrichment",
+               title="Figure 5.25 — GIBBON enrichment of VariationalGP models across evaluation sets",
                xlabel="Training objective", legend=h_prior(), legend_cols=2, show_median=False, share_all_ylim=True,
-               note=ACQ_NOTE + " All six panels share one y-scale.")
+               note=ACQ_NOTE + " All three panels share one y-scale.")
 
 
 def _acq_vs_steps(df, rows, *, fname, title, note, share_row_ylim=False, share_all_ylim=False, panel_h=4.6):
@@ -1372,34 +1395,14 @@ def _acq_vs_steps(df, rows, *, fname, title, note, share_row_ylim=False, share_a
     save(fig, "5.3", fname, title, legend=h_fam(["pll", "elbo"]) + h_prior_ls(), legend_cols=4, note=note)
 
 
-def fig_5_22b(df):
-    _acq_vs_steps(df, [ENR100, ENR1000], fname="fig5_22b_gibbon_enrichment_vs_training_steps",
-                  title="Figure 5.22b — GIBBON enrichment versus training steps",
-                  note="20k training molecules, one run per objective, prior setting and step count. Enrichment = mean true y of the picks ÷ pool mean; "
-                       "dashed grey line = 1× (a random pick). All six panels share one y-scale. " + ACQ_NOTE, share_all_ylim=True)
-
-
-def fig_5_23b(df):
-    miss = var(df)[var(df).val_gibbon_value_effective_support.isna()]
-    miss_txt = (f"On Validation, effective support is missing for {len(miss)} runs "
-                f"({', '.join(sorted({f'{FAM_SHORT[c]} prior {p}' for c, p in zip(miss.cls, miss.prior)}))}), so that line is absent. "
-                if len(miss) else "")
-    _acq_vs_steps(df, [ACQ_ROWS[1]], fname="fig5_23b_gibbon_effective_support_vs_training_steps",
-                  title="Figure 5.23b — GIBBON effective support versus training steps",
-                  note="20k training molecules, one run per objective, prior setting and step count. Effective support = exp(entropy) of the "
-                       "normalised acquisition scores: the number of molecules that share the acquisition mass. " + miss_txt
-                       + "One y-scale across the three evaluation sets. " + ACQ_NOTE,
-                  share_row_ylim=True, panel_h=5.6)
-
-
-def fig_5_23(df):
+def fig_5_26(df):
     miss = var(df)[var(df).val_gibbon_value_effective_support.isna()]
     miss_txt = (f"On Validation, effective support is missing for {len(miss)} of {len(var(df))} runs "
                 f"({', '.join(sorted({f'{FAM_SHORT[c]} prior {p}' for c, p in zip(miss.cls, miss.prior)}))}) and those runs are omitted from that panel. "
                 if len(miss) else "")
     strip_grid(var(df), fam_groups(["pll", "elbo"]), [ACQ_ROWS[1]], section="5.3",
-               fname="fig5_23_gibbon_effective_support",
-               title="Figure 5.23 — GIBBON effective support of VariationalGP models across evaluation sets",
+               fname="fig5_26_gibbon_effective_support",
+               title="Figure 5.26 — GIBBON effective support of VariationalGP models across evaluation sets",
                xlabel="Training objective", legend=h_prior(), legend_cols=2, show_median=False, share_row_ylim=True,
                panel_h=6.4,
                note=ACQ_NOTE + " Effective support = exp(entropy) of the normalised acquisition scores: the number of molecules that "
@@ -1409,7 +1412,7 @@ def fig_5_23(df):
 GIBBON_VIOLIN_YLIM: dict = {}
 
 
-def fig_5_24(df):
+def fig_5_27(df):
     """Distribution of per-molecule log GIBBON over training steps: rows = objective (PLL, ELBO), columns = Validation, GP-Molformer.
 
     One violin per (training steps, prior setting). Colour = objective (green PLL, orange ELBO); FILLED violin and solid median
@@ -1470,12 +1473,12 @@ def fig_5_24(df):
         top = min(ax.get_ylim()[1] for ax in axes[r])
         for ax in axes[r]:  # one y-scale per row, so Validation and GP-Molformer compare directly
             ax.set_ylim(bottom, top)
-        GIBBON_VIOLIN_YLIM[cls] = (bottom, top)  # reused by Figure 5.8 so the two violin figures share one scale
+        GIBBON_VIOLIN_YLIM[cls] = (bottom, top)  # reused by Figure 5.13 so the two violin figures share one scale
     handles = h_fam(["pll", "elbo"]) + [
         Patch(facecolor="#888888", edgecolor="black", alpha=0.85, label="prior ON (filled violin, solid median line)"),
         Patch(facecolor="white", edgecolor="#444444", linestyle="--", linewidth=2, label="prior OFF (open violin, dashed median line)")]
-    save(fig, "5.3", "fig5_24_gibbon_log_distribution_vs_steps",
-         "Figure 5.24 — Log GIBBON distribution across training steps: PLL (top) and ELBO (bottom)",
+    save(fig, "5.3", "fig5_27_gibbon_log_distribution_vs_steps",
+         "Figure 5.27 — Log GIBBON distribution across training steps: PLL (top) and ELBO (bottom)",
          legend=handles, legend_cols=2,
          note="20k training molecules, one violin per run; dots are the medians, joined across steps. Log GIBBON is negative, so the y-axis "
               "shows its magnitude on a log scale, inverted: the top is 0 (highest acquisition value) and ticks read −1, −10, −100, −1,000. "
@@ -1489,7 +1492,7 @@ def n20(df):
     return df[df.n == 20000]
 
 
-def fig_5_25(df):
+def fig_5_28(df):
     d = n20(df)
     groups = fam_groups(["exact", "pll", "elbo"])
     fig, axes = plt.subplots(1, 4, figsize=(22.5, 5.9))
@@ -1498,32 +1501,32 @@ def fig_5_25(df):
         lab(ax, "GP model family", "Mean latent variance of f(x)\n(score units², log scale)", dname)
     strip_panel(axes[3], d, "noise_var", groups, log=True)
     lab(axes[3], "GP model family", "Learned likelihood noise variance σₙ²\n(score units², log scale)", "Likelihood noise (fit-level)")
-    save(fig, "5.4", "fig5_25_uncertainty_allocation_model_families",
-         "Figure 5.25 — Uncertainty allocation: ExactGP and ELBO use noise, PLL uses the latent GP",
+    save(fig, "5.4", "fig5_28_uncertainty_allocation_model_families",
+         "Figure 5.28 — Uncertainty allocation: ExactGP and ELBO use noise, PLL uses the latent GP",
          legend=h_prior(), legend_cols=2,
          note="20k training molecules only: 6 ExactGP runs, 8 PLL and 8 ELBO runs. Both quantities are variances in "
               "score units² (noise variance = SD²).")
 
 
-def fig_5_26(df):
+def fig_5_29(df):
     strip_grid(n20(df), fam_groups(["exact", "pll", "elbo"]), [RMSE, SPEAR], section="5.4",
-               fname="fig5_26_predictive_performance_model_families",
-               title="Figure 5.26 — Predictive performance across GP model families (20k training molecules)",
+               fname="fig5_29_predictive_performance_model_families",
+               title="Figure 5.29 — Predictive performance across GP model families (20k training molecules)",
                xlabel="GP model family", legend=h_prior(), legend_cols=2,
                note="Descriptive comparison of observed configurations; families differ in optimizer and posterior "
                     "representation, so this is not a controlled test.")
 
 
-def fig_5_27(df):
+def fig_5_30(df):
     strip_grid(n20(df), fam_groups(["exact", "pll", "elbo"]), [ENR100, ENR1000], section="5.4",
-               fname="fig5_27_gibbon_enrichment_model_families",
-               title="Figure 5.27 — GIBBON enrichment across GP model families (20k training molecules)",
+               fname="fig5_30_gibbon_enrichment_model_families",
+               title="Figure 5.30 — GIBBON enrichment across GP model families (20k training molecules)",
                xlabel="GP model family", legend=h_prior(), legend_cols=2,
                note=ACQ_NOTE + " Descriptive comparison, not evidence of family superiority.")
 
 
 # ================================================================== 5.5
-def fig_5_28(df):
+def fig_5_31(df):
     """Supplementary (not in the outline): the selection trade-off across every main-chapter arm."""
     fig, axes = plt.subplots(1, 3, figsize=(18.5, 6.2))
     panels = [("val_rmse", "Validation RMSE (score units, lower = better)"),
@@ -1543,14 +1546,14 @@ def fig_5_28(df):
     handles = h_fam(["exact", "pll", "elbo"]) + h_prior() + [
         Line2D([], [], marker="o", ls="", ms=16, markerfacecolor="none", color="black", markeredgewidth=2,
                label="ExactGP prior on/off, pinned mean (Table 5.4)")]
-    save(fig, "5.5", "fig5_28_selection_tradeoff_overview",
-         "Figure 5.28 — No configuration is best on prediction, calibration and acquisition at once",
+    save(fig, "5.5", "fig5_31_selection_tradeoff_overview",
+         "Figure 5.31 — No configuration is best on prediction, calibration and acquisition at once",
          legend=handles, legend_cols=3,
          note=f"Supplementary figure added for this section: all {len(df)} grid arms (6 ExactGP + {len(df) - 6} VariationalGP, all at 20k). Use it to read off the trade-offs behind Table 5.6.")
 
 
 FIGS = {f"5.{i}": globals()[f"fig_5_{i}"] for i in range(1, 30) if f"fig_5_{i}" in globals()}
-FIGS = dict(sorted({**FIGS, "5.4a": fig_5_4a, "5.4b": fig_5_4b, "5.4c": fig_5_4c, "5.5b": fig_5_5b, "5.5c": fig_5_5c, "5.12a": fig_5_12a, "5.12b": fig_5_12b, "5.18c": fig_5_18c, "5.22b": fig_5_22b, "5.23b": fig_5_23b}.items(),
+FIGS = dict(sorted({**FIGS, "5.18a": fig_5_18a, "5.18b": fig_5_18b, "5.24a": fig_5_24a, "5.24b": fig_5_24b}.items(),
                    key=lambda kv: (float(kv[0].rstrip("abc")), kv[0])))
 
 

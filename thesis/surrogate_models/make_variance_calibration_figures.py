@@ -6,7 +6,7 @@ Reads only files already on disk, per arm:
   outputs/ampc/{exact_gp_sweep,variational_gp_sweep}/<arm>/fit_summary.json
   outputs/ampc/{exact_gp_sweep,variational_gp_sweep}/<arm>/eval/<set>.csv
 
-Writes <figure>.png and <figure>.pdf to variance_calibration_figures/ beside this file.
+Writes <figure>.png to variance_calibration_figures/ beside this file.
 Run from the repo root:
   .venv/bin/python thesis/surrogate_models/make_variance_calibration_figures.py
 """
@@ -146,7 +146,6 @@ def class_legend(ax, loc="best"):
 def save(fig, name: str):
     FIG_DIR.mkdir(parents=True, exist_ok=True)
     fig.savefig(FIG_DIR / f"{name}.png", dpi=200, bbox_inches="tight")
-    fig.savefig(FIG_DIR / f"{name}.pdf", bbox_inches="tight")
     plt.close(fig)
     print(f"wrote {name}")
 
