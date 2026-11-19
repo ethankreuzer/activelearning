@@ -72,7 +72,7 @@ survive scrutiny: max and median log GIBBON measure the *scale* of the acquisiti
 quality of the ranking, and acquisition only cares about the order. The metrics that do matter all
 argue against 625 steps:
 
-- The predicted-vs-true panels (Figure 5.18b) show ELBO at 625 steps has not learned to fit the
+- The predicted-vs-true panels (Figure 5.2.4b) show ELBO at 625 steps has not learned to fit the
   high-y molecules and severely under-predicts the enriched band. For a loop whose entire purpose
   is to accumulate hits, carrying a model that cannot fit hits is the wrong starting point.
 - 90% coverage from total variance is 0.43 at 625 steps, against 0.82 at 5,000.
