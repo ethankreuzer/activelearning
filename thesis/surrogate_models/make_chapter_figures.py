@@ -1159,6 +1159,41 @@ def fig_5_18(df):
 EXACT_ARMS = {f"n20000_{pr}_{m}" for pr in ("on", "off") for m in ("pinned", "learned", "constant")}
 
 
+def fig_5_18c(df):
+    """Empirical coverage of the 50/80/90% central predictive intervals on Validation, against actual training steps.
+
+    Coverage columns (val_cov50/80/90) come from scripts/export_sweep_csv.py: fraction of molecules with
+    |y - mu| <= z * sigma_total, sigma_total being the total (latent + noise) predictive sd.
+    """
+    v = var(df)
+    levels = [("50", 0.50), ("80", 0.80), ("90", 0.90)]
+    fig, axes = plt.subplots(2, 3, figsize=(17.5, 10.5), sharex=True, sharey=True, squeeze=False)
+    for r, cls in enumerate(["pll", "elbo"]):
+        d = v[v.cls == cls]
+        for c, (tag, nominal) in enumerate(levels):
+            ax = axes[r, c]
+            series_lines(ax, d, "steps", f"val_cov{tag}", key_cols=["prior"],
+                         color_fn=lambda k, cls=cls: FAM_COL[cls], ls_fn=lambda k: "-" if k[0] == "on" else "--")
+            ax.axhline(nominal, color="#888888", ls=":", lw=1.8)
+            steps_axis(ax, d)
+            ax.set_ylim(0, 1.02)
+            ax.tick_params(axis="y", labelleft=True)
+            ax.tick_params(axis="x", labelbottom=True)  # sharex hides the top row's step labels; restore them
+            lab(ax, "Actual training steps (log scale)", "Empirical coverage (fraction)",
+                f"{FAM_SHORT[cls]}: nominal {tag}%")
+    legend = [Line2D([], [], color="black", ls="-", lw=2.4, label="prior on (solid)"),
+              Line2D([], [], color="black", ls="--", lw=2.4, label="prior off (dashed)"),
+              Line2D([], [], color="#888888", ls=":", lw=1.8, label="nominal coverage (dotted)"),
+              Line2D([], [], color=FAM_COL["pll"], ls="-", lw=2.4, label="PLL (green)"),
+              Line2D([], [], color=FAM_COL["elbo"], ls="-", lw=2.4, label="ELBO (orange)")]
+    save(fig, "5.3", "fig5_18c_empirical_coverage_50_80_90_vs_training_steps",
+         "Figure 5.18c — Empirical coverage of 50%, 80% and 90% intervals vs training steps",
+         legend=legend, legend_cols=3,
+         note="One run per point at 20k training molecules, six nominal step levels, all Validation molecules. Intervals are central "
+              "Gaussian intervals of the total predictive distribution N(μ, σ_total²) (latent + learned noise), as in Figure 5.18. "
+              "Each panel is judged against its dotted nominal line; the y-axis is shared across all six panels.")
+
+
 def exact_reference(ax, ex, col):
     """ExactGP has no step count, so draw its 20k arms (pinned mean) as horizontal reference lines, one per prior setting."""
     for pr in ("on", "off"):
@@ -1515,7 +1550,7 @@ def fig_5_28(df):
 
 
 FIGS = {f"5.{i}": globals()[f"fig_5_{i}"] for i in range(1, 30) if f"fig_5_{i}" in globals()}
-FIGS = dict(sorted({**FIGS, "5.4a": fig_5_4a, "5.4b": fig_5_4b, "5.4c": fig_5_4c, "5.5b": fig_5_5b, "5.5c": fig_5_5c, "5.12a": fig_5_12a, "5.12b": fig_5_12b, "5.22b": fig_5_22b, "5.23b": fig_5_23b}.items(),
+FIGS = dict(sorted({**FIGS, "5.4a": fig_5_4a, "5.4b": fig_5_4b, "5.4c": fig_5_4c, "5.5b": fig_5_5b, "5.5c": fig_5_5c, "5.12a": fig_5_12a, "5.12b": fig_5_12b, "5.18c": fig_5_18c, "5.22b": fig_5_22b, "5.23b": fig_5_23b}.items(),
                    key=lambda kv: (float(kv[0].rstrip("abc")), kv[0])))
 
 
