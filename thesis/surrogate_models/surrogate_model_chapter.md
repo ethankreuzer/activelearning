@@ -138,22 +138,38 @@ Explain that predictive accuracy and uncertainty calibration are not interchange
 
 ## 5.2 Exact Gaussian Process Sweep
 
-The purpose of this section is to characterize the behavior of the ExactGP and understand the impact of the lengthscale prior.
+This section characterizes the ExactGP and the effect of the lengthscale prior. It follows the same three-step argument as the VariationalGP sweep (5.3): first the fit of the predicted mean (5.2.2), then the predictive uncertainty (5.2.3), then the behaviour of the GIBBON acquisition function (5.2.4), ending with the choice of model (5.2.5). The sweep has one factor, so each figure compares two models.
 
-Mean parameterization (pinned, learned, or pinned plus ConstantKernel) had no measurable effect on predictions across the three held-out sets, so it is not analyzed further. Everything in this section uses the **pinned-mean** runs only: `n20000_off_pinned` (prior off) and `n20000_on_pinned` (prior on). The lengthscale prior is therefore the only factor compared, and each figure shows two models.
+Mean parameterization (pinned, learned, or pinned plus ConstantKernel) had no measurable effect on predictions across the three held-out sets, so it is not analyzed further. Everything in this section uses the **pinned-mean** runs only: `n20000_off_pinned` (prior off) and `n20000_on_pinned` (prior on).
 
-The main findings to investigate are that the lengthscale prior substantially changes the learned kernel and creates a tradeoff: the prior-off model predicts the original library slightly better, while the prior-on model has far higher GIBBON enrichment on the GP-Molformer distribution.
+The argument of the section:
 
-### 5.2.1 Impact of the lengthscale prior on learned kernel parameters
+- The prior changes the learned kernel by about an order of magnitude (5.2.1), but barely changes the predicted means: both models separate enriched molecules from the bulk equally well and both under-predict high scorers in the same way (5.2.2). The fit therefore cannot decide between them.
+- The prior moves variance from the likelihood noise into the latent GP, and leaves the total predictive variance almost unchanged (5.2.3). The latent variance is what GIBBON uses.
+- That is where the models separate: on the GP-Molformer distribution, GIBBON top-100 enrichment is about 3.98× with the prior and 1.57× without, while Validation (about 1.72× for both) and InVitro (about 1.4× for both) are unchanged (5.2.4).
+- The tradeoff is that the prior-off model predicts the original library slightly better (5.2.5).
+
+### 5.2.1 Overview of the ExactGP sweep and the effect of the prior on the kernel
 
 **Purpose**
 
-Investigate how the lengthscale prior changes the learned GP kernel.
+Introduce the two compared models and show what the lengthscale prior changes in the learned kernel, the one structural difference that the rest of the section explains.
 
-- Without the prior: lengthscale 19.2, outputscale 18.2.
-- With the prior: lengthscale 2.75, outputscale 0.184.
+| Factor | Values |
+|---|---|
+| Lengthscale prior | Off, On |
+| Training size | 20k (fixed) |
+| Mean | Pinned |
+| Optimizer | L-BFGS on the exact marginal likelihood (no training-step factor) |
 
-The prior therefore does much more than slightly regularize the lengthscale: it moves the lengthscale and the outputscale together by roughly an order of magnitude or more.
+Unlike the VariationalGP, the ExactGP has no objective choice and no training-duration factor, so the lengthscale prior is the only thing that varies.
+
+The learned kernel parameters:
+
+- Without the prior: lengthscale 19.2, outputscale 18.2 (signal-to-noise 84).
+- With the prior: lengthscale 2.75, outputscale 0.184 (signal-to-noise 1.07).
+
+The prior does much more than slightly regularize the lengthscale: it moves the lengthscale and the outputscale together by roughly an order of magnitude or more. A long lengthscale with a large outputscale describes a smooth function with a wide prior spread; a short lengthscale with a small outputscale describes a function that varies locally with a small spread. This difference is the mechanism behind the uncertainty and acquisition results below.
 
 **Figure 5.3 — Learned kernel hyperparameters with and without the lengthscale prior**
 
@@ -164,102 +180,178 @@ The prior therefore does much more than slightly regularize the lengthscale: it 
 
 **Purpose of figure:** Visualize the substantial change in kernel behavior induced by the prior.
 
-### 5.2.2 Impact of the lengthscale prior on predictive performance
+### 5.2.2 Fit: the prior barely moves the predicted means
 
 **Purpose**
 
-Establish the tradeoff between predictive accuracy on the original screening library and performance on the generative-policy distribution, with explicit attention to the high-scoring molecules.
+Describe how well the ExactGP predictive mean fits the targets and show that the mean fit does not separate the two models. As in 5.3.2, the argument has three parts: both models separate enriched molecules from the bulk equally well (5.2.2.1), both get the scale of the predictions wrong in the same way (5.2.2.2), and what differs between them is second order (5.2.2.3). The uncertainty and acquisition sections that follow are therefore where the models have to be told apart.
 
-The metrics are RMSE and Spearman correlation. Spearman is used rather than Pearson because acquisition depends on how molecules are ranked, and Pearson is dominated by the long tail of y. A single figure covers all molecules and the enriched and hit subsets.
+Numbers are on the Validation set (about 231k molecules: about 200k bulk with y < 0.26, about 15k enriched, about 16k hits with y ≥ 0.52) unless stated otherwise. The metrics are the ones 5.3.2 found informative, so that 5.4 can compare the two model families on the same footing:
 
-**Figure 5.4 — Predictive performance on all, enriched and hit molecules**
+| Metric | Prior off | Prior on | Verdict |
+|---|---|---|---|
+| AUC, enriched and hits vs bulk | 0.938 | 0.933 | Separation, the loop's goal; tied |
+| Share of true hits among the top-N predictions | 0.752 | 0.751 | Separation; tied (random pick 0.068) |
+| Enriched signed bias | −0.101 | −0.097 | Scale; same sign and size |
+| Hit signed bias | −0.146 | −0.142 | Scale; same sign and size |
+| Enriched RMSE | 0.141 | 0.138 | Mostly bias; tied |
+| Whole-set Spearman ρ | 0.794 | 0.748 | Overall ordering; off higher, through the bulk |
+| Bulk Spearman ρ | 0.720 | 0.655 | Where the whole-set gap comes from |
+| Whole-set RMSE | 0.095 | 0.101 | Not used for the argument: dominated by the bulk |
 
-- Three dataset panels: Validation, InVitro and GP-Molformer.
-- Two rows: RMSE and Spearman.
-- X-axis: subset of the evaluation set — All, Enriched (0.26 ≤ y < 0.52) and Hit (y ≥ 0.52), each labelled with its n. Two bars per subset: lengthscale prior off and on, annotated with their values.
-- Spearman is computed within each subset.
-- Subsets with fewer than 10 molecules are not computed. GP-Molformer contains only 46 enriched molecules and 1 hit, so its hit band is empty and its enriched band is noisy.
+**5.2.2.1 Both models separate enriched molecules from the bulk equally well**
 
-**Purpose of figure:** Show overall predictive performance (the "All" group) and, explicitly, performance on the high-y molecules that the active-learning loop is trying to find. Discuss that ranking within the hit band (Spearman roughly 0.25 on Validation) is much weaker than ranking over all molecules, and that the two models are close within each band: RMSE differs by about 0.005 or less on the enriched and hit bands (slightly lower with the prior on), while Spearman is higher with the prior off in every band computed.
+**Figure 5.4a — Separation of enriched molecules from the bulk (Validation)**
 
-Discuss that a model that predicts the original library better does not necessarily provide the best surrogate behavior for the generator's initial distribution.
+- Two panels with one labelled point per prior setting. Left: AUC of the predicted mean for telling molecules with y ≥ 0.26 from the bulk. Right: among the N molecules with the highest predicted mean, where N is the number of true hits, the share that are true hits. Dashed = chance (AUC 0.5) or a random pick (0.068).
+- Same construction as Figure 5.10, so the two sections can be read side by side.
 
-### 5.2.3 Predictive uncertainty and calibration
+**Purpose of figure:** Test the thing the loop needs most from the mean: that high scorers are ranked above the bulk.
+
+**What it reveals:** The two models are essentially identical: AUC 0.938 (off) and 0.933 (on), and about 75% of the true hits land in the top-N (0.752 and 0.751), against 0.068 for a random pick. The prior does not change how well the mean finds the high scorers.
+
+**5.2.2.2 Both models get the scale wrong in the same way**
+
+**Figure 5.4b — Fit by score range on the Validation set: both models under-predict high scorers**
+
+- Two panels: signed bias and absolute error of the predicted mean against the true score, binned in steps of 0.06 (bins under 50 molecules dropped). Dotted verticals mark the enriched (0.26) and hit (0.52) boundaries. Solid = prior on, dashed = prior off.
+- Same construction as Figure 5.11.
+
+**Purpose of figure:** Show where along the score range the predicted means are right and wrong, which the whole-set metrics hide.
+
+**What it reveals:** Both models over-predict the lowest scores (bias about +0.07 to +0.08 in the lowest bin), cross zero at about y = 0.2, and then under-predict increasingly: bias is about −0.11 at y ≈ 0.4, about −0.13 at y ≈ 0.5 and about −0.16 in the top bin (y ≥ 0.6). The two curves almost coincide. Because the bulk dominates the whole set, whole-set RMSE hides this shrinkage toward the mean, and the enriched error is mostly this bias (enriched RMSE 0.14 against bias −0.10).
+
+**Figure 5.4c — Predicted versus true score on Validation, prior off and prior on (supporting)**
+
+- File `fig5_04c_predicted_vs_true`. Two density panels side by side (about 231k molecules, log colour), prior off on the left and prior on on the right, of predicted mean against true score, with dotted verticals at the enriched (0.26) and hit (0.52) boundaries, a dashed diagonal for perfect prediction, and each model's RMSE and Spearman ρ.
+- Same axes and colour scale in both panels and in Figures 5.12a and 5.12b.
+
+**Purpose of figure:** Show the two things the binned summary cannot: the ceiling on the predictions and the spread around the mean fit.
+
+**What it reveals:** Both models predict at most about 0.65, and both show the shrinkage toward the mean of Figure 5.4b: the high-score molecules (y ≥ 0.52) are predicted anywhere between about 0.1 and 0.65. The two panels are close. The prior-on panel has a wider vertical spread at the lowest scores, which is consistent with its higher bulk error (RMSE 0.101 against 0.095 overall; bulk Spearman 0.655 against 0.720).
+
+**5.2.2.3 What differs between the models is second order**
+
+The remaining differences are in the ranking and on the other two sets. Spearman is used rather than Pearson because acquisition depends on how molecules are ranked, and Pearson is dominated by the long tail of y. Spearman is computed within each subset (all, enriched with 0.26 ≤ y < 0.52, hits with y ≥ 0.52); subsets with fewer than 10 molecules are not computed (GP-Molformer contains only 46 enriched molecules and 1 hit).
+
+- **Within the high bands the models are close.** RMSE differs by about 0.005 or less on the enriched and hit bands (slightly lower with the prior on), and ranking within the hit band is weak for both (Spearman about 0.25 on Validation, against 0.79 and 0.75 over all molecules).
+- **The prior-off model orders molecules better overall.** Spearman is higher with the prior off in every band computed, and the whole-set gap on Validation (0.794 against 0.748) sits in the bulk (0.720 against 0.655), not in the enriched or hit bands (0.442 against 0.437 and 0.247 against 0.240).
+- **Other sets.** On InVitro the two are tied (RMSE 0.209 and 0.208; Spearman 0.696 and 0.685). On GP-Molformer the prior-off model is clearly better (RMSE 0.046 against 0.061; Spearman 0.271 against 0.232).
+
+A model that predicts the original library better does not necessarily provide the best surrogate behaviour for the generator's initial distribution; this is the point of 5.2.4.
+
+**What this section establishes.** The means are good at ranking and wrong in scale, and they are almost the same in both models. Both separate enriched molecules from the bulk equally well (AUC 0.93–0.94, about 75% of hits found) and both under-predict high scorers by roughly 0.1–0.18 while over-predicting the lowest scores. The prior-off model is slightly better on the bulk and on the GP-Molformer set. The means do not favour the prior-on model, and they cannot explain the acquisition result below; the uncertainty does (5.2.3–5.2.4).
+
+### 5.2.3 Predictive uncertainty: the prior moves variance from the noise into the latent GP
 
 **Purpose**
 
-Investigate whether the lengthscale prior changes how predictive uncertainty is split between the latent GP and the likelihood noise, and whether those changes improve calibration.
+Investigate how the lengthscale prior changes the split of predictive uncertainty between the latent GP and the likelihood noise, whether the latent uncertainty is informative about error, and whether the intervals are calibrated. Three parts: allocation (5.2.3.1), whether the latent uncertainty tracks error (5.2.3.2), and calibration (5.2.3.3).
+
+**5.2.3.1 Allocation of variance**
 
 The export shows (medians over molecules; the noise is a fit-level constant):
 
 - Latent variance rises by roughly 3× with the prior (Validation: about 3.3e-4 without, 9.6e-4 with).
 - Likelihood noise variance falls by about 20% (σₙ² of about 3.5e-3 without, 2.8e-3 with; SD 0.059 versus 0.053).
 - The **total** predictive variance is nearly unchanged (about 3.8e-3 versus 3.7e-3; a 1–4% decrease across the three sets). The prior mostly moves variance from the noise term into the latent GP: the latent share of the total rises from about 9% to about 25%.
-- With a short lengthscale (2.75 versus 19) the kernel explains more of the structure, so less is absorbed as noise. The noise term is therefore best described as the variance the model leaves unexplained (including representation error from the frozen embedding), not as irreducible noise; this should be stated explicitly in the thesis.
+- With a short lengthscale (2.75 versus 19) the kernel explains more of the structure, so less is absorbed as noise. The noise term is best read as the variance the model leaves unexplained (including representation error from the frozen embedding), not as irreducible noise.
 - Per-molecule spread is small: the latent variance has a 5th–95th percentile ratio of only about 1.5–2.6×, so the total predictive variance is nearly the same for every molecule (within roughly ±5%). All per-molecule discrimination in the predictive uncertainty comes from this small latent term.
-- The latent variance is lower on the high-scoring molecules. On Validation the median latent variance is 3.3e-4 (all), 2.9e-4 (enriched), 2.6e-4 (hit) without the prior, and 9.6e-4, 8.2e-4, 6.7e-4 with it; the latent share of the total on hits falls from about 26% to 19% with the prior on. The GP is therefore least uncertain about the molecules the loop most wants to find. InVitro shows a smaller version of this effect.
-- GIBBON uses the latent variance rather than the total, so the 3× rise is relevant to the acquisition results in 5.2.4 even though it barely changes total uncertainty.
+- GIBBON uses the latent variance rather than the total, so the 3× rise is the link to the acquisition results in 5.2.4, even though it barely changes total uncertainty.
 
-**Figure 5.5 — Decomposition of predictive variance, and latent variance by y-band**
+**Figure 5.5 — How the learned variance is split between the latent GP and the noise**
 
-Top row (decomposition), one panel per held-out dataset (shared y-axis):
+- Three panels, one per held-out dataset. One point per prior setting (off/on). X-axis: learned likelihood noise variance σₙ² (a fit-level constant). Y-axis: median latent variance of f(x) over the molecules. Both axes are logarithmic, in score units², and have the same range as the panels of Figures 5.14 and 5.15, so the ExactGP points can be placed directly in the allocation space of the variational runs.
+- Each point is labelled with its noise variance and its median latent variance.
+- Per molecule, total variance equals latent variance plus the constant noise variance (verified on the per-molecule outputs), so the median total is exactly the noise plus the median latent variance. The noise SD (0.0591 and 0.0528) is converted by squaring before plotting.
 
-- One stacked bar per prior setting (off/on): likelihood noise variance σₙ² (hatched, bottom) plus median latent variance (solid, top), on a linear axis in score units².
-- Each segment is labelled with its own value (the segment height); the total (bar top, readable on the y-axis) and the latent share (%) are printed under each bar. A whisker beside each bar spans the 5th–95th percentile of molecules.
-- The bar height is the median predictive variance: per molecule, total variance equals latent variance plus the constant noise variance (verified on the per-molecule outputs), so the median total is exactly the noise plus the median latent variance. The noise SD (0.0591 and 0.0528) is converted by squaring before plotting.
+**Purpose of figure:** Show that the prior re-allocates variance between the latent GP and the noise term (the point moves up and to the left) while leaving the total predictive variance almost unchanged.
 
-Bottom row (latent variance by y-band), one panel per dataset:
+**Figure 5.5b — Distribution of the latent variance across molecules, prior off versus on**
 
-- X-axis: All, Enriched (0.26 ≤ y < 0.52) and Hit (y ≥ 0.52), each labelled with its n; two boxes per group (prior off/on).
+- One panel. X-axis: the three evaluation sets (Validation, InVitro, GP-Molformer), each labelled with its n; two boxes per set (prior off/on), over the **entire set** (not split into enriched and hit molecules).
 - Y-axis: per-molecule latent variance of f(x) in score units². Box = 25th–75th percentile, line = median (value printed), whiskers = 5th–95th percentile.
-- Because the noise is a single constant, only the latent part can vary between molecules, so this row shows everything that varies. Subsets with fewer than 10 molecules are not computed (GP-Molformer: 46 enriched, 1 hit).
+- Because the noise is a single constant, only the latent part can vary between molecules, so this figure shows everything that varies.
 
-**Purpose of figure:** Show that the prior re-allocates variance between the latent GP and the noise term while leaving total predictive variance almost unchanged, how little the per-molecule variance varies (latent 5th–95th percentile ratio of about 1.5–2.6×, against a constant noise that is 3–10× larger), and that the latent variance is lower on the high-y molecules. Use the median (not the mean); the two agree to about 5%.
+**Purpose of figure:** Show how the prior changes the distribution of the latent variance, and how little it varies between molecules.
 
-**Figure 5.6 — Empirical predictive coverage**
+**What it reveals:** The prior raises the latent variance across the whole distribution on every set (median 3.3e-4 to 9.6e-4 on Validation, 3.0e-4 to 8.7e-4 on InVitro, 3.6e-4 to 1.0e-3 on GP-Molformer), and the boxes of the two settings do not overlap. The spread is small: the 5th–95th percentile ratio is only about 1.5–2.6×, against a constant noise that is 3–10× larger. The median, not the mean, is used; the two agree to about 5%.
 
-- X-axis: nominal coverage (50%, 80%, 90%).
-- Y-axis: empirical coverage.
-- Three panels: Validation, InVitro and GP-Molformer.
-- Two lines: prior enabled/disabled, with the diagonal ideal-calibration reference.
-- Coverage uses the **total** predictive distribution (latent plus likelihood noise), as computed in `scripts/export_sweep_csv.py`.
+**Variance by y-band (text only).** The latent variance is lower on the high-scoring molecules. On Validation the median latent variance is 3.3e-4 (all), 2.9e-4 (enriched), 2.6e-4 (hit) without the prior, and 9.6e-4, 8.2e-4, 6.7e-4 with it; the latent share of the total on hits falls from about 26% to 19% with the prior on. The GP is therefore least uncertain about the molecules the loop most wants to find, which is the opposite of what its error says (5.2.3.2). InVitro shows a smaller version of this effect.
 
-**Purpose of figure:** Determine whether the prior improves uncertainty calibration and whether the effect transfers across evaluation distributions.
+**5.2.3.2 Is the latent uncertainty informative about error?**
 
-Observations to discuss: InVitro coverage is far below nominal for both prior settings (0.32 at the 90% level). On GP-Molformer the prior-off model over-covers (0.98) while the prior-on model is close to nominal (0.90). Because the total predictive variance is almost identical for the two models, this difference comes mainly from the errors, not from the predicted uncertainty: on GP-Molformer the prior-off model has lower RMSE (0.046 versus 0.061) at about the same total variance, so more of its targets fall inside the intervals.
+Coverage (5.2.3.3) asks whether intervals have the right width on average; this asks whether the model's *relative* uncertainty ranks its errors. It uses the same two measures as 5.3.7, so the two families can be compared in 5.4.
+
+**Figure 5.5c — Latent uncertainty versus error (Validation)**
+
+- Left: Spearman correlation between each molecule's latent standard deviation and its absolute prediction error (`spearman_std_error`), for all molecules, the bulk, the enriched band and the hit band, two bars per band (prior off/on). Dotted line = 0 (uninformative).
+- Right: mean latent SD ÷ mean absolute error against true y, binned in steps of 0.06 (bins under 50 molecules dropped), with dotted verticals at the enriched (0.26) and hit (0.52) boundaries. A ratio of 1 means the uncertainty is the right size; below 1 it is too narrow.
+- Same construction as Figures 5.20 and 5.21, so the two sections can be read side by side.
+
+**Purpose of figure:** Test whether the latent uncertainty, which is what GIBBON acquires on, is informative about where the model is wrong, and where along the score range it is too narrow.
+
+**What it reveals:**
+- **Overall the uncertainty points the wrong way.** On all molecules the correlation is negative for both models (−0.33 off, −0.37 on), and in the bulk it is more negative (−0.41 and −0.47). The same sign is seen for ELBO in 5.3.7.
+- **Within the high bands it is positive and stronger with the prior.** Enriched +0.43 (off) and +0.54 (on); hits +0.58 and +0.72. The enriched and hit bands are selected on y, so within them the error is largely driven by y itself (the systematic under-prediction of high scorers); read this as a diagnostic, not a selection criterion.
+- **The intervals are far too narrow, more so for the high scorers.** The SD ÷ error ratio is 0.26–0.34 (off) and 0.40–0.56 (on) below y = 0.3, and falls to 0.10–0.12 (off) and 0.16–0.20 (on) for y ≥ 0.45. The prior roughly doubles the ratio everywhere, without making the uncertainty close to the size of the error.
+
+**5.2.3.3 Calibration**
+
+**Figure 5.6 — 90% interval coverage of the ExactGP, from total and from latent-only variance**
+
+- Two rows, three columns (Validation, InVitro, GP-Molformer). Top row: coverage of the 90% interval built from the **total** predictive SD (latent plus likelihood noise). Bottom row: coverage of the 90% interval built from the **latent SD alone**, which is what GIBBON uses.
+- X-axis: subset of the evaluation set (all molecules, enriched molecules); two labelled points per subset (prior off/on). Dotted line = nominal 0.90. GP-Molformer enriched has only 46 molecules.
+- Same quantities as Figures 5.18 (total) and 5.19 (latent only), so the ExactGP and VariationalGP results can be compared directly.
+
+**Purpose of figure:** Determine whether the prior improves uncertainty calibration, whether the effect transfers across evaluation distributions, and how much of the interval comes from the noise term.
+
+**What it reveals:**
+- **Total variance, all molecules.** Validation under-covers for both models, more with the prior (0.77 off, 0.69 on). InVitro is far below nominal for both (0.32). On GP-Molformer the prior-off model over-covers (0.98) while the prior-on model is close to nominal (0.90). Because the total predictive variance is almost identical for the two models, the GP-Molformer difference comes mainly from the errors, not from the predicted uncertainty: the prior-off model has lower RMSE (0.046 versus 0.061) at about the same total variance, so more of its targets fall inside the intervals.
+- **Total variance, enriched molecules.** Coverage falls for both models on every set (Validation 0.51 and 0.52, InVitro 0.19 and 0.21, GP-Molformer 0.39 and 0.37), and the prior makes no difference. The intervals are too narrow on the molecules the loop most wants, which is the under-prediction of Figure 5.4b.
+- **Latent variance only.** The latent interval covers far less than the total interval everywhere (Validation 0.22 off and 0.36 on, InVitro 0.10 and 0.16, GP-Molformer 0.50 and 0.58), so most of the coverage in the top row comes from the noise term. The prior raises the latent-only coverage on every set and subset, as expected from the tripled latent variance, but it stays far from nominal. On GP-Molformer enriched it is 0.07 and 0.17.
+
+**What this section establishes.** The prior leaves the total uncertainty almost unchanged and moves it from the noise into the latent GP, tripling the latent variance. Neither model has latent uncertainty that tracks error across the whole set, and neither is calibrated on Validation or InVitro. Calibration therefore does not clearly favour either model, and the interesting difference is the latent variance, which is what the acquisition function sees (5.2.4).
 
 ### 5.2.4 GIBBON acquisition behavior across the evaluation distributions
 
 **Purpose**
 
-Investigate how the learned GP affects the acquisition rankings generated by GIBBON. This is one of the most important ExactGP subsections in relation to the active-learning objective.
+Investigate how the learned GP affects the acquisition rankings generated by GIBBON. This is the part of the ExactGP analysis closest to the active-learning objective: GIBBON uses the latent variance (5.2.3.1), so the 3× change in latent variance is the route by which the prior can change what is acquired even though the means (5.2.2) and the total variance are almost the same.
 
-The main finding is that the lengthscale prior leads to considerably higher GIBBON enrichment on GP-Molformer (about 3.98× versus 1.57× at top-100), while Validation (about 1.72× for both) and InVitro (about 1.4× for both) are essentially unchanged.
+This section follows the order of 5.3.8: first the enrichment that GIBBON achieves, then the distribution of its values, then how concentrated they are.
 
 **Figure 5.7 — GIBBON top-100 enrichment across evaluation datasets**
 
 - Three panels: Validation, InVitro and GP-Molformer.
 - Y-axis: top-100 enrichment; X-axis: lengthscale prior (off/on); dashed line at 1× (a random pick).
 - Top-100 enrichment: take the 100 molecules GIBBON ranks highest, average their true docking scores, and divide by the average over the whole evaluation set. It is the payoff of one 100-molecule acquisition batch relative to choosing at random.
-- Only top-100 is shown. Top-1,000 would cover about two thirds of the 1,521-molecule InVitro set and is nearly identical to top-100 on the larger sets.
+- Only top-100 is shown. Top-1,000 would cover about two thirds of the 1,521-molecule InVitro set and is nearly identical to top-100 on the larger sets (on GP-Molformer it is 2.20× with the prior and 1.36× without).
 
 **Purpose of figure:** Show how well GIBBON prioritizes molecules that actually have high docking-derived scores. The GP-Molformer panel deserves particular attention because it represents the initial generative-policy distribution.
 
+**What it reveals:** The lengthscale prior leads to considerably higher GIBBON enrichment on GP-Molformer (about 3.98× versus 1.57× at top-100), while Validation (about 1.72× for both) and InVitro (about 1.4× for both) are essentially unchanged. This happens although the prior-on model has the worse RMSE and Spearman on GP-Molformer (5.2.2.3) and the means are almost the same on Validation.
+
 **Figure 5.8 — Distribution of log GIBBON acquisition values**
 
-- A 3×3 grid: columns are the three held-out datasets; rows are all molecules, enriched molecules (0.26 ≤ y < 0.52) and hit molecules (y ≥ 0.52).
-- Each panel overlays the per-molecule log GIBBON histograms for prior on and prior off, with a legend. The x-axis is shared down each column so the bands are directly comparable.
-- GP-Molformer has 46 enriched molecules and 1 hit, so its enriched histogram is coarse and its hit panel is empty (n = 1).
-- X-axis: log GIBBON acquisition value (natural log); Y-axis: fraction of molecules per bin.
+- Two panels, Validation (the 45,850-molecule acquisition slice) and GP-Molformer, as in Figure 5.24. In each, two violins over the **entire set**: prior off (open, dashed outline, white median dot) and prior on (filled, black median dot). The enriched and hit subsets are not shown.
+- Log GIBBON is negative, so the y-axis shows its magnitude on a log scale, inverted: the top is 0 (the highest acquisition value) and the ticks read −10, −100, −1,000. The y-scale is exactly that of the ELBO row of Figure 5.24, so the two figures can be compared directly.
+- Each violin is a kernel density estimate in log10|log GIBBON| over the **full range** of the molecules, so its top tip is the best molecule. Width is proportional to the square root of the density, with the same maximum width for every violin, so the sparse tail stays visible. Same construction as Figure 5.24.
 
-**Purpose of figure:** Understand whether the prior changes not only the ranking of candidates but the whole distribution of acquisition values. The prior-on distribution sits at far larger (less negative) log values, and on GP-Molformer it is much narrower.
+**Purpose of figure:** Understand whether the prior changes not only the ranking of candidates but the whole distribution of acquisition values, including the tail that the acquisition actually selects from.
+
+**What it reveals:** The prior-on distribution sits at far larger (less negative) log values (median log GIBBON on GP-Molformer −148 against −452, on Validation −81 against −242), and on GP-Molformer it is much narrower. The best molecule on GP-Molformer has a log value of −63 without the prior and −28 with it.
 
 **Figure 5.9 — GIBBON effective support**
 
 - Three panels, one per held-out set; X-axis: lengthscale prior; Y-axis: effective support on a logarithmic axis, with a reference line at 1.
 - Effective support is the number of molecules that carry the acquisition mass (1 means all of it sits on one molecule).
 
-**Purpose of figure:** Show how concentrated the acquisition signal is. On GP-Molformer the effective support is about 1.0 without the prior and about 2.0 with it, which is extremely concentrated in both cases.
+**Purpose of figure:** Show how concentrated the acquisition signal is.
+
+**What it reveals:** On GP-Molformer the effective support is about 1.0 without the prior and about 2.0 with it, which is extremely concentrated in both cases. On Validation it is about 270 without and 1,170 with the prior, and on InVitro about 3.6 and 16. The prior spreads the acquisition mass over more molecules, but on the GP-Molformer distribution GIBBON still effectively acquires one or two molecules.
+
+**What this section establishes.** The two models have nearly the same means and total variance but different acquisition behaviour on the GP-Molformer distribution, and the prior-on model is far better there. The mechanism available from the earlier sections is the tripled latent variance, which changes how GIBBON ranks the candidates; this section does not isolate it from the changes in the kernel.
 
 ### 5.2.5 ExactGP model selection
 
@@ -274,9 +366,9 @@ Compare:
 - `n20000_off_pinned`
 - `n20000_on_pinned`
 
-Include validation performance, InVitro performance, GP-Molformer performance (all molecules and enriched/hit bands), calibration and GIBBON top-100 enrichment.
+Include validation performance, InVitro performance, GP-Molformer performance (all molecules and enriched/hit bands), the separation and bias metrics of 5.2.2, calibration and GIBBON top-100 enrichment.
 
-The narrative should explain the decision as a tradeoff: the prior-off model performs slightly better on validation prediction, but the prior-on model exhibits stronger acquisition-relevant behavior on the GP-Molformer distribution. The selected model is therefore a candidate chosen based on the intended downstream application, not proof that the prior-enabled ExactGP is universally superior.
+The narrative should explain the decision as a tradeoff, following the three steps above. The fit does not separate the models, apart from the prior-off model being slightly better on the bulk and on GP-Molformer (5.2.2). The uncertainty is more informative within the high bands with the prior on, but neither model is calibrated (5.2.3). The acquisition result decides: the prior-on model has about 2.5× the top-100 enrichment on GP-Molformer, the initial distribution of the generator (5.2.4). The selected model is therefore a candidate chosen based on the intended downstream application, not proof that the prior-enabled ExactGP is universally superior.
 
 ---
 
@@ -458,15 +550,15 @@ Preliminary observations:
 
 Under PLL the noise falls with training while the latent variance stays roughly flat, whereas under ELBO the noise rises and the prior-on latent variance falls. The ELBO noise and calibration stop changing after about 5,000 steps, so the 7,500- and 10,000-step levels add almost nothing there (the prior-off latent variance still creeps up); the PLL runs keep drifting toward less noise and a slightly smaller latent variance.
 
-### 5.3.6 Calibration and latent uncertainty versus training duration
+### 5.3.6 Calibration of the predictive intervals
 
 **Purpose**
 
-Connect the variance trajectories of 5.3.5 to their consequences for calibration and for the usefulness of the latent uncertainty. The effects of training duration on the predictive means are in section 5.3.2.
+Connect the variance trajectories of 5.3.5 to their consequences for calibration: are the predictive intervals the right width, and how much of that width is latent uncertainty, which the acquisition function can see, and how much is likelihood noise, which it cannot. The effects of training duration on the predictive means are in section 5.3.2, and whether the latent uncertainty points at the molecules the model gets wrong is the subject of 5.3.7.
 
 For ELBO, increasing training duration substantially improves NLPD and coverage (median Validation NLPD 6.2 to −0.8 and 90% coverage 0.33 to 0.82 from 625 to 5,000 steps), after which both are flat through 10,000 steps (−0.80 and 0.82); InVitro remains poorly calibrated (coverage 0.11 to 0.33). PLL moves the other way, slowly: median Validation coverage falls from 0.89 at 625 steps to 0.85 at 10,000 and NLPD rises from −1.03 to −0.95.
 
-The next four figures ask one question in four ways: are the model's predictive intervals trustworthy, and where do they come from? Figure 5.18 uses the total predictive variance (latent plus likelihood noise). Figure 5.19 isolates the latent part, which is the part GIBBON acquires on. Figures 5.20 and 5.21 ask whether the latent uncertainty is informative about where the model is wrong. All four use the Validation set for the finer diagnostics; the Validation enriched band has about 15,000 molecules, whereas GP-Molformer's has 46, so those diagnostics are not repeated on the smaller sets.
+The next two figures ask one question in two ways: are the model's predictive intervals trustworthy, and where do they come from? Figure 5.18 uses the total predictive variance (latent plus likelihood noise). Figure 5.19 isolates the latent part, which is the part GIBBON acquires on. The finer diagnostics here and in 5.3.7 use the Validation set; its enriched band has about 15,000 molecules, whereas GP-Molformer's has 46, so those diagnostics are not repeated on the smaller sets.
 
 **Figure 5.18 — 90% interval coverage from total learned variance (latent + noise) falls short on enriched molecules**
 
@@ -489,6 +581,14 @@ The next four figures ask one question in four ways: are the model's predictive 
 
 **What it reveals:** Under PLL the latent variance alone covers about as much as the total (about 0.84–0.92 on all molecules), because PLL's learned noise is tiny. Under ELBO it covers only about 0.07–0.34, because the noise supplies most of the interval. ExactGP (not plotted here) sits with ELBO, not PLL: its latent-only coverage is about 0.36 (prior on) and 0.22 (prior off) on all molecules, and 0.25 and 0.14 on enriched molecules. ELBO's and ExactGP's total coverage therefore overstates how much of their uncertainty the acquisition function can see. On enriched molecules even PLL's latent-only coverage is only about 0.53–0.62. On InVitro the latent interval is far too narrow under both objectives: PLL covers only about 0.35–0.39 of the entire set and about 0.21–0.27 of the enriched molecules, and ELBO covers about 0.02–0.12 and 0.01–0.05, which matches the poor total coverage on InVitro in Figure 5.18.
 
+**Across the three evaluation distributions.** The three held-out sets are different predictive challenges, and the calibration results differ accordingly. InVitro coverage is very low for both objectives (Figure 5.18, top row), even when Validation and GP-Molformer show substantially more reasonable behavior. This is scientifically relevant because InVitro is the experimentally characterized, hit-enriched subset. Validation coverage is reasonable for PLL, GP-Molformer is over-covered or near nominal for most configurations, and InVitro is under-covered for every configuration, so InVitro is the hardest of the three for the learned predictive distributions. Discuss possible dataset-selection effects and representation-related error without claiming that the InVitro results necessarily demonstrate a particular noise mechanism.
+
+### 5.3.7 Is the latent uncertainty informative about error?
+
+**Purpose**
+
+Test whether the latent uncertainty, which is what the acquisition function acquires on, is informative about where the model is wrong. Coverage (5.3.6) asks whether intervals have the right width on average; the two figures here ask whether the model's *relative* uncertainty ranks its errors, first overall and across training steps (Figure 5.20) and then across the range of true scores (Figure 5.21). Both use the Validation set.
+
 **Figure 5.20 — PLL ranks its errors best overall; ELBO and ExactGP rank them best on enriched molecules**
 
 - Validation set only; two panels (all molecules, enriched). Y-axis: Spearman correlation between each molecule's latent standard deviation and its absolute prediction error (`spearman_std_error`). Dotted line = 0 (uninformative). Blue horizontal lines = ExactGP at 20k (pinned mean), as in Figure 5.19.
@@ -505,17 +605,7 @@ The next four figures ask one question in four ways: are the model's predictive 
 
 **What it reveals:** Mean error rises roughly three- to six-fold from low to high y (PLL 4× with the prior on and 6× with it off, ELBO about 3×) and is similar under PLL and ELBO at the top of the range, so the means are not what separates the objectives. PLL's latent SD rises only about 1.2× (prior on) to 2× (prior off) over the same range, so its SD÷error ratio falls from about 1.4 at low y (too wide), crosses 1 at about y = 0.27–0.33 (the enriched boundary), and ends at about 0.4–0.5 at the top (too narrow). ELBO's latent SD is flat in y (it even falls slightly), so its ratio sits far below 1 everywhere (about 0.14–0.33 at low y, 0.04–0.09 at the top). Overall coverage looks good for PLL because the low-y bulk (about 200k of 231k molecules) dominates it, while the enriched and hit bands are where its intervals are too narrow. The figure does not explain why the enriched-band rank correlation in Figure 5.20 differs between objectives, which would need a within-bin correlation.
 
-**Reading Figures 5.18–5.21 together.** PLL is better calibrated overall and its latent uncertainty ranks errors well across the whole set, but its intervals are too narrow in the high-scoring tail. ELBO's and ExactGP's latent uncertainty is too small everywhere and ranks errors in the wrong direction overall, although within the enriched band they are the ones that rank errors better (PLL with the prior off is the weakest there). None of these four figures measures the quantity the loop needs, which is whether the acquisition picks good molecules; that is Figure 5.22.
-
-### 5.3.7 Generalization and uncertainty across the three evaluation distributions
-
-**Purpose**
-
-Bring together the evaluation results and emphasize that the three held-out sets represent different predictive challenges.
-
-The exported results show that InVitro coverage is very low across both objectives (Figure 5.18, top row), even when Validation and GP-Molformer show substantially more reasonable behavior. This is scientifically relevant because InVitro is the experimentally characterized, hit-enriched subset.
-
-Validation coverage is reasonable for PLL, GP-Molformer is over-covered or near nominal for most configurations, and InVitro is under-covered for every configuration, so InVitro is the hardest of the three for the learned predictive distributions. Discuss possible dataset-selection effects and representation-related error without claiming that the InVitro results necessarily demonstrate a particular noise mechanism.
+**Reading Figures 5.18–5.21 together (5.3.6 and 5.3.7).** PLL is better calibrated overall and its latent uncertainty ranks errors well across the whole set, but its intervals are too narrow in the high-scoring tail. ELBO's and ExactGP's latent uncertainty is too small everywhere and ranks errors in the wrong direction overall, although within the enriched band they are the ones that rank errors better (PLL with the prior off is the weakest there). None of these four figures measures the quantity the loop needs, which is whether the acquisition picks good molecules; that is Figure 5.22.
 
 ### 5.3.8 GIBBON acquisition behavior
 
@@ -557,7 +647,7 @@ PLL is therefore strongest with the prior off (2.84) and weak with the prior on 
 
 **Figure 5.23 — GIBBON effective support of VariationalGP models across evaluation sets**
 
-- 1×3 grid: effective support (log scale) on each of the three held-out datasets. File `fig5_23_gibbon_effective_support`. The median-log-GIBBON row was removed; the log GIBBON distributions are in Figure 5.23b.
+- 1×3 grid: effective support (log scale) on each of the three held-out datasets. File `fig5_23_gibbon_effective_support`. The median-log-GIBBON row was removed; the log GIBBON distributions are in Figure 5.24.
 - Each point is one configuration: filled = prior on, open = prior off. No median bar is drawn. One y-scale across the three evaluation sets.
 - Effective support is missing on Validation for the 6 PLL prior-off runs (6 of 24) and for no run on InVitro or GP-Molformer; the cause must be investigated before the Validation panel is used.
 
@@ -567,17 +657,17 @@ PLL is therefore strongest with the prior off (2.84) and weak with the prior on 
 
 Distinguish acquisition ranking quality from acquisition concentration. A concentrated distribution of acquisition values does not necessarily mean the model prioritizes the best actual docking molecules.
 
-**Figure 5.23c — GIBBON effective support versus training steps**
+**Figure 5.23b — GIBBON effective support versus training steps**
 
-- File `fig5_23c_gibbon_effective_support_vs_training_steps`. The effective-support panels of Figure 5.23 plotted against nominal training steps (log scale), one line per objective and prior setting, with one y-scale across the three datasets. The PLL prior-off line is absent on Validation (effective support is missing there).
+- File `fig5_23b_gibbon_effective_support_vs_training_steps`. The effective-support panels of Figure 5.23 plotted against nominal training steps (log scale), one line per objective and prior setting, with one y-scale across the three datasets. The PLL prior-off line is absent on Validation (effective support is missing there).
 
 **Purpose of figure:** Show how the concentration of the acquisition mass changes with training duration.
 
 **What it reveals:** Effective support is mostly flat for PLL and moves for ELBO, in different directions by prior. On Validation, ELBO with the prior on shrinks from about 1,580 at 625 steps to about 310 and plateaus from 5,000 steps, while ELBO with the prior off grows slowly (about 50–150). PLL's Validation support is nearly constant (about 6,000 falling to 4,600). On GP-Molformer, PLL with the prior on falls from about 230 at 625 steps to about 40 at 10,000, PLL with the prior off stays near 15, and both ELBO lines sit at about 1 at every step count. On InVitro PLL is flat (about 110–280) and ELBO shrinks to a few molecules.
 
-**Figure 5.23b — Log GIBBON distribution across training steps: PLL (top) and ELBO (bottom)**
+**Figure 5.24 — Log GIBBON distribution across training steps: PLL (top) and ELBO (bottom)**
 
-- File `fig5_23b_gibbon_log_distribution_vs_steps`. 2×2 grid: rows are PLL (green) and ELBO (orange); columns are Validation (the 45,850-molecule acquisition slice) and GP-Molformer. Each panel has one violin per training-step count (625 to 10,000) and prior setting, with the median as a dot, joined across steps.
+- File `fig5_24_gibbon_log_distribution_vs_steps`. 2×2 grid: rows are PLL (green) and ELBO (orange); columns are Validation (the 45,850-molecule acquisition slice) and GP-Molformer. Each panel has one violin per training-step count (625 to 10,000) and prior setting, with the median as a dot, joined across steps.
 - Filled violin and solid median line = prior on; open violin with a dashed outline and dashed median line = prior off. The y-axis is a log scale of the magnitude of the (negative) log GIBBON value, inverted so that 0, the highest acquisition value, is at the top. The two panels in a row share one y-scale; the rows have different ranges.
 
 **Purpose of figure:** Show how the whole distribution of acquisition values changes with training duration, not only a summary statistic such as the median or the effective support.
@@ -609,7 +699,7 @@ Establish whether extending optimization beyond 5,000 steps keeps improving the 
 
 **Purpose of table:** Establish whether optimization beyond 5,000 steps still improves the model.
 
-**What it reveals:** It does not. ELBO is essentially converged by 5,000 steps: noise, RMSE, NLPD and coverage change in the third decimal place or not at all, and the log GIBBON distribution of the prior-on runs stops moving (Figure 5.23b). The one thing still creeping is ELBO with the prior off, whose latent variance and log GIBBON values keep rising slowly (Figure 5.23b). PLL keeps drifting in the wrong direction: the noise keeps falling, Validation coverage falls (0.885 to 0.859 with the prior off) and NLPD worsens (−1.064 to −0.985) while RMSE is flat to slightly worse, and PLL with the prior off loses GP-Molformer enrichment (2.54 to 2.08; ELBO with the prior off also drifts down, 2.76 to 2.38). The prior-on PLL runs are almost unchanged. These are single runs per cell and the differences are small apart from the PLL prior-off trend, so they support stopping at or before 5,000 steps without establishing a universal stopping point.
+**What it reveals:** It does not. ELBO is essentially converged by 5,000 steps: noise, RMSE, NLPD and coverage change in the third decimal place or not at all, and the log GIBBON distribution of the prior-on runs stops moving (Figure 5.24). The one thing still creeping is ELBO with the prior off, whose latent variance and log GIBBON values keep rising slowly (Figure 5.24). PLL keeps drifting in the wrong direction: the noise keeps falling, Validation coverage falls (0.885 to 0.859 with the prior off) and NLPD worsens (−1.064 to −0.985) while RMSE is flat to slightly worse, and PLL with the prior off loses GP-Molformer enrichment (2.54 to 2.08; ELBO with the prior off also drifts down, 2.76 to 2.38). The prior-on PLL runs are almost unchanged. These are single runs per cell and the differences are small apart from the PLL prior-off trend, so they support stopping at or before 5,000 steps without establishing a universal stopping point.
 
 ---
 
@@ -631,7 +721,7 @@ Compare learned uncertainty decomposition between:
 
 Restrict the main comparison to 20k training observations.
 
-**Figure 5.24 — Uncertainty allocation across GP model families**
+**Figure 5.25 — Uncertainty allocation across GP model families**
 
 - X-axis: GP model type/objective (ExactGP, PLL, ELBO).
 - Y-axis: learned latent variance and likelihood noise.
@@ -648,14 +738,14 @@ Discuss the observation that PLL places considerably more uncertainty into the l
 
 Determine whether differences in uncertainty allocation are accompanied by meaningful differences in predictive means and GIBBON outputs.
 
-**Figure 5.25 — Predictive performance across GP model families**
+**Figure 5.26 — Predictive performance across GP model families**
 
 - Three dataset panels.
 - X-axis: ExactGP, PLL, ELBO.
 - Y-axis: RMSE and Spearman in separate panels.
 - Restrict to 20k training-size configurations.
 
-**Figure 5.26 — GIBBON enrichment across GP model families**
+**Figure 5.27 — GIBBON enrichment across GP model families**
 
 - Three dataset panels.
 - X-axis: ExactGP, PLL, ELBO.
@@ -737,11 +827,15 @@ The following is the consolidated figure list. Core figures are intended for the
 | 5.1 | GP–GIBBON–GFlowNet pipeline | Core |
 | 5.2 | Target distributions across three held-out sets | Core |
 | 5.3 | ExactGP learned kernel hyperparameters | Core |
-| 5.4 | ExactGP predictive performance, all, enriched and hit molecules | Core |
-| 5.5 | ExactGP variance decomposition and latent variance by y-band | Core |
-| 5.6 | ExactGP predictive coverage | Core |
+| 5.4a | ExactGP separation of enriched molecules from the bulk (AUC, hit share) | Core |
+| 5.4b | ExactGP fit by score range: bias and error by true-y bin | Core |
+| 5.4c | ExactGP predicted versus true score on Validation, prior off and on | Supplementary |
+| 5.5 | ExactGP uncertainty allocation space (noise vs median latent variance) | Core |
+| 5.5b | ExactGP distribution of latent variance over the entire sets, prior off vs on | Core |
+| 5.5c | ExactGP latent uncertainty versus error (rank correlation, SD÷error by true-y bin) | Core |
+| 5.6 | ExactGP 90% coverage from total and latent-only variance | Core |
 | 5.7 | ExactGP GIBBON top-100 enrichment | Core |
-| 5.8 | ExactGP log GIBBON acquisition distributions | Supplementary |
+| 5.8 | ExactGP log GIBBON acquisition distributions (violins, Validation and GP-Molformer) | Supplementary |
 | 5.9 | ExactGP GIBBON effective support | Supplementary |
 | 5.10 | Separation of enriched molecules from the bulk (AUC, hit share) | Core |
 | 5.11 | Fit by score range: bias and RMSE by true-y bin | Core |
@@ -759,12 +853,12 @@ The following is the consolidated figure list. Core figures are intended for the
 | 5.22 | VariationalGP GIBBON enrichment | Core |
 | 5.22b | GIBBON enrichment versus training steps | Core |
 | 5.23 | VariationalGP GIBBON effective support | Supplementary |
-| 5.23b | Log GIBBON distribution across training steps, PLL and ELBO, Validation and GP-Molformer | Core |
-| 5.23c | GIBBON effective support versus training steps | Core |
-| 5.24 | Variance allocation across ExactGP, PLL and ELBO | Core |
-| 5.25 | Predictive performance across model families | Core |
-| 5.26 | GIBBON enrichment across model families | Core |
-| 5.27 | Selection trade-off overview across the 30 main-chapter arms (6 ExactGP, 24 VariationalGP) | Supplementary |
+| 5.23b | GIBBON effective support versus training steps | Core |
+| 5.24 | Log GIBBON distribution across training steps, PLL and ELBO, Validation and GP-Molformer | Core |
+| 5.25 | Variance allocation across ExactGP, PLL and ELBO | Core |
+| 5.26 | Predictive performance across model families | Core |
+| 5.27 | GIBBON enrichment across model families | Core |
+| 5.28 | Selection trade-off overview across the 30 main-chapter arms (6 ExactGP, 24 VariationalGP) | Supplementary |
 
 Aim to put approximately 12–16 figures in the main thesis and move remaining diagnostics into an appendix.
 

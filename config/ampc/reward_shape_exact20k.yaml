@@ -1,0 +1,240 @@
+# Reward-shape arm on the ExactGP chosen for the active-learning run: the
+# 20,000-molecule svgpscale set, isotropic Matern on the frozen MiniMol AmpC
+# fingerprints, LENGTHSCALE PRIOR ON, pinned mean
+# (outputs/ampc/exact_gp_sweep/n20000_on_pinned, fitted on Mila 2026-11-10).
+#
+#   LOG_SCORE_FLOOR=-150 sbatch jobs/reward_shape_exact20k_mila.sh power 0.1 0 5000 42
+#
+# WHY THIS SURROGATE. It is arm 1 of the four carried into the active-learning
+# run (thesis/surrogate_models/active_learning_model_selection.md): the prior
+# raises GIBBON top-100 enrichment on GP-Molformer from 1.57x to 3.98x while
+# leaving Validation and InVitro unchanged. The beta scan is run here on the
+# assumption that what it finds transfers to the variational arms; that
+# assumption is strongest for ELBO, which shares this model's noise-heavy
+# uncertainty allocation, and weakest for PLL, which does not.
+#
+# WHAT THE SCAN IS: a 4 x 4 GRID over beta and the floor, 16 arms, betas
+# 0.05 / 0.1 / 0.2 / 0.4 and floors -750 / -175 / -150 / -125. Both are set per
+# arm by jobs/reward_shape_exact20k_mila.sh; the values here are only defaults.
+#
+# WHY A GRID AND NOT TWO SCANS. beta and the floor are not independent. With
+# ``log R = beta * max(s, F)``: the fraction of the pool that is tied is set by
+# F alone, the reward ratio between two ABOVE-FLOOR molecules is set by beta
+# alone, but the ratio between the best molecule and the tied mass -- the
+# reward's total dynamic range, which is what drives how hard the policy is
+# pushed off the prior -- is set by the PRODUCT beta * (s_max - F). Tuning beta
+# at a fixed floor and then tuning the floor walks an L through a space whose
+# contours are diagonal, so the beta chosen in the first leg is not the right
+# one by the end of the second.
+#
+# WHERE THE GRID POINTS COME FROM. The floors are sited on the log GIBBON
+# distribution this surrogate assigns to gp_molformer_set, which is not a proxy
+# for the step-0 pool -- it IS the step-0 pool, 83,811 molecules sampled from
+# the GP-MoLFormer prior the policy is initialised to. That distribution is
+# tight: max -27.6, p99 -104.9, median -147.8, p1 -184.8, min -219.9. Hence
+# the above-floor fraction at step 0:
+#
+#     floor -250 and below   1.0000   (non-binding; -250, -400 and -750 are
+#                                      the same experiment)
+#     floor -175             ~0.93
+#     floor -150             0.5532
+#     floor -125             ~0.03
+#     floor -100             0.0060
+#     floor  -50             0.0001   (dead: the whole batch is tied, the
+#                                      reward expresses no preference, and
+#                                      training never leaves the ground)
+#
+# So the entire useful floor range is about -100 to -200 and -125 is the
+# boundary case, included to find where training stops starting at all.
+#
+# What the step-0 distribution does NOT tell you is whether a floor still binds
+# at step 2,000, once the policy has moved toward high acquisition. That does
+# not need predicting: reward/above_floor_fraction is logged every step.
+#
+# BETA, on the same evidence. The reward ratio across the pool with a
+# non-binding floor is exp(beta * spread), and the bulk spread is p1 to p99 =
+# ~80 nats, not the 192 of min to max (the maximum is one outlier molecule 77
+# nats clear of p99). So beta 0.05 spans ~55x, 0.1 ~3,000x, 0.2 ~9e6, 0.4 ~8e13.
+# Below ~0.02 the reward is nearly flat.
+#
+# -750 IS HOW "NO FLOOR" IS EXPRESSED, and `log_score_floor: null` is not: with
+# the power transform, null falls back to a BATCH-RELATIVE floor at
+# max(batch) - MAX_LOG_SCORE_SPREAD (20 nats, reward_transform.py), which makes
+# a molecule's reward depend on which molecules share its batch. -750 sits just
+# below float64's exp() underflow (log(5e-324) = -744.4), so no finite score is
+# clipped and only a genuinely-underflowed 0.0 lands on it.
+#
+# THE FLOOR SCALE HERE IS NOT THE svgp300k SCALE, and the svgp300k arms'
+# EMPIRICAL findings do not transfer either. That surrogate is a variational GP
+# on 300,000 molecules; this is an exact GP on 20,000. Its log GIBBON sits one
+# to two orders of magnitude lower (median -2,688 against -148) and ~77% of a
+# trained pool underflowed to exactly 0.0, against essentially none here. The
+# -500 default there, the ~1,150-step warmup before above_floor_fraction left
+# zero, and the floor->validity / beta->diversity mapping are all properties of
+# that reward landscape. Only the algebra above carries over.
+#
+# Everything outside the surrogate, the dataset and the floor is
+# reward_shape_svgp300k.yaml's.
+
+runtime:
+  device: cuda
+  # 32, matching the fit the state was saved from.
+  precision: 32
+  seed: 42
+
+dataset:
+  # The 20,000 molecules the fit saw: they rebuild the input scaling check and
+  # are the rows GIBBON's max-value support is drawn from.
+  type: ListDataset
+  initial_data:
+    path: data/ampc_svgpscale_20000.csv
+    x_columns: SMILE
+    y_column: y
+    fidelity_column: fidelity
+
+surrogate:
+  type: FixedFeatureGPSurrogate
+  # Restored in place of fitting; every setting below must match
+  # config/ampc/exact_gp_sweep.yaml as the n20000_on_pinned arm ran it, or
+  # load_state_dict raises.
+  state_path: outputs/ampc/exact_gp_sweep/n20000_on_pinned/surrogate_state.pt
+  encoder:
+    type: MiniMolAmpcSmilesFixedEncoder
+    checkpoint_path: minimol_ampc_encoder/model/final.pt
+    package_path: minimol_ampc_encoder
+    # cache_only FALSE and a live cache, unlike the sweep config this mirrors:
+    # the sweep only ever encoded cached library molecules, and the policy's
+    # generated SMILES are in no cache. device cuda for the same reason --
+    # every training step encodes a fresh batch.
+    device: cuda
+    batch_size: 64
+    cache_size: 4096
+    cache_only: false
+    feature_cache_path: cache/ampc/exact_dkl_top_n/svgpscale_20000.npy
+  lengthscale_prior: true
+  ard: false
+  kernel: matern
+  outputscale: true
+  prior_mean: 0.004286418936043844  # Mean y of data/10M_unif_random_subset.csv, recomputed 2026-11-07 after the y relabel.
+  constant_kernel: false
+  scale_inputs: true
+  standardize_outputs: true
+  max_cholesky_size: 30000
+  accept_abnormal_lbfgsb: true
+
+acquisition:
+  type: QLowerBoundMaxValueEntropy
+  candidate_set_spec:
+    # No max_support_size: all 20,000 training rows are the max-value support,
+    # as in the earlier 25,000-molecule exact-GP arms.
+    type: TrainDataCandidateSetSpec
+    fallback_size: 100000
+    seed: 42
+  num_mv_samples: 10
+  # 64 and not svgp300k's 256: an exact GP concatenates its training rows onto
+  # every candidate, so peak memory is chunk x n_train. 64 is the value the
+  # 25,000-molecule exact-GP arms used, i.e. tested at this scale.
+  score_chunk_size: 64
+  maximize: true
+  # log_space so the information gain never underflows; log_output false so it
+  # comes back on the VALUE scale, which is what the power transform logs.
+  log_space: true
+  log_output: false
+
+sampler:
+  type: S3GFNSampler
+  n_samples: 100000
+  fidelities: [1]
+  model_name_or_path: ibm-research/GP-MoLFormer-Uniq
+  tokenizer_name_or_path: ibm-research/MoLFormer-XL-both-10pct
+  trust_remote_code: true
+  performance_mode: optimized
+  max_length: 80
+  batch_size: 64
+  replay_batch_size: 64
+  generation_batch_size: 128
+  # Transform, beta and steps are set per arm by the job script; the floor is
+  # fixed at the non-binding -750 for this scan.
+  n_train_steps: 5000
+  num_warmup_steps: 10
+  reward_transform: power
+  beta: 0.1
+  log_score_floor: -750.0
+  initial_log_z: -8.0
+  log_z_learning_rate: 0.01
+  aux_coefficient: 0.001
+  sa_threshold: 4.0
+
+selector:
+  type: CostAwareSelector
+
+oracle:
+  type: Dock3Oracle
+  mol_repr: smiles
+  indock_template: /home/ethankrz/dock_smiles/ampc_dockfiles/INDOCK
+  dockfiles_dir: /home/ethankrz/dock_smiles/ampc_dockfiles
+  fidelity_costs:
+    1: 1.0
+  fidelity_confidences:
+    1: 1.0
+  num_workers: null
+  ligbuild_timeout: 150
+  hitrate_params: ampc_hitrate_fits/fitted_params.json
+  score_pprop_table: ampc_hitrate_fits/data/ampc_full_scores_1p7b.df
+  hitrate_target: ampc
+  pki_threshold: 6.5
+
+budget:
+  available_budget: 10000.0
+  schedule:
+    type: constant
+    value: 10000.0
+  # Required with surrogate.state_path: train the policy once against a fixed
+  # surrogate and look at what it generated.
+  max_rounds: 1
+
+logger:
+  # Run names and tags are overridden per arm by the job script.
+  type: MultiLogger
+  loggers:
+    - type: ConsoleLogger
+      project_name: thesis-ampc-reward-shape-exact20k
+      run_name: reward-shape
+    - type: WandbLogger
+      project_name: thesis-ampc-reward-shape-exact20k
+      run_name: reward-shape
+      entity: models-mila5723
+      group: reward-shape
+      tags: [reward-shape]
+
+run_writer:
+  type: JSONLinesRunWriter
+  output_dir: outputs/ampc/reward_shape_exact20k/default
+  write_samples: true
+  # THESIS-GRADE, DO NOT TURN OFF. write_sample_scores is what makes the loop
+  # take a second posterior pass over the generated pool and write
+  # artifacts/acquisition/general/round_0001/scored_samples.csv: one row per
+  # molecule of the final 100,000-molecule sample with
+  #
+  #   x                   the SMILES, as the sampler canonicalized it
+  #   gp_mean             the surrogate's mean prediction
+  #   gp_std              the LATENT sd, which is what GIBBON consumed
+  #   gp_total_std        latent + fitted noise, which a residual must be
+  #                       divided by and which cannot be recovered from gp_std
+  #   acquisition_score   the raw GIBBON value
+  #   reward_input_score  max(log(acq), log_score_floor) -- the log GIBBON the
+  #                       policy was actually trained against
+  #   ranking_score, selected, selection_rank
+  #
+  # Without it the pool is written as SMILES and fidelity only (write_pool_log)
+  # and the posterior behind every acquisition score is lost: the policy is not
+  # checkpointed and the surrogate's predictions on generated molecules exist
+  # nowhere else.
+  #
+  # reward_input_score is DROPPED under the power transform when
+  # log_score_floor is null, because a batch-relative floor is undefined for a
+  # 100k pool that was never one of the sampler's batches. The fixed -750 keeps
+  # the column -- a second, independent reason not to express "no floor" as
+  # null.
+  write_sample_scores: true
+  write_config: true
