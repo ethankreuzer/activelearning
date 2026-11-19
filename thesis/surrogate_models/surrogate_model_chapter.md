@@ -11,7 +11,7 @@
 
 ### 5.0.1 GP surrogate and active-learning pipeline
 
-**Purpose:** Show why the GP's uncertainty matters beyond regression accuracy.
+**Purpose:** Explain the GP's role in the discovery pipeline.
 
 **Figure 0.1 — GP-guided molecular discovery pipeline**
 
@@ -26,7 +26,7 @@
 
 ### 5.1.1 Overview of the ExactGP sweep and the effect of the prior on the kernel
 
-**Purpose:** Introduce the two models and show the kernel change the rest of the section builds on.
+**Purpose:** Introduce the two models and their learned kernels.
 
 **Figure 5.1.1 — The lengthscale prior reshapes the learned ExactGP kernel**
 
@@ -35,9 +35,9 @@
 **Takeaway:** With the prior the lengthscale falls from 19.2 to 2.75 and the outputscale from 18.2 to 0.18, about an order of magnitude each. The prior therefore changes the function class, not just the amount of regularisation.
 
 
-### 5.1.2 Fit: the prior barely moves the predicted means
+### 5.1.2 Fit of the predictive mean
 
-**Purpose:** Show that the mean fit does not separate the two models.
+**Purpose:** Demonstrate how well the predictive mean fits the targets on each held-out set.
 
 **Figure 5.1.2 — The prior does not change how well the mean separates enriched from bulk**
 
@@ -58,9 +58,9 @@
 **Takeaway:** Both models predict at most about 0.65, and high scorers (y ≥ 0.52) are predicted anywhere from about 0.1 to 0.65. The prior-on panel is wider at the lowest scores, consistent with its slightly higher bulk error.
 
 
-### 5.1.3 Predictive uncertainty: the prior moves variance from the noise into the latent GP
+### 5.1.3 Predictive uncertainty
 
-**Purpose:** Show how the prior splits predictive variance between the latent GP and the noise, whether the latent uncertainty ranks errors, and whether the intervals are calibrated.
+**Purpose:** Investigate how the model handles variance: how it is split between the latent GP and the noise, whether the latent part ranks errors, and whether the intervals are calibrated.
 
 **Figure 5.1.5 — The prior raises the latent variance of every molecule**
 
@@ -95,7 +95,7 @@
 
 ### 5.1.4 GIBBON acquisition behavior across the evaluation distributions
 
-**Purpose:** Show how the learned GP changes the molecules GIBBON acquires, since GIBBON uses the latent variance.
+**Purpose:** Investigate how the learned GP behaves when GIBBON uses it to rank candidates.
 
 **Figure 5.1.10 — The prior raises GIBBON enrichment only on the GP-Molformer distribution**
 
@@ -129,7 +129,7 @@
 
 ### 5.2.1 Overview of the VariationalGP sweep and the effect of the prior on the kernel
 
-**Purpose:** Introduce the factorial design and show the kernel change under each objective.
+**Purpose:** Introduce the factorial design and the learned kernels under each objective.
 
 **Figure 5.2.1 — The lengthscale prior shifts the learned kernel under both objectives**
 
@@ -138,9 +138,9 @@
 **Takeaway:** The prior lowers the lengthscale about 3× under both objectives (ELBO 17 to 22 off, 5.5 to 6.8 on; PLL 14 to 22 off, 5.4 to 6.3 on) and the outputscale about 4 to 5× (ELBO 1.1 to 2.8 off, 0.26 to 0.41 on; PLL 0.9 to 3.2 off, 0.34 to 0.54 on).
 
 
-### 5.2.2 Fit: the predicted means do not separate the models
+### 5.2.2 Fit of the predictive mean
 
-**Purpose:** Show that the mean fit cannot decide between the models.
+**Purpose:** Demonstrate how well the predictive mean fits the targets for each objective, prior and step count.
 
 **Figure 5.2.2 — Every model separates enriched molecules from the bulk equally well**
 
@@ -169,7 +169,7 @@
 
 ### 5.2.3 Effect of the training objective on uncertainty allocation
 
-**Purpose:** Show how each objective splits uncertainty between the GP posterior and the noise.
+**Purpose:** Investigate how each objective splits uncertainty between the GP posterior and the noise.
 
 **Figure 5.2.5 — PLL and ELBO occupy different regions of uncertainty-allocation space**
 
@@ -180,7 +180,7 @@
 
 ### 5.2.4 Effect of training duration on learned uncertainty
 
-**Purpose:** Show how noise and latent variance change with training length.
+**Purpose:** Investigate how noise and latent variance change with training length.
 
 **Figure 5.2.6 — Training steps move the two objectives in opposite directions in noise and latent variance**
 
@@ -231,7 +231,7 @@
 
 ### 5.2.7 GIBBON acquisition behavior
 
-**Purpose:** Show how the variational models' acquisition compares across evaluation sets and training length.
+**Purpose:** Investigate how acquisition behaves across evaluation sets and training length.
 
 **Figure 5.2.11 — GIBBON enrichment of VariationalGP models across evaluation sets**
 
