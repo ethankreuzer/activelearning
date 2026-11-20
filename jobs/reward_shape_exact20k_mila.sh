@@ -251,6 +251,7 @@ uv run --no-sync python scripts/run_with_sigterm_flush.py \
   "sampler.loss=${LOSS}" \
   "sampler.log_score_floor=${LOG_SCORE_FLOOR}" \
   "sampler.log_z_learning_rate=${LOG_Z_LR}" \
+  "sampler.max_generation_attempts=500000" \
   "${SEED_OVERRIDE[@]}" \
   "run_writer.output_dir=${OUTPUT_DIR}" \
   "sampler.reject_log_path=${REJECT_LOG_PATH}" \
