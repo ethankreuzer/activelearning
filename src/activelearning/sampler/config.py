@@ -390,6 +390,11 @@ class S3GFNSamplerConfig(BaseModel):
     same numbers the per-step figures are drawn from, as data, so they can be
     re-binned or overlaid rather than only looked at. One row per step. None
     disables it.
+    generation_summary_path : str, optional
+    JSON of the round's generation and training counts -- attempts, yield, why
+    strings were rejected, validity and uniqueness totals -- with ``{round}``
+    replaced by the round index. Written even when final generation fails, which
+    is the case where ``round_history.jsonl`` is empty. None disables it.
     step_bin_size : int, default=100
     Training steps reduced to one median point on the per-step figures, so the
     curves show a trend rather than batch-to-batch noise. The median resists
@@ -449,6 +454,7 @@ class S3GFNSamplerConfig(BaseModel):
     pool_log_path: str | None = None
     training_sample_log_path: str | None = None
     training_step_log_path: str | None = None
+    generation_summary_path: str | None = None
     step_bin_size: int = Field(default=100, ge=1)
     seed: int = Field(default=42, ge=0)
 
@@ -537,6 +543,7 @@ class S3GFNSamplerConfig(BaseModel):
             pool_log_path=self.pool_log_path,
             training_sample_log_path=self.training_sample_log_path,
             training_step_log_path=self.training_step_log_path,
+            generation_summary_path=self.generation_summary_path,
             step_bin_size=self.step_bin_size,
             seed=self.seed,
         )

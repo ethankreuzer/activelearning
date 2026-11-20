@@ -12,12 +12,14 @@ from __future__ import annotations
 
 import csv
 import gzip
+import json
 from pathlib import Path
 
 import pytest
 
 from activelearning.sampler.s3gfn.logging import (
     _RoundMetrics,
+    write_generation_summary,
     write_training_samples_log,
     write_training_steps_log,
 )
@@ -262,3 +264,115 @@ def test_training_steps_log_omits_series_that_never_recorded(tmp_path: Path) -> 
         header = next(csv.reader(handle))
     assert "above_floor_fraction" not in header
     assert "log_z" in header
+
+
+def _generation_summary(tmp_path: Path, metrics: _RoundMetrics, **overrides) -> dict:
+    """Write a summary for ``metrics`` and read it back."""
+    settings = {
+        "round_index": 1,
+        "n_samples": 95,
+        "max_attempts": 500,
+        "generation_elapsed_s": 12.5,
+    }
+    settings.update(overrides)
+    written = write_generation_summary(
+        metrics, str(tmp_path / "gen_{round}.json"), **settings
+    )
+    assert written is not None
+    return json.loads(Path(written).read_text(encoding="utf-8"))
+
+
+def test_generation_summary_of_a_finished_round_uses_the_pool_size(
+    tmp_path: Path,
+) -> None:
+    metrics = _two_steps()
+    metrics.record_generation_batch(attempts=100, invalid_count=3, duplicate_count=2)
+    metrics.record_reject_count("unterminated", 3, phase="generation")
+    # Only len() is read, so strings stand in for Candidates.
+    metrics.final_candidates = tuple("C" * (i + 1) for i in range(95))
+
+    summary = _generation_summary(tmp_path, metrics)
+
+    generation = summary["generation"]
+    assert summary["reached_target"] is True
+    assert generation["attempts"] == 100
+    # 100 - 3 - 2 = 95 here; the pool's own size is what is reported.
+    assert generation["accepted_count"] == 95
+    assert generation["yield"] == pytest.approx(0.95)
+    assert generation["invalid_rate"] == pytest.approx(0.03)
+    assert generation["duplicate_rate"] == pytest.approx(0.02)
+    assert generation["cap_reached"] is False
+    assert generation["reject_counts"] == {"unterminated": 3}
+    assert generation["duration_s"] == 12.5
+
+
+def test_generation_summary_of_a_failed_round_derives_the_accepted_count(
+    tmp_path: Path,
+) -> None:
+    """No pool exists after a failure, so the counters are all there is."""
+    metrics = _two_steps()
+    metrics.record_generation_batch(attempts=500, invalid_count=100, duplicate_count=300)
+    metrics.record_reject_count("disconnected", 100, phase="generation")
+
+    summary = _generation_summary(tmp_path, metrics, max_attempts=500)
+
+    generation = summary["generation"]
+    assert summary["reached_target"] is False
+    assert generation["accepted_count"] == 100
+    assert generation["yield"] == pytest.approx(0.2)
+    assert generation["duplicates"] == 300
+    assert generation["cap_reached"] is True
+
+
+def test_generation_summary_carries_training_totals_and_phase_rates(
+    tmp_path: Path,
+) -> None:
+    metrics = _two_steps()
+    metrics.record_generation_batch(attempts=10, invalid_count=0, duplicate_count=0)
+    metrics.record_reject_count("parse_error", 3, phase="train")
+    metrics.record_reject_count("parse_error", 5, phase="generation")
+
+    summary = _generation_summary(tmp_path, metrics)
+
+    train = summary["train"]
+    # _two_steps generates 3 + 3 strings, 3 valid, 3 unique.
+    assert train["generated_total"] == 6
+    assert train["valid_total"] == 3
+    assert train["validity_rate"] == pytest.approx(0.5)
+    assert train["unique_total"] == 3
+    assert train["unique_rate"] == pytest.approx(0.5)
+    # Each phase is normalised by its own denominator, as the W&B metrics are.
+    assert train["reject_counts"] == {"parse_error": 3}
+    assert train["reject_rates"]["parse_error"] == pytest.approx(3 / 6)
+    assert summary["generation"]["reject_rates"]["parse_error"] == pytest.approx(0.5)
+
+
+def test_generation_summary_resolves_the_round_placeholder(tmp_path: Path) -> None:
+    metrics = _two_steps()
+    metrics.record_generation_batch(attempts=4, invalid_count=0, duplicate_count=0)
+
+    written = write_generation_summary(
+        metrics,
+        str(tmp_path / "gen_{round}.json"),
+        round_index=7,
+        n_samples=4,
+        max_attempts=10,
+    )
+
+    assert written == str(tmp_path / "gen_0007.json")
+    assert json.loads(Path(written).read_text())["round"] == 7
+
+
+def test_generation_summary_skips_a_round_that_recorded_nothing(
+    tmp_path: Path,
+) -> None:
+    written = write_generation_summary(
+        _RoundMetrics(),
+        str(tmp_path / "gen_{round}.json"),
+        round_index=1,
+        n_samples=4,
+        max_attempts=10,
+    )
+
+    assert written is None
+    assert list(tmp_path.iterdir()) == []

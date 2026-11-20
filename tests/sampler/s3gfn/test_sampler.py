@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import json
 import random
 from pathlib import Path
 from types import SimpleNamespace
@@ -283,6 +284,77 @@ def test_final_generation_stops_at_strict_attempt_cap(make_sampler):
 
     assert model.calls == [3]
     assert sampler.round_metrics.generation_invalid == 3
+
+
+def test_training_logs_are_written_when_final_generation_fails(
+    make_sampler,
+    fake_model,
+    fake_acquisition,
+    patch_molecule_dependencies,
+):
+    sampler = make_sampler()
+    sampler._new_round_model = lambda: fake_model
+    sampler._train_round = lambda **kwargs: None
+    written: list[int] = []
+    sampler._write_training_logs = written.append
+
+    def _fail(**kwargs):
+        raise RuntimeError("short pool")
+
+    sampler._generate_final_candidates = _fail
+
+    with pytest.raises(RuntimeError, match="short pool"):
+        sampler.sample(
+            acquisition=fake_acquisition,
+            cost_fn=lambda candidates: [1.0 for _ in candidates],
+        )
+
+    assert len(written) == 1
+
+
+def test_generation_summary_is_written_when_final_generation_fails(
+    make_sampler,
+    fake_acquisition,
+    patch_molecule_dependencies,
+    tmp_path,
+):
+    """A collapsed policy leaves no metrics flush, so the file is the only record."""
+
+    class _EmptyGenerationModel:
+        pad_token_id = 0
+
+        def __init__(self) -> None:
+            self.policy = nn.Linear(1, 1)
+            self.prior = nn.Linear(1, 1)
+
+        def generate(self, count, max_length, temperature):
+            del max_length, temperature
+            return SimpleNamespace(smiles=(), fidelity_indices=None)
+
+    sampler = make_sampler(
+        n_samples=1,
+        generation_batch_size=8,
+        max_generation_attempts=3,
+        generation_summary_path=str(tmp_path / "gen_{round}.json"),
+    )
+    sampler._new_round_model = lambda: _EmptyGenerationModel()
+    sampler._train_round = lambda **kwargs: None
+
+    with pytest.raises(RuntimeError, match="after 3 attempts"):
+        sampler.sample(
+            acquisition=fake_acquisition,
+            cost_fn=lambda candidates: [1.0 for _ in candidates],
+        )
+
+    (path,) = tmp_path.glob("gen_*.json")
+    summary = json.loads(path.read_text(encoding="utf-8"))
+    assert summary["reached_target"] is False
+    assert summary["generation"]["attempts"] == 3
+    assert summary["generation"]["cap_reached"] is True
+    assert summary["generation"]["accepted_count"] == 0
+    assert summary["generation"]["yield"] == 0.0
+    assert summary["generation"]["reject_counts"] == {"unterminated": 3}
+    assert isinstance(summary["generation"]["duration_s"], float)
 
 
 def test_sampler_returns_canonical_smiles_with_conditionally_sampled_fidelities(

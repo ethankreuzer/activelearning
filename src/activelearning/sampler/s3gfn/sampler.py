@@ -39,6 +39,7 @@ from activelearning.sampler.s3gfn._optional import (
 from activelearning.sampler.s3gfn.logging import (
     S3GFNLoggingMixin,
     _RoundMetrics,
+    write_generation_summary,
     write_pool_log,
     write_reject_log,
     write_training_samples_log,
@@ -172,6 +173,7 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
         pool_log_path: str | None = None,
         training_sample_log_path: str | None = None,
         training_step_log_path: str | None = None,
+        generation_summary_path: str | None = None,
         step_bin_size: int = 100,
         seed: int = 42,
     ) -> None:
@@ -417,6 +419,7 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
         self.pool_log_path = pool_log_path
         self.training_sample_log_path = training_sample_log_path
         self.training_step_log_path = training_step_log_path
+        self.generation_summary_path = generation_summary_path
         self.step_bin_size = step_bin_size
         self.seed = seed
         # Separate from the global seed so sampling rejects never consumes
@@ -560,9 +563,20 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
             # A round that cannot reach n_samples raises here, and that is
             # exactly the round whose rejects explain why. Write them first.
             self._write_reject_log(round_number)
+            # The per-step series is the only record of a trained policy (it
+            # is not checkpointed), so a policy too degenerate to yield
+            # n_samples must not take its own training curves down with it.
+            # After training and generation, so both hold the whole round.
+            self._write_training_logs(round_number)
+            # The counts that say WHY a round failed -- attempts, yield, reject
+            # reasons -- exist nowhere else on disk: the round's metrics are
+            # flushed only after generation succeeds, so round_history.jsonl is
+            # empty for exactly the arms that collapsed.
+            self._write_generation_summary(
+                round_number,
+                generation_elapsed_s=time.perf_counter() - generation_started,
+            )
         self._write_pool_log(round_number, candidates)
-        # After training and generation, so both hold the whole round.
-        self._write_training_logs(round_number)
         self.round_metrics.generation_duration_s = (
             time.perf_counter() - generation_started
         )
@@ -1448,6 +1462,27 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
                 _logger.warning(
                     "Could not write the training %s log: %s", label, error
                 )
+
+    def _write_generation_summary(
+        self,
+        round_number: int,
+        *,
+        generation_elapsed_s: float,
+    ) -> None:
+        """Write the round's generation and training counts, never failing the round."""
+        if self.generation_summary_path is None:
+            return
+        try:
+            write_generation_summary(
+                self.round_metrics,
+                self.generation_summary_path,
+                round_index=round_number,
+                n_samples=self.n_samples,
+                max_attempts=self.max_generation_attempts,
+                generation_elapsed_s=generation_elapsed_s,
+            )
+        except (OSError, ValueError) as error:
+            _logger.warning("Could not write the generation summary: %s", error)
 
     def _write_pool_log(
         self,

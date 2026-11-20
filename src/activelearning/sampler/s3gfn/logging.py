@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import gzip
+import json
 import logging
 import math
 import random
@@ -981,6 +982,124 @@ def write_reject_log(
         len(metrics.reject_examples),
         resolved,
     )
+    return str(resolved)
+
+
+def write_generation_summary(
+    metrics: _RoundMetrics,
+    path: str,
+    *,
+    round_index: int,
+    n_samples: int,
+    max_attempts: int,
+    generation_elapsed_s: float | None = None,
+) -> str | None:
+    """Write the round's training and generation counts to a JSON file.
+
+    These are the numbers the W&B summary carries as ``sampler/s3gfn/generation/*``
+    and ``sampler/s3gfn/train/*``, and they are the ones that decide whether an arm
+    is healthy: the generation yield, the attempts it took, and why strings were
+    thrown away. A round that cannot reach ``n_samples`` raises before the round's
+    metrics are ever flushed, so ``round_history.jsonl`` is empty for exactly the
+    arms that collapsed. Writing this from the accumulator, which survives the
+    failure, is what keeps those arms' numbers on disk.
+
+    Parameters
+    ----------
+    metrics : _RoundMetrics
+        Accumulator for the round.
+    path : str
+        Destination path. ``{round}`` is replaced by the zero-padded round index.
+    round_index : int
+        Round the counts came from.
+    n_samples : int
+        Number of unique candidates the round was asked for.
+    max_attempts : int
+        The generation attempt cap in force.
+    generation_elapsed_s : float, optional
+        Seconds spent in final generation. Passed in rather than read from
+        ``metrics.generation_duration_s``, which is only set after a round
+        succeeds.
+
+    Returns
+    -------
+    str or None
+        The path written, or None when the round recorded nothing.
+
+    Notes
+    -----
+    On a successful round ``accepted_count`` is the size of the final pool. On a
+    failed one no pool exists, so it is the unique valid molecules the loop had
+    accumulated, ``attempts - invalid - duplicates``; that identity is exact only
+    because nothing is capped away before the target is reached.
+    """
+    attempts = metrics.generation_attempts
+    generated_total = sum(metrics.generated_counts)
+    if attempts == 0 and generated_total == 0:
+        return None
+    reached_target = len(metrics.final_candidates) == n_samples
+    if metrics.final_candidates:
+        accepted = len(metrics.final_candidates)
+    else:
+        accepted = max(
+            attempts - metrics.generation_invalid - metrics.generation_duplicates,
+            0,
+        )
+    valid_total = sum(metrics.valid_counts)
+    synthesizable_total = sum(metrics.synthesizable_counts)
+    unique_total = sum(metrics.unique_counts) if metrics.unique_counts else None
+
+    reject_counts: dict[str, dict[str, int]] = {"train": {}, "generation": {}}
+    reject_rates: dict[str, dict[str, float]] = {"train": {}, "generation": {}}
+    for key, count in sorted(metrics.reject_counts.items()):
+        phase, _, reason = key.partition("/")
+        denominator = generated_total if phase == "train" else attempts
+        reject_counts.setdefault(phase, {})[reason] = count
+        reject_rates.setdefault(phase, {})[reason] = _safe_ratio(count, denominator)
+
+    summary = {
+        "round": round_index,
+        "reached_target": reached_target,
+        "n_samples_requested": n_samples,
+        "generation": {
+            "max_attempts": max_attempts,
+            "attempts": attempts,
+            "cap_reached": attempts >= max_attempts,
+            "accepted_count": accepted,
+            "yield": _safe_ratio(accepted, attempts),
+            "invalid": metrics.generation_invalid,
+            "invalid_rate": _safe_ratio(metrics.generation_invalid, attempts),
+            "duplicates": metrics.generation_duplicates,
+            "duplicate_rate": _safe_ratio(metrics.generation_duplicates, attempts),
+            "reject_counts": reject_counts["generation"],
+            "reject_rates": reject_rates["generation"],
+            "duration_s": generation_elapsed_s,
+        },
+        "train": {
+            "online_updates": metrics.online_updates,
+            "replay_updates": metrics.replay_updates,
+            "generated_total": generated_total,
+            "valid_total": valid_total,
+            "synthesizable_total": synthesizable_total,
+            "unique_total": unique_total,
+            "validity_rate": _safe_ratio(valid_total, generated_total),
+            "synthesizable_rate": _safe_ratio(synthesizable_total, valid_total),
+            "unique_rate": (
+                None
+                if unique_total is None
+                else _safe_ratio(unique_total, generated_total)
+            ),
+            "reject_counts": reject_counts["train"],
+            "reject_rates": reject_rates["train"],
+            "positive_buffer": metrics.positive_buffer_size,
+            "negative_buffer": metrics.negative_buffer_size,
+            "duration_s": metrics.training_duration_s,
+        },
+    }
+    resolved = Path(path.replace("{round}", f"{round_index:04d}"))
+    resolved.parent.mkdir(parents=True, exist_ok=True)
+    resolved.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+    _logger.info("Wrote the generation summary to %s.", resolved)
     return str(resolved)
 
 
