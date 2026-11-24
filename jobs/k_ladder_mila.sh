@@ -9,6 +9,15 @@
 #
 # jobs/submit_k_ladder.sh submits the whole ladder: 3 surrogates x 5 K x 2 seeds.
 #
+# DESALT=1 turns on sampler.desalt_largest_fragment: a multi-fragment generation
+# (a molecule plus a counter-ion tail such as .Cl) is reduced to its largest
+# fragment and scored, instead of being rejected, and the salted trajectory goes
+# to the negative buffer. Such an arm is named kladder_<surrogate>-desalt_K..., is
+# tagged "desalt", sits in W&B group k-ladder-<surrogate>-desalt, and records
+# "desalt_largest_fragment": true in arm_params.json, so it cannot be mistaken for
+# the reject-only arms of the same surrogate.
+#   DESALT=1 sbatch jobs/k_ladder_mila.sh pll 100 42
+#
 # WHAT K IS. K = R(p99) / R(median): how many times larger the reward of the
 # 99th-percentile molecule is than the median molecule's, on the surrogate's own
 # log-GIBBON distribution on gp_molformer_set. That set is the policy's step-0
@@ -93,6 +102,23 @@ INITIAL_LOG_Z="0"
 LOG_Z_LR="0.01"
 WANDB_PROJECT="thesis-ampc-k-ladder"
 
+DESALT="${DESALT:-0}"
+if [[ ! "${DESALT}" =~ ^[01]$ ]]; then
+  echo "DESALT must be 0 or 1, got '${DESALT}'." >&2
+  exit 2
+fi
+# What the arm is called everywhere. A desalted arm gets its own label, with a
+# hyphen rather than an underscore so a glob like kladder_pll_* still matches only
+# the reject-only arms.
+SURROGATE_LABEL="${SURROGATE}"
+DESALT_TAG=""
+DESALT_BOOL="false"
+if [[ "${DESALT}" == "1" ]]; then
+  SURROGATE_LABEL="${SURROGATE}-desalt"
+  DESALT_TAG=",desalt"
+  DESALT_BOOL="true"
+fi
+
 case "${SURROGATE}" in
   exactgp)
     BASE_CONFIG="config/ampc/reward_shape_exact20k.yaml"
@@ -155,7 +181,7 @@ if [[ -z "${BETA:-}" || -z "${LOG_SCORE_FLOOR:-}" ]]; then
   exit 2
 fi
 
-ARM="kladder_${SURROGATE}_K${K}_s${SEED}_steps${N_TRAIN_STEPS}"
+ARM="kladder_${SURROGATE_LABEL}_K${K}_s${SEED}_steps${N_TRAIN_STEPS}"
 # Optional suffix for rerunning an arm whose settings are unchanged, so the
 # rerun gets its own directory instead of colliding with the earlier pool.
 ARM_SUFFIX="${ARM_SUFFIX:-}"
@@ -179,7 +205,7 @@ TRAINING_SAMPLE_LOG_PATH="${OUTPUT_DIR}/training_samples_round_{round}.csv.gz"
 GENERATION_SUMMARY_PATH="${OUTPUT_DIR}/generation_summary_round_{round}.json"
 
 RUN_NAME="${ARM//_/-}-${SLURM_JOB_ID:-local}"
-TAGS="k-ladder,no-docking,${TRANSFORM},K${K},beta${BETA},vargrad,floor${LOG_SCORE_FLOOR},floor-p5,steps${N_TRAIN_STEPS},${SURROGATE_TAGS},restored-state,1-round,seed${SEED}${ARM_SUFFIX:+,suffix${ARM_SUFFIX}}"
+TAGS="k-ladder${DESALT_TAG},no-docking,${TRANSFORM},K${K},beta${BETA},vargrad,floor${LOG_SCORE_FLOOR},floor-p5,steps${N_TRAIN_STEPS},${SURROGATE_TAGS},restored-state,1-round,seed${SEED}${ARM_SUFFIX:+,suffix${ARM_SUFFIX}}"
 
 # Restated as one YAML value each rather than overridden field by field:
 # OmegaConf.from_dotlist reads every path segment as a dict key, so
@@ -187,7 +213,7 @@ TAGS="k-ladder,no-docking,${TRANSFORM},K${K},beta${BETA},vargrad,floor${LOG_SCOR
 # its receptor paths behind.
 ORACLE="oracle={type: ConstantOracle, value: 0.0, fidelity_costs: {1: 1.0}}"
 BUDGET="budget={available_budget: 1.0, schedule: {type: constant, value: 1.0}, max_rounds: 1}"
-LOGGER="logger={type: MultiLogger, loggers: [{type: ConsoleLogger, project_name: ${WANDB_PROJECT}, run_name: ${RUN_NAME}}, {type: WandbLogger, project_name: ${WANDB_PROJECT}, run_name: ${RUN_NAME}, entity: models-mila5723, group: k-ladder-${SURROGATE}, tags: [mila,${TAGS}]}]}"
+LOGGER="logger={type: MultiLogger, loggers: [{type: ConsoleLogger, project_name: ${WANDB_PROJECT}, run_name: ${RUN_NAME}}, {type: WandbLogger, project_name: ${WANDB_PROJECT}, run_name: ${RUN_NAME}, entity: models-mila5723, group: k-ladder-${SURROGATE_LABEL}, tags: [mila,${TAGS}]}]}"
 
 OVERRIDES=(
   "${SURROGATE_OVERRIDES[@]}"
@@ -199,6 +225,7 @@ OVERRIDES=(
   "sampler.log_score_floor=${LOG_SCORE_FLOOR}"
   "sampler.log_z_learning_rate=${LOG_Z_LR}"
   "sampler.max_generation_attempts=${MAX_GENERATION_ATTEMPTS}"
+  "sampler.desalt_largest_fragment=${DESALT_BOOL}"
   "runtime.seed=${SEED}"
   "run_writer.output_dir=${OUTPUT_DIR}"
   "sampler.reject_log_path=${REJECT_LOG_PATH}"
@@ -218,6 +245,7 @@ export HF_HUB_OFFLINE=1   # nothing is downloaded: the prior and encoder are cac
 
 echo "arm        ${ARM}"
 echo "surrogate  ${SURROGATE}   (${FITTED_DIR})"
+echo "desalt     ${DESALT_BOOL}   (sampler.desalt_largest_fragment)"
 echo "K          ${K}   beta ${BETA}   floor ${LOG_SCORE_FLOOR} (5th percentile)"
 echo "dist       median ${DIST_MEDIAN}   p99 ${DIST_P99}   p5 ${DIST_P5}   n ${DIST_N}"
 echo "steps      ${N_TRAIN_STEPS}   seed ${SEED}   max_generation_attempts ${MAX_GENERATION_ATTEMPTS}"
@@ -244,6 +272,8 @@ print("sampler.log_score_floor", sampler.log_score_floor)
 print("sampler.loss          ", sampler.loss)
 print("sampler.n_train_steps ", sampler.n_train_steps)
 print("sampler.max_generation_attempts", sampler.max_generation_attempts)
+print("sampler.desalt_largest_fragment", sampler.desalt_largest_fragment)
+print("sampler.aux_coefficient", sampler.aux_coefficient)
 print("sampler.generation_summary_path", sampler.generation_summary_path)
 print("runtime.seed          ", cfg.runtime.seed)
 print("oracle.type           ", type(cfg.oracle).__name__)
@@ -274,6 +304,7 @@ cat > "${OUTPUT_DIR}/arm_params.json" <<JSON
 {
   "arm": "${ARM}",
   "surrogate": "${SURROGATE}",
+  "desalt_largest_fragment": ${DESALT_BOOL},
   "K": ${K},
   "beta": ${BETA},
   "log_score_floor": ${LOG_SCORE_FLOOR},
@@ -297,7 +328,12 @@ cat > "${OUTPUT_DIR}/arm_params.json" <<JSON
 JSON
 python3 -c "import json,sys; json.load(open(sys.argv[1]))" "${OUTPUT_DIR}/arm_params.json"
 
-export WANDB_NOTES="K-LADDER arm ${ARM}, on Mila, WITHOUT DOCKING. One active-learning round training the S3-GFN policy against a fixed GIBBON acquisition on a frozen surrogate, generating its pool, then one stubbed oracle query.
+DESALT_NOTE=""
+if [[ "${DESALT}" == "1" ]]; then
+  DESALT_NOTE="DESALTING IS ON (sampler.desalt_largest_fragment=true). A generation made of a molecule plus a counter-ion tail (e.g. .Cl) is reduced to its fragment with the most heavy atoms; that parent is scored and trained on as a positive, and the salted trajectory the policy actually sampled goes to the negative buffer for the contrastive loss. Reject-only arms of the same surrogate (no -desalt in the name) discard such samples instead, so validity, reject counts and yield are NOT comparable between the two without allowing for that: 'desalted' rows count as valid here. A desalted column is added to training_steps_round_0001.csv and 'desalted' appears in the reject counts.
+"
+fi
+export WANDB_NOTES="${DESALT_NOTE}K-LADDER arm ${ARM}, on Mila, WITHOUT DOCKING. One active-learning round training the S3-GFN policy against a fixed GIBBON acquisition on a frozen surrogate, generating its pool, then one stubbed oracle query.
 THE QUESTION: how does the reward's dynamic range shape training, on a scale that means the same thing for every surrogate? K = R(p99)/R(median) is how many times larger the reward of the 99th-percentile molecule is than the median molecule's, on this surrogate's log-GIBBON distribution on gp_molformer_set (n=${DIST_N}), which is the policy's step-0 sampling distribution. The reward is log R = beta * r with r the log GIBBON, so K = exp(beta * (p99 - median)) and beta = ln(K) / (p99 - median). This arm: K=${K}, median ${DIST_MEDIAN}, p99 ${DIST_P99}, so beta=${BETA}. beta has units of 1/nats and does not transfer between surrogates; K does. The ladder is K = 10, 30, 100, 300, 1000, two seeds (42, 43) each, on ExactGP, ELBO and PLL.
 FLOOR: ${LOG_SCORE_FLOOR}, the 5th percentile of the same distribution (${DIST_P5}), fixed for every batch so a molecule's reward depends on that molecule alone. It is a numerical guard, not a tuned knob, and is the same for every K on this surrogate.
 ORACLE IS A STUB. oracle=ConstantOracle returns the same label for every molecule and the budget is 1, so one molecule is 'labelled' at a made-up value and the round closes. Mila has no AmpC receptor files and no dock64. IGNORE dataset/general/docked/*, surrogate/general/held_out/* and every other y-derived number in this run.
