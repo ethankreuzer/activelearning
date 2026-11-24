@@ -94,6 +94,17 @@ class _PreparedMoleculeBatch:
         identity: ``ReplayBuffer`` deduplicates on the string, and the FIFO
         policy the negative buffer uses never calls RDKit on it, unlike the
         reward policy.
+
+        With ``desalt_largest_fragment`` on, these two fields ALSO hold the rows
+        that were desalted: the policy's own token ids and raw string for a
+        sample that carried a counter-ion tail. Those rows are present twice on
+        purpose -- the stripped parent is a scored positive in the fields above,
+        and the salted trajectory is a negative here -- so the contrastive term
+        sees the same molecule with and without the tail and the only
+        difference between the two is the tail.
+    desalted_count : int
+        How many rows of ``smiles`` were reduced to their largest fragment.
+        Zero when desalting is off.
     """
 
     smiles: tuple[str, ...]
@@ -104,6 +115,7 @@ class _PreparedMoleculeBatch:
     fidelity_indices: Tensor | None = None
     invalid_input_ids: Tensor | None = None
     invalid_smiles: tuple[str, ...] = ()
+    desalted_count: int = 0
 
 
 # Warn above this beta when the acquisition reports log-scale scores.
@@ -168,6 +180,7 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
         sampling_temperature: float = 1.0,
         gradient_clip_norm: float = 10.0,
         max_generation_attempts: int | None = None,
+        desalt_largest_fragment: bool = False,
         reject_sample_size: int = 2000,
         reject_log_path: str | None = None,
         pool_log_path: str | None = None,
@@ -309,6 +322,14 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
             failing. Defaults to
             ``max(n_samples * 20, generation_batch_size * 2)`` after applying
             the ``batch_size`` fallback.
+        desalt_largest_fragment : bool, optional
+            When a generated molecule has several fragments (a drug plus a
+            counter-ion such as ``.Cl``), keep the fragment with the most heavy
+            atoms and score that, instead of rejecting the whole sample. The
+            policy is trained on the stripped SMILES, and the salted trajectory
+            it actually sampled goes to the negative buffer so the contrastive
+            loss can push the tail down. Off by default, which rejects every
+            multi-fragment sample as before.
         seed : int, optional
             Base seed. The active-learning round index is added to it before
             seeding Python, PyTorch, and CUDA generators.
@@ -414,6 +435,7 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
             if max_generation_attempts is not None
             else max(n_samples * 20, self.effective_generation_batch_size * 2)
         )
+        self.desalt_largest_fragment = desalt_largest_fragment
         self.reject_sample_size = reject_sample_size
         self.reject_log_path = reject_log_path
         self.pool_log_path = pool_log_path
@@ -866,6 +888,9 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
             # Canonical SMILES, so a repeat is the same molecule: this is the only
             # per-step reading of mode collapse that keeps validity high.
             unique_count=len(set(prepared.smiles)),
+            desalted_count=(
+                prepared.desalted_count if self.desalt_largest_fragment else None
+            ),
             beta=self.beta,
             on_policy_diagnostics=on_policy_diagnostics,
             # Only `power` logs the score, so only there is the floor on the
@@ -1072,6 +1097,7 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
             canonical_smiles,
             canonical_fidelity_indices,
             rejected_positions,
+            desalted_positions,
         ) = self._canonicalize_batch(
             smiles,
             fidelity_indices=fidelity_indices,
@@ -1082,17 +1108,22 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
         # what generate() returned rather than re-encoded, and only when the
         # caller supplied them, so every other call site keeps its old
         # behaviour and gets None.
+        #
+        # Desalted rows are included: the stripped parent is trained on as a
+        # positive, and the salted trajectory the policy really sampled is a
+        # negative, so the contrastive term can penalize the tail itself.
+        negative_positions = tuple(sorted((*rejected_positions, *desalted_positions)))
         invalid_input_ids: Tensor | None = None
         invalid_smiles: tuple[str, ...] = ()
-        if generated_input_ids is not None and rejected_positions:
+        if generated_input_ids is not None and negative_positions:
             invalid_input_ids = generated_input_ids[
                 torch.tensor(
-                    rejected_positions,
+                    negative_positions,
                     dtype=torch.long,
                     device=generated_input_ids.device,
                 )
             ]
-            invalid_smiles = tuple(smiles[index] for index in rejected_positions)
+            invalid_smiles = tuple(smiles[index] for index in negative_positions)
 
         if not canonical_smiles:
             empty_ids = model.encode_smiles([])
@@ -1109,6 +1140,7 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
                 fidelity_indices=canonical_fidelity_indices,
                 invalid_input_ids=invalid_input_ids,
                 invalid_smiles=invalid_smiles,
+                desalted_count=0,
             )
 
         candidates = [
@@ -1145,6 +1177,7 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
             fidelity_indices=canonical_fidelity_indices,
             invalid_input_ids=invalid_input_ids,
             invalid_smiles=invalid_smiles,
+            desalted_count=len(desalted_positions),
         )
 
     def _canonicalize_batch(
@@ -1153,13 +1186,18 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
         *,
         fidelity_indices: Tensor | None,
         molecule_chem: Any,
-    ) -> tuple[tuple[str, ...], Tensor | None, tuple[int, ...]]:
+    ) -> tuple[tuple[str, ...], Tensor | None, tuple[int, ...], tuple[int, ...]]:
         """Return valid canonical SMILES, aligned action indices, and rejects.
 
         The third element holds the positions in ``smiles`` that failed to
         parse. Callers need them to recover the policy's own token ids for the
         rejected rows, which are otherwise discarded here and so reach no
         buffer and no loss term.
+
+        The fourth holds the positions that were kept only after desalting. Those
+        rows are in the first element as their stripped parent; the positions let
+        the caller recover the salted trajectory the policy actually sampled.
+        Empty unless ``desalt_largest_fragment`` is on.
         """
         # Validate alignment before filtering; retained indices are remapped below.
         self._resolve_fidelity_values(fidelity_indices, count=len(smiles))
@@ -1167,15 +1205,22 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
         retained_fidelity_indices: list[int] = []
         rejects: list[tuple[str, str]] = []
         rejected_positions: list[int] = []
+        desalted_positions: list[int] = []
         for index, generated_smiles in enumerate(smiles):
             canonical, reason = _canonicalize_with_reason(
                 generated_smiles,
                 molecule_chem=molecule_chem,
+                desalt=self.desalt_largest_fragment,
             )
             if canonical is None:
                 rejects.append((reason or "parse_error", generated_smiles))
                 rejected_positions.append(index)
             else:
+                if reason == "desalted":
+                    # Counted and sampled like a reject so the tail rate is
+                    # visible, but the molecule itself is kept below.
+                    rejects.append(("desalted", generated_smiles))
+                    desalted_positions.append(index)
                 canonical_smiles.append(canonical)
                 if fidelity_indices is not None:
                     retained_fidelity_indices.append(
@@ -1194,6 +1239,7 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
                 )
             ),
             tuple(rejected_positions),
+            tuple(desalted_positions),
         )
 
     def _resolve_fidelity_values(
@@ -1338,11 +1384,14 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
             canonical, reason = _canonicalize_with_reason(
                 generated_smiles,
                 molecule_chem=molecule_chem,
+                desalt=self.desalt_largest_fragment,
             )
             if canonical is None:
                 invalid_count += 1
                 rejects.append((reason or "parse_error", generated_smiles))
                 continue
+            if reason == "desalted":
+                rejects.append(("desalted", generated_smiles))
             if canonical in seen_smiles:
                 duplicate_count += 1
                 rejects.append(("duplicate", generated_smiles))
@@ -1526,15 +1575,50 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
             torch.cuda.manual_seed_all(seed)
 
 
+def _largest_fragment_smiles(molecule: Any, *, molecule_chem: Any) -> str | None:
+    """Return the canonical SMILES of the fragment with the most heavy atoms.
+
+    Ties go to the lexicographically smaller canonical string, so the choice
+    never depends on the order RDKit lists the fragments in. Fragments with no
+    heavy atom (a lone ``[H]``) are never chosen; ``None`` means nothing was
+    left to keep.
+    """
+    try:
+        fragments = molecule_chem.GetMolFrags(molecule, asMols=True)
+    except (ValueError, RuntimeError):
+        return None
+    best_key: tuple[int, str] | None = None
+    best_text: str | None = None
+    for fragment in fragments:
+        heavy_atoms = fragment.GetNumHeavyAtoms()
+        if heavy_atoms == 0:
+            continue
+        try:
+            text = molecule_chem.MolToSmiles(
+                fragment, canonical=True, isomericSmiles=False
+            )
+        except (TypeError, ValueError, RuntimeError):
+            continue
+        if not text or "." in text:
+            continue
+        key = (-heavy_atoms, text)
+        if best_key is None or key < best_key:
+            best_key, best_text = key, text
+    return best_text
+
+
 def _canonicalize_with_reason(
     smiles: str,
     *,
     molecule_chem: Any,
+    desalt: bool = False,
 ) -> tuple[str | None, str | None]:
     """Return a canonical connected SMILES and why it was rejected.
 
     Exactly one element is ``None``: a string with no reason on success, or a
-    reason with no string on rejection.
+    reason with no string on rejection. The one exception is a desalted
+    success, which returns both: ``(parent, "desalted")``. Callers that only
+    test ``canonical is None`` keep working unchanged.
 
     The reasons distinguish the three rejection paths that
     :func:`_canonicalize_to_smiles` collapses into a single ``None``. Two of
@@ -1548,13 +1632,17 @@ def _canonicalize_with_reason(
         Raw decoded SMILES from the policy.
     molecule_chem : Any
         RDKit ``Chem`` module.
+    desalt : bool, optional
+        Keep the largest fragment of a multi-fragment molecule instead of
+        rejecting it as ``"disconnected"``.
 
     Returns
     -------
     tuple of (str or None, str or None)
-        ``(canonical, None)`` when the molecule is usable, otherwise
-        ``(None, reason)`` with reason one of ``"empty"``, ``"parse_error"``,
-        or ``"disconnected"``.
+        ``(canonical, None)`` when the molecule is usable, ``(parent,
+        "desalted")`` when ``desalt`` reduced it to its largest fragment,
+        otherwise ``(None, reason)`` with reason one of ``"empty"``,
+        ``"parse_error"``, or ``"disconnected"``.
     """
     if not isinstance(smiles, str) or not smiles.strip():
         return None, "empty"
@@ -1574,6 +1662,10 @@ def _canonicalize_with_reason(
     # Parses cleanly, so RDKit logs nothing: salts and multi-fragment spam land
     # here and are invisible in the run's stderr.
     if "." in canonical:
+        if desalt:
+            parent = _largest_fragment_smiles(molecule, molecule_chem=molecule_chem)
+            if parent is not None:
+                return parent, "desalted"
         return None, "disconnected"
     return canonical, None
 

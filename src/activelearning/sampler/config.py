@@ -369,6 +369,10 @@ class S3GFNSamplerConfig(BaseModel):
     Maximum gradient norm during policy training.
     max_generation_attempts : int, optional
     Maximum attempts to produce the requested number of valid candidates.
+    desalt_largest_fragment : bool, default=False
+    Keep the largest fragment of a multi-fragment molecule and score that,
+    instead of rejecting the sample. The salted trajectory goes to the negative
+    buffer so the contrastive loss can push the tail down.
     reject_sample_size : int, default=2000
     Rejected generations retained per round as a reservoir sample. Counts are
     exact regardless; zero keeps counts only.
@@ -449,6 +453,7 @@ class S3GFNSamplerConfig(BaseModel):
     sampling_temperature: PositiveFloat = 1.0
     gradient_clip_norm: PositiveFloat = 10.0
     max_generation_attempts: int | None = Field(default=None, gt=0)
+    desalt_largest_fragment: bool = False
     reject_sample_size: int = Field(default=2000, ge=0)
     reject_log_path: str | None = None
     pool_log_path: str | None = None
@@ -538,6 +543,7 @@ class S3GFNSamplerConfig(BaseModel):
             sampling_temperature=self.sampling_temperature,
             gradient_clip_norm=self.gradient_clip_norm,
             max_generation_attempts=self.max_generation_attempts,
+            desalt_largest_fragment=self.desalt_largest_fragment,
             reject_sample_size=self.reject_sample_size,
             reject_log_path=self.reject_log_path,
             pool_log_path=self.pool_log_path,

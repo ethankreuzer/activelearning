@@ -44,6 +44,10 @@ class _RoundMetrics:
     raw_reward_mins: list[float] = field(default_factory=list)
     raw_reward_medians: list[float] = field(default_factory=list)
     unique_counts: list[int] = field(default_factory=list)
+    # Rows of each step's valid molecules that were reduced to their largest
+    # fragment. Appended only when desalting is on, so a run without it writes
+    # no column.
+    desalted_counts: list[int] = field(default_factory=list)
     # Training-step numbers for the series below, which are recorded only when a
     # step produced valid molecules. Without them a step that yielded nothing
     # would shift every later point one to the left -- worst exactly when
@@ -113,6 +117,7 @@ class _RoundMetrics:
         acq_scores: Sequence[float] = (),
         smiles: Sequence[str] = (),
         unique_count: int | None = None,
+        desalted_count: int | None = None,
         beta: float = 1.0,
         on_policy_diagnostics: tuple[float, float, float] | None = None,
         log_score_floor: float | None = None,
@@ -142,6 +147,9 @@ class _RoundMetrics:
         unique_count : int, optional
             Distinct canonical SMILES in the step's valid molecules. ``None``
             omits the uniqueness line from the batch-health figure.
+        desalted_count : int, optional
+            Valid molecules in the step that were reduced to their largest
+            fragment. ``None`` (desalting off) records nothing.
         beta : float, optional
             The reward's configured beta, needed because the concentration
             diagnostics describe ``beta * score`` rather than the score itself.
@@ -220,6 +228,8 @@ class _RoundMetrics:
             self.acq_mins.append(min(acq_values))
         if unique_count is not None:
             self.unique_counts.append(int(unique_count))
+        if desalted_count is not None:
+            self.desalted_counts.append(int(desalted_count))
         self.online_rtb_losses.append(online_loss)
         if online_loss is not None:
             self.online_updates += 1
@@ -1450,6 +1460,7 @@ _TRAINING_STEP_SERIES: tuple[tuple[str, str, str | None], ...] = (
     ("valid", "valid_counts", None),
     ("synthesizable", "synthesizable_counts", None),
     ("unique", "unique_counts", None),
+    ("desalted", "desalted_counts", None),
     ("online_loss", "online_rtb_losses", None),
     ("replay_loss", "replay_losses", None),
     ("auxiliary_loss", "auxiliary_losses", None),
