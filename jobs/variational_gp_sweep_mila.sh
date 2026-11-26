@@ -154,6 +154,23 @@ case "${OBJECTIVE_ARG}" in
   *) echo "axis 1 must be 'pll' or 'elbo', got '${OBJECTIVE_ARG}'" >&2; exit 2 ;;
 esac
 
+# ARD=1 fits one lengthscale PER FEATURE (512) instead of the sweep's single shared one.
+# Nothing else changes. The arm gets an `_ard` suffix before its step count, its own
+# W&B group and an `ard` tag in place of `isotropic`, so it cannot be mistaken for, or
+# overwrite, the isotropic arm of the same cell. ARD works with the prior on or off here.
+ARD="${ARD:-0}"
+ARD_OVERRIDE=()
+ARD_SUFFIX=""
+ARD_GROUP=""
+KERNEL_TAG="isotropic"
+LENGTHSCALE_NOTE="one lengthscale over all 512 features (ard=false)"
+case "${ARD}" in
+  0) ;;
+  1) ARD_OVERRIDE=("surrogate.ard=true"); ARD_SUFFIX="_ard"; ARD_GROUP="-ard"; KERNEL_TAG="ard"
+     LENGTHSCALE_NOTE="ARD: one lengthscale PER FEATURE, 512 of them (ard=true) -- the ONE deliberate departure from the exact sweep's single shared lengthscale" ;;
+  *) echo "ARD must be 0 or 1, got '${ARD}'" >&2; exit 2 ;;
+esac
+
 case "${PRIOR}" in
   on)  PRIOR_OVERRIDE="surrogate.lengthscale_prior=true" ;;
   off) PRIOR_OVERRIDE="surrogate.lengthscale_prior=false" ;;
@@ -225,7 +242,7 @@ SCORE_CHUNK=$(( 256 * 1024 * 1024 / (M * M) ))
 # second level would fail at submit, or silently need --overwrite and destroy
 # the first. TOTAL_STEPS rather than STEPS, since it is what actually ran
 # (10000 at n=20,000 and 100,000, 10064 at 300,000).
-ARM="n${SIZE}_${OBJECTIVE_ARG}_${PRIOR}_s${TOTAL_STEPS}"
+ARM="n${SIZE}_${OBJECTIVE_ARG}_${PRIOR}${ARD_SUFFIX}_s${TOTAL_STEPS}"
 OUTPUT_DIR="outputs/ampc/variational_gp_sweep/${ARM}"
 WANDB_PROJECT="${WANDB_PROJECT:-VariationalGP_thesis}"
 WANDB_ENTITY="${WANDB_ENTITY:-models-mila5723}"
@@ -246,7 +263,7 @@ export WANDB_DIR="${OUTPUT_DIR}"
 mkdir -p "${WANDB_DIR}" slurm_logs
 
 export WANDB_NOTES="Variational GP sweep, arm ${ARM}. Sparse variational GP with ${M} learned inducing points on the frozen MiniMol AmpC fingerprints, fitted to ${TRAIN_CSV} (${SIZE} molecules, the svgpscale ladder).
-THE COMPANION OF THE EXACT-GP SWEEP (W&B ExactGP_thesis, config/ampc/exact_gp_sweep.yaml). Everything the two surrogates share is pinned to the same value: the training set, the frozen encoder and its cache, Matern-5/2, one lengthscale over all 512 features (ard=false), inputs min-max scaled to [0,1] on the training rows, a learned output scale, the constant mean PINNED at 0.0042864189360438442 (the 10M library mean), standardized outputs, float32, seed 42, and GIBBON with num_mv_samples=10 scored on both the value and the log scale. n=20000 is the MATCHED cell -- the exact sweep's training set molecule for molecule, and the only size the exact GP could fit (38.8 GB at n=25000).
+THE COMPANION OF THE EXACT-GP SWEEP (W&B ExactGP_thesis, config/ampc/exact_gp_sweep.yaml). Everything the two surrogates share is pinned to the same value: the training set, the frozen encoder and its cache, Matern-5/2, ${LENGTHSCALE_NOTE}, inputs min-max scaled to [0,1] on the training rows, a learned output scale, the constant mean PINNED at 0.0042864189360438442 (the 10M library mean), standardized outputs, float32, seed 42, and GIBBON with num_mv_samples=10 scored on both the value and the log scale. n=20000 is the MATCHED cell -- the exact sweep's training set molecule for molecule, and the only size the exact GP could fit (38.8 GB at n=25000).
 AXIS 1, objective: ${OBJECTIVE}. Fitted on ${OBJECTIVE_NOTE}. This axis does not exist for an exact GP and is the largest effect measured in this project: on old y at 300k it moved the gp_molformer_set log-GIBBON median -2688 -> -376 and the de-biased latent calibration slope 28.3 -> 1.28 for 0.008 of Pearson.
 AXIS 2, lengthscale prior: ${PRIOR}. BoTorch's dimension-scaled LogNormal(sqrt2 + 0.5*log 512, sqrt3), mode 4.63, started at its mode; off means prior-free and started at sqrt(512) = 22.63, so the axis changes both the gradient and the starting point and a difference cannot be split between them. This is the axis that decided the exact sweep: prior-off predicted better pointwise and was unusable, with one molecule of 83811 holding 90% of the acquisition mass.
 NOT SWEPT: prior_mean (the exact sweep measured its three levels inert, 16-89x below the axis-1 gap), ard, num_inducing, inducing_init, seed, steps, and noise_floor -- which is UNSET by design, for the same reason the exact sweep left noise_std_floor unset: flooring the noise pins the outputscale-to-noise ratio by fiat, and that ratio is the latent variance GIBBON consumes.
@@ -262,6 +279,7 @@ uv run --no-sync python -m scripts.exact_dkl_top_n \
   config/ampc/variational_gp_sweep.yaml \
   "surrogate.training_params.variational_objective=${OBJECTIVE}" \
   "${PRIOR_OVERRIDE}" \
+  ${ARD_OVERRIDE[@]+"${ARD_OVERRIDE[@]}"} \
   "surrogate.training_params.epochs=${EPOCHS}" \
   "surrogate.num_inducing=${M}" \
   "dataset.initial_data.path=${TRAIN_CSV}" \
@@ -274,8 +292,8 @@ uv run --no-sync python -m scripts.exact_dkl_top_n \
   --extra-set ampc_val_screen_232k_acq \
   --wandb-project "${WANDB_PROJECT}" \
   --wandb-entity "${WANDB_ENTITY}" \
-  --wandb-group "variational-gp-n${SIZE}" \
-  --wandb-tags "variational-gp-sweep,svgp,n${SIZE},trainset-svgpscale${SIZE},${OBJECTIVE_ARG},${OBJECTIVE},prior-${PRIOR},M${M},steps${TOTAL_STEPS},isotropic,matern,outputscale,pinned-mean,noise-prior,scale-inputs,no-noise-floor,adam,minibatch4096,lr-cosine,lr3e-3,fp32,nested,keep-pprop3.5,support-cap100k,chunk${SCORE_CHUNK}" \
+  --wandb-group "variational-gp-n${SIZE}${ARD_GROUP}" \
+  --wandb-tags "variational-gp-sweep,svgp,n${SIZE},trainset-svgpscale${SIZE},${OBJECTIVE_ARG},${OBJECTIVE},prior-${PRIOR},M${M},steps${TOTAL_STEPS},${KERNEL_TAG},matern,outputscale,pinned-mean,noise-prior,scale-inputs,no-noise-floor,adam,minibatch4096,lr-cosine,lr3e-3,fp32,nested,keep-pprop3.5,support-cap100k,chunk${SCORE_CHUNK}" \
   --run-name "${ARM}-${SLURM_JOB_ID}" \
   "${@:4}"
 

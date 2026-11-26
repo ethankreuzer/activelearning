@@ -8,6 +8,9 @@
 #   sbatch jobs/exact_gp_sweep_mila.sh off learned    # arm 5
 #   sbatch jobs/exact_gp_sweep_mila.sh off constant   # arm 6
 #
+# ARD. ARD=1 sbatch jobs/exact_gp_sweep_mila.sh on pinned fits per-feature lengthscales
+# (arm n20000_on_pinned_ard, W&B group exact-gp-n20000-ard); see the ARD block below.
+#
 # TRAINING SIZE. SIZE picks the arm of the svgpscale ladder, default 20000:
 #
 #   SIZE=25000 sbatch jobs/exact_gp_sweep_mila.sh on pinned
@@ -128,6 +131,26 @@ if [[ ! "${SIZE}" =~ ^[1-9][0-9]*$ ]]; then
   exit 2
 fi
 
+# ARD=1 fits one lengthscale PER FEATURE (512) instead of the sweep's single shared one.
+# Nothing else changes. The arm gets an `_ard` suffix, its own W&B group and an `ard`
+# tag, so it can never be mistaken for, or overwrite, the isotropic arm of the same cell.
+# ARD needs lengthscale_prior=on: the prior-free kernel is isotropic-only (see
+# fixed_feature_gp.py), so `ARD=1 ... off ...` is rejected below.
+ARD="${ARD:-0}"
+ARD_OVERRIDE=()
+ARD_SUFFIX=""
+ARD_GROUP=""
+ARD_TAG=""
+case "${ARD}" in
+  0) ;;
+  1) ARD_OVERRIDE=("surrogate.ard=true"); ARD_SUFFIX="_ard"; ARD_GROUP="-ard"; ARD_TAG=",ard" ;;
+  *) echo "ARD must be 0 or 1, got '${ARD}'" >&2; exit 2 ;;
+esac
+if [[ "${ARD}" == "1" && "${PRIOR}" == "off" ]]; then
+  echo "ARD=1 needs the lengthscale prior on; the prior-free kernel is isotropic-only." >&2
+  exit 2
+fi
+
 case "${PRIOR}" in
   on)  PRIOR_OVERRIDE="surrogate.lengthscale_prior=true" ;;
   off) PRIOR_OVERRIDE="surrogate.lengthscale_prior=false" ;;
@@ -158,7 +181,7 @@ for required in "${TRAIN_CSV}" "${FEATURE_CACHE}" "${FEATURE_CACHE}.json"; do
 done
 
 # The size leads the arm name so the six arms of one size sort together.
-ARM="n${SIZE}_${PRIOR}_${MEAN}"
+ARM="n${SIZE}_${PRIOR}_${MEAN}${ARD_SUFFIX}"
 OUTPUT_DIR="outputs/ampc/exact_gp_sweep/${ARM}"
 WANDB_PROJECT="${WANDB_PROJECT:-ExactGP_thesis}"
 WANDB_ENTITY="${WANDB_ENTITY:-models-mila5723}"
@@ -192,6 +215,7 @@ uv run --no-sync python -m scripts.exact_dkl_top_n \
   config/ampc/exact_gp_sweep.yaml \
   "${PRIOR_OVERRIDE}" \
   "${MEAN_OVERRIDE}" \
+  ${ARD_OVERRIDE[@]+"${ARD_OVERRIDE[@]}"} \
   "dataset.initial_data.path=${TRAIN_CSV}" \
   "surrogate.encoder.feature_cache_path=${FEATURE_CACHE}" \
   ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} \
@@ -203,8 +227,8 @@ uv run --no-sync python -m scripts.exact_dkl_top_n \
   --extra-set ampc_val_screen_232k_acq \
   --wandb-project "${WANDB_PROJECT}" \
   --wandb-entity "${WANDB_ENTITY}" \
-  --wandb-group "exact-gp-n${SIZE}" \
-  --wandb-tags "exact-gp-sweep,n${SIZE},trainset-svgpscale${SIZE},prior-${PRIOR},mean-${MEAN}" \
+  --wandb-group "exact-gp-n${SIZE}${ARD_GROUP}" \
+  --wandb-tags "exact-gp-sweep,n${SIZE},trainset-svgpscale${SIZE},prior-${PRIOR},mean-${MEAN}${ARD_TAG}" \
   --run-name "${ARM}-${SLURM_JOB_ID}" \
   "${@:3}"
 
