@@ -1,0 +1,4 @@
+Surrogate,Validation top-100 enrichment,Validation effective support,Prior (GP-Molformer) top-100 enrichment,Prior (GP-Molformer) effective support
+ExactGP,1.72x,"1,172.0",19.27x,2.0
+"PLL, 10k steps",1.74x,"4,607.1",3.26x,40.5
+"ELBO, 10k steps",1.71x,314.0,12.59x,1.0

@@ -1,0 +1,5 @@
+| Set | Surrogate | AUC (enriched + hits vs bulk) | Hits in top-N | Random pick | n hits | n enriched + hits | n bulk |
+|---|---|---|---|---|---|---|---|
+| Validation | ExactGP | 0.933 | 0.751 | 0.068 | 15767 | 30850 | 200037 |
+| Validation | PLL, 10k steps | 0.942 | 0.757 | 0.068 | 15767 | 30850 | 200037 |
+| Validation | ELBO, 10k steps | 0.941 | 0.756 | 0.068 | 15767 | 30850 | 200037 |
