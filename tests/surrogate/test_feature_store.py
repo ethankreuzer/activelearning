@@ -156,3 +156,104 @@ def test_an_inner_encoder_returning_the_wrong_shape_is_refused(
 
     with pytest.raises(ValueError, match="Inner encoder output must have shape"):
         encoder.encode(["OCCO"], device=torch.device("cpu"))
+
+
+EXTRA = ["CCCO", "CCCN", "CCC"]
+
+
+def _extra_store(tmp_path: Path, name: str = "extra", values=EXTRA, offset: int = 200):
+    """Write a second store whose rows are told apart by their own offset."""
+    store_path = tmp_path / f"{name}.npy"
+    smiles_path = tmp_path / f"{name}.smiles.txt"
+    np.save(store_path, np.array([_features(v) for v in values], np.float32) + offset)
+    smiles_path.write_text("".join(f"{v}\n" for v in values), encoding="utf-8")
+    return store_path, smiles_path
+
+
+def test_extra_store_serves_its_molecules_without_live_encoding(tmp_path: Path) -> None:
+    """A molecule only the extra store holds is read from it, not encoded."""
+    base = _store(tmp_path)
+    extra = _extra_store(tmp_path)
+    inner = _StoreEncoder()
+    encoder = FeatureStoreEncoder(
+        inner, store_path=base[0], smiles_path=base[1], extra_stores=[extra]
+    )
+
+    # base hit, extra hit, extra hit, base hit -- interleaved, in request order
+    values = ["CC", "CCCN", "CCC", "C"]
+    features = encoder.encode(values, device=torch.device("cpu"))
+
+    offsets = torch.tensor([[100.0], [200.0], [200.0], [100.0]])
+    expected = torch.tensor([_features(v) for v in values]) + offsets
+    assert torch.equal(features, expected)
+    assert inner.calls == []
+
+
+def test_only_molecules_in_no_store_are_encoded_live(tmp_path: Path) -> None:
+    base = _store(tmp_path)
+    extra = _extra_store(tmp_path)
+    inner = _StoreEncoder()
+    encoder = FeatureStoreEncoder(
+        inner, store_path=base[0], smiles_path=base[1], extra_stores=[extra]
+    )
+
+    values = ["CCCO", "OCCO", "CCO", "NCCN"]
+    features = encoder.encode(values, device=torch.device("cpu"))
+
+    assert inner.calls == [["OCCO", "NCCN"]]
+    assert torch.equal(features[0], torch.tensor(_features("CCCO")) + 200)  # extra
+    assert torch.equal(features[1], torch.tensor(_features("OCCO")))  # live
+    assert torch.equal(features[2], torch.tensor(_features("CCO")) + 100)  # base
+    assert torch.equal(features[3], torch.tensor(_features("NCCN")))  # live
+
+
+def test_base_store_wins_over_an_extra_store_and_extras_are_ordered(tmp_path: Path) -> None:
+    base = _store(tmp_path)
+    first = _extra_store(tmp_path, "first", ["C", "CCCO"], offset=300)
+    second = _extra_store(tmp_path, "second", ["CCCO", "CCCN"], offset=400)
+    encoder = FeatureStoreEncoder(
+        _StoreEncoder(),
+        store_path=base[0],
+        smiles_path=base[1],
+        extra_stores=[first, second],
+    )
+
+    features = encoder.encode(["C", "CCCO", "CCCN"], device=torch.device("cpu"))
+
+    assert features[0, 0].item() == _features("C")[0] + 100  # base, not first
+    assert features[1, 0].item() == _features("CCCO")[0] + 300  # first, not second
+    assert features[2, 0].item() == _features("CCCN")[0] + 400  # second
+
+
+def test_no_extra_stores_behaves_as_before(tmp_path: Path) -> None:
+    base = _store(tmp_path)
+    inner = _StoreEncoder()
+    encoder = FeatureStoreEncoder(inner, store_path=base[0], smiles_path=base[1])
+    encoder.encode(["CCCO"], device=torch.device("cpu"))
+    assert inner.calls == [["CCCO"]]
+
+
+def test_extra_store_that_does_not_match_its_smiles_is_refused(tmp_path: Path) -> None:
+    base = _store(tmp_path)
+    store_path, smiles_path = _extra_store(tmp_path)
+    smiles_path.write_text("CCCO\n", encoding="utf-8")
+    encoder = FeatureStoreEncoder(
+        _StoreEncoder(),
+        store_path=base[0],
+        smiles_path=base[1],
+        extra_stores=[(store_path, smiles_path)],
+    )
+
+    with pytest.raises(ValueError, match="not built from these SMILES"):
+        encoder.encode(["CCCO"], device=torch.device("cpu"))
+
+
+def test_extra_store_is_not_opened_when_the_base_serves_everything(tmp_path: Path) -> None:
+    base = _store(tmp_path)
+    encoder = FeatureStoreEncoder(
+        _StoreEncoder(),
+        store_path=base[0],
+        smiles_path=base[1],
+        extra_stores=[(tmp_path / "missing.npy", tmp_path / "missing.smiles.txt")],
+    )
+    encoder.encode(["C", "CC"], device=torch.device("cpu"))  # must not raise

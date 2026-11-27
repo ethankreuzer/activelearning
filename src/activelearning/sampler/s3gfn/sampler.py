@@ -27,6 +27,13 @@ import torch
 from torch import Tensor
 
 from activelearning.acquisition.cost_utility import cost_weighting_from_cost_fn
+from activelearning.sampler.reward_calibration import (
+    RewardCalibrationSettings,
+    RewardScale,
+    derive_reward_scale,
+    load_prior_smiles,
+    log_scores_from_values,
+)
 from activelearning.sampler.reward_transform import (
     RewardTransform,
     apply_reward_transform,
@@ -174,6 +181,7 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
         beta: float = 50.0,
         reward_transform: RewardTransform = "exponential",
         log_score_floor: float | None = None,
+        reward_calibration: RewardCalibrationSettings | None = None,
         aux_coefficient: float = 1.0e-4,
         buffer_size: int = 6400,
         sa_threshold: float = 4.0,
@@ -281,6 +289,15 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
             transform, so a molecule's reward does not depend on its batch.
             ``None`` floors each batch against its own maximum. Ignored by
             ``exponential``.
+        reward_calibration : RewardCalibrationSettings or None, optional
+            When given, ``beta`` and ``log_score_floor`` are not fixed: every
+            round, after the acquisition is updated and before the policy
+            trains, the fixed prior sample is rescored and both are re-derived
+            from it for the constant K (see
+            :mod:`activelearning.sampler.reward_calibration`). The ``beta`` and
+            ``log_score_floor`` passed in are then only placeholders until the
+            first round overwrites them. Requires the ``power`` transform and a
+            single fidelity.
         aux_coefficient : float, optional
             Weight of the negative replay contrastive loss. Zero disables the
             negative replay buffer and auxiliary loss.
@@ -365,6 +382,18 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
             raise ValueError("beta must be a finite positive value.")
         if log_score_floor is not None and not math.isfinite(log_score_floor):
             raise ValueError("log_score_floor must be finite when provided.")
+        if reward_calibration is not None:
+            if reward_transform != "power":
+                raise ValueError(
+                    "reward_calibration derives beta from log R = beta * log(score), "
+                    "which is the 'power' transform; reward_transform is "
+                    f"{reward_transform!r}."
+                )
+            if len(tuple(fidelities)) != 1:
+                raise ValueError(
+                    "reward_calibration scores the prior sample at one fidelity, "
+                    f"but {len(tuple(fidelities))} were configured."
+                )
         if aux_coefficient < 0.0 or not math.isfinite(aux_coefficient):
             raise ValueError("aux_coefficient must be finite and nonnegative.")
         if buffer_size <= 0:
@@ -425,6 +454,8 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
         self.beta = beta
         self.reward_transform = reward_transform
         self.log_score_floor = log_score_floor
+        self.reward_calibration = reward_calibration
+        self._prior_candidates: list[Candidate] | None = None
         self.aux_coefficient = aux_coefficient
         self.buffer_size = buffer_size
         self.sa_threshold = sa_threshold
@@ -510,6 +541,11 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
         self._round_metrics = _RoundMetrics()
         _ = observations
         if self.n_train_steps:
+            # Before the contract check: its beta warnings must read the beta
+            # the round will train with, not the placeholder. A missing
+            # acquisition falls through to the check, which raises.
+            if self.reward_calibration is not None and acquisition is not None:
+                self._calibrate_reward(acquisition, cost_fn)
             self._validate_acquisition(acquisition)
 
         self._set_round_seed()
@@ -656,6 +692,81 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
         self._pretrained_model.policy.to("cpu")
         if self._pretrained_model.fidelity_head is not None:
             self._pretrained_model.fidelity_head.to("cpu")
+
+    def _calibrate_reward(
+        self,
+        acquisition: Any,
+        cost_fn: Callable[[Sequence[Candidate]], list[float]] | None,
+    ) -> RewardScale:
+        """Re-derive ``beta`` and ``log_score_floor`` for this round's surrogate.
+
+        Rescores the fixed prior sample with the acquisition this round's policy
+        will be trained against. That has to be the same updated object: GIBBON
+        draws its posterior max-values when it is updated, so a separately
+        updated copy would score the prior sample on a different scale from the
+        reward it is calibrating.
+
+        Raises
+        ------
+        ValueError
+            From :func:`derive_reward_scale`, before any training has started.
+        """
+        settings = self.reward_calibration
+        assert settings is not None
+        if self._prior_candidates is None:
+            fidelity = self.fidelities[0]
+            self._prior_candidates = [
+                Candidate(x=smiles, fidelity=fidelity)
+                for smiles in load_prior_smiles(
+                    settings.prior_set_path, settings.smiles_column
+                )
+            ]
+            _logger.info(
+                "Loaded %d prior molecule(s) from %s for reward calibration.",
+                len(self._prior_candidates),
+                settings.prior_set_path,
+            )
+        started = time.perf_counter()
+        values = _acquisition_values(acquisition, self._prior_candidates, cost_fn=cost_fn)
+        scale = derive_reward_scale(
+            log_scores_from_values(values),
+            settings.k,
+            floor_percentile=settings.floor_percentile,
+        )
+        elapsed = time.perf_counter() - started
+        previous = (self.beta, self.log_score_floor)
+        self.beta = scale.beta
+        self.log_score_floor = scale.floor
+        # Scoring 84k molecules through GIBBON holds tens of GiB; hand it back
+        # before the policy is built.
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        self.round_metrics.reward_calibration = {
+            "k": scale.k,
+            "beta": scale.beta,
+            "log_score_floor": scale.floor,
+            "median": scale.median,
+            "p99": scale.p99,
+            "spread": scale.spread,
+            "n": scale.n,
+            "seconds": elapsed,
+        }
+        _logger.info(
+            "S3-GFN reward calibrated for K=%g on %d prior molecule(s): "
+            "beta=%.6g, log_score_floor=%.4g (median=%.4g, p99=%.4g, spread=%.4g "
+            "nats; was beta=%.6g, floor=%s); took %.1fs.",
+            scale.k,
+            scale.n,
+            scale.beta,
+            scale.floor,
+            scale.median,
+            scale.p99,
+            scale.spread,
+            previous[0],
+            "unset" if previous[1] is None else f"{previous[1]:.4g}",
+            elapsed,
+        )
+        return scale
 
     def _validate_acquisition(self, acquisition: Any | None) -> None:
         """Validate the singleton-scoring acquisition contract."""
@@ -1680,6 +1791,38 @@ def _canonicalize_to_smiles(
     return canonical
 
 
+def _acquisition_values(
+    acquisition: Any,
+    candidates: Sequence[Candidate],
+    *,
+    cost_fn: Callable[[Sequence[Candidate]], list[float]] | None,
+) -> list[float]:
+    """Return the acquisition score of each candidate, inverse-cost weighted if asked.
+
+    The one scoring path shared by the training reward and the reward
+    calibration, so the scale a round is calibrated on is the scale it trains on.
+
+    Raises
+    ------
+    ValueError
+        If the score count does not match, or any score is not finite.
+    """
+    scores = (
+        acquisition.score(candidates)
+        if cost_fn is None
+        else acquisition.score(
+            candidates,
+            cost_weighting=cost_weighting_from_cost_fn(cost_fn),
+        )
+    )
+    if len(scores) != len(candidates):
+        raise ValueError("Acquisition returned a score count that does not align.")
+    score_values = [float(score) for score in scores]
+    if not all(math.isfinite(score) for score in score_values):
+        raise ValueError("Acquisition returned a non-finite score.")
+    return score_values
+
+
 def _score_candidates(
     acquisition: Any,
     candidates: Sequence[Candidate],
@@ -1699,19 +1842,7 @@ def _score_candidates(
         the transformed score changes meaning with the transform, so diagnostics
         can plot progress on one scale whatever the reward shape.
     """
-    scores = (
-        acquisition.score(candidates)
-        if cost_fn is None
-        else acquisition.score(
-            candidates,
-            cost_weighting=cost_weighting_from_cost_fn(cost_fn),
-        )
-    )
-    if len(scores) != len(candidates):
-        raise ValueError("Acquisition returned a score count that does not align.")
-    score_values = [float(score) for score in scores]
-    if not all(math.isfinite(score) for score in score_values):
-        raise ValueError("Acquisition returned a non-finite score.")
+    score_values = _acquisition_values(acquisition, candidates, cost_fn=cost_fn)
     return score_values, apply_reward_transform(
         transform, score_values, log_score_floor
     )

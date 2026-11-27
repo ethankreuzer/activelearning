@@ -59,6 +59,14 @@ surrogate:
       # -0.90) and the repeats arrive close together, so a bounded cache catches
       # most of them. The value the reward-shape arms ran with.
       cache_size: 4096
+    # The prior sample the reward calibration rescores every round. Only 32 of its
+    # 83,811 molecules are in the 10M store above, so without this each round would
+    # encode ~84k molecules live. Pre-encoded with the same encoder; the manifest
+    # records a hash of the ordered SMILES list, which scripts/write_prior_smiles.py
+    # --features checks. Consulted after the 10M store and before live encoding.
+    extra_stores:
+      - store_path: cache/ampc/exact_dkl_top_n/gp_molformer_set.npy
+        smiles_path: cache/ampc/exact_dkl_top_n/gp_molformer_set.smiles.txt
   training_subset:
     # HOW THE LABELED DATA IS MANAGED OVER ROUNDS. This node is the choice, and
     # the alternative is not a variant of the block below but a replacement of
@@ -224,11 +232,34 @@ sampler:
   # the logarithm itself, which is why the acquisition stays on the value
   # scale.
   reward_transform: power
-  beta: 0.1
-  # A FIXED floor, the same for every batch, so a molecule's reward depends on
-  # that molecule alone. Earlier arms floored 20 nats below each batch's own
-  # best, which made the reward level swing from batch to batch.
-  log_score_floor: -150.0
+  # beta AND THE FLOOR ARE DERIVED EVERY ROUND, NOT SET HERE. Each round, after the
+  # surrogate is refit and the acquisition updated and before the policy trains,
+  # the fixed 83,811-molecule GP-MoLFormer prior sample is rescored and
+  #
+  #   beta = ln(K) / (p99 - median)   of its log-GIBBON scores
+  #   floor = 5th percentile of the same scores
+  #
+  # so K -- the reward ratio between a 99th-percentile and a median prior
+  # molecule -- stays constant while the refit surrogate's score spread moves.
+  # A fixed beta does not: K_eff = exp(beta * spread), so a 20% wider spread turns
+  # K = 300 into ~939. The floor is still a fixed number WITHIN a round (a
+  # molecule's reward depends on that molecule alone), it just follows the
+  # surrogate between rounds. `beta` and `log_score_floor` must NOT be set
+  # alongside this block; the config is refused if they are.
+  #
+  # K = 250 is the recorded choice for this surrogate (ExactGP, prior on, pinned
+  # mean; see thesis/sf_activelearning/4_1_beta_tuning/K_selection.md). Per
+  # surrogate: ELBO 300, PLL 100.
+  #
+  # The prior sample is the same file the K ladder was derived on (same molecules,
+  # same order). It is gitignored, so it must exist on the machine running this:
+  # generate it with scripts/write_prior_smiles.py. Its features are pre-encoded
+  # (see surrogate.encoder.extra_stores) so rescoring it costs ~90 s a round
+  # instead of live-encoding 84k molecules.
+  reward_calibration:
+    k: 250
+    prior_set_path: cache/ampc/exact_dkl_top_n/gp_molformer_set.smiles.txt
+    floor_percentile: 5.0
   aux_coefficient: 0.001
   sa_threshold: 4.0
   # Written the moment generation finishes, so a round that later dies in

@@ -7,6 +7,11 @@ access instead: a SMILES -> row index over the base matrix, which stays
 memory-mapped and read-only. Molecules the store does not hold are encoded live
 and not retained here.
 
+Optional *extra* stores of the same kind are consulted, in order, between the base
+store and live encoding. They exist for a fixed set the run rescored every round --
+the prior sample its reward calibration reads -- which is not in the 10M base but
+is already encoded on disk, and would otherwise be encoded live, in full, each time.
+
 Not retaining them is deliberate. A run-local shard persisted every molecule
 this encoder ever saw, which in an active-learning loop is dominated by what the
 policy samples while training -- ~240,000 molecules a round in job 24882282,
@@ -55,6 +60,7 @@ class FeatureStoreEncoder(FixedEncoder):
         *,
         store_path: str | Path,
         smiles_path: str | Path,
+        extra_stores: Sequence[tuple[str | Path, str | Path]] = (),
     ) -> None:
         """Initialize the store-backed encoder.
 
@@ -68,6 +74,11 @@ class FeatureStoreEncoder(FixedEncoder):
             Base ``.npy`` feature matrix; its manifest is the sibling ``.json``.
         smiles_path : Path or str
             The SMILES the store was built from, one per line in row order.
+        extra_stores : Sequence of (store_path, smiles_path), optional
+            Further stores, each built by the same ``inner`` encoder and opened
+            with the same validation, consulted in order for molecules the base
+            store lacks. Their features are not copied into memory: each stays
+            memory-mapped.
 
         Raises
         ------
@@ -85,6 +96,11 @@ class FeatureStoreEncoder(FixedEncoder):
         self._smiles_path = Path(smiles_path).expanduser()
         self._base: np.ndarray | None = None
         self._base_index: dict[str, int] | None = None
+        self._extra_paths = tuple(
+            (Path(store).expanduser(), Path(smiles).expanduser())
+            for store, smiles in extra_stores
+        )
+        self._extras: list[tuple[np.ndarray, dict[str, int]]] | None = None
 
     def bind_runtime_context(self, runtime_context: RuntimeContext) -> None:
         """Bind runtime settings to this encoder and the one it wraps."""
@@ -122,11 +138,73 @@ class FeatureStoreEncoder(FixedEncoder):
             features[positions] = self.base_features[rows[positions]]
 
         outside = np.flatnonzero(rows < 0)
+        if outside.size and self._extra_paths:
+            outside = self._fill_from_extra_stores(strings, features, outside)
         if outside.size:
             features[outside] = self._encode_live(
                 [strings[position] for position in outside]
             )
         return torch.from_numpy(features).to(device=device, dtype=torch.float32)
+
+    def _fill_from_extra_stores(
+        self,
+        strings: Sequence[str],
+        features: np.ndarray,
+        outside: np.ndarray,
+    ) -> np.ndarray:
+        """Fill what the extra stores hold into ``features``; return what is left.
+
+        Parameters
+        ----------
+        strings : Sequence[str]
+            The requested SMILES, in order.
+        features : np.ndarray
+            Output matrix, written in place at the positions found.
+        outside : np.ndarray
+            Positions in ``strings`` the base store did not hold.
+
+        Returns
+        -------
+        np.ndarray
+            The positions no store holds, still to be encoded live.
+        """
+        self._open_extras()
+        assert self._extras is not None
+        remaining = outside
+        for matrix, index in self._extras:
+            if not remaining.size:
+                break
+            rows = np.fromiter(
+                (index.get(strings[position], -1) for position in remaining),
+                dtype=np.int64,
+                count=remaining.size,
+            )
+            hit = rows >= 0
+            if hit.any():
+                found, found_rows = remaining[hit], rows[hit]
+                # Row order keeps the memmap read sequential.
+                order = np.argsort(found_rows, kind="stable")
+                features[found[order]] = matrix[found_rows[order]]
+            remaining = remaining[~hit]
+        return remaining
+
+    def _open_extras(self) -> None:
+        """Open every extra store and index it by SMILES on first use."""
+        if self._extras is not None:
+            return
+        opened: list[tuple[np.ndarray, dict[str, int]]] = []
+        for store_path, smiles_path in self._extra_paths:
+            smiles = smiles_path.read_text(encoding="utf-8").splitlines()
+            matrix = self._inner.open_feature_store(store_path, smiles)
+            if matrix.shape != (len(smiles), self.feature_dim):
+                raise ValueError(
+                    f"Feature store {store_path} has shape {matrix.shape}; "
+                    f"expected {(len(smiles), self.feature_dim)}."
+                )
+            opened.append(
+                (matrix, {value: row for row, value in enumerate(smiles)})
+            )
+        self._extras = opened
 
     def _encode_live(self, missing: Sequence[str]) -> np.ndarray:
         """Encode the molecules the store lacks, each distinct one once."""

@@ -92,6 +92,11 @@ class _RoundMetrics:
     negative_buffer_size: int = 0
     training_duration_s: float | None = None
     generation_duration_s: float | None = None
+    # The reward scale this round actually trained with when it was derived from
+    # a constant K (see reward_calibration.py): beta, the floor, and the prior
+    # sample percentiles they came from. None when beta and the floor were fixed
+    # in the config, which is the case this series exists to tell apart.
+    reward_calibration: dict[str, float | int] | None = None
     # Every molecule the policy generated while TRAINING, with the step that
     # produced it and the two scores it was judged by. The 100k pool is one
     # snapshot taken AFTER a round's training; this is what the policy explored
@@ -503,6 +508,9 @@ class S3GFNLoggingMixin:
                 metrics["sampler/s3gfn/reward/effective_support_median"] = _median(
                     round_metrics.reward_effective_supports
                 )
+            if round_metrics.reward_calibration is not None:
+                for name, value in round_metrics.reward_calibration.items():
+                    metrics[f"sampler/s3gfn/reward/calibration/{name}"] = value
             if round_metrics.above_floor_fractions:
                 metrics["sampler/s3gfn/reward/above_floor_fraction_median"] = _median(
                     round_metrics.above_floor_fractions
@@ -1106,6 +1114,8 @@ def write_generation_summary(
             "duration_s": metrics.training_duration_s,
         },
     }
+    if metrics.reward_calibration is not None:
+        summary["reward_calibration"] = dict(metrics.reward_calibration)
     resolved = Path(path.replace("{round}", f"{round_index:04d}"))
     resolved.parent.mkdir(parents=True, exist_ok=True)
     resolved.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")

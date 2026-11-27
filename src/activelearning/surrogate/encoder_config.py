@@ -374,6 +374,25 @@ class MiniMolAmpcSmilesFixedEncoderConfig(_MiniMolCacheConfig):
         )
 
 
+class FeatureStoreExtraStoreConfig(BaseModel):
+    """A further persisted feature store, consulted after the base store.
+
+    Parameters
+    ----------
+    store_path : Path
+        ``.npy`` feature matrix, with its manifest as the sibling ``.json``.
+    smiles_path : Path
+        The SMILES the matrix was built from, one per line in row order. The
+        manifest records a hash of that ordered list, so a file that does not
+        match is refused when the store is first used.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    store_path: Path
+    smiles_path: Path
+
+
 class FeatureStoreFixedEncoderConfig(BaseModel):
     """Configuration for fixed features looked up by SMILES in a persisted store.
 
@@ -388,6 +407,11 @@ class FeatureStoreFixedEncoderConfig(BaseModel):
         Base ``.npy`` feature matrix, with its manifest as the sibling ``.json``.
     smiles_path : Path
         The SMILES the store was built from, one per line in row order.
+    extra_stores : list of FeatureStoreExtraStoreConfig, default=[]
+        Further stores built by the same encoder, consulted in order for
+        molecules the base store lacks and before encoding them live. For a
+        fixed set rescored every round, such as the prior sample the reward
+        calibration reads, which would otherwise be encoded in full each time.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -400,6 +424,7 @@ class FeatureStoreFixedEncoderConfig(BaseModel):
     ]
     store_path: Path
     smiles_path: Path
+    extra_stores: list[FeatureStoreExtraStoreConfig] = Field(default_factory=list)
 
     def build(self) -> "FeatureStoreEncoder":
         """Build the store-backed fixed encoder."""
@@ -409,6 +434,9 @@ class FeatureStoreFixedEncoderConfig(BaseModel):
             self.inner.build(),
             store_path=self.store_path,
             smiles_path=self.smiles_path,
+            extra_stores=[
+                (extra.store_path, extra.smiles_path) for extra in self.extra_stores
+            ],
         )
 
 

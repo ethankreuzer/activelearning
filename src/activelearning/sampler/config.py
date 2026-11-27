@@ -21,6 +21,7 @@ from activelearning.sampler.exact_grid_sampler import ExactGridSampler
 from activelearning.sampler.hypercube_sampler import HypercubeSampler
 from activelearning.sampler.sampler import Sampler
 from activelearning.sampler.pool_file_sampler import PoolFileSampler
+from activelearning.sampler.reward_calibration import RewardCalibrationSettings
 from activelearning.sampler.reward_transform import RewardTransform
 from activelearning.sampler.gflownet.config_utils import compose_gflownet_conf
 from activelearning.sampler.gflownet.grid_sampler import GFlowNetGridSampler
@@ -277,6 +278,47 @@ class GFlowNetGridSamplerConfig(GFlowNetSamplerConfig):
         )
 
 
+class RewardCalibrationConfig(BaseModel):
+    """Re-derive the S3-GFN reward scale every round from a constant K.
+
+    Instead of fixing ``beta`` and ``log_score_floor`` once, each round (after the
+    surrogate is fit and the acquisition updated, before the policy trains) the
+    fixed prior sample is rescored and
+
+        beta = ln(K) / (p99 - median),    floor = floor_percentile of the scores
+
+    are recomputed from it, so the reward ratio between a 99th-percentile and a
+    median prior molecule stays K however the refit surrogate's scores move.
+
+    Parameters
+    ----------
+    k : float
+        Reward ratio between the 99th-percentile and the median prior molecule,
+        held constant over rounds. Must exceed 1.
+    prior_set_path : str
+        The fixed prior sample: a ``.csv`` with a ``smiles_column`` header, or a
+        file with one SMILES per line. Use the same file every round and every
+        run (the 83,811-molecule GP-MoLFormer set the K ladder was derived on).
+    smiles_column : str, default="SMILES"
+        SMILES column of a CSV ``prior_set_path``.
+    floor_percentile : float, default=5.0
+        Percentile of the rescored log scores used as the log-score floor.
+    """
+
+    k: float = Field(gt=1.0, allow_inf_nan=False)
+    prior_set_path: str = Field(min_length=1)
+    smiles_column: str = Field(default="SMILES", min_length=1)
+    floor_percentile: float = Field(default=5.0, ge=0.0, lt=50.0)
+
+    def build(self) -> RewardCalibrationSettings:
+        return RewardCalibrationSettings(
+            k=self.k,
+            prior_set_path=self.prior_set_path,
+            smiles_column=self.smiles_column,
+            floor_percentile=self.floor_percentile,
+        )
+
+
 class S3GFNSamplerConfig(BaseModel):
     """Configuration for the soft-constrained S3-GFN molecule sampler.
 
@@ -357,6 +399,13 @@ class S3GFNSamplerConfig(BaseModel):
     Fixed lower bound, in nats, on the logged score under ``power``, so a
     molecule's reward does not depend on its batch. When omitted, each batch is
     floored against its own maximum. Ignored by ``exponential``.
+    reward_calibration : RewardCalibrationConfig, optional
+    Derive ``beta`` and ``log_score_floor`` afresh every round from a constant K
+    and a fixed prior sample (see :class:`RewardCalibrationConfig`). Requires
+    ``reward_transform: power`` and one fidelity, and **replaces** ``beta`` and
+    ``log_score_floor``: setting either as well is an error, so a stale
+    hand-set value cannot sit beside the derived one. The ``beta`` shown in the
+    validated config is then the unused schema default.
     aux_coefficient : float, default=1e-4
     Weight of the auxiliary loss.
     buffer_size : int, default=6400
@@ -447,6 +496,7 @@ class S3GFNSamplerConfig(BaseModel):
     beta: PositiveFloat = 50.0
     reward_transform: RewardTransform = "exponential"
     log_score_floor: FiniteFloat | None = None
+    reward_calibration: RewardCalibrationConfig | None = None
     aux_coefficient: float = Field(default=1.0e-4, ge=0.0)
     buffer_size: int = Field(default=6400, gt=0)
     sa_threshold: float = Field(default=4.0, ge=0.0)
@@ -495,6 +545,33 @@ class S3GFNSamplerConfig(BaseModel):
                 values.setdefault(field_name, default)
         return values
 
+    @model_validator(mode="after")
+    def _check_reward_calibration(self) -> "S3GFNSamplerConfig":
+        """Reject a calibrated reward that contradicts the rest of the config."""
+        if self.reward_calibration is None:
+            return self
+        if self.reward_transform != "power":
+            raise ValueError(
+                "reward_calibration derives beta from log R = beta * log(score), "
+                "so it needs sampler.reward_transform: power; got "
+                f"{self.reward_transform!r}."
+            )
+        fixed = sorted({"beta", "log_score_floor"} & self.model_fields_set)
+        if fixed:
+            raise ValueError(
+                f"sampler.{' and sampler.'.join(fixed)} cannot be set together "
+                "with sampler.reward_calibration, which derives them every round "
+                "from K. Remove "
+                f"{'it' if len(fixed) == 1 else 'them'} so a stale value cannot "
+                "sit beside the derived one."
+            )
+        if self.fidelities is not None and len(self.fidelities) != 1:
+            raise ValueError(
+                "reward_calibration scores the prior sample at a single "
+                f"fidelity; sampler.fidelities has {len(self.fidelities)}."
+            )
+        return self
+
     def build(self) -> Sampler:
         """Build the sampler lazily so base installs need no Transformers.
 
@@ -537,6 +614,9 @@ class S3GFNSamplerConfig(BaseModel):
             beta=self.beta,
             reward_transform=self.reward_transform,
             log_score_floor=self.log_score_floor,
+            reward_calibration=(
+                None if self.reward_calibration is None else self.reward_calibration.build()
+            ),
             aux_coefficient=self.aux_coefficient,
             buffer_size=self.buffer_size,
             sa_threshold=self.sa_threshold,
