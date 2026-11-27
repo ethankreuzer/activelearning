@@ -33,6 +33,7 @@ from activelearning.logger.config import LoggerConfig
 from activelearning.monitoring.diagnostics_config import DiagnosticsConfig
 from activelearning.monitoring.run_writer import RunWriterConfig
 from activelearning.oracle.config import OracleConfig
+from activelearning.pool_filter import PoolFilterConfig
 from activelearning.runtime import RuntimeContextConfig
 from activelearning.sampler.config import (
     SamplerConfig,
@@ -75,6 +76,9 @@ class ActiveLearningConfig(BaseModel):
         Rule used to score candidate queries.
     sampler : SamplerConfig
         Candidate-generation strategy.
+    pool_filter : PoolFilterConfig, optional
+        Filter applied to the sampled pool before the selector sees it, e.g.
+        removing candidates that fail an SA threshold. ``None`` applies none.
     selector : SelectorConfig
         Rule used to select candidates for evaluation.
     oracle : OracleConfig
@@ -94,6 +98,7 @@ class ActiveLearningConfig(BaseModel):
     surrogate: SurrogateConfig
     acquisition: AcquisitionConfig
     sampler: SamplerConfig
+    pool_filter: PoolFilterConfig | None = None
     selector: SelectorConfig
     oracle: OracleConfig
     budget: BudgetConfig

@@ -193,6 +193,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     surrogate = cfg.surrogate.build()
     acquisition = cfg.acquisition.build()
     sampler = cfg.sampler.build()
+    pool_filter = cfg.pool_filter.build() if cfg.pool_filter is not None else None
     selector = cfg.selector.build()
     oracle = cfg.oracle.build()
     budget = cfg.budget.build()
@@ -253,6 +254,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         runtime_context=runtime_context,
         run_writer=run_writer,
         diagnostics_config=cfg.diagnostics,
+        pool_filter=pool_filter,
     )
 
     print(f"Done. Rounds: {num_rounds} | Total cost: {total_cost:.4f}")

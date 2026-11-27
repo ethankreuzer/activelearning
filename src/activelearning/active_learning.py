@@ -20,6 +20,7 @@ from activelearning.monitoring.orchestration import (
     record_partial_round,
 )
 from activelearning.oracle.oracle import Oracle
+from activelearning.pool_filter import SAPoolFilter
 from activelearning.monitoring.profiling import profile_operation
 from activelearning.monitoring.run_writer import RoundRecord, RunWriter
 from activelearning.runtime import (
@@ -74,6 +75,7 @@ def active_learning(
     runtime_context: RuntimeContext | None = None,
     run_writer: RunWriter | None = None,
     diagnostics_config: DiagnosticsConfig = DiagnosticsConfig(),
+    pool_filter: SAPoolFilter | None = None,
 ) -> tuple[Dataset, float, int]:
     """Execute the active learning loop with budget constraints.
 
@@ -107,6 +109,11 @@ def active_learning(
         Durable structured run writer used to persist run-start metadata,
         completed round records and artifacts, and the final run summary.
         It operates independently of the logger.
+    pool_filter : SAPoolFilter, optional
+        Removes candidates from the sampled pool before the selector sees it,
+        so every selection strategy chooses from the same eligible set. The
+        number removed is logged each round. ``None`` selects from the whole
+        pool.
     diagnostics_config : DiagnosticsConfig, optional
         Controls optional diagnostic enrichment for configured sinks. Core round
         metrics and profiling remain active when diagnostics are disabled; with
@@ -253,6 +260,32 @@ def active_learning(
                 **stage_kwargs,
             )
 
+            # Remove ineligible candidates before ANY selection strategy runs,
+            # so the constraint does not depend on how the selector ranks. The
+            # run's sampled_candidates record below is the filtered pool too,
+            # so the selector's recorded indices keep indexing the list that
+            # is saved; the sampler's own pool_log_path CSV still holds the
+            # full pool.
+            num_proposed = len(samples)
+            num_filtered_out: int | None = None
+            if pool_filter is not None:
+                with profile_operation(profiling, "pool_filter/filter"):
+                    filtered = pool_filter(samples)
+                samples = filtered.kept
+                num_filtered_out = filtered.removed
+                _logger.info(
+                    "Pool filter (SA < %s) removed %d/%d candidate(s); %d remain.",
+                    pool_filter.sa_threshold,
+                    num_filtered_out,
+                    num_proposed,
+                    len(samples),
+                )
+                if not samples:
+                    _logger.warning(
+                        "Pool filter removed every candidate; the round will "
+                        "select nothing and the run will stop."
+                    )
+
             # Get the current round budget and pass the same oracle cost model to
             # the selector for ranking/filtering.
             with profile_operation(profiling, "budget/get_round_budget"):
@@ -359,7 +392,19 @@ def active_learning(
             num_rounds += 1
             metrics: dict[str, int | float] = {
                 "active_learning/round": num_rounds,
-                "active_learning/samples/proposed": len(samples),
+                # What the sampler produced, before any pool filter.
+                "active_learning/samples/proposed": num_proposed,
+                **(
+                    {
+                        "active_learning/samples/filtered_out": num_filtered_out,
+                        "active_learning/samples/filtered_out_rate": (
+                            num_filtered_out / num_proposed if num_proposed else 0.0
+                        ),
+                        "active_learning/samples/eligible": len(samples),
+                    }
+                    if num_filtered_out is not None
+                    else {}
+                ),
                 "active_learning/samples/selected": len(selected_samples),
                 # A rate beside the count, so the series is readable when the
                 # pool size is not held fixed.

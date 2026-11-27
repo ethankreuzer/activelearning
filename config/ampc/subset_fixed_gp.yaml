@@ -247,6 +247,16 @@ sampler:
   training_sample_log_path: outputs/ampc/single_fidelity_al/${run_name}/training_samples_round_{round}.csv.gz
   training_step_log_path: outputs/ampc/single_fidelity_al/${run_name}/training_steps_round_{round}.csv
 
+# Removes every candidate with SA >= sa_threshold from the 100k pool BEFORE the
+# selector runs, so whatever selection strategy is configured only ever sees
+# synthesizable molecules, and the docked set passes SA by construction. The
+# sampler's own pool_log_path CSV still holds the full 100k. Interpolated from
+# the sampler so training and selection cut at the same place. The number removed
+# each round is logged as active_learning/samples/filtered_out (and _rate).
+# Remove this block to select from the unfiltered pool.
+pool_filter:
+  sa_threshold: ${sampler.sa_threshold}
+
 selector:
   type: CostAwareSelector
   # Never dock a molecule this run has already docked, whether or not the dock
