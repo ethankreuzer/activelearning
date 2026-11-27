@@ -201,7 +201,7 @@ acquisition:
 
 sampler:
   type: S3GFNSampler
-  n_samples: 100000  # Generate a 100k-candidate pool per round. The round
+  n_samples: 100000  # Generate up to a 100k-candidate pool per round. The round
                      # budget below picks how many of them are docked: 1,000
                      # for the two-round test, at ~32 core-seconds each.
   fidelities: [1]
@@ -262,6 +262,20 @@ sampler:
     floor_percentile: 5.0
   aux_coefficient: 0.001
   sa_threshold: 4.0
+  # FINAL GENERATION STOPS AT 100k UNIQUE MOLECULES OR 500k ATTEMPTS, WHICHEVER
+  # COMES FIRST, and a capped round is carried forward rather than failed as long
+  # as it holds at least min_pool_size. The pool is only the shelf the docking set
+  # is chosen from (and the SA pool filter thins it first), so 10k is ample for
+  # a few thousand docks. Before this, a round that hit the cap raised, discarding
+  # the ~70 minutes of policy training and ending the run: three K-ladder arms
+  # did (ExactGP K=1000 x2, K=300 seed 45; the last had filled 57k). Healthy
+  # rounds need 150-200k attempts (outlier 452k), so 500k is a backstop, not a
+  # target. Hitting it is logged as sampler/s3gfn/generation/partial_pool=1 and in
+  # the round's generation summary; it means the policy is repeating itself. A
+  # pool below min_pool_size still fails the round. Omit min_pool_size to restore
+  # the strict behaviour.
+  max_generation_attempts: 500000
+  min_pool_size: 10000
   # Written the moment generation finishes, so a round that later dies in
   # docking still leaves the 100k pool it produced and a reservoir sample of
   # what it threw away. The reward-shape arms wrote both; this config did not

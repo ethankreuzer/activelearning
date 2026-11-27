@@ -97,6 +97,10 @@ class _RoundMetrics:
     # sample percentiles they came from. None when beta and the floor were fixed
     # in the config, which is the case this series exists to tell apart.
     reward_calibration: dict[str, float | int] | None = None
+    # The pool size final generation was asked for, set when it starts. With
+    # `final_candidates` it tells a full pool from a partial one carried forward
+    # after the attempt cap; None until final generation has begun.
+    pool_target: int | None = None
     # Every molecule the policy generated while TRAINING, with the step that
     # produced it and the two scores it was judged by. The 100k pool is one
     # snapshot taken AFTER a round's training; this is what the policy explored
@@ -411,6 +415,7 @@ class S3GFNLoggingMixin:
                 "sampler/s3gfn/train/positive_buffer": round_metrics.positive_buffer_size,
                 "sampler/s3gfn/train/negative_buffer": round_metrics.negative_buffer_size,
                 "sampler/s3gfn/generation/attempts": generation_attempts,
+                "sampler/s3gfn/generation/pool_size": final_candidate_count,
                 "sampler/s3gfn/generation/yield": _safe_ratio(
                     final_candidate_count, generation_attempts
                 ),
@@ -507,6 +512,12 @@ class S3GFNLoggingMixin:
             if round_metrics.reward_effective_supports:
                 metrics["sampler/s3gfn/reward/effective_support_median"] = _median(
                     round_metrics.reward_effective_supports
+                )
+            if round_metrics.pool_target is not None and final_candidate_count:
+                # 1 when the attempt cap cut the pool short and the round went on
+                # with what it had; the series to watch for a collapsing policy.
+                metrics["sampler/s3gfn/generation/partial_pool"] = int(
+                    final_candidate_count < round_metrics.pool_target
                 )
             if round_metrics.reward_calibration is not None:
                 for name, value in round_metrics.reward_calibration.items():
@@ -1114,6 +1125,9 @@ def write_generation_summary(
             "duration_s": metrics.training_duration_s,
         },
     }
+    # A round that hit the cap but met min_pool_size carries its pool forward:
+    # reached_target is False, yet a pool exists.
+    summary["partial_pool"] = bool(metrics.final_candidates) and not reached_target
     if metrics.reward_calibration is not None:
         summary["reward_calibration"] = dict(metrics.reward_calibration)
     resolved = Path(path.replace("{round}", f"{round_index:04d}"))

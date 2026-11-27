@@ -418,6 +418,13 @@ class S3GFNSamplerConfig(BaseModel):
     Maximum gradient norm during policy training.
     max_generation_attempts : int, optional
     Maximum attempts to produce the requested number of valid candidates.
+    min_pool_size : int, optional
+    Smallest pool a round may carry forward when final generation hits
+    ``max_generation_attempts`` before collecting ``n_samples`` unique molecules.
+    At or above it the round continues with the partial pool and a warning;
+    below it the round fails. Omitted, any shortfall fails the round. Must not
+    exceed ``n_samples``. Generation still stops as soon as ``n_samples`` is
+    reached.
     desalt_largest_fragment : bool, default=False
     Keep the largest fragment of a multi-fragment molecule and score that,
     instead of rejecting the sample. The salted trajectory goes to the negative
@@ -503,6 +510,7 @@ class S3GFNSamplerConfig(BaseModel):
     sampling_temperature: PositiveFloat = 1.0
     gradient_clip_norm: PositiveFloat = 10.0
     max_generation_attempts: int | None = Field(default=None, gt=0)
+    min_pool_size: int | None = Field(default=None, gt=0)
     desalt_largest_fragment: bool = False
     reject_sample_size: int = Field(default=2000, ge=0)
     reject_log_path: str | None = None
@@ -544,6 +552,16 @@ class S3GFNSamplerConfig(BaseModel):
             for field_name, default in preset.items():
                 values.setdefault(field_name, default)
         return values
+
+    @model_validator(mode="after")
+    def _check_min_pool_size(self) -> "S3GFNSamplerConfig":
+        """Reject a pool floor larger than the pool."""
+        if self.min_pool_size is not None and self.min_pool_size > self.n_samples:
+            raise ValueError(
+                f"sampler.min_pool_size ({self.min_pool_size}) cannot exceed "
+                f"sampler.n_samples ({self.n_samples})."
+            )
+        return self
 
     @model_validator(mode="after")
     def _check_reward_calibration(self) -> "S3GFNSamplerConfig":
@@ -623,6 +641,7 @@ class S3GFNSamplerConfig(BaseModel):
             sampling_temperature=self.sampling_temperature,
             gradient_clip_norm=self.gradient_clip_norm,
             max_generation_attempts=self.max_generation_attempts,
+            min_pool_size=self.min_pool_size,
             desalt_largest_fragment=self.desalt_largest_fragment,
             reject_sample_size=self.reject_sample_size,
             reject_log_path=self.reject_log_path,

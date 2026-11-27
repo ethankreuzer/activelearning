@@ -188,6 +188,7 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
         sampling_temperature: float = 1.0,
         gradient_clip_norm: float = 10.0,
         max_generation_attempts: int | None = None,
+        min_pool_size: int | None = None,
         desalt_largest_fragment: bool = False,
         reject_sample_size: int = 2000,
         reject_log_path: str | None = None,
@@ -339,6 +340,14 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
             failing. Defaults to
             ``max(n_samples * 20, generation_batch_size * 2)`` after applying
             the ``batch_size`` fallback.
+        min_pool_size : int or None, optional
+            Smallest pool a round may carry forward when final generation hits
+            ``max_generation_attempts`` before collecting ``n_samples`` unique
+            molecules. At or above it the round proceeds with the partial pool,
+            logging a warning; below it the sampler raises as before. ``None``
+            (default) is strict: anything short of ``n_samples`` raises. Must
+            lie in ``[1, n_samples]``. Generation still stops the moment
+            ``n_samples`` is reached, so this only ever matters at the cap.
         desalt_largest_fragment : bool, optional
             When a generated molecule has several fragments (a drug plus a
             counter-ion such as ``.Cl``), keep the fragment with the most heavy
@@ -406,6 +415,11 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
             raise ValueError("gradient_clip_norm must be finite and positive.")
         if max_generation_attempts is not None and max_generation_attempts <= 0:
             raise ValueError("max_generation_attempts must be positive.")
+        if min_pool_size is not None and not (1 <= min_pool_size <= n_samples):
+            raise ValueError(
+                f"min_pool_size must be between 1 and n_samples ({n_samples}), "
+                f"got {min_pool_size}."
+            )
         if reject_sample_size < 0:
             raise ValueError("reject_sample_size must be nonnegative.")
         if step_bin_size < 1:
@@ -466,6 +480,7 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
             if max_generation_attempts is not None
             else max(n_samples * 20, self.effective_generation_batch_size * 2)
         )
+        self.min_pool_size = min_pool_size
         self.desalt_largest_fragment = desalt_largest_fragment
         self.reject_sample_size = reject_sample_size
         self.reject_log_path = reject_log_path
@@ -527,8 +542,9 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
         Returns
         -------
         Sequence[Candidate]
-            Exactly ``n_samples`` unique candidates with canonical connected
-            SMILES and sampled fidelity levels.
+            ``n_samples`` unique candidates with canonical connected SMILES and
+            sampled fidelity levels; fewer, but at least ``min_pool_size``, only
+            when generation hit the attempt cap and ``min_pool_size`` is set.
 
         Raises
         ------
@@ -1392,7 +1408,14 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
         model: S3GFNModel,
         molecule_chem: Any,
     ) -> list[Candidate]:
-        """Generate exactly ``n_samples`` unique canonical candidates."""
+        """Generate ``n_samples`` unique canonical candidates, or a partial pool.
+
+        Stops as soon as ``n_samples`` are collected. If the attempt cap is hit
+        first, a pool of at least ``min_pool_size`` is returned with a warning,
+        and anything smaller raises ``RuntimeError``; with ``min_pool_size``
+        unset any shortfall raises.
+        """
+        self.round_metrics.pool_target = self.n_samples
         model.policy.eval()
         model.prior.eval()
         candidates: list[Candidate] = []
@@ -1452,16 +1475,39 @@ class S3GFNSampler(S3GFNLoggingMixin, Sampler):
             )
 
         if len(candidates) != self.n_samples:
-            _logger.error(
-                "Final candidate generation stopped at %d/%d unique candidate(s) "
-                "after %d attempts.",
+            carry_forward = (
+                self.min_pool_size is not None and len(candidates) >= self.min_pool_size
+            )
+            if not carry_forward:
+                _logger.error(
+                    "Final candidate generation stopped at %d/%d unique candidate(s) "
+                    "after %d attempts.",
+                    len(candidates),
+                    self.n_samples,
+                    generated_attempts,
+                )
+                floor = (
+                    ""
+                    if self.min_pool_size is None
+                    else f" (below min_pool_size={self.min_pool_size})"
+                )
+                raise RuntimeError(
+                    f"S3GFNSampler generated {len(candidates)} valid unique molecules "
+                    f"after {generated_attempts} attempts; requested "
+                    f"{self.n_samples}{floor}."
+                )
+            _logger.warning(
+                "Final candidate generation hit the %d-attempt cap with %d/%d "
+                "unique candidate(s); carrying the partial pool forward "
+                "(min_pool_size=%d). A capped round means the policy is "
+                "repeating itself: %d of the attempts were duplicates and %d "
+                "invalid.",
+                max_attempts,
                 len(candidates),
                 self.n_samples,
-                generated_attempts,
-            )
-            raise RuntimeError(
-                f"S3GFNSampler generated {len(candidates)} valid unique molecules "
-                f"after {generated_attempts} attempts; requested {self.n_samples}."
+                self.min_pool_size,
+                self.round_metrics.generation_duplicates,
+                self.round_metrics.generation_invalid,
             )
         self.round_metrics.record_final_candidates(candidates)
         _logger.info(
