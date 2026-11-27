@@ -117,18 +117,38 @@ surrogate:
     # dropping a hit.
     keep_above: 0.5247394203416823
     # `band_edges` is deliberately NOT set. The y cutoffs that split the archive
-    # into bands (quantiles 50/75/90/95/99/99.75%) are derived ONCE, from the
-    # whole archive -- the start set plus everything docked so far -- the first
-    # time it exceeds `size` and has to be subsetted, and are then frozen for every
-    # later round. Rounds before that fit the whole archive and use no bands. So
-    # the bands describe the archive actually being cut down, not the 20k start
-    # set, which docking will have enriched by then; and, being frozen after the
-    # switch, a band still means the same y range in every subset round.
-    # The derived edges are logged each round as
-    # surrogate/subset_gp/band_edge_<i>. A RESUMED run would re-derive them from
-    # the archive it restarts with, so to resume, pin the logged values here.
+    # into bands are derived from the whole archive -- the start set plus everything
+    # docked so far -- EVERY round that has to subset (rounds that fit the whole
+    # archive use no bands). So the bands always describe the archive actually
+    # being cut down, which docking keeps enriching, and the edges are a pure
+    # function of that archive: nothing to store, and a resumed run reproduces them.
+    # The price is that a band covers a different y range from round to round, so
+    # per-round band sizes and budgets are not directly comparable. Set
+    # `refresh_band_edges: false` to freeze the first subsetting round's edges for
+    # the rest of the run instead.
+    # The edges used are logged each round as surrogate/subset_gp/band_edge_<i>.
     # (Earlier configs pinned the round-0 quantiles; for this 20k start set those
-    # are [0.06873, 0.20251, 0.30633, 0.35921, 0.48081, 0.577].)
+    # were [0.06873, 0.20251, 0.30633, 0.35921, 0.48081, 0.577].)
+    refresh_band_edges: true
+    #
+    # ONE EDGE IS PINNED: the lower edge of the TOP band, at y 0.4389967546609654
+    # = pProp 4.5, just below the hit cutoff (pProp 5). Hits are kept outright and
+    # belong to no band, so the top band is the highest-y band among the NON-hit
+    # rows. Left to the quantiles its edge would be the 99.75th percentile, which
+    # sits INSIDE the hits (they are 0.58% of the 20k start, 0.25% of the top), so
+    # the top band was empty and the `top_fraction` share reserved for it went
+    # nowhere. Pinned, the top band is the near-hit tier pProp 4.5 to 5 (~250 rows
+    # in the start set), which is the region worth extra coverage. top_fraction
+    # 0.05 below reserves up to 5% of `size` for it; a band smaller than that
+    # takes all of its rows and the shortfall is shared out over the other bands.
+    top_band_edge: 0.4389967546609654
+    # With the top edge pinned, these are the quantiles (of the archive rows BELOW
+    # that edge) that cut the lower bands: five edges plus the pinned one make
+    # seven bands, which is what the seven-entry pool_multiple below is written
+    # for. The band count therefore does not depend on how enriched the archive is,
+    # so it stays seven however the edges move between rounds. The default list also had a 99.75% quantile, which
+    # is what produced the empty top band.
+    quantiles: [50, 75, 90, 95, 99]
     # Set EXPLICITLY, because the module defaults are the original stratified
     # settings (top_fraction 0.5, band_fill even, pool_multiple 15) that the
     # balanced selection was written to replace: half the budget in the top

@@ -31,7 +31,7 @@ from typing import Annotated, Any, Literal, Optional, Union
 
 import numpy as np
 import torch
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from activelearning.surrogate.encoder import FixedEncoder
 from activelearning.surrogate.stratified_fps import (
@@ -198,13 +198,19 @@ class StratifiedFPSSubsetSelector(TrainingSubsetSelector):
     farthest-point sampling in feature space, so each band's rows are spread
     rather than clustered.
 
-    The band edges are fixed on the FIRST call and reused for every later one.
-    Quantiles of each round's own archive would move with the enrichment the
-    loop is producing, so "the top band" would mean something different each
-    round and the compositions could not be compared. Pass ``band_edges`` to
-    pin them explicitly instead, which a run that may be resumed from a
-    checkpoint should do: a resumed process computes its edges from the archive
-    it restarts with, not from the round-0 one.
+    By default the band edges are fixed on the FIRST call that has to subset and
+    reused for every later one. Quantiles of each round's own archive would move
+    with the enrichment the loop is producing, so "the top band" would mean
+    something different each round and the compositions could not be compared.
+    Pass ``band_edges`` to pin them explicitly instead, which a run that may be
+    resumed from a checkpoint should do: a resumed process computes its edges from
+    the archive it restarts with, not from the round-0 one.
+
+    With ``refresh_band_edges`` the opposite trade is made: the edges are derived
+    afresh from the archive handed to EVERY subsetting call, so they follow the
+    archive as it grows, are a pure function of it (nothing to pin on a resume),
+    and are not comparable between rounds. Only edges derived from quantiles can
+    be refreshed, so it cannot be combined with ``band_edges``.
     """
 
     def __init__(
@@ -214,6 +220,8 @@ class StratifiedFPSSubsetSelector(TrainingSubsetSelector):
         keep_above: float,
         quantiles: Sequence[float] | None = None,
         band_edges: Sequence[float] | None = None,
+        top_band_edge: float | None = None,
+        refresh_band_edges: bool = False,
         top_fraction: float | None = None,
         pool_multiple: int | Sequence[int] | None = None,
         band_fill: str | None = None,
@@ -233,6 +241,15 @@ class StratifiedFPSSubsetSelector(TrainingSubsetSelector):
         band_edges : Sequence[float], optional
             Band edges pinned explicitly, so no call derives them from an
             archive.
+        top_band_edge : float, optional
+            Pins the lower edge of the top band; the other edges are quantiles
+            of the archive rows below it, derived at the first subsetting round
+            and then frozen.
+            Set it just below ``keep_above`` so the top band is the near-hit
+            tier (see :func:`select_stratified_rows`).
+        refresh_band_edges : bool, default=False
+            Derive the edges from the current archive at every subsetting call
+            instead of freezing the first call's. Not with ``band_edges``.
         top_fraction, pool_multiple, band_fill : optional
             As for :func:`select_stratified_rows`.
         seed : int, default=42
@@ -241,12 +258,28 @@ class StratifiedFPSSubsetSelector(TrainingSubsetSelector):
         Raises
         ------
         ValueError
-            If ``size`` is not positive.
+            If ``size`` is not positive, ``top_band_edge`` is not below
+            ``keep_above`` or is given with ``band_edges``, or
+            ``refresh_band_edges`` is given with ``band_edges``.
         """
         if size < 1:
             raise ValueError("size must be positive.")
+        if refresh_band_edges and band_edges is not None:
+            raise ValueError(
+                "refresh_band_edges re-derives the edges every round, so it "
+                "cannot be combined with band_edges, which pins them."
+            )
+        if top_band_edge is not None:
+            if band_edges is not None:
+                raise ValueError("top_band_edge cannot be combined with band_edges.")
+            if not top_band_edge < keep_above:
+                raise ValueError(
+                    f"top_band_edge={top_band_edge} must be below keep_above="
+                    f"{keep_above}, or the top band would hold only kept rows."
+                )
         self.size = size
         self.keep_above = keep_above
+        self.top_band_edge = top_band_edge
         self.seed = seed
         self._quantiles = (
             DEFAULT_QUANTILES
@@ -260,15 +293,24 @@ class StratifiedFPSSubsetSelector(TrainingSubsetSelector):
             DEFAULT_POOL_MULTIPLE if pool_multiple is None else pool_multiple
         )
         self._band_fill = DEFAULT_BAND_FILL if band_fill is None else band_fill
+        self.refresh_band_edges = refresh_band_edges
         self._band_edges: np.ndarray | None = (
             None if band_edges is None else np.asarray(band_edges, dtype=np.float64)
         )
+        # The edges the latest subsetting call used; the same as ``_band_edges``
+        # unless they are being refreshed.
+        self._latest_band_edges: np.ndarray | None = self._band_edges
         self.last_diagnostics: dict[str, Any] = {}
 
     @property
     def band_edges(self) -> list[float] | None:
-        """The fixed band edges, once a call has established them."""
-        return None if self._band_edges is None else self._band_edges.tolist()
+        """The inner band edges the latest subsetting call used, or ``None``.
+
+        Fixed after the first call unless ``refresh_band_edges`` is set, in which
+        case they are those of the most recent call.
+        """
+        edges = self._latest_band_edges
+        return None if edges is None else edges.tolist()
 
     def select(
         self,
@@ -321,21 +363,22 @@ class StratifiedFPSSubsetSelector(TrainingSubsetSelector):
             encode_rows=encode_rows,
             quantiles=self._quantiles,
             band_edges=self._band_edges,
+            # Once the edges are frozen they include this one.
+            top_band_edge=self.top_band_edge if self._band_edges is None else None,
             top_fraction=self._top_fraction,
             pool_multiple=self._pool_multiple,
             band_fill=self._band_fill,
             keep_above=self.keep_above,
             seed=self.seed,
         )
-        # Fixed from here on, whether they were given or derived.
-        self._band_edges = np.asarray(
-            [
-                edge
-                for edge in diagnostics["band_edges"]
-                if edge is not None
-            ],
+        used = np.asarray(
+            [edge for edge in diagnostics["band_edges"] if edge is not None],
             dtype=np.float64,
         )
+        self._latest_band_edges = used
+        if not self.refresh_band_edges:
+            # Fixed from here on, whether they were given or derived.
+            self._band_edges = used
         self.last_diagnostics = diagnostics
         indices = np.sort(rows_per_size[self.size])
         return TrainingSubset(indices=indices.tolist(), top_count=top_count)
@@ -473,10 +516,43 @@ class StratifiedFPSSubsetSelectorConfig(BaseModel):
     #: should set these: a resumed process would otherwise derive them from the
     #: archive it restarts with rather than the round-0 one.
     band_edges: Optional[list[float]] = None
+    #: Pins only the LOWER edge of the top band; the other edges are quantiles of
+    #: the archive rows BELOW it, derived at the first subsetting round. Set just
+    #: below `keep_above` so the top band is the near-hit tier. Without it the top
+    #: band starts at the last quantile, which lies inside the kept rows (and is
+    #: empty) once hits exceed that quantile's share of the archive. Not with
+    #: `band_edges`.
+    top_band_edge: Optional[float] = None
+    #: Derive the edges from the current archive at EVERY subsetting round instead
+    #: of freezing the first one's. They then follow the archive as it grows, need
+    #: no pinning on a resume, and a band no longer covers the same y range from
+    #: round to round. Not with `band_edges`.
+    refresh_band_edges: bool = False
     top_fraction: Optional[float] = Field(default=None, ge=0.0, le=1.0)
     pool_multiple: Optional[Union[int, list[int]]] = None
     band_fill: Optional[Literal["proportional", "even"]] = None
     seed: int = 42
+
+    @model_validator(mode="after")
+    def _check_top_band_edge(self) -> "StratifiedFPSSubsetSelectorConfig":
+        """Refuse a top band that could only hold kept rows, or two pinnings."""
+        if self.refresh_band_edges and self.band_edges is not None:
+            raise ValueError(
+                "refresh_band_edges re-derives the edges every round, so it "
+                "cannot be combined with band_edges, which pins them."
+            )
+        if self.top_band_edge is None:
+            return self
+        if self.band_edges is not None:
+            raise ValueError(
+                "top_band_edge pins one edge and band_edges pins them all; set one."
+            )
+        if not self.top_band_edge < self.keep_above:
+            raise ValueError(
+                f"top_band_edge ({self.top_band_edge}) must be below keep_above "
+                f"({self.keep_above}), or the top band holds only kept rows."
+            )
+        return self
 
     def build(self) -> StratifiedFPSSubsetSelector:
         """Build the configured selector."""
@@ -485,6 +561,8 @@ class StratifiedFPSSubsetSelectorConfig(BaseModel):
             keep_above=self.keep_above,
             quantiles=self.quantiles,
             band_edges=self.band_edges,
+            top_band_edge=self.top_band_edge,
+            refresh_band_edges=self.refresh_band_edges,
             top_fraction=self.top_fraction,
             pool_multiple=self.pool_multiple,
             band_fill=self.band_fill,

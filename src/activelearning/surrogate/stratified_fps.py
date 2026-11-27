@@ -527,6 +527,7 @@ def select_stratified_rows(
     encode_rows: Callable[[np.ndarray], np.ndarray],
     quantiles: Sequence[float] = DEFAULT_QUANTILES,
     band_edges: Sequence[float] | np.ndarray | None = None,
+    top_band_edge: float | None = None,
     top_fraction: float | None = DEFAULT_TOP_FRACTION,
     pool_multiple: int | Sequence[int] = DEFAULT_POOL_MULTIPLE,
     band_fill: str = DEFAULT_BAND_FILL,
@@ -564,6 +565,16 @@ def select_stratified_rows(
         Infinite outer edges are added when absent. For a selection repeated
         over rounds on a growing archive: recomputed quantiles would move with
         the enrichment and the rounds would not be comparable.
+    top_band_edge : float, optional
+        Pins the LOWER edge of the top band. The other edges are quantiles of the
+        rows BELOW it, so the number of bands is ``len(quantiles) + 1`` however
+        enriched ``targets`` is (barring tied values), and per-band settings such
+        as ``pool_multiple`` keep matching. With ``keep_above`` it makes the top
+        band the rows from ``top_band_edge`` up to ``keep_above``. Without it the
+        top band starts at the last quantile of all of ``targets``, which lies
+        inside the kept rows, and so is empty, as soon as those exceed the top
+        quantile's share of the archive. Must be below ``keep_above`` and cannot be
+        combined with ``band_edges``.
     top_fraction : float or None, default=DEFAULT_TOP_FRACTION
         Share of each size's budget given to the top band. ``None`` gives the
         top band an equal share of the filler alongside every other band; see
@@ -596,8 +607,9 @@ def select_stratified_rows(
     ValueError
         If ``sizes`` is empty or holds a non-positive entry, if any
         ``pool_multiple`` is less than one, if a per-band ``pool_multiple``
-        does not have one entry per band, or if ``keep_above`` keeps at least
-        as many rows as the smallest size.
+        does not have one entry per band, if ``keep_above`` keeps at least
+        as many rows as the smallest size, or if ``top_band_edge`` is not finite,
+        is not below ``keep_above``, or is given with ``band_edges``.
     """
     values = np.asarray(targets, dtype=np.float64)
     requested = sorted({int(size) for size in sizes})
@@ -606,8 +618,34 @@ def select_stratified_rows(
     if requested[0] < 1:
         raise ValueError(f"sizes must be positive; got {sorted(sizes)}.")
 
+    if top_band_edge is not None:
+        if not np.isfinite(top_band_edge):
+            raise ValueError(f"top_band_edge must be finite; got {top_band_edge}.")
+        if band_edges is not None:
+            raise ValueError(
+                "top_band_edge pins one edge of quantile-derived bands and cannot "
+                "be combined with band_edges, which pins them all."
+            )
+        if keep_above is not None and top_band_edge >= keep_above:
+            raise ValueError(
+                f"top_band_edge={top_band_edge} is not below keep_above="
+                f"{keep_above}, so the top band would hold only kept rows."
+            )
     if band_edges is None:
-        edges = quantile_band_edges(values, quantiles)
+        if top_band_edge is None:
+            edges = quantile_band_edges(values, quantiles)
+        else:
+            # The lower bands partition what lies below the pinned edge, and the
+            # top band starts exactly at it. Quantiles of the rows below it, not of
+            # everything, so enrichment above it cannot change the band count.
+            below = values[values < top_band_edge]
+            if below.size == 0:
+                raise ValueError(
+                    f"no row lies below top_band_edge={top_band_edge}; there is "
+                    "nothing to band."
+                )
+            inner = quantile_band_edges(below, quantiles)[1:-1]
+            edges = np.concatenate(([-np.inf], inner, [top_band_edge], [np.inf]))
     else:
         # Edges fixed by the caller, for a selection repeated over rounds on a
         # growing archive. Quantiles of each round's own archive would chase the

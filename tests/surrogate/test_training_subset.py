@@ -443,3 +443,176 @@ def test_band_edges_are_logged_with_the_round_metrics() -> None:
     assert "surrogate/subset_gp/band_edge_0" not in metrics  # open ends skipped
     assert "surrogate/subset_gp/band_edge_4" not in metrics
     assert metrics["surrogate/subset_gp/train/kept_above_threshold"] == 3
+
+
+def _near_hit_archive() -> list[Observation]:
+    """500 low rows, 60 near-hit rows (0.45-0.5), 40 hits (0.6): hits are 6.7%."""
+    ys = (
+        [i / 1667 for i in range(500)]  # 0 .. 0.3
+        + [0.45 + i * 0.05 / 60 for i in range(60)]  # near-hit tier, below 0.52
+        + [0.6] * 40  # hits
+    )
+    return [Observation(x=f"m{index}", y=y) for index, y in enumerate(ys)]
+
+
+def test_without_a_pinned_top_edge_the_top_band_is_empty_when_hits_are_common() -> None:
+    """The problem being fixed: the top quantile lies inside the kept rows."""
+    selector = StratifiedFPSSubsetSelector(size=300, keep_above=0.52, seed=1)
+
+    selector.select(_near_hit_archive(), encoder=_IndexEncoder())
+
+    assert selector.last_diagnostics["bands"][-1]["n_band"] == 0
+
+
+def test_a_pinned_top_edge_makes_the_top_band_the_near_hit_tier() -> None:
+    archive = _near_hit_archive()
+    selector = StratifiedFPSSubsetSelector(
+        size=300, keep_above=0.52, top_band_edge=0.44, seed=1
+    )
+
+    subset = selector.select(archive, encoder=_IndexEncoder())
+
+    top = selector.last_diagnostics["bands"][-1]
+    near_hit = {i for i, o in enumerate(archive) if 0.44 <= o.y < 0.52}
+    assert top["n_band"] == len(near_hit) == 60
+    # The band's share (top_fraction of the budget) exceeds its size, so it is
+    # taken whole and the shortfall goes to the other bands.
+    assert near_hit <= set(subset.indices)
+    assert len(subset.indices) == 300
+    hits = {i for i, o in enumerate(archive) if o.y >= 0.52}
+    assert hits <= set(subset.indices)
+    # The last inner edge is exactly the pinned one; quantile edges at or above
+    # it were folded into the top band.
+    assert selector.band_edges[-1] == 0.44
+    assert all(edge < 0.44 for edge in selector.band_edges[:-1])
+
+
+def test_the_pinned_top_edge_survives_freezing_across_rounds() -> None:
+    """Later rounds reuse the frozen edges, which already include the pinned one."""
+    archive = _near_hit_archive()
+    selector = StratifiedFPSSubsetSelector(
+        size=300, keep_above=0.52, top_band_edge=0.44, seed=1
+    )
+    selector.select(archive, encoder=_IndexEncoder())
+    first = selector.band_edges
+
+    selector.select(archive + archive[:40], encoder=_IndexEncoder())  # must not raise
+
+    assert selector.band_edges == first
+
+
+def test_a_top_edge_not_below_the_hit_cutoff_or_beside_band_edges_is_refused() -> None:
+    with pytest.raises(ValueError, match="below keep_above"):
+        StratifiedFPSSubsetSelector(size=100, keep_above=0.5, top_band_edge=0.5)
+    with pytest.raises(ValueError, match="band_edges"):
+        StratifiedFPSSubsetSelector(
+            size=100, keep_above=0.5, top_band_edge=0.4, band_edges=[0.1, 0.2]
+        )
+    for bad in (
+        {"keep_above": 0.5, "top_band_edge": 0.6},
+        {"keep_above": 0.5, "top_band_edge": 0.4, "band_edges": [0.1, 0.2]},
+    ):
+        with pytest.raises(ValueError):
+            StratifiedFPSSubsetSelectorConfig(size=100, **bad)
+    config = StratifiedFPSSubsetSelectorConfig(size=100, keep_above=0.5, top_band_edge=0.4)
+    assert config.build().top_band_edge == 0.4
+
+
+def test_band_count_does_not_depend_on_how_enriched_the_archive_is() -> None:
+    """Per-band settings (pool_multiple) need the count fixed when the switch comes.
+
+    More and more of the archive above the pinned edge must not change the number
+    of bands, which is len(quantiles) + 1 because the lower edges are quantiles of
+    the rows below it.
+    """
+    counts = set()
+    for near_hit_rows, hits in ((10, 5), (60, 40), (150, 200)):
+        ys = (
+            [i / 1667 for i in range(500)]
+            + [0.45 + i * 0.05 / max(near_hit_rows, 1) for i in range(near_hit_rows)]
+            + [0.6] * hits
+        )
+        archive = [Observation(x=f"m{i}", y=y) for i, y in enumerate(ys)]
+        selector = StratifiedFPSSubsetSelector(
+            size=300,
+            keep_above=0.52,
+            top_band_edge=0.44,
+            quantiles=[50, 75, 90, 95, 99],
+            pool_multiple=[3, 3, 3, 2, 2, 2, 2],  # seven entries, one per band
+            seed=1,
+        )
+        selector.select(archive, encoder=_IndexEncoder())
+        counts.add(len(selector.last_diagnostics["bands"]))
+    assert counts == {7}
+
+
+def _enriched(extra_mid_rows: int) -> list[Observation]:
+    """The near-hit archive plus rows added in the mid-y bulk, as docking would."""
+    base = _near_hit_archive()
+    extra = [
+        Observation(x=f"m{len(base) + i}", y=0.15 + 0.15 * i / max(extra_mid_rows, 1))
+        for i in range(extra_mid_rows)
+    ]
+    return base + extra
+
+
+def _refresh_selector(**kwargs) -> StratifiedFPSSubsetSelector:
+    return StratifiedFPSSubsetSelector(
+        size=300,
+        keep_above=0.52,
+        top_band_edge=0.44,
+        quantiles=[50, 75, 90, 95, 99],
+        pool_multiple=[3, 3, 3, 2, 2, 2, 2],
+        seed=1,
+        **kwargs,
+    )
+
+
+def test_refreshed_band_edges_follow_the_archive_each_round() -> None:
+    selector = _refresh_selector(refresh_band_edges=True)
+
+    selector.select(_enriched(0), encoder=_IndexEncoder())
+    first = selector.band_edges
+    selector.select(_enriched(400), encoder=_IndexEncoder())
+    second = selector.band_edges
+
+    assert first != second  # re-derived from the larger, shifted archive
+    assert first[-1] == second[-1] == 0.44  # the pinned top edge never moves
+    # Every call used edges derived from ITS archive.
+    assert selector.last_diagnostics["band_edges"][1:-1] == second
+
+
+def test_frozen_band_edges_are_the_default_and_do_not_follow_the_archive() -> None:
+    selector = _refresh_selector()  # refresh_band_edges defaults to False
+
+    selector.select(_enriched(0), encoder=_IndexEncoder())
+    first = selector.band_edges
+    selector.select(_enriched(400), encoder=_IndexEncoder())
+
+    assert selector.band_edges == first
+
+
+def test_refreshing_keeps_the_band_count_and_the_hits() -> None:
+    selector = _refresh_selector(refresh_band_edges=True)
+    for extra in (0, 100, 400):
+        archive = _enriched(extra)
+        subset = selector.select(archive, encoder=_IndexEncoder())
+        assert len(selector.last_diagnostics["bands"]) == 7
+        assert len(subset.indices) == 300
+        hits = {i for i, o in enumerate(archive) if o.y >= 0.52}
+        assert hits <= set(subset.indices)
+
+
+def test_refresh_cannot_be_combined_with_pinned_band_edges() -> None:
+    with pytest.raises(ValueError, match="refresh_band_edges"):
+        StratifiedFPSSubsetSelector(
+            size=100, keep_above=0.5, band_edges=[0.1, 0.2], refresh_band_edges=True
+        )
+    with pytest.raises(ValueError, match="refresh_band_edges"):
+        StratifiedFPSSubsetSelectorConfig(
+            size=100, keep_above=0.5, band_edges=[0.1, 0.2], refresh_band_edges=True
+        )
+    config = StratifiedFPSSubsetSelectorConfig(
+        size=100, keep_above=0.5, refresh_band_edges=True
+    )
+    assert config.build().refresh_band_edges is True
