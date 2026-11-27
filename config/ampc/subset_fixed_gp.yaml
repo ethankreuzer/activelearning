@@ -116,13 +116,19 @@ surrogate:
     # If the hit tier ever exceeds `size` the fit raises, rather than silently
     # dropping a hit.
     keep_above: 0.5247394203416823
-    # Pinned, NOT recomputed per round: the quantiles (50/75/90/95/99/99.75%) of
-    # the round-0 archive, i.e. data/ampc_svgpscale_20000.csv. Derived edges would
-    # move with the enrichment the loop produces, so the top band would mean
-    # something different each round, and a resumed job would derive them from the
-    # archive it restarted with. tests/test_subset_fixed_gp_config.py checks these
-    # still match the start set. See MULTI_ROUND_AL_PLAN.md.
-    band_edges: [0.06873, 0.20251, 0.30633, 0.35921, 0.48081, 0.577]
+    # `band_edges` is deliberately NOT set. The y cutoffs that split the archive
+    # into bands (quantiles 50/75/90/95/99/99.75%) are derived ONCE, from the
+    # whole archive -- the start set plus everything docked so far -- the first
+    # time it exceeds `size` and has to be subsetted, and are then frozen for every
+    # later round. Rounds before that fit the whole archive and use no bands. So
+    # the bands describe the archive actually being cut down, not the 20k start
+    # set, which docking will have enriched by then; and, being frozen after the
+    # switch, a band still means the same y range in every subset round.
+    # The derived edges are logged each round as
+    # surrogate/subset_gp/band_edge_<i>. A RESUMED run would re-derive them from
+    # the archive it restarts with, so to resume, pin the logged values here.
+    # (Earlier configs pinned the round-0 quantiles; for this 20k start set those
+    # are [0.06873, 0.20251, 0.30633, 0.35921, 0.48081, 0.577].)
     # Set EXPLICITLY, because the module defaults are the original stratified
     # settings (top_fraction 0.5, band_fill even, pool_multiple 15) that the
     # balanced selection was written to replace: half the budget in the top

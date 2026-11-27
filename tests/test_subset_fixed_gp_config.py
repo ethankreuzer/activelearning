@@ -11,7 +11,6 @@ from activelearning.utils.config_loader import load_config
 
 REPO = Path(__file__).resolve().parents[1]
 CONFIG = REPO / "config/ampc/subset_fixed_gp.yaml"
-QUANTILES = (50.0, 75.0, 90.0, 95.0, 99.0, 99.75)
 
 
 @pytest.fixture(scope="module")
@@ -39,6 +38,9 @@ def test_exact_cholesky_covers_the_largest_fit(cfg):
     assert cfg["surrogate"]["max_cholesky_size"] >= cfg["surrogate"]["training_subset"]["size"]
 
 
+def test_band_edges_come_from_the_archive_at_the_switch_not_the_start_set(cfg):
+    """Unpinned: derived once from the whole archive when it first exceeds `size`."""
+    assert cfg["surrogate"]["training_subset"].get("band_edges") is None
 
 
 @pytest.fixture(scope="module")
@@ -56,9 +58,3 @@ def test_the_start_set_fits_and_holds_every_hit(cfg, start_targets):
     hits = int((start_targets >= cfg["surrogate"]["training_subset"]["keep_above"]).sum())
     assert len(start_targets) <= size  # round 1 fits the whole start set
     assert 0 < hits < size  # a hit tier that could not exceed the budget
-
-
-def test_pinned_band_edges_are_the_start_sets_round_zero_quantiles(cfg, start_targets):
-    pinned = cfg["surrogate"]["training_subset"]["band_edges"]
-    derived = np.percentile(start_targets, QUANTILES)
-    assert pinned == pytest.approx(derived.tolist(), abs=6e-6)

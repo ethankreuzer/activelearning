@@ -333,6 +333,15 @@ def _band_metrics(diagnostics: Any) -> dict[str, int | float]:
         metrics["surrogate/subset_gp/train/kept_above_threshold"] = diagnostics[
             "n_kept"
         ]
+    # The y cutoffs the bands were cut at. When the selector derived them from the
+    # archive at the first subsetting round they exist nowhere else, and a rerun
+    # or a resumed run needs them to pin. The two open ends are not finite and
+    # are skipped; the index is the edge's position in the full list.
+    edges = diagnostics.get("band_edges")
+    if isinstance(edges, list):
+        for index, edge in enumerate(edges):
+            if isinstance(edge, (int, float)) and math.isfinite(edge):
+                metrics[f"surrogate/subset_gp/band_edge_{index}"] = float(edge)
     return metrics
 
 

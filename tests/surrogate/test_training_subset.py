@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Any
 
+import numpy as np
 import pytest
 import torch
 from pydantic import TypeAdapter
@@ -399,3 +400,46 @@ def test_stratified_fps_fits_everything_until_the_archive_passes_size_then_pivot
         assert hits <= set(subset.indices)  # every hit kept
         assert subset.top_count == len(hits)
         assert selector.last_diagnostics["n_kept"] == len(hits)
+
+
+def test_unpinned_band_edges_are_derived_from_the_whole_archive_at_the_switch() -> None:
+    """No edges while the archive fits; at the switch, its own quantiles; then frozen."""
+    selector = StratifiedFPSSubsetSelector(size=100, keep_above=0.5, seed=1)
+    archive = _graded_archive(400)
+
+    for rows in (60, 100):  # whole-archive rounds: no bands, nothing derived
+        selector.select(archive[:rows], encoder=_IndexEncoder())
+        assert selector.band_edges is None
+
+    selector.select(archive[:150], encoder=_IndexEncoder())  # first subsetting round
+    edges = selector.band_edges
+    assert edges is not None
+    # The inner edges are quantiles of the WHOLE archive handed in at that round.
+    from activelearning.surrogate.stratified_fps import (
+        DEFAULT_QUANTILES,
+        quantile_band_edges,
+    )
+
+    targets = np.array([obs.y for obs in archive[:150]])
+    inner = quantile_band_edges(targets, DEFAULT_QUANTILES)
+    assert edges == [float(e) for e in inner if np.isfinite(e)]
+
+    # A later, differently distributed archive does not move them.
+    selector.select(archive[:400], encoder=_IndexEncoder())
+    assert selector.band_edges == edges
+
+
+def test_band_edges_are_logged_with_the_round_metrics() -> None:
+    """The derived edges are on record, so a rerun or a resume can pin them."""
+    from activelearning.surrogate.subset_gp import _band_metrics
+
+    metrics = _band_metrics(
+        {"band_edges": [None, 0.1, 0.25, 0.5, None], "bands": [], "n_kept": 3}
+    )
+
+    assert metrics["surrogate/subset_gp/band_edge_1"] == 0.1
+    assert metrics["surrogate/subset_gp/band_edge_2"] == 0.25
+    assert metrics["surrogate/subset_gp/band_edge_3"] == 0.5
+    assert "surrogate/subset_gp/band_edge_0" not in metrics  # open ends skipped
+    assert "surrogate/subset_gp/band_edge_4" not in metrics
+    assert metrics["surrogate/subset_gp/train/kept_above_threshold"] == 3
