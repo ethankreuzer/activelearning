@@ -56,11 +56,15 @@ def _training_subset(paths: list[Path], overrides: list[str] | None = None) -> o
 
 
 def test_the_shipped_config_is_the_subset_regime() -> None:
-    """Unswitched, the config is what the completed 10-round run ran."""
+    """Unswitched, the config fits the whole archive to 40k rows, then subsets.
+
+    Hits are pProp >= 5, which is ``DEFAULT_HIT_THRESHOLD`` on the y scale.
+    """
     parsed = _ADAPTER.validate_python(_training_subset([BASE_CONFIG]))
 
     assert isinstance(parsed, StratifiedFPSSubsetSelectorConfig)
-    assert parsed.keep_above == 0.5
+    assert parsed.size == 40000
+    assert parsed.keep_above == pytest.approx(0.5247394203416823)
 
 
 def test_the_two_piece_switch_replaces_the_node() -> None:
@@ -93,7 +97,7 @@ def test_the_override_alone_is_refused() -> None:
     node = _training_subset([BASE_CONFIG], overrides=[FULL_ARCHIVE_OVERRIDE])
 
     assert node["type"] == "FullArchive"
-    assert node["size"] == 25000  # the merge left it behind
+    assert node["size"] == 40000  # the merge left it behind
 
     with pytest.raises(ValidationError):
         _ADAPTER.validate_python(node)

@@ -940,7 +940,9 @@ def test_al_surrogate_is_the_sweeps_on_pinned_arm() -> None:
     assert surrogate.outputscale is True
     assert surrogate.scale_inputs is True
     assert surrogate.standardize_outputs is True
-    assert surrogate.max_cholesky_size == 30000
+    # At least the largest fit (training_subset.size = 40,000): above it gpytorch
+    # silently falls back to approximate conjugate gradients.
+    assert surrogate.max_cholesky_size == 40000
     assert surrogate.accept_abnormal_lbfgsb is True
     # Deliberately unset: a noise floor pins the outputscale-to-noise ratio by
     # fiat, and that ratio is what the marginal likelihood is there to estimate.

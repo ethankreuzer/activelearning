@@ -367,3 +367,35 @@ def test_full_archive_config_rejects_a_leftover_subset_size() -> None:
         TypeAdapter(TrainingSubsetSelectorConfig).validate_python(
             {"type": "FullArchive", "size": 25000, "keep_above": 0.5}
         )
+
+
+def test_stratified_fps_fits_everything_until_the_archive_passes_size_then_pivots() -> None:
+    """The multi-round path: whole archive while it fits, subset once it cannot.
+
+    One selector over a growing archive, as the loop calls it. Up to ``size``
+    rows the GP fits everything (no farthest-point pass, nothing encoded); the
+    first round past ``size`` switches to the stratified subset, which keeps
+    every hit and spends the budget exactly, and every later round stays on it.
+    """
+    size, hit = 100, 0.5
+    # Pinned, as in the AL config, so the first call is not what sets the bands.
+    selector = StratifiedFPSSubsetSelector(
+        size=size, keep_above=hit, band_edges=[0.01, 0.02, 0.05, 0.08], seed=1
+    )
+    full = _graded_archive(400)  # 16 hits spread through it
+
+    for rows in (60, 80, 100):  # at or under the cap, including exactly at it
+        encoder = _IndexEncoder()
+        subset = selector.select(full[:rows], encoder=encoder)
+        assert subset.indices == list(range(rows))
+        assert encoder.encoded == []  # no subsetting work was done
+        assert selector.last_diagnostics == {}
+
+    for rows in (120, 200, 400):  # past it: pivot, and stay pivoted
+        archive = full[:rows]
+        subset = selector.select(archive, encoder=_IndexEncoder())
+        hits = {i for i, obs in enumerate(archive) if obs.y >= hit}
+        assert len(subset.indices) == size  # exactly the budget, never more
+        assert hits <= set(subset.indices)  # every hit kept
+        assert subset.top_count == len(hits)
+        assert selector.last_diagnostics["n_kept"] == len(hits)
