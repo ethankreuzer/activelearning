@@ -458,25 +458,3 @@ diagnostics:
   # Cost: one SA score per docked candidate, so 5,000 a round -- seconds
   # against the ~2.3 hours the same round spends docking them.
   docked_sa_threshold: 4.0
-
-  # The surrogate's health on ONE FIXED set every round, which is what makes
-  # "it was fine at round 2 and had degraded by round 7" a statement about the
-  # surrogate rather than about the policy. The per-round
-  # surrogate/general/held_out/* panels score whatever that round proposed, so
-  # they move with the policy and cannot answer it.
-  #
-  # ampc_331k, the same 331,480 docked molecules the offline arms report under
-  # `ampc_331k/final/*` (W&B project ampc-fixed-gp-fps-keep-above), scored with
-  # the same prediction_metrics and predicted_vs_observed figure, so a round's
-  # pearson / r2 / coverage_1std / coverage_2std are directly comparable with
-  # them. Logged under surrogate/eval_set/ampc_331k/.
-  #
-  # Cost: one encode-and-predict pass per round. The encoder is the feature
-  # store above, so molecules it already holds are memory-mapped lookups rather
-  # than MiniMol inference; the ~1,700 it does not hold are encoded every round,
-  # which is seconds.
-  held_out_sets:
-    - name: ampc_331k
-      path: cache/ampc/exact_dkl_top_n/ampc_331k.csv
-      x_column: SMILES
-      y_column: y
