@@ -77,6 +77,11 @@ surrogate:
     extra_stores:
       - store_path: cache/ampc/exact_dkl_top_n/gp_molformer_set.npy
         smiles_path: cache/ampc/exact_dkl_top_n/gp_molformer_set.smiles.txt
+      # The validation set (diagnostics.held_out_sets). It is disjoint from the
+      # 10M store by construction, so without this each round would encode all
+      # ~231k molecules live. Same encoder, same manifest hash check as above.
+      - store_path: cache/ampc/exact_dkl_top_n/ampc_val_screen_232k.npy
+        smiles_path: cache/ampc/exact_dkl_top_n/ampc_val_screen_232k.smiles.txt
   training_subset:
     # HOW THE LABELED DATA IS MANAGED OVER ROUNDS. This node is the choice, and
     # the alternative is not a variant of the block below but a replacement of
@@ -458,3 +463,20 @@ diagnostics:
   # Cost: one SA score per docked candidate, so 5,000 a round -- seconds
   # against the ~2.3 hours the same round spends docking them.
   docked_sa_threshold: 4.0
+
+  # The validation set: the GP is scored on this one fixed set every round, so
+  # its health can be compared across rounds. Metrics are logged under
+  # surrogate/eval_set/ampc_val_screen_232k/.
+  #
+  # 230,887 docked molecules drawn from the virtual screen, disjoint from the 10M
+  # library by construction (scripts/build_ampc_val_set.py).
+  #
+  # THESE METRICS ARE UNWEIGHTED. The set is stratified by pProp and the file's
+  # `weight` column undoes that, but the held-out loader does not read it. So the
+  # numbers describe this stratified sample, not the screen, and are not
+  # comparable with weighted results.
+  held_out_sets:
+    - name: ampc_val_screen_232k
+      path: data/ampc_val_screen_232k_labelled.csv
+      x_column: SMILES
+      y_column: y
