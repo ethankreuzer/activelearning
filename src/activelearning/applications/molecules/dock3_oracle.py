@@ -260,6 +260,7 @@ def _run_ligbuild(
     ligbuild_exe: str,
     timeout: int,
     ligbuild_timeout: int,
+    cxcalc_exe: Optional[str] = None,
     env: Optional[dict[str, str]] = None,
 ) -> Path:
     """Run ligbuild on ``smi_file`` and return the ``.tgz`` bundle it produced.
@@ -280,6 +281,10 @@ def _run_ligbuild(
         Wall-clock seconds allowed for the ligbuild subprocess.
     ligbuild_timeout : int
         Internal per-protomer timeout hint written into ``custom_parms.json``.
+    cxcalc_exe : str, optional
+        cxcalc launcher written into ``custom_parms.json`` as ``cxcalc_exe``.
+        ``None`` omits the key, leaving ligbuild to resolve ``cxcalc`` from
+        ``$PATH`` as before.
     env : dict[str, str], optional
         Complete environment for the subprocess; ``None`` inherits this
         process's.
@@ -298,10 +303,20 @@ def _run_ligbuild(
 
     # verbose=1 makes build_db2 print its errors instead of silently returning
     # None, which is the difference between a diagnosable failure and a mystery.
+    #
+    # cxcalc_exe, when set, points ligbuild's shutil.which() lookup at a
+    # specific launcher. The stock freechem launcher is an install4j shell
+    # script that creates ~575 processes before starting Java, twice per
+    # ligbuild call, and that kernel cost grows superlinearly with concurrency:
+    # measured in job 28927270, stock throughput peaks at 48 concurrent calls
+    # and collapses at 192, while a direct-java launcher keeps scaling to 192
+    # with every call succeeding. The key is omitted when unset so the default
+    # behaviour is unchanged.
+    custom_parms: dict[str, object] = {"verbose": 1, "timeout": ligbuild_timeout}
+    if cxcalc_exe is not None:
+        custom_parms["cxcalc_exe"] = cxcalc_exe
     custom_parms_path = out_dir.parent / "custom_parms.json"
-    custom_parms_path.write_text(
-        json.dumps({"verbose": 1, "timeout": ligbuild_timeout})
-    )
+    custom_parms_path.write_text(json.dumps(custom_parms))
 
     cmd = (
         f'source "{dockenv_sh}" && '
@@ -637,6 +652,12 @@ class Dock3Oracle(MultiFidelityOracle):
     ligbuild_timeout : int, default=150
         Internal per-protomer timeout hint passed to ligbuild through
         ``custom_parms.json``. Only meaningful when it is below ``timeout``.
+    cxcalc_exe : str or Path, optional
+        cxcalc launcher passed to ligbuild through ``custom_parms.json``.
+        Defaults to ``None``, which leaves ligbuild to resolve ``cxcalc`` from
+        ``$PATH``: the stock freechem install4j launcher. Point this at a
+        direct-java launcher to raise the concurrency at which docking
+        throughput stops improving; see the note under ``num_workers``.
     num_workers : int, optional
         Threads used to evaluate a query batch. Defaults to ``None``, which
         sizes the pool from the CPUs this job actually holds; see
@@ -684,6 +705,7 @@ class Dock3Oracle(MultiFidelityOracle):
         tmp_dir: str | Path | None = None,
         timeout: int = 300,
         ligbuild_timeout: int = 150,
+        cxcalc_exe: str | Path | None = None,
         num_workers: Optional[int] = None,
         hitrate_target: str = "ampc",
         warmup: bool = True,
@@ -736,6 +758,7 @@ class Dock3Oracle(MultiFidelityOracle):
         self._ligbuild_exe = ligbuild_exe
         self._timeout = timeout
         self._ligbuild_timeout = ligbuild_timeout
+        self._cxcalc_exe = None if cxcalc_exe is None else str(cxcalc_exe)
         self._pki_threshold = pki_threshold
         self._num_workers = resolve_num_workers(num_workers)
 
@@ -1191,6 +1214,7 @@ class Dock3Oracle(MultiFidelityOracle):
                     ligbuild_exe=self._ligbuild_exe,
                     timeout=self._timeout,
                     ligbuild_timeout=self._ligbuild_timeout,
+                    cxcalc_exe=self._cxcalc_exe,
                     env=self._subprocess_env(),
                 )
             except Exception as error:

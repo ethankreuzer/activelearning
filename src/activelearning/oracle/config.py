@@ -295,6 +295,12 @@ class Dock3OracleConfig(BaseModel):
     ligbuild_timeout : int
         Internal per-protomer timeout hint passed to ligbuild through
         ``custom_parms.json``.  Only meaningful when below ``timeout``.
+    cxcalc_exe : str, optional
+        cxcalc launcher passed to ligbuild through ``custom_parms.json``.
+        Defaults to ``null``, which leaves ligbuild to resolve ``cxcalc`` from
+        ``$PATH``: the stock freechem install4j launcher, whose per-call kernel
+        cost grows superlinearly with concurrency.  Point this at a direct-java
+        launcher to keep docking throughput rising past ~48 concurrent calls.
     num_workers : int, optional
         Threads used per query batch.  Defaults to ``null``, which sizes the
         pool from the CPUs this job actually holds -- the process CPU affinity
@@ -332,6 +338,7 @@ class Dock3OracleConfig(BaseModel):
     tmp_dir: str | None = None
     timeout: int = Field(default=300, gt=0)
     ligbuild_timeout: int = Field(default=150, gt=0)
+    cxcalc_exe: str | None = None
     num_workers: int | None = Field(default=None, ge=1)
     warmup: bool = True
 
@@ -377,6 +384,7 @@ class Dock3OracleConfig(BaseModel):
             tmp_dir=self.tmp_dir,
             timeout=self.timeout,
             ligbuild_timeout=self.ligbuild_timeout,
+            cxcalc_exe=self.cxcalc_exe,
             num_workers=self.num_workers,
             hitrate_params=self.hitrate_params,
             score_pprop_table=self.score_pprop_table,
@@ -414,6 +422,7 @@ class SlurmDock3OracleConfig(Dock3OracleConfig):
             tmp_dir=self.tmp_dir,
             timeout=self.timeout,
             ligbuild_timeout=self.ligbuild_timeout,
+            cxcalc_exe=self.cxcalc_exe,
             num_workers=self.num_workers,
             hitrate_params=self.hitrate_params,
             score_pprop_table=self.score_pprop_table,

@@ -536,6 +536,60 @@ class TestRunLigbuild:
         custom_parms = json.loads((out_dir.parent / "custom_parms.json").read_text())
         assert custom_parms == {"verbose": 1, "timeout": 150}
 
+    def test_omits_cxcalc_exe_when_unset(self, tmp_path: Path) -> None:
+        """No key means ligbuild resolves cxcalc from $PATH, as it always has."""
+        import json
+
+        smi, out_dir = self._setup(tmp_path)
+
+        def fake_run(*args, **kwargs):
+            out_dir.mkdir(parents=True, exist_ok=True)
+            (out_dir / "bundle.tgz").write_bytes(b"tgz")
+            return subprocess.CompletedProcess(args[0], returncode=0)
+
+        with patch(f"{_MODULE}._run_subprocess", side_effect=fake_run):
+            _run_ligbuild(
+                smi,
+                out_dir,
+                dockenv_sh="/fake/dockenv.sh",
+                ligbuild_exe="ligbuild",
+                timeout=300,
+                ligbuild_timeout=150,
+                cxcalc_exe=None,
+            )
+
+        custom_parms = json.loads((out_dir.parent / "custom_parms.json").read_text())
+        assert "cxcalc_exe" not in custom_parms
+
+    def test_writes_cxcalc_exe_when_set(self, tmp_path: Path) -> None:
+        """ligbuild resolves cxcalc_exe with shutil.which, so a path works."""
+        import json
+
+        smi, out_dir = self._setup(tmp_path)
+
+        def fake_run(*args, **kwargs):
+            out_dir.mkdir(parents=True, exist_ok=True)
+            (out_dir / "bundle.tgz").write_bytes(b"tgz")
+            return subprocess.CompletedProcess(args[0], returncode=0)
+
+        with patch(f"{_MODULE}._run_subprocess", side_effect=fake_run):
+            _run_ligbuild(
+                smi,
+                out_dir,
+                dockenv_sh="/fake/dockenv.sh",
+                ligbuild_exe="ligbuild",
+                timeout=300,
+                ligbuild_timeout=150,
+                cxcalc_exe="/home/u/dock/cxcalc_fast",
+            )
+
+        custom_parms = json.loads((out_dir.parent / "custom_parms.json").read_text())
+        assert custom_parms == {
+            "verbose": 1,
+            "timeout": 150,
+            "cxcalc_exe": "/home/u/dock/cxcalc_fast",
+        }
+
 
 class TestExtractDb2:
     """Tests for ligand bundle extraction."""
@@ -735,6 +789,7 @@ class TestDock3OracleConfig:
             num_workers=8,
             timeout=111,
             ligbuild_timeout=77,
+            cxcalc_exe="/home/u/dock/cxcalc_fast",
             warmup=False,
         )
         built = config.build()
@@ -743,6 +798,7 @@ class TestDock3OracleConfig:
         assert built._num_workers == 8
         assert built._timeout == 111
         assert built._ligbuild_timeout == 77
+        assert built._cxcalc_exe == "/home/u/dock/cxcalc_fast"
         assert built._pki_threshold == pytest.approx(6.5)
         assert built.get_supported_fidelities() == [0]
 
