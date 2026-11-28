@@ -116,7 +116,7 @@ oracle:
       num_array_tasks: 16
       max_parallel_tasks: 16
       shared_work_dir: /scratch/ethankrz/activelearning/dock3_queries
-      poll_interval: 5.0
+      poll_interval: 60.0
       sbatch_args:
         - --account=rrg-mailhoto_cpu
         - --nodes=1

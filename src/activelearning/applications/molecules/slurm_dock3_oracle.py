@@ -26,10 +26,21 @@ logger = logging.getLogger(__name__)
 
 _PROTOCOL_VERSION = 1
 _SCHEDULER_TIMEOUT = 30
+# sbatch gets longer than other scheduler commands: in job 23082420 it exceeded
+# 30 s and the array was created anyway, with nothing left to collect it.
+_SUBMIT_TIMEOUT = 300
+# Alliance policy: wait at least 60 s between Slurm queries.
+_MIN_POLL_INTERVAL = 60.0
+_DEFAULT_MAX_WAIT = 6 * 60 * 60.0
+_SUBMISSION_LOOKUPS = 2
+# Consecutive failed squeue checks before the array is given up on, so that one
+# scheduler hiccup during a long wait does not discard a round of docking.
+_MAX_MONITOR_FAILURES = 5
 _RESERVED_LONG_OPTIONS = (
     "--array",
     "--cpus-per-task",
     "--error",
+    "--job-name",
     "--output",
     "--parsable",
 )
@@ -37,6 +48,7 @@ _RESERVED_SHORT_OPTIONS = (
     "-a",
     "-c",
     "-e",
+    "-J",
     "-o",
 )
 _INFRASTRUCTURE_FAILURES = frozenset(
@@ -46,6 +58,7 @@ _INFRASTRUCTURE_FAILURES = frozenset(
         "slurm_task_failed",
         "slurm_result_invalid",
         "slurm_monitor_failed",
+        "slurm_wait_timeout",
     }
 )
 
@@ -435,6 +448,9 @@ class SlurmDock3Oracle(Dock3Oracle):
     ``num_workers`` is both the CPU request and local docking-pool size for
     every array task. Result files on ``shared_work_dir`` are authoritative;
     ``squeue`` only determines when missing results can no longer arrive.
+    ``poll_interval`` must be at least 60 s. ``max_wait`` bounds the seconds
+    spent waiting after submission, queue time included; when it expires the
+    array is cancelled and unfinished tasks fail. ``None`` waits indefinitely.
     Infrastructure failures return ``NaN`` observations and retain their query
     directory for diagnosis.
     """
@@ -462,7 +478,8 @@ class SlurmDock3Oracle(Dock3Oracle):
         hitrate_target: str = "ampc",
         warmup: bool = True,
         max_parallel_tasks: int | None = None,
-        poll_interval: float = 5.0,
+        poll_interval: float = _MIN_POLL_INTERVAL,
+        max_wait: float | None = _DEFAULT_MAX_WAIT,
         sbatch_args: Sequence[str] = (),
     ) -> None:
         """Initialize the Slurm scheduler settings and local score converter."""
@@ -474,9 +491,19 @@ class SlurmDock3Oracle(Dock3Oracle):
             isinstance(poll_interval, bool)
             or not isinstance(poll_interval, (int, float))
             or not math.isfinite(float(poll_interval))
-            or poll_interval <= 0
+            or poll_interval < _MIN_POLL_INTERVAL
         ):
-            raise ValueError(f"poll_interval must be positive, got {poll_interval!r}")
+            raise ValueError(
+                f"poll_interval must be at least {_MIN_POLL_INTERVAL:g} s, "
+                f"got {poll_interval!r}"
+            )
+        if max_wait is not None and (
+            isinstance(max_wait, bool)
+            or not isinstance(max_wait, (int, float))
+            or not math.isfinite(float(max_wait))
+            or max_wait <= 0
+        ):
+            raise ValueError(f"max_wait must be None or positive, got {max_wait!r}")
 
         work_dir = Path(shared_work_dir).resolve()
         try:
@@ -492,6 +519,7 @@ class SlurmDock3Oracle(Dock3Oracle):
         self._num_array_tasks = num_array_tasks
         self._max_parallel_tasks = max_parallel_tasks
         self._poll_interval = float(poll_interval)
+        self._max_wait = None if max_wait is None else float(max_wait)
         self._sbatch_args = _validate_sbatch_args(sbatch_args)
         self._worker_warmup = warmup
         self._worker_hitrate_params = str(Path(hitrate_params).resolve())
@@ -637,6 +665,9 @@ class SlurmDock3Oracle(Dock3Oracle):
         array = f"0-{task_count - 1}"
         if self._max_parallel_tasks is not None:
             array += f"%{self._max_parallel_tasks}"
+        # Unique per query, so the array can be found by name if sbatch fails
+        # to report its ID.
+        job_name = f"dock3-{query_dir.name}"
         command = [
             "sbatch",
             "--parsable",
@@ -644,17 +675,56 @@ class SlurmDock3Oracle(Dock3Oracle):
             f"--cpus-per-task={self._num_workers}",
             f"--output={query_dir}/worker-%A_%a.out",
             f"--error={query_dir}/worker-%A_%a.err",
+            f"--job-name={job_name}",
             *self._sbatch_args,
             str(query_dir / "run_worker.sh"),
         ]
         try:
-            completed = _run_subprocess(command, timeout=_SCHEDULER_TIMEOUT)
+            completed = _run_subprocess(command, timeout=_SUBMIT_TIMEOUT)
         except (OSError, subprocess.SubprocessError) as error:
-            raise _SubmissionError from error
-        job_id = (completed.stdout or "").strip().split(";", 1)[0]
-        if completed.returncode != 0 or not job_id.isdigit():
-            raise _SubmissionError(completed.stderr or "invalid sbatch job ID")
-        return job_id
+            problem = f"sbatch did not complete: {error!r}"
+        else:
+            job_id = (completed.stdout or "").strip().split(";", 1)[0]
+            if completed.returncode == 0 and job_id.isdigit():
+                return job_id
+            problem = completed.stderr or "invalid sbatch job ID"
+
+        # A failed or timed-out sbatch does not prove that no job was created.
+        found = self._find_job(job_name)
+        if found is not None:
+            logger.warning(
+                "Adopting Slurm array %s after a submission error: %s",
+                found,
+                problem,
+            )
+            return found
+        self._cancel(f"--name={job_name}")
+        raise _SubmissionError(problem)
+
+    def _find_job(self, job_name: str) -> str | None:
+        """Return the ID of this user's single queued array named ``job_name``."""
+        for attempt in range(_SUBMISSION_LOOKUPS):
+            if attempt:
+                time.sleep(self._poll_interval)
+            try:
+                status = _run_subprocess(
+                    [
+                        "squeue",
+                        "--noheader",
+                        "--me",
+                        f"--name={job_name}",
+                        "--format=%F",
+                    ],
+                    timeout=_SCHEDULER_TIMEOUT,
+                )
+            except (OSError, subprocess.SubprocessError):
+                continue
+            job_ids = set((status.stdout or "").split())
+            if status.returncode == 0 and len(job_ids) == 1:
+                job_id = job_ids.pop()
+                if job_id.isdigit():
+                    return job_id
+        return None
 
     def _wait(
         self,
@@ -663,15 +733,37 @@ class SlurmDock3Oracle(Dock3Oracle):
         job_id: str,
         chunks: Sequence[Sequence[_TaskCandidate]],
     ) -> tuple[dict[int, _TaskResult], bool]:
-        """Wait for result files or a terminal scheduler state."""
+        """Wait for result files, a terminal scheduler state or ``max_wait``."""
+        deadline = (
+            None if self._max_wait is None else time.monotonic() + self._max_wait
+        )
         pending = set(range(len(chunks)))
         results: dict[int, _TaskResult] = {}
         infrastructure_failure = False
+        monitor_failures = 0
         while pending:
             infrastructure_failure |= self._collect_results(
                 query_dir, query_id, chunks, pending, results
             )
             if not pending:
+                break
+            if deadline is not None and time.monotonic() >= deadline:
+                logger.warning(
+                    "Cancelling Slurm array %s: %d task(s) unfinished after %.0f s",
+                    job_id,
+                    len(pending),
+                    self._max_wait,
+                )
+                self._cancel(job_id)
+                # Keep anything published while the array was being cancelled.
+                infrastructure_failure |= self._collect_results(
+                    query_dir, query_id, chunks, pending, results
+                )
+                if pending:
+                    self._fill_failures(
+                        pending, results, query_id, chunks, "slurm_wait_timeout"
+                    )
+                    infrastructure_failure = True
                 break
             try:
                 status = _run_subprocess(
@@ -681,12 +773,28 @@ class SlurmDock3Oracle(Dock3Oracle):
             except (OSError, subprocess.SubprocessError):
                 status = None
             if status is None or status.returncode != 0:
-                self._cancel(job_id)
-                self._fill_failures(
-                    pending, results, query_id, chunks, "slurm_monitor_failed"
+                monitor_failures += 1
+                logger.warning(
+                    "squeue check for Slurm array %s failed (%d/%d in a row)",
+                    job_id,
+                    monitor_failures,
+                    _MAX_MONITOR_FAILURES,
                 )
-                infrastructure_failure = True
+                if monitor_failures < _MAX_MONITOR_FAILURES:
+                    time.sleep(self._poll_interval)
+                    continue
+                self._cancel(job_id)
+                # Keep anything published since the last collection.
+                infrastructure_failure |= self._collect_results(
+                    query_dir, query_id, chunks, pending, results
+                )
+                if pending:
+                    self._fill_failures(
+                        pending, results, query_id, chunks, "slurm_monitor_failed"
+                    )
+                    infrastructure_failure = True
                 break
+            monitor_failures = 0
             if not (status.stdout or "").strip():
                 time.sleep(self._poll_interval)
                 infrastructure_failure |= self._collect_results(

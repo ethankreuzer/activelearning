@@ -91,7 +91,7 @@ oracle:
   # Run all four at once. Lower it to trade wall time for a lighter footprint in
   # the queue when the partition is busy.
   max_parallel_tasks: 4
-  poll_interval: 5.0
+  poll_interval: 60.0
   sbatch_args:
     - --account=def-yvesbrun_cpu
     - --time=0:30:00

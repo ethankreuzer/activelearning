@@ -341,6 +341,102 @@ def test_submission_uses_array_and_reserved_generated_paths(
     assert command[-1] == str(query_dir / "run_worker.sh")
 
 
+def test_submit_adopts_array_created_despite_sbatch_timeout(
+    oracle: SlurmDock3Oracle,
+    tmp_path: Path,
+) -> None:
+    query_dir = tmp_path / "query"
+    commands = []
+
+    def fake_scheduler(command, **kwargs):
+        commands.append(command)
+        if command[0] == "sbatch":
+            raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+        return subprocess.CompletedProcess(command, 0, stdout="777\n777\n")
+
+    with patch.object(slurm_module, "_run_subprocess", side_effect=fake_scheduler):
+        assert oracle._submit(query_dir, 2) == "777"
+
+    assert "--job-name=dock3-query" in commands[0]
+    assert "--name=dock3-query" in commands[1]
+    assert len(commands) == 2
+
+
+def test_submit_cancels_by_name_when_array_is_not_found(
+    oracle: SlurmDock3Oracle,
+    tmp_path: Path,
+) -> None:
+    commands = []
+
+    def fake_scheduler(command, **kwargs):
+        commands.append(command)
+        if command[0] == "sbatch":
+            raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    with patch.object(slurm_module, "_run_subprocess", side_effect=fake_scheduler):
+        with patch.object(slurm_module.time, "sleep") as sleep:
+            with pytest.raises(slurm_module._SubmissionError, match="TimeoutExpired"):
+                oracle._submit(tmp_path / "query", 2)
+
+    sleep.assert_called_once_with(60.0)
+    assert commands[-1] == ["scancel", "--name=dock3-query"]
+
+
+def test_wait_cancels_array_after_max_wait_and_keeps_finished_tasks(
+    oracle: SlurmDock3Oracle,
+    tmp_path: Path,
+) -> None:
+    query_dir = tmp_path / "query"
+    query_dir.mkdir()
+    chunks = [
+        [_TaskCandidate(index=0, smiles="a", fidelity=0)],
+        [_TaskCandidate(index=1, smiles="b", fidelity=0)],
+    ]
+    oracle._write_query(query_dir, "query", chunks)
+    _write_task_result(
+        query_dir / "task-00000.result.json",
+        _task_result("query", 0, [(0, -60.0, None)]),
+    )
+    oracle._max_wait = 100.0
+    queued = subprocess.CompletedProcess(["squeue"], 0, stdout="123\n", stderr="")
+
+    with patch.object(slurm_module, "_run_subprocess", return_value=queued):
+        with patch.object(slurm_module.time, "monotonic", side_effect=[0, 50, 101]):
+            with patch.object(slurm_module.time, "sleep"):
+                with patch.object(oracle, "_cancel") as cancel:
+                    results, infrastructure_failure = oracle._wait(
+                        query_dir, "query", "123", chunks
+                    )
+
+    cancel.assert_called_once_with("123")
+    assert infrastructure_failure is True
+    assert results[0].observations[0].failure_reason is None
+    assert results[1].observations[0].failure_reason == "slurm_wait_timeout"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("poll_interval", 5.0), ("max_wait", 0)],
+)
+def test_config_rejects_invalid_scheduler_timing(
+    tmp_path: Path, field: str, value: float
+) -> None:
+    with pytest.raises(ValueError, match=field):
+        SlurmDock3OracleConfig(
+            indock_template="INDOCK",
+            dockfiles_dir="dockfiles",
+            fidelity_costs={0: 1.0},
+            hitrate_params="params.json",
+            score_pprop_table="scores.df",
+            pki_threshold=6.5,
+            shared_work_dir=str(tmp_path),
+            num_array_tasks=2,
+            num_workers=4,
+            **{field: value},
+        )
+
+
 def test_wait_marks_missing_tasks_after_array_leaves_queue(
     oracle: SlurmDock3Oracle,
     tmp_path: Path,
@@ -371,7 +467,7 @@ def test_wait_marks_missing_tasks_after_array_leaves_queue(
     } == {"slurm_task_failed"}
 
 
-def test_wait_cancels_job_when_squeue_fails(
+def test_wait_cancels_job_after_repeated_squeue_failures(
     oracle: SlurmDock3Oracle,
     tmp_path: Path,
 ) -> None:
@@ -385,13 +481,52 @@ def test_wait_cancels_job_when_squeue_fails(
 
     with patch.object(slurm_module, "_run_subprocess", return_value=completed):
         with patch.object(oracle, "_cancel") as cancel:
-            results, infrastructure_failure = oracle._wait(
-                query_dir, "query", "123", chunks
-            )
+            with patch.object(slurm_module.time, "sleep") as sleep:
+                results, infrastructure_failure = oracle._wait(
+                    query_dir, "query", "123", chunks
+                )
 
     cancel.assert_called_once_with("123")
+    assert sleep.call_count == 4
     assert infrastructure_failure is True
     assert results[0].observations[0].failure_reason == "slurm_monitor_failed"
+
+
+def test_wait_resets_squeue_failure_count_after_success(
+    oracle: SlurmDock3Oracle,
+    tmp_path: Path,
+) -> None:
+    query_dir = tmp_path / "query"
+    query_dir.mkdir()
+    chunks = [[_TaskCandidate(index=0, smiles="a", fidelity=0)]]
+    oracle._write_query(query_dir, "query", chunks)
+    failed = subprocess.CompletedProcess(["squeue"], 1, stdout="", stderr="busy")
+    queued = subprocess.CompletedProcess(["squeue"], 0, stdout="123\n", stderr="")
+    replies = [failed] * 4 + [queued] + [failed] * 4 + [queued]
+
+    def publish_after_last_reply(_seconds):
+        if not replies:
+            _write_task_result(
+                query_dir / "task-00000.result.json",
+                _task_result("query", 0, [(0, -60.0, None)]),
+            )
+
+    with patch.object(
+        slurm_module,
+        "_run_subprocess",
+        side_effect=lambda *args, **kwargs: replies.pop(0),
+    ):
+        with patch.object(oracle, "_cancel") as cancel:
+            with patch.object(
+                slurm_module.time, "sleep", side_effect=publish_after_last_reply
+            ):
+                results, infrastructure_failure = oracle._wait(
+                    query_dir, "query", "123", chunks
+                )
+
+    cancel.assert_not_called()
+    assert infrastructure_failure is False
+    assert results[0].observations[0].failure_reason is None
 
 
 def test_submission_failure_returns_nan_and_retains_artifacts(
@@ -402,7 +537,8 @@ def test_submission_failure_returns_nan_and_retains_artifacts(
     )
 
     with patch.object(slurm_module, "_run_subprocess", return_value=completed):
-        observations = oracle.query([Candidate(x="CCO", fidelity=0)])
+        with patch.object(slurm_module.time, "sleep"):
+            observations = oracle.query([Candidate(x="CCO", fidelity=0)])
 
     assert math.isnan(observations[0].y)
     assert observations[0].metadata["dock3_failure_reason"] == (

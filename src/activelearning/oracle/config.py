@@ -402,7 +402,8 @@ class SlurmDock3OracleConfig(Dock3OracleConfig):
     num_array_tasks: int = Field(gt=0)
     num_workers: int = Field(ge=1)
     max_parallel_tasks: int | None = Field(default=None, ge=1)
-    poll_interval: float = Field(default=5.0, gt=0)
+    poll_interval: float = Field(default=60.0, ge=60)
+    max_wait: float | None = Field(default=21600.0, gt=0)
     sbatch_args: list[str] = Field(default_factory=list)
 
     def build(self) -> Oracle:
@@ -433,6 +434,7 @@ class SlurmDock3OracleConfig(Dock3OracleConfig):
             num_array_tasks=self.num_array_tasks,
             max_parallel_tasks=self.max_parallel_tasks,
             poll_interval=self.poll_interval,
+            max_wait=self.max_wait,
             sbatch_args=self.sbatch_args,
         )
 
